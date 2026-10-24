@@ -227,13 +227,22 @@ fn profile_settings_check(paths: &Paths) -> Check {
             format!("{} is not valid JSON", path.display()),
         );
     };
-    let status_ok = settings
+    let command = settings
         .pointer("/statusLine/command")
         .and_then(Value::as_str)
-        .is_some_and(|c| c.contains("cc-rotate-ctl") && c.contains("statusline"));
+        .unwrap_or("");
+    let status_ok = command.contains("cc-rotate-ctl") && command.contains("statusline");
     let hook_ok = settings
         .pointer("/hooks/StopFailure")
         .is_some_and(|h| h.to_string().contains("cc-rotate-ctl"));
+    // Older setups quoted the path, which PowerShell cannot run, so no usage was ever recorded.
+    if status_ok && command.trim_start().starts_with('"') {
+        return check(
+            "Profile",
+            Status::Fail,
+            "the statusline command starts with a quoted path, which fails when Claude Code runs it through PowerShell; run `cc-rotate-ctl setup --force`",
+        );
+    }
     match (status_ok, hook_ok) {
         (true, true) => check(
             "Profile",

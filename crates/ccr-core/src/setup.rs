@@ -239,7 +239,7 @@ fn build_settings(
     let obj = settings
         .as_object_mut()
         .context("settings.json is not an object")?;
-    let ctl = format!("\"{}\"", forward_slashes(ctl));
+    let ctl = command_path(ctl);
 
     let mut status = obj
         .get("statusLine")
@@ -265,6 +265,49 @@ fn build_settings(
         "hooks": [{ "type": "command", "command": format!("{ctl} hook stop-failure"), "timeout": 60 }]
     }));
     Ok((settings, downstream))
+}
+
+/// The executable as it should appear at the start of a statusline or hook command.
+///
+/// Claude Code may run those commands through PowerShell (`CLAUDE_CODE_USE_POWERSHELL_TOOL`),
+/// bash or cmd. A quoted path followed by arguments is a parse error in PowerShell, so the path
+/// must be unquoted: as is when it has no spaces, else its 8.3 short form. Quoting is the last
+/// resort, for volumes with short names disabled.
+pub fn command_path(exe: &Path) -> String {
+    let plain = forward_slashes(exe);
+    if !plain.contains(char::is_whitespace) {
+        return plain;
+    }
+    if let Some(short) = short_path(exe).map(|p| forward_slashes(&p)) {
+        if !short.contains(char::is_whitespace) {
+            return short;
+        }
+    }
+    format!("\"{plain}\"")
+}
+
+#[cfg(windows)]
+fn short_path(path: &Path) -> Option<PathBuf> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut buf = vec![0u16; 1024];
+    // SAFETY: `wide` is NUL-terminated and `buf` is writable for its full length.
+    let len =
+        unsafe { GetShortPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    if len == 0 || len >= buf.len() {
+        return None;
+    }
+    Some(PathBuf::from(std::ffi::OsString::from_wide(&buf[..len])))
+}
+
+#[cfg(not(windows))]
+fn short_path(_path: &Path) -> Option<PathBuf> {
+    None
 }
 
 /// The `.claude.json` Claude Code uses for a profile. The default profile (`~/.claude`)
@@ -443,6 +486,55 @@ mod tests {
         assert!(out.contains(r#""d":"C:\\Users\\x\\.claude-rotate""#));
     }
 
+    /// Claude Code may run statusline and hook commands through any of these shells, so the
+    /// generated command must start a program in every one of them, even from a path with spaces.
+    #[cfg(windows)]
+    #[test]
+    fn command_path_runs_in_every_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let spaced = dir.path().join("Program Files Like").join("bin");
+        std::fs::create_dir_all(&spaced).unwrap();
+        let exe = spaced.join("probe tool.exe");
+        std::fs::copy(r"C:\Windows\System32\where.exe", &exe).unwrap();
+
+        // No `/flags`: Git Bash rewrites arguments that start with `/` into Windows paths.
+        let command = format!("{} cmd", command_path(&exe));
+        assert!(
+            !command.starts_with('"'),
+            "unquoted when 8.3 names exist: {command}"
+        );
+
+        let shells: [(&str, &[&str]); 4] = [
+            ("pwsh", &["-NoProfile", "-Command"]),
+            ("powershell", &["-NoProfile", "-Command"]),
+            ("cmd", &["/D", "/C"]),
+            ("bash", &["-c"]),
+        ];
+        let mut ran = 0;
+        for (shell, args) in shells {
+            let Ok(found) = which::which(shell) else {
+                continue;
+            };
+            // System32\bash.exe is the WSL launcher, which runs Linux; Claude Code uses Git Bash.
+            if shell == "bash" && found.to_string_lossy().to_lowercase().contains("system32") {
+                continue;
+            }
+            let status = std::process::Command::new(found)
+                .args(args)
+                .arg(&command)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "{shell} could not run: {command}");
+            ran += 1;
+        }
+        assert!(
+            ran >= 2,
+            "at least cmd and Windows PowerShell exist on Windows"
+        );
+    }
+
     #[test]
     fn alias_block_is_idempotent() {
         let once = replace_block(
@@ -516,7 +608,7 @@ mod tests {
         assert_eq!(settings["model"], "opus");
         assert_eq!(
             settings["statusLine"]["command"],
-            r#""C:/bin/cc-rotate-ctl.exe" statusline"#
+            "C:/bin/cc-rotate-ctl.exe statusline"
         );
         assert_eq!(settings["statusLine"]["refreshInterval"], 30);
         let hook = settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
@@ -525,7 +617,7 @@ mod tests {
         assert!(hook.contains("rot"), "hook path rewritten: {hook}");
         assert_eq!(
             settings["hooks"]["StopFailure"][0]["hooks"][0]["command"],
-            r#""C:/bin/cc-rotate-ctl.exe" hook stop-failure"#
+            "C:/bin/cc-rotate-ctl.exe hook stop-failure"
         );
         let config: Value =
             serde_json::from_str(&std::fs::read_to_string(profile.join(".claude.json")).unwrap())
