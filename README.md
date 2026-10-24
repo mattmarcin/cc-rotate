@@ -85,6 +85,10 @@ cc-rotate
 ```
 
 `cc-rotate` passes its arguments through to `claude`, so `cc-rotate --resume` and the rest work as usual.
+
+Start it in a project folder, not your home folder.
+Claude Code does not run status lines in the home folder (trust there lasts for one run and is never saved), so cc-rotate cannot see usage or swap accounts for a session started there.
+The `cc-rotate` command warns you, and `cc-rotate-ctl doctor` lists any such session.
 The status line starts with the active account's label, and your own status line still shows after it.
 
 The desktop app shows every account, how much of each limit is used, when each resets, usage over the last day or week with swaps marked, and an activity log.

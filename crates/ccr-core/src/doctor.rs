@@ -1,13 +1,14 @@
 //! `cc-rotate-ctl doctor`: health checks for the store, the profile, and Claude Code.
 
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::paths::Paths;
+use crate::paths::{self, Paths};
 use crate::store::{AccountState, Store};
-use crate::{credfile, login, time};
+use crate::{credfile, login, statusline, time};
 
 /// Claude Code versions whose internals (credential reload, refresh locks, statusline and hook
 /// payloads) this release was verified against end to end.
@@ -190,6 +191,51 @@ pub fn run(store: &Store, paths: &Paths) -> Vec<Check> {
         }
     }
 
+    // Claude Code does not run custom status lines in the home folder (its trust there is
+    // per-run only), so a session started there is invisible to cc-rotate.
+    let home = paths::home_dir()
+        .ok()
+        .and_then(|h| dunce::canonicalize(h).ok());
+    let in_home = session_cwds(paths)
+        .iter()
+        .filter(|cwd| dunce::canonicalize(cwd).ok() == home)
+        .count();
+    if in_home > 0 {
+        checks.push(check(
+            "Sessions",
+            Status::Warn,
+            format!(
+                "{in_home} cc-rotate session(s) running in your home folder; Claude Code does not run status lines there, so cc-rotate cannot see their usage or swap them. Start cc-rotate in a project folder"
+            ),
+        ));
+    }
+
+    let last_tick = store.meta_i64(statusline::META_LAST_TICK_AT).ok().flatten();
+    let had_usage = store
+        .meta(statusline::META_LAST_TICK_HAD_USAGE)
+        .ok()
+        .flatten();
+    checks.push(match (last_tick, had_usage.as_deref()) {
+        (None, _) => check(
+            "Statusline",
+            Status::Warn,
+            "has not run yet; start a cc-rotate session and send a message",
+        ),
+        (Some(ts), Some("1")) => check(
+            "Statusline",
+            Status::Ok,
+            format!("last ran {}, with usage data", age(time::now_ms() - ts)),
+        ),
+        (Some(ts), _) => check(
+            "Statusline",
+            Status::Warn,
+            format!(
+                "last ran {}, but Claude Code sent no usage data (it does after the first reply on a subscription login)",
+                age(time::now_ms() - ts)
+            ),
+        ),
+    });
+
     let last_sample = accounts
         .iter()
         .filter_map(|a| store.last_sample(a.id).ok().flatten())
@@ -209,6 +255,52 @@ pub fn run(store: &Store, paths: &Paths) -> Vec<Check> {
     });
 
     checks
+}
+
+/// Working folders of the Claude Code sessions registered in the profile (`sessions/<pid>.json`)
+/// whose process is still running.
+fn session_cwds(paths: &Paths) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(paths.profile_dir.join("sessions")) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .filter_map(|t| serde_json::from_str::<Value>(&t).ok())
+        .filter(|s| {
+            s.get("pid")
+                .and_then(Value::as_u64)
+                .is_some_and(|pid| process_alive(pid as u32))
+        })
+        .filter_map(|s| s.get("cwd").and_then(Value::as_str).map(PathBuf::from))
+        .collect()
+}
+
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // SAFETY: plain Win32 calls on a handle opened and closed here.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let mut code = 0u32;
+        let ok = GetExitCodeProcess(handle, &mut code);
+        CloseHandle(handle);
+        ok != 0 && code == STILL_ACTIVE as u32
+    }
+}
+
+#[cfg(not(windows))]
+fn process_alive(pid: u32) -> bool {
+    // Linux has /proc; elsewhere assume the registration is current.
+    let proc = std::path::Path::new("/proc");
+    !proc.is_dir() || proc.join(pid.to_string()).exists()
 }
 
 fn profile_settings_check(paths: &Paths) -> Check {

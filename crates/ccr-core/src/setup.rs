@@ -429,6 +429,9 @@ pub fn install_powershell_alias(profile_dir: &Path) -> Result<Vec<PathBuf>> {
         "{ALIAS_BEGIN}\n\
          # Runs Claude Code on the cc-rotate account pool. Managed by `cc-rotate-ctl setup`.\n\
          function cc-rotate {{\n\
+         \x20   if ((Get-Location).Path -eq $HOME) {{\n\
+         \x20       Write-Warning \"cc-rotate cannot track usage or swap accounts in your home folder: Claude Code does not run status lines there. Start it in a project folder.\"\n\
+         \x20   }}\n\
          \x20   $old = $env:CLAUDE_CONFIG_DIR\n\
          \x20   $env:CLAUDE_CONFIG_DIR = '{quoted}'\n\
          \x20   try {{ claude @args }} finally {{ $env:CLAUDE_CONFIG_DIR = $old }}\n\

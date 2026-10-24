@@ -20,6 +20,8 @@ use crate::swap::{
     META_LAST_SWAP_FROM_WEEK_RESETS, META_PROFILE_FOREIGN, SwapRequest,
 };
 
+pub const META_LAST_TICK_AT: &str = "statusline_last_tick_at";
+pub const META_LAST_TICK_HAD_USAGE: &str = "statusline_last_tick_had_usage";
 const META_CONFIG_MTIME_SEEN: &str = "profile_config_mtime_seen";
 const META_PROFILE_UUID_SEEN: &str = "profile_account_uuid_seen";
 const META_SWAP_REQUESTED_AT: &str = "swap_requested_at";
@@ -147,6 +149,17 @@ pub struct TickResult {
 pub fn tick(store: &Store, paths: &Paths, input: &StatusInput, now_ms: i64) -> Result<TickResult> {
     let mut result = TickResult::default();
     let mut dead_login = false;
+
+    // Recorded for `doctor`: proves the statusline runs, and whether Claude Code sent usage.
+    store.set_meta(META_LAST_TICK_AT, now_ms)?;
+    store.set_meta(
+        META_LAST_TICK_HAD_USAGE,
+        if input.sample_for(0, "", now_ms).is_some() {
+            "1"
+        } else {
+            "0"
+        },
+    )?;
 
     sync_profile_login(store, paths, &mut dead_login)?;
 
