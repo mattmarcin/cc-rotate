@@ -1,6 +1,6 @@
 /target/
 **/node_modules/
-/app/ui/dist/
+/app/dist/
 /app/src-tauri/gen/
 *.db
 *.db-wal
