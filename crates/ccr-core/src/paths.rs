@@ -65,6 +65,17 @@ impl Paths {
         self.profile_dir.join(".credentials.json")
     }
 
+    /// The profile's credentials wherever Claude Code keeps them on this platform.
+    pub fn credentials(&self) -> crate::credstore::Credentials {
+        crate::credstore::Credentials::for_profile(&self.profile_dir)
+    }
+
+    /// Claude Code's lock around every read-modify-write of the credentials:
+    /// `<profile>/.storage-write.lock`.
+    pub fn storage_lock(&self) -> PathBuf {
+        self.profile_dir.join(".storage-write.lock")
+    }
+
     pub fn profile_config(&self) -> PathBuf {
         self.profile_dir.join(".claude.json")
     }

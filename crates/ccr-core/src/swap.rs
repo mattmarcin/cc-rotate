@@ -6,6 +6,9 @@
 //!    target login is written, so no refresh can be in flight. A refresh that finished before
 //!    we took the locks is in the file and gets captured; one that starts after we release them
 //!    re-reads the file under the lock and refreshes the target.
+//! 3. Claude Code's credentials write lock (`.storage-write.lock`) is held for the read and
+//!    write as well, so no other read-modify-write of the credentials (an MCP login, say) can
+//!    put the outgoing login back.
 
 use std::time::Duration;
 
@@ -22,7 +25,9 @@ use crate::{credfile, secret, time};
 pub const META_LAST_SWAP_AT: &str = "last_swap_at";
 pub const META_LAST_SWAP_FROM_FIVE_RESETS: &str = "last_swap_from_five_resets";
 pub const META_LAST_SWAP_FROM_WEEK_RESETS: &str = "last_swap_from_week_resets";
-pub const META_CRED_MTIME_SEEN: &str = "cred_mtime_seen";
+/// The credentials change marker (`Credentials::change_marker`) last seen. Named for the file
+/// mtime it held before the marker could also be a Keychain fingerprint.
+pub const META_CRED_SEEN: &str = "cred_mtime_seen";
 /// Set when the profile is signed in to an account outside the pool; a swap clears it.
 pub const META_PROFILE_FOREIGN: &str = "profile_foreign";
 
@@ -153,9 +158,21 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
                 format!("could not take Claude Code's legacy refresh lock: {e}"),
             )
         })?;
+    let storage_lock = DirLock::acquire(
+        &paths.storage_lock(),
+        LockOptions::claude_storage(lock_timeout),
+    )
+    .map_err(|e| {
+        log_error(
+            store,
+            req,
+            &target,
+            format!("could not take Claude Code's credentials write lock: {e}"),
+        )
+    })?;
 
-    let cred_path = paths.credentials_file();
-    let previous = credfile::read_oauth(&cred_path)?;
+    let creds = paths.credentials();
+    let previous = creds.read_oauth()?;
     let mut outgoing_state = AccountState::Parked;
     if let Some(account) = &active {
         match &previous {
@@ -170,8 +187,9 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
         }
     }
 
-    backup_daily(store, paths, now).context("backing up .credentials.json")?;
-    credfile::write_oauth(&cred_path, &target_login.oauth)?;
+    backup_daily(store, paths, now).context("backing up the profile's credentials")?;
+    creds.write_oauth(&target_login.oauth)?;
+    let marker = creds.change_marker()?;
 
     let from_sample = match active_id {
         Some(id) => store.last_sample(id)?,
@@ -194,8 +212,8 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
             .unwrap_or(0);
         s.set_meta(META_LAST_SWAP_FROM_FIVE_RESETS, five)?;
         s.set_meta(META_LAST_SWAP_FROM_WEEK_RESETS, week)?;
-        if let Some(mtime) = credfile::mtime_ms(&cred_path) {
-            s.set_meta(META_CRED_MTIME_SEEN, mtime)?;
+        if let Some(marker) = &marker {
+            s.set_meta(META_CRED_SEEN, marker)?;
         }
         s.log_event(
             kind::SWAP,
@@ -214,15 +232,17 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
     });
 
     if let Err(e) = committed {
-        // Put the outgoing login back so the file and the store agree again.
+        // Put the outgoing login back so the profile and the store agree again.
         if let Some(oauth) = &previous {
-            let _ = credfile::write_oauth(&cred_path, oauth);
+            let _ = creds.write_oauth(oauth);
         }
+        drop(storage_lock);
         drop(legacy_lock);
         drop(refresh_lock);
         return Err(e.context("recording the swap failed; the previous login was restored"));
     }
 
+    drop(storage_lock);
     drop(legacy_lock);
     drop(refresh_lock);
     Ok(SwapOutcome::Swapped {
@@ -234,14 +254,16 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
 /// Write a fresh login for the account that is already active (a re-login of the active
 /// account), under Claude Code's refresh locks like any swap.
 pub fn install_active_login(store: &Store, paths: &Paths, oauth: &serde_json::Value) -> Result<()> {
-    let opts = LockOptions::claude(Duration::from_millis(store.settings()?.lock_timeout_ms));
+    let timeout = Duration::from_millis(store.settings()?.lock_timeout_ms);
+    let opts = LockOptions::claude(timeout);
     let _swap_lock = DirLock::acquire(&paths.swap_lock(), opts)?;
     let _refresh = DirLock::acquire(&paths.refresh_lock(), opts)?;
     let _legacy = DirLock::acquire(&paths.legacy_refresh_lock(), opts)?;
-    let cred_path = paths.credentials_file();
-    credfile::write_oauth(&cred_path, oauth)?;
-    if let Some(mtime) = credfile::mtime_ms(&cred_path) {
-        store.set_meta(META_CRED_MTIME_SEEN, mtime)?;
+    let _storage = DirLock::acquire(&paths.storage_lock(), LockOptions::claude_storage(timeout))?;
+    let creds = paths.credentials();
+    creds.write_oauth(oauth)?;
+    if let Some(marker) = creds.change_marker()? {
+        store.set_meta(META_CRED_SEEN, marker)?;
     }
     Ok(())
 }
@@ -296,11 +318,10 @@ fn log_error(store: &Store, req: &SwapRequest, target: &Account, message: String
     anyhow!(message)
 }
 
-/// Keep one encrypted copy of `.credentials.json` per day, for the last `BACKUPS_KEPT` days.
-/// `cc-rotate-ctl backup <file>` prints one.
+/// Keep one encrypted copy of the profile's credentials document per day, for the last
+/// `BACKUPS_KEPT` days. `cc-rotate-ctl backup <file>` prints one.
 fn backup_daily(store: &Store, paths: &Paths, now_ms: i64) -> Result<()> {
-    let source = paths.credentials_file();
-    let Ok(bytes) = std::fs::read(&source) else {
+    let Some((_, bytes)) = paths.credentials().read_raw()? else {
         return Ok(());
     };
     let dir = paths.backups_dir();

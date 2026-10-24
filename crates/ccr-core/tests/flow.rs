@@ -323,6 +323,44 @@ fn swap_waits_for_claude_refresh_lock_and_captures_its_result() {
     assert_eq!(refresh_of(&env.file_doc()), "refresh-b1");
 }
 
+/// Claude Code holds `.storage-write.lock` around every read-modify-write of the credentials
+/// (an MCP login, for example). A swap in the middle would be overwritten with the old login.
+#[test]
+fn swap_waits_for_claude_credentials_write_lock() {
+    let env = Env::new();
+    let (store, a, b, _) = pool(&env);
+    let holder = DirLock::acquire(
+        &env.paths.storage_lock(),
+        LockOptions::claude_storage(Duration::ZERO),
+    )
+    .unwrap();
+    let cred = env.cred_file();
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(600));
+        let mut doc: Value =
+            serde_json::from_str(&std::fs::read_to_string(&cred).unwrap()).unwrap();
+        doc["mcpOAuth"]["srv|2"] = json!({"accessToken": "mcp2"});
+        std::fs::write(&cred, doc.to_string()).unwrap();
+        drop(holder);
+    });
+
+    let started = std::time::Instant::now();
+    let out = swap::run(&store, &env.paths, &manual(Some(b))).unwrap();
+    writer.join().unwrap();
+    assert!(started.elapsed() >= Duration::from_millis(500));
+    assert_eq!(
+        out,
+        SwapOutcome::Swapped {
+            from: Some(a),
+            to: b
+        }
+    );
+    let doc = env.file_doc();
+    assert_eq!(refresh_of(&doc), "refresh-b1");
+    assert_eq!(doc["mcpOAuth"]["srv|2"]["accessToken"], "mcp2");
+    assert!(!env.paths.storage_lock().exists(), "lock released");
+}
+
 #[test]
 fn tick_records_usage_and_requests_swap_at_threshold() {
     let env = Env::new();

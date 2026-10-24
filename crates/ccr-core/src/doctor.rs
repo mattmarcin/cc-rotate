@@ -6,6 +6,7 @@ use std::process::{Command, Stdio};
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::credstore::{self, Location};
 use crate::paths::{self, Paths};
 use crate::store::{AccountState, Store};
 use crate::{credfile, login, statusline, time};
@@ -156,9 +157,12 @@ pub fn run(store: &Store, paths: &Paths) -> Vec<Check> {
         )
     });
     checks.push(encryption_check(store));
+    checks.push(credential_storage_check(paths));
 
     if let Some(account) = active.first() {
-        let file_fp = credfile::read_oauth(&paths.credentials_file())
+        let file_fp = paths
+            .credentials()
+            .read_oauth()
             .ok()
             .flatten()
             .as_ref()
@@ -183,6 +187,7 @@ pub fn run(store: &Store, paths: &Paths) -> Vec<Check> {
     for lock in [
         paths.refresh_lock(),
         paths.legacy_refresh_lock(),
+        paths.storage_lock(),
         paths.swap_lock(),
     ] {
         if let Ok(meta) = std::fs::metadata(&lock) {
@@ -315,6 +320,46 @@ fn process_alive(pid: u32) -> bool {
     // Linux has /proc; elsewhere assume the registration is current.
     let proc = std::path::Path::new("/proc");
     !proc.is_dir() || proc.join(pid.to_string()).exists()
+}
+
+/// Where Claude Code keeps the profile's login, which is where swaps write it.
+fn credential_storage_check(paths: &Paths) -> Check {
+    let name = "Claude Code login storage";
+    if cfg!(windows)
+        && credstore::windows_credman_enabled(
+            &paths.profile_dir,
+            std::env::var("CLAUDE_CODE_FORCE_WINDOWS_CREDMAN")
+                .ok()
+                .as_deref(),
+        )
+    {
+        return check(
+            name,
+            Status::Fail,
+            "Claude Code is set to keep this profile's login in the Windows Credential Manager (tengu_windows_credman or CLAUDE_CODE_FORCE_WINDOWS_CREDMAN), which cc-rotate does not support yet; swaps will not reach running sessions",
+        );
+    }
+    let creds = paths.credentials();
+    match creds.location() {
+        Ok(Some(Location::Keychain)) => check(
+            name,
+            Status::Ok,
+            format!(
+                "{} (macOS support is experimental; a swap reaches running sessions within about 30 seconds)",
+                creds.describe(Location::Keychain)
+            ),
+        ),
+        Ok(Some(Location::File)) => check(name, Status::Ok, creds.describe(Location::File)),
+        Ok(None) => check(
+            name,
+            Status::Ok,
+            format!(
+                "nothing yet; the first login goes to {}",
+                creds.describe(Location::File)
+            ),
+        ),
+        Err(e) => check(name, Status::Fail, format!("{e:#}")),
+    }
 }
 
 /// Where the key that encrypts the stored logins lives, and whether only its owner can read it.

@@ -13,6 +13,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::credfile;
+use crate::credstore::Credentials;
 use crate::paths::Paths;
 use crate::profile_account::{self, ProfileAccount};
 use crate::scheduler::Reason;
@@ -53,7 +54,10 @@ impl Staging {
 }
 
 impl Drop for Staging {
+    /// On macOS the login lands in a Keychain item named after the staging directory; it goes
+    /// with the directory, whether the login was imported, failed or was cancelled.
     fn drop(&mut self) {
+        let _ = Credentials::for_profile(&self.dir).delete_keychain_item();
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -99,7 +103,8 @@ pub fn import(
     staging: &Path,
     req: &LoginRequest,
 ) -> Result<Imported> {
-    let oauth = credfile::read_oauth(&staging.join(".credentials.json"))?
+    let oauth = Credentials::for_profile(staging)
+        .read_oauth()?
         .filter(|o| !credfile::is_dead(o))
         .ok_or_else(|| anyhow!("the login did not complete; no account login was written"))?;
 

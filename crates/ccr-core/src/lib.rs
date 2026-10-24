@@ -4,6 +4,7 @@
 //! the StopFailure hook, the CLI and the desktop app) goes through this crate.
 
 pub mod credfile;
+pub mod credstore;
 pub mod doctor;
 pub mod lock;
 pub mod login;

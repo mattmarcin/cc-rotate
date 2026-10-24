@@ -21,6 +21,8 @@ use filetime::FileTime;
 /// Claude Code's settings for its refresh locks (`stale: 60000`, `update: 5000`).
 pub const CLAUDE_STALE: Duration = Duration::from_millis(60_000);
 pub const CLAUDE_UPDATE: Duration = Duration::from_millis(5_000);
+/// Claude Code's setting for its credentials write lock (`.storage-write`).
+pub const CLAUDE_STORAGE_STALE: Duration = Duration::from_millis(15_000);
 
 #[derive(Debug, Clone, Copy)]
 pub struct LockOptions {
@@ -34,6 +36,16 @@ impl LockOptions {
     pub fn claude(timeout: Duration) -> Self {
         Self {
             stale: CLAUDE_STALE,
+            update: CLAUDE_UPDATE,
+            timeout,
+        }
+    }
+
+    /// Claude Code's credentials write lock (`stale: 15000`); updating every 5 s keeps it
+    /// well inside that.
+    pub fn claude_storage(timeout: Duration) -> Self {
+        Self {
+            stale: CLAUDE_STORAGE_STALE,
             update: CLAUDE_UPDATE,
             timeout,
         }

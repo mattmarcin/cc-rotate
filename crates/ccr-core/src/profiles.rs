@@ -12,6 +12,7 @@ use anyhow::Result;
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::credstore::Credentials;
 use crate::paths::{self, Paths};
 use crate::store::Store;
 use crate::{credfile, profile_account};
@@ -33,16 +34,22 @@ pub struct FoundProfile {
 /// The `.claude.json` that goes with a profile directory: the default profile (`~/.claude`)
 /// keeps it in the home directory, every other profile keeps it inside.
 pub fn config_file_for(dir: &Path) -> PathBuf {
+    match paths::home_dir() {
+        Ok(home) if is_default_profile(dir) && home.join(".claude.json").is_file() => {
+            home.join(".claude.json")
+        }
+        _ => dir.join(".claude.json"),
+    }
+}
+
+/// Whether `dir` is the profile Claude Code uses when `CLAUDE_CONFIG_DIR` is unset.
+fn is_default_profile(dir: &Path) -> bool {
     let default = paths::default_template_dir()
         .ok()
         .and_then(|d| dunce::canonicalize(d).ok());
-    let is_default = dunce::canonicalize(dir)
+    dunce::canonicalize(dir)
         .ok()
-        .is_some_and(|d| Some(d) == default);
-    match paths::home_dir() {
-        Ok(home) if is_default && home.join(".claude.json").is_file() => home.join(".claude.json"),
-        _ => dir.join(".claude.json"),
-    }
+        .is_some_and(|d| Some(d) == default)
 }
 
 pub fn short_name(dir: &Path) -> String {
@@ -87,7 +94,8 @@ pub fn discover_in(store: &Store, rotation: &Paths, home: &Path) -> Result<Vec<F
         if ident.email.is_none() && ident.account_uuid.is_none() {
             continue;
         }
-        let oauth = credfile::read_oauth(&dir.join(".credentials.json"))
+        let oauth = Credentials::new(&dir, is_default_profile(&dir))
+            .read_oauth()
             .ok()
             .flatten();
         let in_pool = match (&ident.account_uuid, &ident.email) {
