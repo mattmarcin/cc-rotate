@@ -29,7 +29,9 @@ There are no versioned releases yet, so only the latest `main` is supported.
 - The daily backups of the profile's login file in the `backups` folder are encrypted with the same key.
   `cc-rotate-ctl backup <file>` prints one decrypted.
 - Stores from older versions, encrypted with Windows DPAPI, are converted to this format the first time a new version opens them.
-- The rotation profile's `.credentials.json` holds the active account's login in plain text, exactly as Claude Code itself stores it.
+- The rotation profile's `.credentials.json` holds the active account's login in plain text, exactly as Claude Code itself stores it (mode 600 on Linux and macOS).
+  On macOS, where Claude Code keeps the login in the Keychain, cc-rotate writes it to the same Keychain item through Apple's `security` tool, like Claude Code does.
+  Like Claude Code, it passes the login to `security` on standard input, and on the command line only when the document is too long for that (over about 2 KB, for example with many MCP logins); a command line is briefly visible to other local users.
 - A new login is made in a temporary staging folder under `staging` in the data folder, which is deleted when the login finishes, fails, is cancelled or times out.
 - cc-rotate makes no network requests of its own, and the desktop app opens no network port.
 - Your other Claude Code profiles are only read, to find out which account each belongs to; their logins are never imported or changed.

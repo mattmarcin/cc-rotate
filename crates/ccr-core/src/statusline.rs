@@ -16,7 +16,7 @@ use crate::profile_account;
 use crate::scheduler::{self, Reason, Thresholds, Usage};
 use crate::store::{Account, AccountState, Sample, Store, kind};
 use crate::swap::{
-    META_CRED_MTIME_SEEN, META_LAST_SWAP_AT, META_LAST_SWAP_FROM_FIVE_RESETS,
+    META_CRED_SEEN, META_LAST_SWAP_AT, META_LAST_SWAP_FROM_FIVE_RESETS,
     META_LAST_SWAP_FROM_WEEK_RESETS, META_PROFILE_FOREIGN, SwapRequest,
 };
 
@@ -25,6 +25,8 @@ pub const META_LAST_TICK_HAD_USAGE: &str = "statusline_last_tick_had_usage";
 const META_CONFIG_MTIME_SEEN: &str = "profile_config_mtime_seen";
 const META_PROFILE_UUID_SEEN: &str = "profile_account_uuid_seen";
 const META_SWAP_REQUESTED_AT: &str = "swap_requested_at";
+/// The credentials change marker a dead login was last reported for, so it is logged once.
+const META_DEAD_LOGIN_SEEN: &str = "dead_login_seen";
 /// Window after a swap during which samples matching the outgoing account's reset times are
 /// treated as stale readings of the old account.
 const STALE_SAMPLE_GUARD_MS: i64 = 120_000;
@@ -278,28 +280,25 @@ fn sync_profile_login(store: &Store, paths: &Paths, dead_login: &mut bool) -> Re
         return Ok(());
     }
 
-    let cred_path = paths.credentials_file();
-    let Some(mtime) = credfile::mtime_ms(&cred_path) else {
+    let creds = paths.credentials();
+    let Some(marker) = creds.change_marker()? else {
         return Ok(());
     };
-    if store.meta_i64(META_CRED_MTIME_SEEN)? == Some(mtime) {
+    if store.meta(META_CRED_SEEN)?.as_deref() == Some(marker.as_str()) {
         return Ok(());
     }
     let Some(active) = store.active_account()? else {
-        store.set_meta(META_CRED_MTIME_SEEN, mtime)?;
+        store.set_meta(META_CRED_SEEN, &marker)?;
         return Ok(());
     };
-    let Some(oauth) = credfile::read_oauth(&cred_path)? else {
-        store.set_meta(META_CRED_MTIME_SEEN, mtime)?;
+    let Some(oauth) = creds.read_oauth()? else {
+        store.set_meta(META_CRED_SEEN, &marker)?;
         return Ok(());
     };
 
     if credfile::is_dead(&oauth) {
         *dead_login = true;
-        if store
-            .last_event_of(kind::DEAD_LOGIN)?
-            .is_none_or(|e| e.account_from != Some(active.id) || e.ts < mtime)
-        {
+        if store.meta(META_DEAD_LOGIN_SEEN)?.as_deref() != Some(marker.as_str()) {
             store.log_event(
                 kind::DEAD_LOGIN,
                 Some(active.id),
@@ -307,8 +306,9 @@ fn sync_profile_login(store: &Store, paths: &Paths, dead_login: &mut bool) -> Re
                 Some("refresh_rejected"),
                 None,
             )?;
+            store.set_meta(META_DEAD_LOGIN_SEEN, &marker)?;
         }
-        // Leave the mtime unseen so every tick keeps requesting a swap until one lands.
+        // Leave the change unseen so every tick keeps requesting a swap until one lands.
         return Ok(());
     }
 
@@ -318,7 +318,7 @@ fn sync_profile_login(store: &Store, paths: &Paths, dead_login: &mut bool) -> Re
         store.save_credential(active.id, &oauth, "sync")?;
         store.log_event(kind::SYNC, Some(active.id), None, Some("refreshed"), None)?;
     }
-    store.set_meta(META_CRED_MTIME_SEEN, mtime)?;
+    store.set_meta(META_CRED_SEEN, &marker)?;
     Ok(())
 }
 
@@ -326,7 +326,7 @@ fn sync_profile_login(store: &Store, paths: &Paths, dead_login: &mut bool) -> Re
 /// account. When that account is in the pool, make it active and store its new login; when it
 /// is not, record the foreign login once and stop syncing until it changes back.
 ///
-/// Returns true when the tick must not sync the credentials file this time.
+/// Returns true when the tick must not sync the credentials this time.
 fn adopt_manual_login(store: &Store, paths: &Paths) -> Result<bool> {
     let foreign = store.meta(META_PROFILE_FOREIGN)?.as_deref() == Some("1");
     let config = paths.profile_config();
@@ -358,7 +358,8 @@ fn adopt_manual_login(store: &Store, paths: &Paths) -> Result<bool> {
 
     match store.account_by_uuid(&uuid)? {
         Some(account) => {
-            let oauth = credfile::read_oauth(&paths.credentials_file())?;
+            let creds = paths.credentials();
+            let oauth = creds.read_oauth()?;
             store.immediate(|s| {
                 if let Some(a) = &active {
                     s.set_state(a.id, AccountState::Parked)?;
@@ -376,8 +377,8 @@ fn adopt_manual_login(store: &Store, paths: &Paths) -> Result<bool> {
                 )?;
                 Ok(())
             })?;
-            if let Some(m) = credfile::mtime_ms(&paths.credentials_file()) {
-                store.set_meta(META_CRED_MTIME_SEEN, m)?;
+            if let Some(marker) = creds.change_marker()? {
+                store.set_meta(META_CRED_SEEN, &marker)?;
             }
             Ok(true)
         }

@@ -39,6 +39,11 @@ The design, with the Claude Code behavior it relies on, is in [docs/specs/2026-1
 
 `~` is your home folder (`%USERPROFILE%` on Windows).
 
+On macOS, Claude Code keeps its login in the Keychain rather than in a file, and cc-rotate swaps the Keychain item.
+Claude Code rereads that item at most every 30 seconds, so a swap reaches running sessions within about 30 seconds instead of on their next request.
+Start Claude Code with `cc-rotate` there: the Keychain item is named after the exact profile path, which `cc-rotate` sets for you.
+If you try it on a Mac, `cc-rotate-ctl doctor` shows where the login lives, and reports of what works and what does not are very welcome.
+
 ## Requirements
 
 - Claude Code, native install (`claude --version`). Tested with 2.1.310.
@@ -162,6 +167,7 @@ It never touches that profile's login and never swaps anything.
 ## What it does not cover
 
 - **The Claude desktop app.** Its Code tab passes its own login to Claude Code directly, so swapping the profile's login cannot reach it.
+- **Claude Code's Windows Credential Manager storage.** Claude Code can be switched to keep its login in the Windows Credential Manager; swaps would then stop reaching running sessions. `cc-rotate-ctl doctor` fails loudly if that is on.
 - **Claude Code updates.** cc-rotate relies on how Claude Code reloads its login and locks login renewal, which is not a documented interface.
   `cc-rotate-ctl doctor` and the app warn when your Claude Code version has not been tested.
 
