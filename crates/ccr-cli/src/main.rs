@@ -165,6 +165,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
 fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> {
     match command {
         Command::Status { json } => {
+            if let Some(req) = statusline::sync(store, paths)? {
+                swap::run(store, paths, &req)?;
+            }
             let snap = snapshot::snapshot(store, paths)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&snap)?);
@@ -289,6 +292,12 @@ fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> 
             match &report.statusline_downstream {
                 Some(cmd) => println!("  your statusline still runs after cc-rotate's: {cmd}"),
                 None => println!("  no existing statusline to chain"),
+            }
+            if !report.mcp_servers.is_empty() {
+                println!("  MCP servers: {}", report.mcp_servers.join(", "));
+                println!(
+                    "  (servers that sign in with OAuth need one /mcp login in the cc-rotate profile)"
+                );
             }
             for file in &report.alias_files {
                 println!("  added the cc-rotate alias to {}", file.display());

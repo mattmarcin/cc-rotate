@@ -18,7 +18,7 @@ Because every session lives in one profile, sessions can see and message each ot
   cc-rotate saves that login in a local store, encrypted with Windows DPAPI so only your Windows user can read it.
 - A dedicated profile (`%USERPROFILE%\.claude-rotate`) holds the account in use.
   cc-rotate copies your existing settings, hooks, skills and plugins into it.
-- Every Claude Code session in that profile runs `cc-rotate-ctl statusline` every few seconds.
+- Every Claude Code session in that profile runs `cc-rotate-ctl statusline` after every reply and every 30 seconds.
   It records the account's usage, copies renewed logins back into the store, and starts a swap at 98% of either limit.
 - A swap takes the same lock Claude Code uses when it renews a login, saves the outgoing account's latest login, and writes the next account's login into the profile.
   Claude Code notices the change and uses the new account on its next request.
@@ -118,7 +118,7 @@ If you keep using separate profiles for some accounts, cc-rotate can record thei
 In that profile's `settings.json`, set the status line to:
 
 ```json
-"statusLine": { "type": "command", "command": "cc-rotate-ctl statusline --observe", "refreshInterval": 5000 }
+"statusLine": { "type": "command", "command": "cc-rotate-ctl statusline --observe", "refreshInterval": 30 }
 ```
 
 To keep your own status line, add it with `--then`, for example `cc-rotate-ctl statusline --observe --then \"node C:/path/to/statusline.js\"`.

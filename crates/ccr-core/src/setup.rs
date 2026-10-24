@@ -6,6 +6,7 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
+use crate::credfile;
 use crate::paths::{self, forward_slashes};
 use crate::store::Store;
 
@@ -26,7 +27,15 @@ const SEEDED_CONFIG_KEYS: &[&str] = &[
     "autoUpdatesProtectedForNative",
     "theme",
 ];
-const PROJECT_FLAGS: &[&str] = &["hasTrustDialogAccepted", "hasCompletedProjectOnboarding"];
+/// Per-project settings carried over: trust flags and project-scoped MCP configuration.
+const PROJECT_KEYS: &[&str] = &[
+    "hasTrustDialogAccepted",
+    "hasCompletedProjectOnboarding",
+    "mcpServers",
+    "enabledMcpjsonServers",
+    "disabledMcpjsonServers",
+    "disabledMcpServers",
+];
 const ALIAS_BEGIN: &str = "# >>> cc-rotate >>>";
 const ALIAS_END: &str = "# <<< cc-rotate <<<";
 
@@ -47,6 +56,8 @@ pub struct SetupReport {
     pub claude_md: Option<String>,
     pub statusline_downstream: Option<String>,
     pub alias_files: Vec<PathBuf>,
+    /// User-level MCP servers carried over from the template.
+    pub mcp_servers: Vec<String>,
 }
 
 pub fn run(store: &Store, opts: &SetupOptions) -> Result<SetupReport> {
@@ -104,7 +115,7 @@ pub fn run(store: &Store, opts: &SetupOptions) -> Result<SetupReport> {
     report.copied.push("settings.json".into());
     report.statusline_downstream = downstream.clone();
 
-    seed_config(&template, &profile)?;
+    report.mcp_servers = merge_config(&template, &profile)?;
 
     store.set_setting("profile_dir", Some(&profile.display().to_string()))?;
     store.set_setting("statusline_downstream", downstream.as_deref())?;
@@ -224,7 +235,8 @@ fn build_settings(
         .unwrap_or_default();
     status.insert("type".into(), json!("command"));
     status.insert("command".into(), json!(format!("{ctl} statusline")));
-    status.insert("refreshInterval".into(), json!(5000));
+    // Seconds. Ticks also run after every message; this covers idle sessions.
+    status.insert("refreshInterval".into(), json!(30));
     obj.insert("statusLine".into(), Value::Object(status));
 
     let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
@@ -256,42 +268,80 @@ fn template_config(template: &Path) -> PathBuf {
     }
 }
 
-fn seed_config(template: &Path, profile: &Path) -> Result<()> {
+/// Merge what the rotation profile needs from the template's `.claude.json` into the profile's:
+/// onboarding flags, user-level MCP servers, and per-project trust flags and MCP servers.
+/// Existing values in the profile always win, so re-running setup never undoes a change made in
+/// the rotation profile. Account data, history and caches are never copied.
+/// Returns the names of the user-level MCP servers that were added.
+fn merge_config(template: &Path, profile: &Path) -> Result<Vec<String>> {
     let dst = profile.join(".claude.json");
-    if dst.exists() {
-        return Ok(());
-    }
     let src = template_config(template);
     let original: Map<String, Value> = std::fs::read_to_string(&src)
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
         .unwrap_or_default();
-    let mut seeded = Map::new();
+    let mut merged: Map<String, Value> = match credfile::read_document(&dst)? {
+        Some(doc) => doc,
+        None => Map::new(),
+    };
+
     for key in SEEDED_CONFIG_KEYS {
         if let Some(v) = original.get(*key) {
-            seeded.insert((*key).to_string(), v.clone());
+            merged.entry(*key).or_insert_with(|| v.clone());
         }
     }
-    seeded
+    merged
         .entry("hasCompletedOnboarding")
         .or_insert(json!(true));
-    if let Some(projects) = original.get("projects").and_then(Value::as_object) {
-        let mut trimmed = Map::new();
-        for (path, project) in projects {
-            let mut flags = Map::new();
-            for flag in PROJECT_FLAGS {
-                if let Some(v) = project.get(*flag).filter(|v| v.as_bool() == Some(true)) {
-                    flags.insert((*flag).to_string(), v.clone());
+
+    let mut added = Vec::new();
+    if let Some(servers) = original.get("mcpServers").and_then(Value::as_object) {
+        let target = merged.entry("mcpServers").or_insert_with(|| json!({}));
+        if let Some(target) = target.as_object_mut() {
+            for (name, server) in servers {
+                if !target.contains_key(name) {
+                    target.insert(name.clone(), server.clone());
+                    added.push(name.clone());
                 }
             }
-            if !flags.is_empty() {
-                trimmed.insert(path.clone(), Value::Object(flags));
+        }
+    }
+
+    if let Some(projects) = original.get("projects").and_then(Value::as_object) {
+        let target = merged.entry("projects").or_insert_with(|| json!({}));
+        if let Some(target) = target.as_object_mut() {
+            for (path, project) in projects {
+                let mut carried = Map::new();
+                for key in PROJECT_KEYS {
+                    let Some(v) = project.get(*key) else { continue };
+                    let worth_copying = match v {
+                        Value::Bool(b) => *b,
+                        Value::Object(o) => !o.is_empty(),
+                        Value::Array(a) => !a.is_empty(),
+                        _ => false,
+                    };
+                    if worth_copying {
+                        carried.insert((*key).to_string(), v.clone());
+                    }
+                }
+                if carried.is_empty() {
+                    continue;
+                }
+                let entry = target.entry(path.clone()).or_insert_with(|| json!({}));
+                if let Some(entry) = entry.as_object_mut() {
+                    for (k, v) in carried {
+                        entry.entry(k).or_insert(v);
+                    }
+                }
             }
         }
-        seeded.insert("projects".into(), Value::Object(trimmed));
     }
-    std::fs::write(&dst, serde_json::to_string_pretty(&Value::Object(seeded))?)?;
-    Ok(())
+
+    credfile::atomic_write(
+        &dst,
+        serde_json::to_string_pretty(&Value::Object(merged))?.as_bytes(),
+    )?;
+    Ok(added)
 }
 
 /// Add (or replace) a `cc-rotate` function in the user's PowerShell profiles.
@@ -421,7 +471,9 @@ mod tests {
         .unwrap();
         std::fs::write(
             template.join(".claude.json"),
-            r#"{"hasCompletedOnboarding":true,"oauthAccount":{"accountUuid":"u"},"projects":{"C:/p":{"hasTrustDialogAccepted":true,"history":[1]}}}"#,
+            r#"{"hasCompletedOnboarding":true,"oauthAccount":{"accountUuid":"u"},
+                "mcpServers":{"docs":{"type":"http","url":"https://example.test/mcp"},"local":{"command":"node","args":["s.js"]}},
+                "projects":{"C:/p":{"hasTrustDialogAccepted":true,"history":[1],"mcpServers":{"proj":{"command":"x"}},"enabledMcpjsonServers":[]}}}"#,
         )
         .unwrap();
 
@@ -453,7 +505,7 @@ mod tests {
             settings["statusLine"]["command"],
             r#""C:/bin/cc-rotate-ctl.exe" statusline"#
         );
-        assert_eq!(settings["statusLine"]["refreshInterval"], 5000);
+        assert_eq!(settings["statusLine"]["refreshInterval"], 30);
         let hook = settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
             .as_str()
             .unwrap();
@@ -468,9 +520,41 @@ mod tests {
         assert_eq!(config["hasCompletedOnboarding"], true);
         assert!(config.get("oauthAccount").is_none());
         assert_eq!(
-            config["projects"]["C:/p"],
-            json!({"hasTrustDialogAccepted": true})
+            config["mcpServers"],
+            json!({"docs":{"type":"http","url":"https://example.test/mcp"},"local":{"command":"node","args":["s.js"]}})
         );
+        assert_eq!(report.mcp_servers, vec!["docs", "local"]);
+        assert_eq!(
+            config["projects"]["C:/p"],
+            json!({"hasTrustDialogAccepted": true, "mcpServers": {"proj": {"command": "x"}}})
+        );
+
+        // Re-running with --force merges: values already in the profile win, new servers are added,
+        // and keys Claude Code wrote meanwhile survive.
+        let mut edited = config.clone();
+        edited["mcpServers"]["docs"] = json!({"type":"http","url":"https://changed.test/mcp"});
+        edited["numStartups"] = json!(4);
+        std::fs::write(profile.join(".claude.json"), edited.to_string()).unwrap();
+        let again = run(
+            &store,
+            &SetupOptions {
+                template: template.clone(),
+                profile: profile.clone(),
+                ctl_path: PathBuf::from(r"C:\bin\cc-rotate-ctl.exe"),
+                force: true,
+                install_alias: false,
+            },
+        )
+        .unwrap();
+        assert!(again.mcp_servers.is_empty());
+        let merged: Value =
+            serde_json::from_str(&std::fs::read_to_string(profile.join(".claude.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            merged["mcpServers"]["docs"]["url"],
+            "https://changed.test/mcp"
+        );
+        assert_eq!(merged["numStartups"], 4);
         assert_eq!(
             store.settings().unwrap().statusline_downstream.as_deref(),
             Some("node status.js")

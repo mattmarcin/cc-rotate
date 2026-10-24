@@ -5,7 +5,7 @@
 use std::time::Duration;
 
 use ccr_core::store::{Event, Store, kind};
-use ccr_core::{Paths, snapshot};
+use ccr_core::{Paths, snapshot, statusline, swap};
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_notification::NotificationExt;
 
@@ -32,7 +32,18 @@ fn run(
     last_event_id: &mut Option<i64>,
 ) {
     // `data_version` only reflects other connections' commits, so keep this connection open.
+    let mut tick = 0u64;
     loop {
+        // Keep the store's copy of the active login current even when no interactive session
+        // is running a statusline (for example only `claude -p` jobs).
+        if tick % 5 == 0 {
+            if let Ok(Some(req)) = statusline::sync(store, paths) {
+                let _ = swap::run(store, paths, &req);
+                // Our own writes do not move `data_version` for this connection.
+                *last_version = None;
+            }
+        }
+        tick += 1;
         let Ok(version) = store.data_version() else {
             return;
         };

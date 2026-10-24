@@ -246,7 +246,11 @@ function renderOverview() {
         h("div", { class: "tank" }, h("div", { class: "fill", style: { height: `${a.state === "needs_login" ? 0 : weekLeft}%` } })),
         h("div", { class: "five", "aria-hidden": "true" }, h("span", { style: { width: `${a.state === "needs_login" ? 0 : fiveLeft}%` } })),
         h("div", { class: "cell-label" }, a.label),
-        h("div", { class: "cell-sub tnum" }, a.state === "needs_login" ? "Log in" : a.state === "paused" ? "Paused" : `${pct(weekLeft)} left`),
+        h(
+          "div",
+          { class: "cell-sub tnum" },
+          a.state === "needs_login" ? "Log in" : a.state === "paused" ? "Paused" : a.last_sample ? `${pct(weekLeft)} left` : "No reading",
+        ),
       );
     }),
   );
@@ -376,7 +380,7 @@ async function renderChart() {
   chart.render({
     accounts: snap.accounts,
     samples,
-    swaps: state.events.filter((e) => e.kind === "swap" && e.ts >= sinceMs),
+    swaps: state.events.filter((e) => e.kind === "swap" && e.account_from !== null && e.ts >= sinceMs),
     metric: state.metric,
     sinceMs,
     threshold: state.metric === "weekly" ? snap.settings.swap_threshold_7d : snap.settings.swap_threshold_5h,

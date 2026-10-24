@@ -92,7 +92,8 @@ pub fn snapshot(store: &Store, paths: &Paths) -> Result<Snapshot> {
     let swaps_24h = store
         .events(500)?
         .iter()
-        .filter(|e| e.kind == kind::SWAP && e.ts >= day_ago)
+        // A swap with no outgoing account is the first activation, not a rotation.
+        .filter(|e| e.kind == kind::SWAP && e.account_from.is_some() && e.ts >= day_ago)
         .count();
 
     Ok(Snapshot {

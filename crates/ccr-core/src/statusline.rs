@@ -238,6 +238,26 @@ fn is_stale_reading(store: &Store, sample: &Sample, now_ms: i64) -> Result<bool>
     Ok(matches(sample.five_resets_at, five) || matches(sample.week_resets_at, week))
 }
 
+/// Write-back outside a statusline tick, for callers that run while no interactive session
+/// does (the desktop app's watcher, `cc-rotate-ctl status`). Returns a swap request when the
+/// profile's login turned out to be dead.
+pub fn sync(store: &Store, paths: &Paths) -> Result<Option<SwapRequest>> {
+    let mut dead_login = false;
+    sync_profile_login(store, paths, &mut dead_login)?;
+    if !dead_login {
+        return Ok(None);
+    }
+    let Some(active) = store.active_account()? else {
+        return Ok(None);
+    };
+    Ok(Some(SwapRequest {
+        from: Some(active.id),
+        to: None,
+        reason: Reason::DeadLogin,
+        wait: false,
+    }))
+}
+
 /// Keep the store's copy of the active login current, and notice when the login in the
 /// profile changed for reasons other than our own swaps.
 fn sync_profile_login(store: &Store, paths: &Paths, dead_login: &mut bool) -> Result<()> {
