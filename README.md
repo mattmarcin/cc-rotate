@@ -15,7 +15,7 @@ Because every session lives in one profile, sessions can see and message each ot
 ## How it works
 
 - Each account signs in once through Claude Code's own login page (`claude auth login`), in a scratch folder.
-  cc-rotate saves that login in a local store, encrypted with Windows DPAPI so only your Windows user can read it.
+  cc-rotate saves that login in a local store, encrypted with a key kept in a file only you can read (details in [SECURITY.md](SECURITY.md)).
 - A dedicated profile (`%USERPROFILE%\.claude-rotate`) holds the account in use.
   cc-rotate copies your existing settings, hooks, skills and plugins into it.
 - Every Claude Code session in that profile runs `cc-rotate-ctl statusline` after every reply and every 30 seconds.
@@ -107,6 +107,7 @@ It lives in the tray, starts when you sign in to Windows (you can turn that off 
 | `cc-rotate-ctl priority <label> <n>` | Break ties between equally used accounts (lower is preferred). |
 | `cc-rotate-ctl events` | Recent swaps, logins and problems. |
 | `cc-rotate-ctl doctor` | Check the profile, the store and Claude Code. |
+| `cc-rotate-ctl backup <file>` | Print a daily backup of the profile's login file, decrypted. It contains tokens, so keep the output private. |
 | `cc-rotate-ctl config [key] [value]` | Show or change settings. `--unset` restores a default. |
 | `cc-rotate-ctl setup` | Create the rotation profile. `--from <dir>` picks the template, `--force` rebuilds it, `--install-alias` adds the `cc-rotate` function. |
 | `cc-rotate-ctl dashboard` | Open the desktop app. |
@@ -151,6 +152,7 @@ It never touches that profile's login and never swaps anything.
 - Errors from the status line and hooks go to `%LOCALAPPDATA%\cc-rotate\logs\cc-rotate.log`.
 - An account marked **needs login** had its login rejected by Anthropic. Sign it in again with `cc-rotate-ctl login --relogin <label>`.
 - A daily encrypted backup of the profile's login file is kept in `%LOCALAPPDATA%\cc-rotate\backups`.
+  `cc-rotate-ctl backup <file>` prints one decrypted.
 
 ## Uninstall
 

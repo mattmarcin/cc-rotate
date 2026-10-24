@@ -4,7 +4,8 @@
 //! seconds) open the store concurrently, so it runs in WAL mode with a busy timeout, and every
 //! multi-row change goes through an IMMEDIATE transaction.
 
-use std::path::Path;
+use std::cell::OnceCell;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -13,9 +14,12 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::{credfile, secret, time};
+use crate::secret::{self, Key};
+use crate::{credfile, time};
 
-const SCHEMA_VERSION: i64 = 1;
+/// 1: initial schema, logins sealed with Windows DPAPI.
+/// 2: logins sealed with the platform-independent format in `secret`.
+const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE accounts (
@@ -256,31 +260,86 @@ pub const SETTING_KEYS: &[&str] = &[
 
 pub struct Store {
     conn: Connection,
+    /// `<data dir>/master.key`; `None` for in-memory stores, whose key is never written.
+    key_path: Option<PathBuf>,
+    /// Loaded on first use, so ticks that never touch a login never read the key file.
+    key: OnceCell<Key>,
 }
 
 impl Store {
+    /// Open (or create) the store. Its encryption key is `master.key` next to it.
     pub fn open(path: &Path) -> Result<Store> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
+        let dir = path
+            .parent()
+            .context("the store path has no parent directory")?;
+        secret::create_private_dir(dir)?;
         let conn =
             Connection::open(path).with_context(|| format!("opening store {}", path.display()))?;
-        Self::init(conn)
+        Self::init(conn, Some(secret::key_path(dir)), OnceCell::new())
     }
 
     pub fn open_in_memory() -> Result<Store> {
-        Self::init(Connection::open_in_memory()?)
+        Self::init(
+            Connection::open_in_memory()?,
+            None,
+            OnceCell::from(Key::ephemeral()?),
+        )
     }
 
-    fn init(conn: Connection) -> Result<Store> {
+    fn init(conn: Connection, key_path: Option<PathBuf>, key: OnceCell<Key>) -> Result<Store> {
         conn.busy_timeout(Duration::from_millis(5000))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        let store = Store { conn };
+        let store = Store {
+            conn,
+            key_path,
+            key,
+        };
         store.migrate()?;
         Ok(store)
+    }
+
+    /// Where the encryption key lives (`None` for an in-memory store).
+    pub fn key_path(&self) -> Option<&Path> {
+        self.key_path.as_deref()
+    }
+
+    /// The encryption key, read from `master.key` or created there on first use.
+    pub fn key(&self) -> Result<&Key> {
+        if let Some(key) = self.key.get() {
+            return Ok(key);
+        }
+        let path = self
+            .key_path
+            .as_deref()
+            .context("this store has no key file")?;
+        let key = match secret::read_key(path)? {
+            Some(key) => key,
+            // A new key cannot open what an earlier one sealed. Say so, instead of creating
+            // one that leaves every stored login unreadable without an explanation.
+            None if self.has_sealed_credentials()? => bail!(
+                "{} is missing, so the stored logins cannot be decrypted; restore that file, or remove the accounts and sign them in again",
+                path.display()
+            ),
+            None => secret::load_or_create_key(path)?,
+        };
+        Ok(self.key.get_or_init(|| key))
+    }
+
+    fn has_sealed_credentials(&self) -> Result<bool> {
+        Ok(self
+            .credential_blobs()?
+            .iter()
+            .any(|(_, blob)| secret::is_sealed(blob)))
+    }
+
+    fn credential_blobs(&self) -> Result<Vec<(i64, Vec<u8>)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT account_id, oauth_blob FROM credentials")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     fn migrate(&self) -> Result<()> {
@@ -299,8 +358,53 @@ impl Store {
                 s.conn.execute_batch(SCHEMA_V1)?;
                 s.conn.pragma_update(None, "user_version", 1)?;
             }
+            if version < 2 {
+                s.convert_legacy_credentials()?;
+                s.conn.pragma_update(None, "user_version", 2)?;
+            }
             Ok(())
         })
+    }
+
+    /// Schema 2: re-seal every login an older cc-rotate stored with Windows DPAPI, in the same
+    /// transaction as the version bump. A login that cannot be converted is left as it is and
+    /// logged; reading it later says that the account needs a new sign-in.
+    fn convert_legacy_credentials(&self) -> Result<()> {
+        for (account_id, blob) in self.credential_blobs()? {
+            if secret::is_sealed(&blob) {
+                continue;
+            }
+            match legacy_unseal(&blob) {
+                Ok(plain) => {
+                    let sealed = self
+                        .key()?
+                        .seal(&plain, &secret::credential_aad(account_id))?;
+                    self.conn.execute(
+                        "UPDATE credentials SET oauth_blob = ?2 WHERE account_id = ?1",
+                        params![account_id, sealed],
+                    )?;
+                }
+                Err(e) => {
+                    self.log_event(
+                        kind::ERROR,
+                        Some(account_id),
+                        None,
+                        Some("store_upgrade"),
+                        Some(serde_json::json!({
+                            "message": format!("could not convert this account's stored login ({e:#}); sign it in again"),
+                        })),
+                    )?;
+                }
+            }
+        }
+        #[cfg(windows)]
+        if let Some(dir) = self.key_path.as_deref().and_then(Path::parent) {
+            let legacy = crate::swap::legacy_backups(&dir.join("backups"));
+            if !legacy.is_empty() {
+                crate::swap::convert_legacy_backups(&legacy, self.key()?);
+            }
+        }
+        Ok(())
     }
 
     pub fn conn(&self) -> &Connection {
@@ -608,7 +712,10 @@ impl Store {
     pub fn save_credential(&self, account_id: i64, oauth: &Value, source: &str) -> Result<()> {
         let fp = credfile::oauth_fingerprint(oauth)
             .ok_or_else(|| anyhow!("refusing to store a login without a refresh token"))?;
-        let sealed = secret::protect(serde_json::to_vec(oauth)?.as_slice())?;
+        let sealed = self.key()?.seal(
+            serde_json::to_vec(oauth)?.as_slice(),
+            &secret::credential_aad(account_id),
+        )?;
         let expires = oauth.get("expiresAt").and_then(Value::as_i64);
         let refresh_expires = oauth.get("refreshTokenExpiresAt").and_then(Value::as_i64);
         self.conn.execute(
@@ -646,7 +753,14 @@ impl Store {
         else {
             return Ok(None);
         };
-        let plain = secret::unprotect(&blob)
+        if !secret::is_sealed(&blob) {
+            bail!(
+                "the stored login for account {account_id} was saved by an older cc-rotate and could not be converted; sign it in again with `cc-rotate-ctl login --relogin`"
+            );
+        }
+        let plain = self
+            .key()?
+            .open(&blob, &secret::credential_aad(account_id))
             .with_context(|| format!("decrypting the stored login for account {account_id}"))?;
         Ok(Some(StoredCredential {
             oauth: serde_json::from_slice(&plain)?,
@@ -817,6 +931,17 @@ impl Store {
     }
 }
 
+/// Open a login sealed by cc-rotate before schema 2.
+#[cfg(windows)]
+fn legacy_unseal(blob: &[u8]) -> Result<Vec<u8>> {
+    secret::dpapi::unprotect(blob)
+}
+
+#[cfg(not(windows))]
+fn legacy_unseal(_blob: &[u8]) -> Result<Vec<u8>> {
+    bail!("it was sealed with Windows DPAPI, which only Windows can open")
+}
+
 fn validate_setting(key: &str, value: &str) -> Result<()> {
     match key {
         "swap_threshold_5h" | "swap_threshold_7d" => {
@@ -916,7 +1041,6 @@ mod tests {
         assert_eq!(s.account(a).unwrap().unwrap().state, AccountState::Active);
     }
 
-    #[cfg(windows)]
     #[test]
     fn credential_round_trip_is_encrypted() {
         let s = Store::open_in_memory().unwrap();
@@ -938,6 +1062,155 @@ mod tests {
         assert_eq!(back.oauth, oauth);
         assert_eq!(back.refresh_fp, credfile::fingerprint("ref-456"));
         assert_eq!(back.expires_at, Some(10));
+        assert!(blob.starts_with(secret::MAGIC));
+    }
+
+    fn blob_of(s: &Store, account_id: i64) -> Vec<u8> {
+        s.conn()
+            .query_row(
+                "SELECT oauth_blob FROM credentials WHERE account_id = ?1",
+                [account_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn a_login_moved_to_another_account_does_not_open() {
+        let s = Store::open_in_memory().unwrap();
+        let a = s
+            .insert_account("a", &ident("ua"), AccountState::Parked)
+            .unwrap();
+        let b = s
+            .insert_account("b", &ident("ub"), AccountState::Parked)
+            .unwrap();
+        s.save_credential(a, &json!({"refreshToken": "ref-a"}), "login")
+            .unwrap();
+        s.save_credential(b, &json!({"refreshToken": "ref-b"}), "login")
+            .unwrap();
+        s.conn()
+            .execute(
+                "UPDATE credentials SET oauth_blob = ?2 WHERE account_id = ?1",
+                params![b, blob_of(&s, a)],
+            )
+            .unwrap();
+        assert!(s.credential(b).is_err());
+        assert_eq!(
+            s.credential(a).unwrap().unwrap().oauth["refreshToken"],
+            "ref-a"
+        );
+    }
+
+    #[test]
+    fn key_file_is_shared_by_every_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("data").join("store.db");
+        let first = Store::open(&db).unwrap();
+        let a = first
+            .insert_account("a", &ident("ua"), AccountState::Parked)
+            .unwrap();
+        assert!(
+            !dir.path().join("data").join(secret::KEY_FILE).exists(),
+            "the key is only created when a login is stored"
+        );
+        first
+            .save_credential(a, &json!({"refreshToken": "ref-a"}), "login")
+            .unwrap();
+        let second = Store::open(&db).unwrap();
+        assert_eq!(
+            second.credential(a).unwrap().unwrap().oauth["refreshToken"],
+            "ref-a"
+        );
+    }
+
+    #[test]
+    fn missing_key_file_is_reported_not_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("store.db");
+        let s = Store::open(&db).unwrap();
+        let a = s
+            .insert_account("a", &ident("ua"), AccountState::Parked)
+            .unwrap();
+        s.save_credential(a, &json!({"refreshToken": "ref-a"}), "login")
+            .unwrap();
+        drop(s);
+        let key = dir.path().join(secret::KEY_FILE);
+        std::fs::remove_file(&key).unwrap();
+
+        let s = Store::open(&db).unwrap();
+        let err = s.credential(a).unwrap_err();
+        assert!(format!("{err:#}").contains("is missing"), "{err:#}");
+        assert!(
+            !key.exists(),
+            "no new key that could never open the old logins"
+        );
+    }
+
+    /// A store written by cc-rotate before schema 2, with logins sealed by Windows DPAPI.
+    #[cfg(windows)]
+    #[test]
+    fn dpapi_store_is_converted_on_first_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("store.db");
+        let oauth = json!({"accessToken": "acc-1", "refreshToken": "ref-1", "expiresAt": 10});
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+            conn.execute(
+                "INSERT INTO accounts (id, label, account_uuid, state, added_at) VALUES (1, 'a', 'ua', 'active', 0), (2, 'b', 'ub', 'parked', 0)",
+                [],
+            )
+            .unwrap();
+            let insert = |id: i64, blob: Vec<u8>| {
+                conn.execute(
+                    "INSERT INTO credentials (account_id, oauth_blob, refresh_fp, updated_at, source) VALUES (?1, ?2, 'fp', 0, 'login')",
+                    params![id, blob],
+                )
+                .unwrap();
+            };
+            insert(
+                1,
+                secret::dpapi::protect(&serde_json::to_vec(&oauth).unwrap()).unwrap(),
+            );
+            // Unreadable: sealed by some other user or machine.
+            insert(2, b"not a dpapi blob".to_vec());
+        }
+        let backups = dir.path().join("backups");
+        std::fs::create_dir_all(&backups).unwrap();
+        std::fs::write(
+            backups.join("credentials-20000.dpapi"),
+            secret::dpapi::protect(b"{\"claudeAiOauth\":{}}").unwrap(),
+        )
+        .unwrap();
+
+        let s = Store::open(&db).unwrap();
+        let version: i64 = s
+            .conn()
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert!(blob_of(&s, 1).starts_with(secret::MAGIC));
+        assert_eq!(s.credential(1).unwrap().unwrap().oauth, oauth);
+        let err = s.credential(2).unwrap_err();
+        assert!(format!("{err:#}").contains("sign it in again"), "{err:#}");
+        let logged = s.last_event_of(kind::ERROR).unwrap().unwrap();
+        assert_eq!(logged.account_from, Some(2));
+
+        assert!(!backups.join("credentials-20000.dpapi").exists());
+        let converted = backups.join("credentials-20000.ccr");
+        let plain = s
+            .key()
+            .unwrap()
+            .open(&std::fs::read(converted).unwrap(), secret::BACKUP_AAD)
+            .unwrap();
+        assert_eq!(plain, b"{\"claudeAiOauth\":{}}");
+
+        // Opening again changes nothing.
+        let before = blob_of(&s, 1);
+        drop(s);
+        let s = Store::open(&db).unwrap();
+        assert_eq!(blob_of(&s, 1), before);
     }
 
     #[test]

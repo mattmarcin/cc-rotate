@@ -28,6 +28,8 @@ pub const META_PROFILE_FOREIGN: &str = "profile_foreign";
 
 const POOL_EXHAUSTED_LOG_INTERVAL_MS: i64 = 10 * 60_000;
 const BACKUPS_KEPT: usize = 7;
+const BACKUP_EXT: &str = "ccr";
+const LEGACY_BACKUP_EXT: &str = "dpapi";
 
 #[derive(Debug, Clone)]
 pub struct SwapRequest {
@@ -168,7 +170,7 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
         }
     }
 
-    backup_daily(paths, now).context("backing up .credentials.json")?;
+    backup_daily(store, paths, now).context("backing up .credentials.json")?;
     credfile::write_oauth(&cred_path, &target_login.oauth)?;
 
     let from_sample = match active_id {
@@ -295,7 +297,8 @@ fn log_error(store: &Store, req: &SwapRequest, target: &Account, message: String
 }
 
 /// Keep one encrypted copy of `.credentials.json` per day, for the last `BACKUPS_KEPT` days.
-fn backup_daily(paths: &Paths, now_ms: i64) -> Result<()> {
+/// `cc-rotate-ctl backup <file>` prints one.
+fn backup_daily(store: &Store, paths: &Paths, now_ms: i64) -> Result<()> {
     let source = paths.credentials_file();
     let Ok(bytes) = std::fs::read(&source) else {
         return Ok(());
@@ -303,19 +306,59 @@ fn backup_daily(paths: &Paths, now_ms: i64) -> Result<()> {
     let dir = paths.backups_dir();
     std::fs::create_dir_all(&dir)?;
     let day = now_ms / 86_400_000;
-    let target = dir.join(format!("credentials-{day}.dpapi"));
+    let target = dir.join(format!("credentials-{day}.{BACKUP_EXT}"));
     if target.exists() {
         return Ok(());
     }
-    credfile::atomic_write(&target, &secret::protect(&bytes)?)?;
+    credfile::atomic_write(&target, &store.key()?.seal(&bytes, secret::BACKUP_AAD)?)?;
     let mut backups: Vec<_> = std::fs::read_dir(&dir)?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "dpapi"))
+        .filter(|p| {
+            p.extension()
+                .is_some_and(|x| x == BACKUP_EXT || x == LEGACY_BACKUP_EXT)
+        })
         .collect();
+    // Names sort by day; a legacy file of the same day sorts first and goes first.
     backups.sort();
     while backups.len() > BACKUPS_KEPT {
         let _ = std::fs::remove_file(backups.remove(0));
     }
     Ok(())
+}
+
+/// Decrypt a backup written by `backup_daily`.
+pub fn open_backup(store: &Store, path: &std::path::Path) -> Result<Vec<u8>> {
+    let sealed = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    store.key()?.open(&sealed, secret::BACKUP_AAD)
+}
+
+/// Backups an older cc-rotate sealed with Windows DPAPI.
+#[cfg(windows)]
+pub(crate) fn legacy_backups(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x == LEGACY_BACKUP_EXT))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Re-seal DPAPI backups in the current format. A backup that cannot be converted is kept and
+/// ages out like any other.
+#[cfg(windows)]
+pub(crate) fn convert_legacy_backups(files: &[std::path::PathBuf], key: &secret::Key) {
+    for file in files {
+        let converted = std::fs::read(file)
+            .map_err(anyhow::Error::from)
+            .and_then(|sealed| secret::dpapi::unprotect(&sealed))
+            .and_then(|plain| key.seal(&plain, secret::BACKUP_AAD))
+            .and_then(|sealed| credfile::atomic_write(&file.with_extension(BACKUP_EXT), &sealed));
+        if converted.is_ok() {
+            let _ = std::fs::remove_file(file);
+        }
+    }
 }

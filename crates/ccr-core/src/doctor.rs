@@ -142,6 +142,7 @@ pub fn run(store: &Store, paths: &Paths) -> Vec<Check> {
             format!("missing or unreadable: {}", undecryptable.join(", ")),
         )
     });
+    checks.push(encryption_check(store));
 
     if let Some(account) = active.first() {
         let file_fp = credfile::read_oauth(&paths.credentials_file())
@@ -301,6 +302,46 @@ fn process_alive(pid: u32) -> bool {
     // Linux has /proc; elsewhere assume the registration is current.
     let proc = std::path::Path::new("/proc");
     !proc.is_dir() || proc.join(pid.to_string()).exists()
+}
+
+/// Where the key that encrypts the stored logins lives, and whether only its owner can read it.
+fn encryption_check(store: &Store) -> Check {
+    let Some(path) = store.key_path() else {
+        return check("Encryption", Status::Ok, "in-memory store");
+    };
+    if !path.is_file() {
+        return check(
+            "Encryption",
+            Status::Ok,
+            format!(
+                "XChaCha20-Poly1305; the key file {} is created with the first login",
+                path.display()
+            ),
+        );
+    }
+    match crate::secret::key_file_exposed(path) {
+        Some(true) => check(
+            "Encryption",
+            Status::Warn,
+            format!(
+                "{} is readable by other users; run `chmod 600` on it",
+                path.display()
+            ),
+        ),
+        _ => check(
+            "Encryption",
+            Status::Ok,
+            format!(
+                "XChaCha20-Poly1305 with the key file {} ({})",
+                path.display(),
+                if cfg!(windows) {
+                    "protected by your user profile's permissions"
+                } else {
+                    "readable only by you"
+                }
+            ),
+        ),
+    }
 }
 
 fn profile_settings_check(paths: &Paths) -> Check {
