@@ -1,0 +1,8 @@
+{
+  "name": "cc-rotate-lock-interop",
+  "private": true,
+  "description": "Runs the real proper-lockfile package against cc-rotate's lock implementation",
+  "dependencies": {
+    "proper-lockfile": "4.1.2"
+  }
+}

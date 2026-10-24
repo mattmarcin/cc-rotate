@@ -1,0 +1,21 @@
+[package]
+name = "ccr-cli"
+description = "cc-rotate-ctl: command-line control, statusline and hook entry points for cc-rotate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "cc-rotate-ctl"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+ccr-core = { version = "0.1.0", path = "../ccr-core" }
+clap = { version = "4.6.7", features = ["derive"] }
+serde_json = "1.0.154"
+
+[dev-dependencies]
+tempfile = "3.27.0"

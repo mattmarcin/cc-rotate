@@ -1,0 +1,15 @@
+[workspace]
+resolver = "3"
+members = ["crates/ccr-core", "crates/ccr-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/OWNER/cc-rotate"
+rust-version = "1.85"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
