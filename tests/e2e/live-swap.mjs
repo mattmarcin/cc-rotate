@@ -24,7 +24,7 @@ if (!labelA || !labelB) {
 }
 
 const ctl = (...args) => execFileSync("cc-rotate-ctl", args, { encoding: "utf8" }).trim();
-const profile = ctl("config", "profile_dir") !== "null" ? ctl("config", "profile_dir") : join(homedir(), ".claude-rotate");
+const profile = ctl("config", "profile_dir") || join(homedir(), ".claude-rotate");
 const credFile = join(profile, ".credentials.json");
 
 function startClaude() {

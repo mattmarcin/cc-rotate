@@ -302,7 +302,13 @@ fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> 
             for file in &report.alias_files {
                 println!("  added the cc-rotate alias to {}", file.display());
             }
-            println!("\nNext: add your accounts with `cc-rotate-ctl login` (once per account).");
+            if store.accounts()?.is_empty() {
+                println!(
+                    "\nNext: add your accounts with `cc-rotate-ctl login` (once per account)."
+                );
+            } else {
+                println!("\nStart a new `cc-rotate` session to pick up the changes.");
+            }
         }
         Command::Doctor { json } => {
             let checks = doctor::run(store, paths);
@@ -358,6 +364,15 @@ fn set_state(store: &Store, reference: &str, state: AccountState) -> Result<()> 
     Ok(())
 }
 
+/// A setting's value as typed: strings without JSON quoting or escaping, null as empty.
+fn plain(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
 fn config_cmd(
     store: &Store,
     key: Option<String>,
@@ -371,7 +386,7 @@ fn config_cmd(
                 let shown = if v.is_null() {
                     "(unset)".to_string()
                 } else {
-                    v.to_string().trim_matches('"').to_string()
+                    plain(v)
                 };
                 println!("{k} = {shown}");
             }
@@ -383,7 +398,8 @@ fn config_cmd(
         (Some(key), None) => {
             let settings = serde_json::to_value(store.settings()?)?;
             match settings.get(&key) {
-                Some(v) => println!("{}", v.to_string().trim_matches('"')),
+                // Unset prints nothing, so scripts can test for an empty result.
+                Some(v) => println!("{}", plain(v)),
                 None => bail!("unknown setting {key:?}"),
             }
         }

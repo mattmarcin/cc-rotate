@@ -70,7 +70,7 @@ $ctl = Join-Path $BinDir "cc-rotate-ctl.exe"
 Write-Host "Installed to $BinDir"
 
 $profileDir = (& $ctl config profile_dir 2>$null | Select-Object -First 1)
-if ($profileDir -and $profileDir -ne "null" -and (Test-Path (Join-Path $profileDir "settings.json"))) {
+if ($profileDir -and (Test-Path (Join-Path $profileDir "settings.json"))) {
   Write-Host "The rotation profile at $profileDir is already set up; leaving it as it is."
   Write-Host "To rebuild it from your template profile, run: cc-rotate-ctl setup --force"
 } else {

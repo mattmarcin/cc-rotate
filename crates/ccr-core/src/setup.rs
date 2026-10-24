@@ -181,11 +181,24 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
         if kind.is_dir() {
             copy_dir(&entry.path(), &target)?;
         } else if kind.is_file() {
+            make_writable(&target);
             std::fs::copy(entry.path(), &target)
                 .with_context(|| format!("copying {}", entry.path().display()))?;
         }
     }
     Ok(())
+}
+
+/// Git stores pack files read-only, so a rebuild must clear that before copying over them.
+fn make_writable(path: &Path) {
+    if let Ok(meta) = std::fs::metadata(path) {
+        let mut perms = meta.permissions();
+        if perms.readonly() {
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            let _ = std::fs::set_permissions(path, perms);
+        }
+    }
 }
 
 fn link_claude_md(template: &Path, profile: &Path) -> Result<Option<String>> {
