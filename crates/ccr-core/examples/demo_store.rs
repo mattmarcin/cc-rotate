@@ -13,7 +13,7 @@ use ccr_core::time;
 use serde_json::json;
 
 const NAMES: &[&str] = &[
-    "main", "alt", "raid-1", "raid-2", "raid-3", "raid-4", "raid-5",
+    "personal", "work", "team-1", "team-2", "team-3", "team-4", "team-5",
 ];
 
 fn main() -> Result<()> {

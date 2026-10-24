@@ -6,7 +6,7 @@ members = ["crates/ccr-core", "crates/ccr-cli", "app/src-tauri"]
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/OWNER/cc-rotate"
+repository = "https://github.com/mattmarcin/cc-rotate"
 rust-version = "1.85"
 
 [profile.release]

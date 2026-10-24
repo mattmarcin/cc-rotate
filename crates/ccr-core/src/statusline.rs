@@ -1,8 +1,8 @@
 //! The statusline tick (spec section 8): record usage, write renewed logins back to the store,
 //! detect dead or foreign logins, and decide whether a swap is needed.
 //!
-//! This runs every few seconds in every session, so it must stay fast and must never fail in a
-//! way that breaks the user's status line; callers log errors and carry on.
+//! This runs after every reply and every 30 seconds in every session, so it must stay fast and
+//! must never fail in a way that breaks the user's status line; callers log errors and carry on.
 
 use std::path::Path;
 

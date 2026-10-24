@@ -38,7 +38,7 @@ The design, with the Claude Code behavior it relies on, is in [docs/specs/2026-1
 ## Install
 
 ```powershell
-git clone https://github.com/OWNER/cc-rotate
+git clone https://github.com/mattmarcin/cc-rotate
 cd cc-rotate
 .\scripts\install.ps1
 ```
@@ -72,6 +72,10 @@ The first account you add becomes the active one.
 
 These are fresh logins, separate from any other Claude Code profiles you already use, so adding an account here never logs you out anywhere else.
 
+If you already have a Claude Code profile per account (for example `%USERPROFILE%\.claude-work`), `cc-rotate-ctl profiles` lists them with the account each one belongs to.
+`cc-rotate-ctl login --from-profile work` then signs that account in fresh, with its email and label filled in, and refuses the login if a different account signs in.
+cc-rotate only reads those profiles to find out which account they belong to; it never copies or changes their logins.
+
 ## Daily use
 
 Open a new terminal and start Claude Code on the pool:
@@ -92,12 +96,15 @@ It lives in the tray, starts when you sign in to Windows (you can turn that off 
 |---|---|
 | `cc-rotate-ctl status` | Every account with its usage and reset times. |
 | `cc-rotate-ctl swap` | Swap now to the account with the most room. `--to <label>` picks one. |
-| `cc-rotate-ctl login` | Add an account. `--relogin <label>` signs an existing account in again. |
+| `cc-rotate-ctl login` | Add an account. `--relogin <label>` signs an existing account in again. `--from-profile <name>` adds the account another profile uses. |
+| `cc-rotate-ctl profiles` | List your other Claude Code profiles and the account each belongs to. |
 | `cc-rotate-ctl pause <label>` / `resume <label>` | Keep an account out of rotation, or bring it back. |
 | `cc-rotate-ctl rename <label> <new>` / `remove <label> --yes` | Rename or delete an account. |
+| `cc-rotate-ctl priority <label> <n>` | Break ties between equally used accounts (lower is preferred). |
 | `cc-rotate-ctl events` | Recent swaps, logins and problems. |
 | `cc-rotate-ctl doctor` | Check the profile, the store and Claude Code. |
-| `cc-rotate-ctl config [key] [value]` | Show or change settings. |
+| `cc-rotate-ctl config [key] [value]` | Show or change settings. `--unset` restores a default. |
+| `cc-rotate-ctl setup` | Create the rotation profile. `--from <dir>` picks the template, `--force` rebuilds it, `--install-alias` adds the `cc-rotate` function. |
 | `cc-rotate-ctl dashboard` | Open the desktop app. |
 
 ### Settings
@@ -110,6 +117,7 @@ It lives in the tray, starts when you sign in to Windows (you can turn that off 
 | `lock_timeout_ms` | 30000 | How long a swap waits for Claude Code to finish renewing a login. |
 | `sample_retention_days` | 90 | How long usage history is kept. |
 | `statusline_downstream` | your old status line | The status line command shown after cc-rotate's label. |
+| `profile_dir` | `%USERPROFILE%\.claude-rotate` | The rotation profile, recorded by `setup`. |
 | `claude_path` | found on `PATH` | The `claude` executable to use for logins. |
 
 ### Tracking your other profiles too
@@ -150,10 +158,13 @@ It never touches that profile's login and never swaps anything.
 ## Development
 
 ```powershell
-cargo test --workspace                 # unit and integration tests
+cd app; npm ci; npm run build; cd ..    # once: the app crate embeds app\dist, so build it before any cargo command
 cd tests\interop; npm ci; cd ..\..      # once: enables the lock tests against the real proper-lockfile package
-cd app; npm ci; npx tauri dev           # run the app with live reload
+cargo test --workspace                  # unit and integration tests
+cd app; npx tauri dev                   # run the app with live reload
 ```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the checks a pull request has to pass.
 
 To try the app without real accounts, generate a demo store and point cc-rotate at it:
 

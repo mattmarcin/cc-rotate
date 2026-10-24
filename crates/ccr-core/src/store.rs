@@ -1,8 +1,8 @@
 //! The SQLite store: accounts, encrypted logins, usage samples, events, settings.
 //!
-//! Many short-lived processes (one statusline tick per session every few seconds) open the
-//! store concurrently, so it runs in WAL mode with a busy timeout, and every multi-row change
-//! goes through an IMMEDIATE transaction.
+//! Many short-lived processes (a statusline tick per session after every reply and every 30
+//! seconds) open the store concurrently, so it runs in WAL mode with a busy timeout, and every
+//! multi-row change goes through an IMMEDIATE transaction.
 
 use std::path::Path;
 use std::str::FromStr;
@@ -989,7 +989,7 @@ mod tests {
     fn labels() {
         assert_eq!(sanitize_label("Jane.Doe+work"), "jane.doe-work");
         assert_eq!(sanitize_label("123"), "account-123");
-        assert!(validate_label("raid-1").is_ok());
+        assert!(validate_label("team-1").is_ok());
         assert!(validate_label("bad label").is_err());
         let s = Store::open_in_memory().unwrap();
         s.insert_account("jane", &ident("u1"), AccountState::Parked)
