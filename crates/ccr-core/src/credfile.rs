@@ -77,12 +77,14 @@ pub fn mtime_ms(path: &Path) -> Option<i64> {
 
 /// Write to a temp file in the same directory, then rename over the target.
 ///
-/// On Windows a rename can briefly fail while another process has the target open, so retry.
+/// On Unix the file is created readable only by its owner, as Claude Code creates
+/// `.credentials.json` (mode 0600). On Windows a rename can briefly fail while another process
+/// has the target open, so retry.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let dir = path.parent().context("target has no parent directory")?;
     std::fs::create_dir_all(dir)?;
     let tmp = temp_sibling(path);
-    std::fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
+    write_new_private(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
     let mut last = None;
     for attempt in 0..40 {
         match std::fs::rename(&tmp, path) {
@@ -99,6 +101,22 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     }
     let _ = std::fs::remove_file(&tmp);
     Err(last.unwrap()).with_context(|| format!("replacing {} (file stayed busy)", path.display()))
+}
+
+/// Create a new file only its owner can read (mode 0600 on Unix; on Windows it inherits the
+/// directory's ACL, which under the user profile allows the user, SYSTEM and Administrators).
+pub(crate) fn write_new_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 fn temp_sibling(path: &Path) -> PathBuf {
@@ -149,6 +167,19 @@ mod tests {
         assert_eq!(fingerprint("abc"), fingerprint("abc"));
         assert_ne!(fingerprint("abc"), fingerprint("abd"));
         assert_eq!(fingerprint("abc").len(), 24);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn written_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".credentials.json");
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_oauth(&path, &json!({"refreshToken": "r"})).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[test]

@@ -104,9 +104,11 @@ enum Command {
         /// Rebuild an existing rotation profile (its login is kept).
         #[arg(long)]
         force: bool,
-        /// Add a `cc-rotate` function to your PowerShell profile.
+        /// Remove the `cc-rotate` PowerShell function older versions added to your PowerShell
+        /// profile; it would hide the `cc-rotate` command. With an existing profile and no
+        /// --force, this is all setup does.
         #[arg(long)]
-        install_alias: bool,
+        remove_alias: bool,
     },
     /// Check the store, the profile and Claude Code.
     Doctor {
@@ -318,8 +320,14 @@ fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> 
         Command::Setup {
             from,
             force,
-            install_alias,
+            remove_alias,
         } => {
+            if remove_alias && !force && paths.settings_file().exists() {
+                for file in setup::remove_powershell_alias()? {
+                    println!("Removed the old cc-rotate function from {}", file.display());
+                }
+                return Ok(ExitCode::SUCCESS);
+            }
             let template = match from {
                 Some(dir) => dir,
                 None => ccr_core::paths::default_template_dir()?,
@@ -332,7 +340,7 @@ fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> 
                     profile: paths.profile_dir.clone(),
                     ctl_path,
                     force,
-                    install_alias,
+                    remove_alias,
                 },
             )?;
             println!("Rotation profile ready at {}", report.profile.display());
@@ -350,8 +358,11 @@ fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> 
                     "  (servers that sign in with OAuth need one /mcp login in the cc-rotate profile)"
                 );
             }
-            for file in &report.alias_files {
-                println!("  added the cc-rotate alias to {}", file.display());
+            for file in &report.alias_removed_from {
+                println!(
+                    "  removed the old cc-rotate function from {}",
+                    file.display()
+                );
             }
             if store.accounts()?.is_empty() {
                 println!(

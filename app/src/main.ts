@@ -717,7 +717,7 @@ async function openHealth() {
     checks,
     h("h3", null, "Settings"),
     settingsForm,
-    h("label", { class: "check", for: "autostart" }, autostart, "Start cc-rotate when I sign in to Windows"),
+    h("label", { class: "check", for: "autostart" }, autostart, "Start cc-rotate when I sign in"),
     h("h3", null, "About"),
     info,
     h("div", { class: "dialog-actions" }, h("button", { class: "btn", onclick: () => d.close() }, "Done")),
