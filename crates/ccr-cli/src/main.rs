@@ -113,6 +113,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Print a daily backup of the profile's login file, decrypted (it contains tokens).
+    Backup {
+        /// A `credentials-<day>.ccr` file from the backups folder.
+        file: PathBuf,
+    },
     /// Open the cc-rotate desktop app.
     Dashboard,
     /// Statusline entry point (configured by `setup`; reads Claude Code's JSON on stdin).
@@ -366,6 +371,11 @@ fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> 
             if checks.iter().any(|c| c.status == doctor::Status::Fail) {
                 return Ok(ExitCode::FAILURE);
             }
+        }
+        Command::Backup { file } => {
+            let plain = swap::open_backup(store, &file)?;
+            std::io::stdout().write_all(&plain)?;
+            println!();
         }
         Command::Dashboard => process::launch_app()?,
         Command::Statusline { .. } | Command::Hook { .. } => unreachable!(),

@@ -9,9 +9,11 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow = "1.0.104"
+chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc", "zeroize"] }
 dirs = "7.0.0"
 dunce = "1.0.5"
 filetime = "0.2.29"
+getrandom = "0.3.4"
 hex = "0.4.3"
 regex = "1.13.1"
 rusqlite = { version = "0.41.0", features = ["bundled"] }

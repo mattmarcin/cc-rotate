@@ -16,9 +16,19 @@ There are no versioned releases yet, so only the latest `main` is supported.
 
 ## How cc-rotate stores logins
 
-- Each account's login is stored in `%LOCALAPPDATA%\cc-rotate\store.db`, encrypted with Windows DPAPI in the current-user scope.
-  Only processes running as your Windows user can decrypt it.
-- The daily backups of the profile's login file in `%LOCALAPPDATA%\cc-rotate\backups` are encrypted the same way.
+- Each account's login is stored in `store.db` in cc-rotate's data folder (`%LOCALAPPDATA%\cc-rotate` on Windows), encrypted with XChaCha20-Poly1305.
+  Every login gets a fresh random nonce, and is bound to its account, so a login copied into another account's row fails to decrypt instead of being used.
+- The 256-bit key is in `master.key` in the same folder.
+  cc-rotate creates it on first use and never logs it or prints it.
+  On Linux and macOS the file and the data folder are readable only by you (modes 600 and 700).
+  On Windows the file inherits your user profile's permissions, which allow your account, SYSTEM and administrators.
+- The key is read without any prompt, because the status line runs every few seconds in every session, including over SSH.
+  It keeps the store safe from casual reads, and a copy of `store.db` on its own (in a backup or a support request) reveals no login.
+  It does not protect against a program running as your user, which can read `master.key` just as it can read Claude Code's own plaintext `.credentials.json`.
+  Keep `master.key` out of shared backups; without it the stored logins cannot be recovered, and each account has to sign in again.
+- The daily backups of the profile's login file in the `backups` folder are encrypted with the same key.
+  `cc-rotate-ctl backup <file>` prints one decrypted.
+- Stores from older versions, encrypted with Windows DPAPI, are converted to this format the first time a new version opens them.
 - The rotation profile's `.credentials.json` holds the active account's login in plain text, exactly as Claude Code itself stores it.
 - A new login is made in a temporary staging folder under `%LOCALAPPDATA%\cc-rotate\staging`, which is deleted when the login finishes, fails, is cancelled or times out.
 - cc-rotate makes no network requests of its own, and the desktop app opens no network port.
@@ -36,8 +46,8 @@ In scope:
 
 Out of scope:
 
-- Malware or another process already running as your Windows user.
-  DPAPI cannot protect against code with your own permissions, and neither can Claude Code's own credential file.
+- Malware or another process already running as your user.
+  Neither cc-rotate's key file nor Claude Code's own credential file can protect against code with your own permissions.
 - Vulnerabilities in Claude Code, the Anthropic API or claude.ai.
   Report those to Anthropic.
 - Whether a particular way of using your accounts is allowed by Anthropic's terms.

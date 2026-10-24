@@ -154,6 +154,28 @@ fn swap_captures_outgoing_and_preserves_other_keys() {
 }
 
 #[test]
+fn first_swap_of_the_day_keeps_an_encrypted_backup() {
+    let env = Env::new();
+    let (store, _, b, c) = pool(&env);
+    let before = std::fs::read(env.cred_file()).unwrap();
+    swap::run(&store, &env.paths, &manual(Some(b))).unwrap();
+    swap::run(&store, &env.paths, &manual(Some(c))).unwrap();
+
+    let backups: Vec<_> = std::fs::read_dir(env.paths.backups_dir())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(backups.len(), 1, "one backup per day: {backups:?}");
+    assert!(backups[0].extension().is_some_and(|x| x == "ccr"));
+    let sealed = std::fs::read(&backups[0]).unwrap();
+    assert!(
+        !String::from_utf8_lossy(&sealed).contains("refresh-a1"),
+        "backups are encrypted"
+    );
+    assert_eq!(swap::open_backup(&store, &backups[0]).unwrap(), before);
+}
+
+#[test]
 fn scheduler_picks_least_used_and_skips_exhausted() {
     let env = Env::new();
     let (store, a, b, c) = pool(&env);
