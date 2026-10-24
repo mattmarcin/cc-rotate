@@ -99,6 +99,16 @@ export interface AppInfo {
   data_dir: string;
 }
 
+export interface FoundProfile {
+  dir: string;
+  name: string;
+  email: string | null;
+  account_uuid: string | null;
+  subscription_type: string | null;
+  signed_in: boolean;
+  in_pool_as: string | null;
+}
+
 export type LoginStage = "starting" | "browser" | "importing" | "done" | "failed" | "cancelled";
 
 export interface LoginProgress {
@@ -129,8 +139,9 @@ export const api = {
   autostartEnabled: () => invoke<boolean>("autostart_enabled"),
   setAutostart: (enabled: boolean) => invoke<void>("set_autostart", { enabled }),
   openUrl: (url: string) => invoke<void>("open_url", { url }),
-  startLogin: (email: string | null, label: string | null, relogin: number | null) =>
-    invoke<string>("start_login", { email, label, relogin }),
+  startLogin: (email: string | null, label: string | null, relogin: number | null, expectEmail: string | null = null) =>
+    invoke<string>("start_login", { email, label, relogin, expectEmail }),
+  otherProfiles: () => invoke<FoundProfile[]>("other_profiles"),
   submitLoginCode: (id: string, code: string) => invoke<void>("submit_login_code", { id, code }),
   cancelLogin: (id: string) => invoke<void>("cancel_login", { id }),
 };

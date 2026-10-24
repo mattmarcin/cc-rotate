@@ -68,6 +68,11 @@ body {
   white-space: nowrap;
 }
 
+/* Class rules like `.fields { display: grid }` would otherwise beat the UA's [hidden] style. */
+[hidden] {
+  display: none !important;
+}
+
 * {
   scrollbar-width: thin;
   scrollbar-color: var(--line-strong) transparent;
@@ -628,6 +633,42 @@ td .updated {
 
 .link.quiet-link {
   color: var(--muted);
+}
+
+.found h3:first-child {
+  margin-top: 0;
+}
+
+.found-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  max-height: 264px;
+  overflow-y: auto;
+}
+
+.found-list li {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.found-list li:last-child {
+  border-bottom: 0;
+}
+
+.found-who {
+  min-width: 0;
+  flex: 1;
+}
+
+.found-state {
+  font-size: 12.5px;
+  white-space: nowrap;
 }
 
 .quick {

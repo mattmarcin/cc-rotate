@@ -492,17 +492,72 @@ function openLogin(account: AccountView | null) {
   const start = h("button", { class: "btn primary" }, "Open sign-in page");
   const cancel = h("button", { class: "btn quiet" }, "Cancel");
 
+  let expectEmail: string | null = null;
+  const found = h("div", { class: "found", hidden: true });
+  const fields = h(
+    "div",
+    { class: "fields" },
+    h("label", null, h("span", null, "Email"), email, h("small", { class: "muted" }, "Optional. Pre-fills the sign-in page.")),
+    h("label", null, h("span", null, "Label"), label, h("small", { class: "muted" }, "Optional. A short name like work or team-3.")),
+    h("p", { class: "muted" }, "Your browser signs in as whichever claude.ai account it is logged in to. Switch accounts there first if needed."),
+  );
   const form = account
     ? h("p", null, `Sign in as ${account.email ?? account.label} in the browser window that opens. If the browser is logged in to a different claude.ai account, switch accounts there first.`)
-    : h(
-        "div",
-        { class: "fields" },
-        h("label", null, h("span", null, "Email"), email, h("small", { class: "muted" }, "Optional. Pre-fills the sign-in page.")),
-        h("label", null, h("span", null, "Label"), label, h("small", { class: "muted" }, "Optional. A short name like work or raid-3.")),
-        h("p", { class: "muted" }, "Your browser signs in as whichever claude.ai account it is logged in to. Switch accounts there first if needed."),
-      );
+    : h("div", null, found, fields);
 
   const d = dialog(account ? `Log in to ${account.label}` : "Add an account", form, steps, status, codeRow, h("div", { class: "dialog-actions" }, cancel, start));
+
+  // Accounts the other Claude Code profiles on this computer belong to: one click starts a fresh
+  // sign-in with the email and the profile's name filled in. Those profiles are left untouched.
+  if (!account) {
+    api
+      .otherProfiles()
+      .then((profiles) => {
+        if (profiles.length === 0) return;
+        const taken = new Set(state.snap?.accounts.map((a) => a.label.toLowerCase()) ?? []);
+        replace(
+          found,
+          h("h3", null, "From your other Claude Code profiles"),
+          h(
+            "ul",
+            { class: "found-list" },
+            profiles.map((p) =>
+              h(
+                "li",
+                null,
+                h(
+                  "div",
+                  { class: "found-who" },
+                  h("div", { class: "who-label" }, p.email ?? p.name),
+                  h("div", { class: "muted who-email" }, `${p.name} profile${p.subscription_type ? `, ${p.subscription_type}` : ""}`),
+                ),
+                p.in_pool_as
+                  ? h("span", { class: "muted found-state" }, `In the pool as ${p.in_pool_as}`)
+                  : h(
+                      "button",
+                      {
+                        class: "btn small",
+                        onclick: () => {
+                          email.value = p.email ?? "";
+                          label.value = taken.has(p.name.toLowerCase()) ? "" : p.name;
+                          expectEmail = p.email;
+                          found.hidden = true;
+                          fields.hidden = true;
+                          d.querySelector("h2")!.textContent = `Add ${p.email ?? p.name}`;
+                          start.click();
+                        },
+                      },
+                      "Sign in",
+                    ),
+              ),
+            ),
+          ),
+          h("h3", null, "Or another account"),
+        );
+        found.hidden = false;
+      })
+      .catch(() => {});
+  }
 
   const setSteps = (active: number) => {
     const labels = ["Open the sign-in page", "Sign in and approve in the browser", "Save the login"];
@@ -563,7 +618,7 @@ function openLogin(account: AccountView | null) {
     status.className = "login-status muted";
     form.querySelectorAll("input").forEach((i) => (i.disabled = true));
     try {
-      const id = await api.startLogin(email.value.trim() || null, label.value.trim() || null, account?.id ?? null);
+      const id = await api.startLogin(email.value.trim() || null, label.value.trim() || null, account?.id ?? null, expectEmail);
       currentLogin = { id, dialog: d, update };
     } catch (e) {
       start.disabled = false;
