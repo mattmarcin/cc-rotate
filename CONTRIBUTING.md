@@ -6,25 +6,26 @@ For a security problem, follow [SECURITY.md](SECURITY.md) instead of opening an 
 
 ## Building
 
-You need Windows 10 or 11, [Rust](https://rustup.rs) 1.85 or newer, and [Node.js](https://nodejs.org) 20 or newer.
-The desktop app crate embeds the built frontend from `app\dist`, so build it once before running any `cargo` command:
+You need [Rust](https://rustup.rs) 1.85 or newer and [Node.js](https://nodejs.org) 20 or newer, on Windows, Linux or macOS.
+On Linux, the desktop app also needs the WebKitGTK and tray libraries (see **Requirements** in the [README](README.md)).
+The desktop app crate embeds the built frontend from `app/dist`, so build it once before running any `cargo` command:
 
-```powershell
-cd app; npm ci; npm run build; cd ..
-cd tests\interop; npm ci; cd ..\..    # enables the lock tests against the real proper-lockfile package
+```sh
+cd app && npm ci && npm run build && cd ..
+cd tests/interop && npm ci && cd ../..   # enables the lock tests against the real proper-lockfile package
 ```
 
 To try the app without real accounts, use the demo store described under **Development** in the [README](README.md).
 
 ## Checks
 
-CI runs these on every pull request, and all of them have to pass:
+CI runs these on Windows, Linux and macOS for every pull request, and all of them have to pass:
 
-```powershell
+```sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
-cd app; npm run typecheck
+cd app && npm run build   # also type-checks the frontend
 ```
 
 `tests/e2e/live-swap.mjs` swaps between two real accounts in your rotation profile.

@@ -17,7 +17,9 @@ mod flags {
 }
 
 /// Start `cc-rotate-ctl swap` in the background so the statusline returns immediately.
-/// It must outlive the statusline process, so it leaves Claude Code's job object if allowed.
+/// It must outlive the statusline process, so it leaves Claude Code's job object if allowed
+/// (Windows) or its process group (Unix), and a signal sent to the statusline's group when
+/// Claude Code times it out does not reach the swap.
 pub fn spawn_swap(req: &SwapRequest, profile: Option<&Path>) -> Result<()> {
     let exe = std::env::current_exe()?;
     let build = || {
@@ -56,9 +58,13 @@ pub fn spawn_swap(req: &SwapRequest, profile: Option<&Path>) -> Result<()> {
             .spawn()
             .context("starting the background swap")?;
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     {
-        build().spawn().context("starting the background swap")?;
+        use std::os::unix::process::CommandExt;
+        build()
+            .process_group(0)
+            .spawn()
+            .context("starting the background swap")?;
     }
     Ok(())
 }
@@ -99,7 +105,7 @@ fn shell(command: &str) -> Command {
     cmd
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
 fn shell(command: &str) -> Command {
     let mut cmd = Command::new("sh");
     cmd.args(["-c", command]);
@@ -130,6 +136,11 @@ pub fn launch_app() -> Result<()> {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(flags::DETACHED_PROCESS | flags::CREATE_NEW_PROCESS_GROUP);
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     cmd.spawn()
         .with_context(|| format!("starting {}", app.display()))?;
     Ok(())
@@ -152,5 +163,28 @@ pub fn log_error(context: &str, error: &anyhow::Error) {
         .open(&path)
     {
         let _ = writeln!(file, "{} {context}: {error:#}", ccr_core::time::now_ms());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn downstream_gets_the_statusline_input() {
+        let command = if cfg!(windows) {
+            "findstr session"
+        } else {
+            "grep session"
+        };
+        let out = run_downstream(command, "{\"session_id\":\"s\"}\n").unwrap();
+        assert_eq!(out.trim(), "{\"session_id\":\"s\"}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn downstream_runs_through_sh() {
+        let out = run_downstream("read line; echo \"got $line\" | tr a-z A-Z", "ok\n").unwrap();
+        assert_eq!(out, "GOT OK\n");
     }
 }

@@ -131,9 +131,9 @@ mod tests {
 
     #[test]
     fn short_names() {
-        assert_eq!(short_name(Path::new(r"C:\Users\x\.claude-work")), "work");
-        assert_eq!(short_name(Path::new(r"C:\Users\x\.claude")), "main");
-        assert_eq!(short_name(Path::new(r"C:\Users\x\.claude-alt")), "alt");
+        assert_eq!(short_name(Path::new("/home/x/.claude-work")), "work");
+        assert_eq!(short_name(Path::new("/home/x/.claude")), "main");
+        assert_eq!(short_name(Path::new("/home/x/.claude-alt")), "alt");
     }
 
     #[test]

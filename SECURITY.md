@@ -16,7 +16,7 @@ There are no versioned releases yet, so only the latest `main` is supported.
 
 ## How cc-rotate stores logins
 
-- Each account's login is stored in `store.db` in cc-rotate's data folder (`%LOCALAPPDATA%\cc-rotate` on Windows), encrypted with XChaCha20-Poly1305.
+- Each account's login is stored in `store.db` in cc-rotate's data folder (`%LOCALAPPDATA%\cc-rotate` on Windows, `~/.local/share/cc-rotate` on Linux, `~/Library/Application Support/cc-rotate` on macOS), encrypted with XChaCha20-Poly1305.
   Every login gets a fresh random nonce, and is bound to its account, so a login copied into another account's row fails to decrypt instead of being used.
 - The 256-bit key is in `master.key` in the same folder.
   cc-rotate creates it on first use and never logs it or prints it.
@@ -30,7 +30,7 @@ There are no versioned releases yet, so only the latest `main` is supported.
   `cc-rotate-ctl backup <file>` prints one decrypted.
 - Stores from older versions, encrypted with Windows DPAPI, are converted to this format the first time a new version opens them.
 - The rotation profile's `.credentials.json` holds the active account's login in plain text, exactly as Claude Code itself stores it.
-- A new login is made in a temporary staging folder under `%LOCALAPPDATA%\cc-rotate\staging`, which is deleted when the login finishes, fails, is cancelled or times out.
+- A new login is made in a temporary staging folder under `staging` in the data folder, which is deleted when the login finishes, fails, is cancelled or times out.
 - cc-rotate makes no network requests of its own, and the desktop app opens no network port.
 - Your other Claude Code profiles are only read, to find out which account each belongs to; their logins are never imported or changed.
 
@@ -39,7 +39,7 @@ There are no versioned releases yet, so only the latest `main` is supported.
 In scope:
 
 - Tokens written to disk unencrypted anywhere other than the rotation profile's `.credentials.json`, or written to logs, events or error messages.
-- A swap or login that leaves a token readable by another Windows user, or that leaks a token through a process argument, environment variable or temporary file.
+- A swap or login that leaves a token readable by another user, or that leaks a token through a process argument, environment variable or temporary file.
 - Ways for another local program or a web page to drive the desktop app or the CLI into revealing, replacing or exporting a login.
 - Staging folders or backups that are not cleaned up or not encrypted as described above.
 - Supply-chain issues in this repository, such as the install script, the build, or the CI workflow.

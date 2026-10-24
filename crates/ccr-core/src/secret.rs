@@ -124,7 +124,8 @@ pub fn load_or_create_key(path: &Path) -> Result<Key> {
     create_private_dir(dir)?;
     let bytes = random::<KEY_LEN>()?;
     let tmp = dir.join(format!(".{KEY_FILE}.{}.tmp", uuid::Uuid::new_v4().simple()));
-    write_private(&tmp, &bytes)?;
+    crate::credfile::write_new_private(&tmp, &bytes)
+        .with_context(|| format!("creating {}", tmp.display()))?;
     let linked = std::fs::hard_link(&tmp, path);
     let _ = std::fs::remove_file(&tmp);
     match linked {
@@ -133,25 +134,6 @@ pub fn load_or_create_key(path: &Path) -> Result<Key> {
         Err(e) => return Err(e).with_context(|| format!("creating {}", path.display())),
     }
     read_key(path)?.with_context(|| format!("{} vanished while it was created", path.display()))
-}
-
-/// Create a file only its owner can read (mode 0600 on Unix; on Windows it inherits the
-/// user-profile ACL of the data directory: the user, SYSTEM and Administrators).
-fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::io::Write;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(path)
-        .with_context(|| format!("creating {}", path.display()))?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    Ok(())
 }
 
 /// Create a directory (and its parents) that only its owner can enter on Unix.

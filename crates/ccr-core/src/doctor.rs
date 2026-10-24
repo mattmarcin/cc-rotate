@@ -81,6 +81,19 @@ pub fn run(store: &Store, paths: &Paths) -> Vec<Check> {
 
     checks.push(profile_settings_check(paths));
 
+    let legacy = crate::setup::legacy_alias_files();
+    if !legacy.is_empty() {
+        let files: Vec<String> = legacy.iter().map(|p| p.display().to_string()).collect();
+        checks.push(check(
+            "cc-rotate command",
+            Status::Warn,
+            format!(
+                "{} still defines the old cc-rotate PowerShell function, which hides the cc-rotate command; run `cc-rotate-ctl setup --remove-alias` and open a new terminal",
+                files.join(" and ")
+            ),
+        ));
+    }
+
     let accounts = store.accounts().unwrap_or_default();
     let active: Vec<_> = accounts
         .iter()

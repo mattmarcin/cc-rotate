@@ -7,7 +7,11 @@ on:
 
 jobs:
   check:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
 
@@ -20,6 +24,13 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 20
+
+      # The desktop app (Tauri) links against WebKitGTK and the tray libraries on Linux.
+      - name: Install the app's system libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
 
       - name: Build the app frontend
         working-directory: app
@@ -39,3 +50,7 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --locked
+
+      - name: Check the install script
+        if: runner.os != 'Windows'
+        run: sh -n scripts/install.sh

@@ -7,7 +7,7 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use crate::credfile;
-use crate::paths::{self, forward_slashes};
+use crate::paths;
 use crate::store::Store;
 
 const COPIED_DIRS: &[&str] = &[
@@ -46,7 +46,8 @@ pub struct SetupOptions {
     /// The `cc-rotate-ctl` executable the profile's statusline and hook should run.
     pub ctl_path: PathBuf,
     pub force: bool,
-    pub install_alias: bool,
+    /// Remove the PowerShell function older versions added (see `remove_powershell_alias`).
+    pub remove_alias: bool,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -55,7 +56,8 @@ pub struct SetupReport {
     pub copied: Vec<String>,
     pub claude_md: Option<String>,
     pub statusline_downstream: Option<String>,
-    pub alias_files: Vec<PathBuf>,
+    /// PowerShell profiles the old `cc-rotate` function was removed from.
+    pub alias_removed_from: Vec<PathBuf>,
     /// User-level MCP servers carried over from the template.
     pub mcp_servers: Vec<String>,
 }
@@ -120,8 +122,8 @@ pub fn run(store: &Store, opts: &SetupOptions) -> Result<SetupReport> {
     store.set_setting("profile_dir", Some(&profile.display().to_string()))?;
     store.set_setting("statusline_downstream", downstream.as_deref())?;
 
-    if opts.install_alias {
-        report.alias_files = install_powershell_alias(&profile)?;
+    if opts.remove_alias {
+        report.alias_removed_from = remove_powershell_alias()?;
     }
     Ok(report)
 }
@@ -269,11 +271,13 @@ fn build_settings(
 
 /// The executable as it should appear at the start of a statusline or hook command.
 ///
-/// Claude Code may run those commands through PowerShell (`CLAUDE_CODE_USE_POWERSHELL_TOOL`),
-/// bash or cmd. A quoted path followed by arguments is a parse error in PowerShell, so the path
-/// must be unquoted: as is when it has no spaces, else its 8.3 short form. Quoting is the last
-/// resort, for volumes with short names disabled.
+/// On Windows, Claude Code may run those commands through PowerShell
+/// (`CLAUDE_CODE_USE_POWERSHELL_TOOL`), bash or cmd. A quoted path followed by arguments is a
+/// parse error in PowerShell, so the path must be unquoted: as is when it has no spaces, else
+/// its 8.3 short form. Quoting is the last resort, for volumes with short names disabled.
+#[cfg(windows)]
 pub fn command_path(exe: &Path) -> String {
+    use crate::paths::forward_slashes;
     let plain = forward_slashes(exe);
     if !plain.contains(char::is_whitespace) {
         return plain;
@@ -305,9 +309,24 @@ fn short_path(path: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(std::ffi::OsString::from_wide(&buf[..len])))
 }
 
-#[cfg(not(windows))]
-fn short_path(_path: &Path) -> Option<PathBuf> {
-    None
+/// On Unix, Claude Code runs statusline and hook commands through a POSIX shell, so a path
+/// with spaces or other special characters is single-quoted.
+#[cfg(unix)]
+pub fn command_path(exe: &Path) -> String {
+    sh_quote(&exe.display().to_string())
+}
+
+/// Quote `text` for a POSIX shell, leaving it bare when that is already safe.
+pub fn sh_quote(text: &str) -> String {
+    let safe = !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._-+:@%,".contains(c));
+    if safe {
+        text.to_string()
+    } else {
+        format!("'{}'", text.replace('\'', r"'\''"))
+    }
 }
 
 /// The `.claude.json` Claude Code uses for a profile. The default profile (`~/.claude`)
@@ -400,75 +419,64 @@ fn merge_config(template: &Path, profile: &Path) -> Result<Vec<String>> {
     Ok(added)
 }
 
-/// Add (or replace) a `cc-rotate` function in the user's PowerShell profiles.
-///
-/// Writes to every existing profile among PowerShell 7 and Windows PowerShell 5.1; when none
-/// exist, creates the PowerShell 7 one if `pwsh` is installed, else the 5.1 one.
-pub fn install_powershell_alias(profile_dir: &Path) -> Result<Vec<PathBuf>> {
-    let docs = dirs::document_dir().context("could not find the Documents folder")?;
-    let pwsh = docs
-        .join("PowerShell")
-        .join("Microsoft.PowerShell_profile.ps1");
-    let winps = docs
-        .join("WindowsPowerShell")
-        .join("Microsoft.PowerShell_profile.ps1");
-    let mut targets: Vec<PathBuf> = [&pwsh, &winps]
-        .into_iter()
-        .filter(|p| p.is_file())
-        .cloned()
-        .collect();
-    if targets.is_empty() {
-        targets.push(if which::which("pwsh").is_ok() {
-            pwsh
-        } else {
-            winps
-        });
-    }
-    let quoted = profile_dir.display().to_string().replace('\'', "''");
-    let block = format!(
-        "{ALIAS_BEGIN}\n\
-         # Runs Claude Code on the cc-rotate account pool. Managed by `cc-rotate-ctl setup`.\n\
-         function cc-rotate {{\n\
-         \x20   if ((Get-Location).Path -eq $HOME) {{\n\
-         \x20       Write-Warning \"cc-rotate cannot track usage or swap accounts in your home folder: Claude Code does not run status lines there. Start it in a project folder.\"\n\
-         \x20   }}\n\
-         \x20   $old = $env:CLAUDE_CONFIG_DIR\n\
-         \x20   $env:CLAUDE_CONFIG_DIR = '{quoted}'\n\
-         \x20   try {{ claude @args }} finally {{ $env:CLAUDE_CONFIG_DIR = $old }}\n\
-         }}\n\
-         {ALIAS_END}\n"
-    );
-    for target in &targets {
-        let existing = std::fs::read_to_string(target).unwrap_or_default();
-        let updated = replace_block(&existing, &block);
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
+/// Remove the `cc-rotate` function that older versions added to the PowerShell profiles. A
+/// PowerShell function hides an executable of the same name, so it would shadow the
+/// `cc-rotate` launcher. Returns the profiles that changed.
+pub fn remove_powershell_alias() -> Result<Vec<PathBuf>> {
+    let mut changed = Vec::new();
+    for path in powershell_profiles() {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Some(updated) = remove_block(&text) {
+            std::fs::write(&path, updated)
+                .with_context(|| format!("writing {}", path.display()))?;
+            changed.push(path);
         }
-        std::fs::write(target, updated).with_context(|| format!("writing {}", target.display()))?;
     }
-    Ok(targets)
+    Ok(changed)
 }
 
-fn replace_block(existing: &str, block: &str) -> String {
-    if let (Some(start), Some(end)) = (existing.find(ALIAS_BEGIN), existing.find(ALIAS_END)) {
-        if end > start {
-            let after = &existing[end + ALIAS_END.len()..];
-            let after = after
-                .strip_prefix("\r\n")
-                .or_else(|| after.strip_prefix('\n'))
-                .unwrap_or(after);
-            return format!("{}{}{}", &existing[..start], block, after);
-        }
+/// PowerShell profiles that still define the old `cc-rotate` function.
+pub fn legacy_alias_files() -> Vec<PathBuf> {
+    powershell_profiles()
+        .into_iter()
+        .filter(|p| std::fs::read_to_string(p).is_ok_and(|t| t.contains(ALIAS_BEGIN)))
+        .collect()
+}
+
+/// The PowerShell 7 and Windows PowerShell 5.1 profiles; older versions only wrote these, and
+/// only on Windows.
+fn powershell_profiles() -> Vec<PathBuf> {
+    if !cfg!(windows) {
+        return Vec::new();
     }
-    let mut out = existing.to_string();
-    if !out.is_empty() && !out.ends_with('\n') {
-        out.push('\n');
-    }
-    if !out.is_empty() {
-        out.push('\n');
-    }
-    out.push_str(block);
-    out
+    let Some(docs) = dirs::document_dir() else {
+        return Vec::new();
+    };
+    ["PowerShell", "WindowsPowerShell"]
+        .iter()
+        .map(|shell| docs.join(shell).join("Microsoft.PowerShell_profile.ps1"))
+        .collect()
+}
+
+/// `existing` without the marked block and the blank line written before it, or `None` when
+/// there is no block.
+fn remove_block(existing: &str) -> Option<String> {
+    let start = existing.find(ALIAS_BEGIN)?;
+    let end = start + existing[start..].find(ALIAS_END)? + ALIAS_END.len();
+    let after = &existing[end..];
+    let after = after
+        .strip_prefix("\r\n")
+        .or_else(|| after.strip_prefix('\n'))
+        .unwrap_or(after);
+    let before = &existing[..start];
+    let before = before
+        .strip_suffix("\r\n\r\n")
+        .map(|b| format!("{b}\r\n"))
+        .or_else(|| before.strip_suffix("\n\n").map(|b| format!("{b}\n")))
+        .unwrap_or_else(|| before.to_string());
+    Some(format!("{before}{after}"))
 }
 
 #[cfg(test)]
@@ -538,17 +546,61 @@ mod tests {
         );
     }
 
+    /// On Unix, Claude Code runs the commands through a POSIX shell (and users run zsh or bash),
+    /// so a path with spaces and quotes must still start the program in each of them.
+    #[cfg(unix)]
     #[test]
-    fn alias_block_is_idempotent() {
-        let once = replace_block(
-            "existing\n",
-            "# >>> cc-rotate >>>\nA\n# <<< cc-rotate <<<\n",
-        );
-        let twice = replace_block(&once, "# >>> cc-rotate >>>\nB\n# <<< cc-rotate <<<\n");
+    fn command_path_runs_in_every_shell() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let spaced = dir.path().join("Program Files Like").join("it's bin");
+        std::fs::create_dir_all(&spaced).unwrap();
+        let exe = spaced.join("probe tool");
+        std::fs::write(&exe, "#!/bin/sh\n[ \"$1\" = cmd ] || exit 1\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let command = format!("{} cmd", command_path(&exe));
+        let mut ran = 0;
+        for shell in ["sh", "bash", "zsh", "dash"] {
+            let Ok(found) = which::which(shell) else {
+                continue;
+            };
+            let status = std::process::Command::new(found)
+                .args(["-c", &command])
+                .status()
+                .unwrap();
+            assert!(status.success(), "{shell} could not run: {command}");
+            ran += 1;
+        }
+        assert!(ran >= 1, "sh exists on every Unix");
         assert_eq!(
-            twice,
-            "existing\n\n# >>> cc-rotate >>>\nB\n# <<< cc-rotate <<<\n"
+            command_path(Path::new("/usr/local/bin/cc-rotate-ctl")),
+            "/usr/local/bin/cc-rotate-ctl"
         );
+    }
+
+    #[test]
+    fn sh_quote_only_when_needed() {
+        assert_eq!(sh_quote("/home/x/.claude-rotate"), "/home/x/.claude-rotate");
+        assert_eq!(sh_quote("/a b/c"), "'/a b/c'");
+        assert_eq!(sh_quote("/it's"), r"'/it'\''s'");
+        assert_eq!(sh_quote("~/x"), "'~/x'");
+        assert_eq!(sh_quote(""), "''");
+    }
+
+    #[test]
+    fn old_powershell_function_is_removed_cleanly() {
+        let block = "# >>> cc-rotate >>>\n# Managed\nfunction cc-rotate { claude @args }\n# <<< cc-rotate <<<\n";
+        assert_eq!(
+            remove_block(&format!("Set-Alias x y\n\n{block}")).as_deref(),
+            Some("Set-Alias x y\n")
+        );
+        assert_eq!(
+            remove_block(&format!("a\r\n\r\n{}b\r\n", block.replace('\n', "\r\n"))).as_deref(),
+            Some("a\r\nb\r\n")
+        );
+        assert_eq!(remove_block(block).as_deref(), Some(""));
+        assert_eq!(remove_block("Set-Alias x y\n"), None);
     }
 
     #[test]
@@ -587,14 +639,19 @@ mod tests {
 
         let store = Store::open_in_memory().unwrap();
         let profile = root.path().join("rot");
+        let (ctl, ctl_cmd) = if cfg!(windows) {
+            (r"C:\bin\cc-rotate-ctl.exe", "C:/bin/cc-rotate-ctl.exe")
+        } else {
+            ("/opt/bin/cc-rotate-ctl", "/opt/bin/cc-rotate-ctl")
+        };
         let report = run(
             &store,
             &SetupOptions {
                 template: template.clone(),
                 profile: profile.clone(),
-                ctl_path: PathBuf::from(r"C:\bin\cc-rotate-ctl.exe"),
+                ctl_path: PathBuf::from(ctl),
                 force: false,
-                install_alias: false,
+                remove_alias: false,
             },
         )
         .unwrap();
@@ -611,7 +668,7 @@ mod tests {
         assert_eq!(settings["model"], "opus");
         assert_eq!(
             settings["statusLine"]["command"],
-            "C:/bin/cc-rotate-ctl.exe statusline"
+            format!("{ctl_cmd} statusline")
         );
         assert_eq!(settings["statusLine"]["refreshInterval"], 30);
         let hook = settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
@@ -620,7 +677,7 @@ mod tests {
         assert!(hook.contains("rot"), "hook path rewritten: {hook}");
         assert_eq!(
             settings["hooks"]["StopFailure"][0]["hooks"][0]["command"],
-            "C:/bin/cc-rotate-ctl.exe hook stop-failure"
+            format!("{ctl_cmd} hook stop-failure")
         );
         let config: Value =
             serde_json::from_str(&std::fs::read_to_string(profile.join(".claude.json")).unwrap())
@@ -648,9 +705,9 @@ mod tests {
             &SetupOptions {
                 template: template.clone(),
                 profile: profile.clone(),
-                ctl_path: PathBuf::from(r"C:\bin\cc-rotate-ctl.exe"),
+                ctl_path: PathBuf::from(ctl),
                 force: true,
-                install_alias: false,
+                remove_alias: false,
             },
         )
         .unwrap();
@@ -676,7 +733,7 @@ mod tests {
                     profile,
                     ctl_path: PathBuf::from("x"),
                     force: false,
-                    install_alias: false
+                    remove_alias: false
                 }
             )
             .is_err()
