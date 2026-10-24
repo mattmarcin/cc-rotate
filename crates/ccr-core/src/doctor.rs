@@ -29,10 +29,25 @@ pub struct Check {
 }
 
 fn check(name: &str, status: Status, detail: impl Into<String>) -> Check {
+    let detail: String = detail.into();
+    let mut chars = detail.chars();
+    let detail = match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => detail,
+    };
     Check {
         name: name.to_string(),
         status,
-        detail: detail.into(),
+        detail,
+    }
+}
+
+fn age(ms: i64) -> String {
+    match ms / 1000 {
+        s if s < 90 => format!("{s} seconds ago"),
+        s if s < 5400 => format!("{} minutes ago", s / 60),
+        s if s < 172_800 => format!("{} hours ago", s / 3600),
+        s => format!("{} days ago", s / 86_400),
     }
 }
 
@@ -184,7 +199,7 @@ pub fn run(store: &Store, paths: &Paths) -> Vec<Check> {
         Some(ts) => check(
             "Usage samples",
             Status::Ok,
-            format!("last sample {}s ago", (time::now_ms() - ts) / 1000),
+            format!("last sample {}", age(time::now_ms() - ts)),
         ),
         None => check(
             "Usage samples",

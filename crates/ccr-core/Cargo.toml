@@ -26,4 +26,5 @@ which = "8.0.6"
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_Threading"] }
 
 [dev-dependencies]
+rusqlite = "0.41"
 tempfile = "3.27.0"
