@@ -467,6 +467,26 @@ fn first_login_becomes_active_and_relogin_checks_identity() {
         "refresh-first"
     );
 
+    // Adding an account found in another profile: a different browser account is refused.
+    let found = env.paths.data_dir.join("st5");
+    write_staging(&found, "fifth", "u-ann", "ann@x.test");
+    let err = login::import(
+        &store,
+        &env.paths,
+        &found,
+        &login::LoginRequest {
+            label: Some("work".into()),
+            expect_email: Some("work@x.test".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("this sign-in was for work@x.test"),
+        "{err}"
+    );
+    assert!(store.account_by_label("work").unwrap().is_none());
+
     let again = env.paths.data_dir.join("st4");
     write_staging(&again, "first-2", "u-jane", "jane@x.test");
     let re = login::import(

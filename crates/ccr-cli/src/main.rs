@@ -10,7 +10,7 @@ use ccr_core::scheduler::Reason;
 use ccr_core::statusline::StatusInput;
 use ccr_core::store::{AccountState, kind};
 use ccr_core::swap::{SwapOutcome, SwapRequest};
-use ccr_core::{Paths, Store, doctor, login, setup, snapshot, statusline, swap, time};
+use ccr_core::{Paths, Store, doctor, login, profiles, setup, snapshot, statusline, swap, time};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -45,7 +45,13 @@ enum Command {
         /// Re-login this existing account (label, email or id).
         #[arg(long, value_name = "ACCOUNT")]
         relogin: Option<String>,
+        /// Sign in fresh as the account another profile uses (see `profiles`); its email and
+        /// name are pre-filled, and a different account signing in is refused.
+        #[arg(long, value_name = "NAME", conflicts_with_all = ["email", "relogin"])]
+        from_profile: Option<String>,
     },
+    /// List your other Claude Code profiles and the account each belongs to.
+    Profiles,
     /// Swap the profile to another account now.
     Swap {
         /// Swap to this account instead of the scheduler's pick.
@@ -179,7 +185,47 @@ fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> 
             email,
             label,
             relogin,
-        } => login_cmd(store, paths, email, label, relogin)?,
+            from_profile,
+        } => match from_profile {
+            Some(name) => {
+                let found = profiles::discover(store, paths)?
+                    .into_iter()
+                    .find(|p| p.name.eq_ignore_ascii_case(&name))
+                    .with_context(|| {
+                        format!("no profile named {name:?}; see `cc-rotate-ctl profiles`")
+                    })?;
+                if let Some(label) = &found.in_pool_as {
+                    bail!(
+                        "{} is already in the pool as {label}",
+                        found.email.as_deref().unwrap_or(&name)
+                    );
+                }
+                let label = label.or_else(|| {
+                    Some(found.name.clone())
+                        .filter(|l| store.account_by_label(l).ok().flatten().is_none())
+                });
+                login_cmd(store, paths, found.email.clone(), label, None, found.email)?
+            }
+            None => login_cmd(store, paths, email, label, relogin, None)?,
+        },
+        Command::Profiles => {
+            let found = profiles::discover(store, paths)?;
+            if found.is_empty() {
+                println!("No other Claude Code profiles found in your home folder.");
+            }
+            for p in &found {
+                let status = match &p.in_pool_as {
+                    Some(label) => format!("in the pool as {label}"),
+                    None => format!("add with: cc-rotate-ctl login --from-profile {}", p.name),
+                };
+                println!(
+                    "{:<10} {:<32} {}",
+                    p.name,
+                    p.email.as_deref().unwrap_or("unknown email"),
+                    status
+                );
+            }
+        }
         Command::Swap {
             to,
             from_id,
@@ -417,6 +463,7 @@ fn login_cmd(
     email: Option<String>,
     label: Option<String>,
     relogin: Option<String>,
+    expect_email: Option<String>,
 ) -> Result<()> {
     let relogin = relogin.map(|r| store.find_account(&r)).transpose()?;
     let email = email.or_else(|| relogin.as_ref().and_then(|a| a.email.clone()));
@@ -447,6 +494,7 @@ fn login_cmd(
             email,
             label,
             relogin: relogin.map(|a| a.id),
+            expect_email,
         },
     )?;
     let a = &imported.account;

@@ -40,6 +40,7 @@ fn main() {
             commands::remove_account,
             commands::rename_account,
             commands::doctor,
+            commands::other_profiles,
             commands::set_setting,
             commands::app_info,
             commands::autostart_enabled,

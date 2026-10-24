@@ -2,6 +2,7 @@
 //! anything that can wait on locks runs on the blocking pool.
 
 use ccr_core::doctor::{self, Check};
+use ccr_core::profiles::{self, FoundProfile};
 use ccr_core::scheduler::Reason;
 use ccr_core::snapshot::{self, Snapshot};
 use ccr_core::store::{AccountState, Event, Sample, kind};
@@ -117,6 +118,12 @@ pub async fn rename_account(id: i64, label: String) -> CmdResult<()> {
         s.rename_account(id, &label)
     })
     .await
+}
+
+/// Other Claude Code profiles on this computer, with the account each belongs to.
+#[tauri::command]
+pub async fn other_profiles() -> CmdResult<Vec<FoundProfile>> {
+    blocking(profiles::discover).await
 }
 
 #[tauri::command]

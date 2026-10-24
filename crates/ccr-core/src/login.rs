@@ -27,6 +27,9 @@ pub struct LoginRequest {
     pub label: Option<String>,
     /// Re-login this existing account; the import is refused if a different account signs in.
     pub relogin: Option<i64>,
+    /// Refuse the import unless this account signs in (used when adding an account found in
+    /// another profile, so a wrong browser account never lands under that profile's label).
+    pub expect_email: Option<String>,
 }
 
 /// A staging directory that removes itself when dropped.
@@ -111,6 +114,14 @@ pub fn import(
     }
     if ident.account_uuid.is_none() && ident.email.is_none() {
         bail!("the login completed but Claude Code did not record which account signed in");
+    }
+
+    if let (Some(expected), Some(got)) = (&req.expect_email, &ident.email) {
+        if !expected.eq_ignore_ascii_case(got) {
+            bail!(
+                "signed in as {got}, but this sign-in was for {expected}; switch to that account in your browser and try again"
+            );
+        }
     }
 
     let existing = match req.relogin {

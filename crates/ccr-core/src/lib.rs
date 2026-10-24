@@ -9,6 +9,7 @@ pub mod lock;
 pub mod login;
 pub mod paths;
 pub mod profile_account;
+pub mod profiles;
 pub mod scheduler;
 pub mod secret;
 pub mod setup;

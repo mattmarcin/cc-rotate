@@ -78,6 +78,7 @@ pub fn start_login(
     email: Option<String>,
     label: Option<String>,
     relogin: Option<i64>,
+    expect_email: Option<String>,
 ) -> CmdResult<String> {
     let (claude, staging, email) = with_store(|store, paths| {
         let target = relogin.map(|id| store.account(id)).transpose()?.flatten();
@@ -138,6 +139,7 @@ pub fn start_login(
         email,
         label: label.filter(|l| !l.trim().is_empty()),
         relogin,
+        expect_email: expect_email.filter(|e| !e.trim().is_empty()),
     };
     let app2 = app.clone();
     let id2 = id.clone();
