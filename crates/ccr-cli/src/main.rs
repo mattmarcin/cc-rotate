@@ -114,6 +114,9 @@ enum Command {
         /// Only record usage for a profile outside the pool; never swaps.
         #[arg(long)]
         observe: bool,
+        /// Status line command to run after cc-rotate's (overrides the `statusline_downstream` setting).
+        #[arg(long, value_name = "COMMAND")]
+        then: Option<String>,
     },
     /// Hook entry points (configured by `setup`; read Claude Code's JSON on stdin).
     Hook {
@@ -140,8 +143,8 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<ExitCode> {
     match cli.command {
-        Command::Statusline { observe } => {
-            statusline_entry(cli.profile, observe);
+        Command::Statusline { observe, then } => {
+            statusline_entry(cli.profile, observe, then);
             Ok(ExitCode::SUCCESS)
         }
         Command::Hook {
@@ -445,7 +448,7 @@ fn read_stdin() -> String {
 }
 
 /// Statusline: never fails visibly. Errors go to the log and the downstream statusline still runs.
-fn statusline_entry(profile: Option<PathBuf>, observe: bool) {
+fn statusline_entry(profile: Option<PathBuf>, observe: bool, then: Option<String>) {
     let raw = read_stdin();
     let input = StatusInput::parse(&raw);
     let mut prefix = String::new();
@@ -476,13 +479,13 @@ fn statusline_entry(profile: Option<PathBuf>, observe: bool) {
         Err(e) => process::log_error("statusline", &e),
     }
 
-    let downstream = if observe {
-        std::env::var("CC_ROTATE_OBSERVE_DOWNSTREAM").ok()
-    } else {
-        ccr_core::open(profile)
+    let downstream = match (then, observe) {
+        (Some(cmd), _) => Some(cmd).filter(|c| !c.trim().is_empty()),
+        (None, true) => None,
+        (None, false) => ccr_core::open(profile)
             .ok()
             .and_then(|(s, _)| s.settings().ok())
-            .and_then(|s| s.statusline_downstream)
+            .and_then(|s| s.statusline_downstream),
     };
     let body = downstream
         .and_then(|cmd| process::run_downstream(&cmd, &raw))
