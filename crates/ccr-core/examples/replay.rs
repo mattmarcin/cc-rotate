@@ -306,7 +306,6 @@ fn play(
     let mut promoted: HashMap<i64, i64> = HashMap::new();
     let mut timing = Timing {
         cooldown_ms: settings.swap_cooldown_s * 1000,
-        active_since_ms: start_s * 1000,
         ..Default::default()
     };
     // Points used in each account's running 5-hour window.
@@ -368,7 +367,6 @@ fn play(
                 *out.swaps.entry(reason.as_str()).or_default() += 1;
                 active = target.account.id;
                 timing.last_swap_ms = timing.now_ms;
-                timing.active_since_ms = timing.now_ms;
             }
         }
 
@@ -472,6 +470,7 @@ fn candidates(
                     .unwrap_or_default(),
                 held_back: false,
                 expiring: None,
+                left_at_stop: false,
                 account,
             }
         })

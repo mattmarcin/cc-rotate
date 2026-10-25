@@ -391,6 +391,10 @@ pub struct Candidate {
     pub held_back: bool,
     /// Its weekly budget would reset unused unless it is used now (`budget::expiring`).
     pub expiring: Option<crate::budget::Expiring>,
+    /// A swap left it lately because a turn stopped at a usage limit, and no reading of it has
+    /// come since, so its room may be out of date: it is not switched back to
+    /// (`swap::left_at_stop`).
+    pub left_at_stop: bool,
 }
 
 impl Candidate {
@@ -509,17 +513,13 @@ impl Policy {
     /// known yet, 3 for a weekly limit. With the preference off: 1 for a weekly budget that would
     /// reset unused, 2 for every other account.
     pub fn tier(&self, c: &Candidate) -> u8 {
-        if self.prefer_no_weekly_limit && c.weekly_limit == WeeklyLimit::None {
-            return 0;
-        }
-        if self.expiring(c).is_some() {
-            return 1;
-        }
+        let expiring = self.expiring(c).is_some();
         if !self.prefer_no_weekly_limit {
-            return 2;
+            return if expiring { 1 } else { 2 };
         }
         match c.weekly_limit {
             WeeklyLimit::None => 0,
+            _ if expiring => 1,
             WeeklyLimit::Unknown => 2,
             WeeklyLimit::Has => 3,
         }
@@ -588,7 +588,8 @@ pub fn pick(
 /// The account to switch back to, the only switch back there is: while an account that may have
 /// a weekly limit is in use, the best eligible account without one that has
 /// `SWITCH_BACK_MARGIN` to spare, so weekly budget is only spent while no such account can be
-/// used. Never with `prefer_no_weekly_limit` off, and `None` while the active account is over a
+/// used. Not to an account a turn just stopped on at a limit its readings do not show
+/// (`Candidate::left_at_stop`), which would swap back and forth every cooldown. Never with `prefer_no_weekly_limit` off, and `None` while the active account is over a
 /// threshold, since the threshold trigger handles that. The account in use is otherwise kept
 /// until a limit.
 pub fn switch_back_target(
@@ -607,7 +608,9 @@ pub fn switch_back_target(
     }
     candidates
         .iter()
-        .filter(|c| c.eligible() && c.weekly_limit == WeeklyLimit::None && c.has_margin())
+        .filter(|c| {
+            c.eligible() && c.weekly_limit == WeeklyLimit::None && c.has_margin() && !c.left_at_stop
+        })
         .min_by(|a, b| policy.pick_order(a, b, now_s))
 }
 
@@ -627,8 +630,6 @@ pub fn threshold_trigger(active: &Candidate) -> Option<(Reason, &WindowUsage)> {
 pub struct Timing {
     pub now_ms: i64,
     pub last_swap_ms: i64,
-    /// When the active account became active.
-    pub active_since_ms: i64,
     pub last_request_ms: i64,
     pub cooldown_ms: i64,
     /// Every reading of the active account since it became active had it over a threshold: it
@@ -875,6 +876,7 @@ mod tests {
             weekly_limit: weekly,
             held_back: false,
             expiring: None,
+            left_at_stop: false,
             account,
         }
     }
@@ -1271,6 +1273,13 @@ mod tests {
                 None,
                 "too close to its threshold to be worth it"
             );
+            let mut stopped = other(9, 0.0, none);
+            stopped.left_at_stop = true;
+            assert_eq!(
+                d(&[active(1, WeeklyLimit::Has), stopped], timing),
+                None,
+                "a turn just stopped on it at a limit its readings do not show"
+            );
             let cooling = Timing {
                 last_swap_ms: timing.now_ms - 60_000,
                 ..timing
@@ -1327,6 +1336,14 @@ mod tests {
         let pool = vec![expiring.clone(), plain.clone()];
         assert_eq!(pick(&pool, POLICY, None, NOW).unwrap().account.id, 1);
 
+        // Without the preference, the budget that would reset unused goes first of all.
+        let off = Policy {
+            prefer_no_weekly_limit: false,
+            ..POLICY
+        };
+        let pool = vec![expiring.clone(), seat.clone(), plain.clone()];
+        assert_eq!(pick(&pool, off, None, NOW).unwrap().account.id, 1);
+
         // Spending an expiring budget, the account in use still gives way to a ready seat.
         let mut in_use = expiring;
         in_use.account.state = AccountState::Active;
@@ -1347,7 +1364,6 @@ mod tests {
         let timing = Timing {
             now_ms,
             last_swap_ms: now_ms - 20_000,
-            active_since_ms: now_ms - 20_000,
             cooldown_ms: 120_000,
             ..Default::default()
         };
@@ -1488,7 +1504,7 @@ mod tests {
     #[test]
     fn a_day_of_ticks_does_not_ping_pong() {
         for policy in [POLICY, STRICT] {
-            let swaps = day_of_ticks(policy);
+            let swaps = day_of_ticks(policy, 0.225, 8);
             for s in &swaps {
                 if s.3 == Reason::PreferredAvailable {
                     assert_eq!(s.1, 3, "only the Max account swaps back: {swaps:?}");
@@ -1502,7 +1518,36 @@ mod tests {
         }
     }
 
-    fn day_of_ticks(policy: Policy) -> Vec<(i64, i64, i64, Reason)> {
+    /// A busier day: both seats reach their limits before either resets, so the Max account
+    /// carries the gaps, and gives way to a seat as soon as one has reset.
+    #[test]
+    fn a_busy_day_switches_back_to_the_seats_without_ping_pong() {
+        for policy in [POLICY, STRICT] {
+            let swaps = day_of_ticks(policy, 0.45, 16);
+            let backs: Vec<_> = swaps
+                .iter()
+                .filter(|s| s.3 == Reason::PreferredAvailable)
+                .collect();
+            assert!(!backs.is_empty(), "{swaps:?}");
+            for s in &swaps {
+                if s.3 == Reason::PreferredAvailable {
+                    assert!(s.1 == 3 && s.2 != 3, "only from the Max account: {swaps:?}");
+                } else {
+                    assert_eq!(s.3, Reason::FiveHour, "{swaps:?}");
+                }
+                if s.2 == 3 {
+                    assert_eq!(s.3, Reason::FiveHour, "the Max account only at a limit");
+                }
+            }
+        }
+    }
+
+    /// `per_tick`: 5-hour points the account in use spends every 30 s of the busy hours.
+    fn day_of_ticks(
+        policy: Policy,
+        per_tick: f64,
+        max_swaps: usize,
+    ) -> Vec<(i64, i64, i64, Reason)> {
         struct Sim {
             id: i64,
             position: i64,
@@ -1562,13 +1607,13 @@ mod tests {
                     s.five_resets = None;
                 }
                 if s.id == active && busy {
-                    // About 0.45 points a minute: a 5-hour window fills in under four hours.
+                    // At 0.225 a tick, a 5-hour window fills in under four hours.
                     if s.five_resets.is_none() {
                         s.five_resets = Some(now + 5 * 3600);
                     }
-                    s.five += 0.225;
+                    s.five += per_tick;
                     if s.weekly {
-                        s.week += 0.02;
+                        s.week += per_tick * 0.09;
                     }
                 }
             }
@@ -1633,7 +1678,6 @@ mod tests {
                     swaps.push((now, active, target.account.id, reason));
                     active = target.account.id;
                     timing.last_swap_ms = timing.now_ms;
-                    timing.active_since_ms = timing.now_ms;
                 }
             }
             now += 30;
@@ -1645,13 +1689,13 @@ mod tests {
             assert_eq!(b, c);
             if d == a {
                 assert!(
-                    t2 - t1 >= 600,
-                    "{a} -> {b} -> {a} within {}s: ping-pong",
+                    t2 - t1 >= 120,
+                    "{a} -> {b} -> {a} within the cooldown ({}s)",
                     t2 - t1
                 );
             }
         }
-        assert!(swaps.len() <= 8, "too many swaps: {swaps:?}");
+        assert!(swaps.len() <= max_swaps, "too many swaps: {swaps:?}");
         swaps
     }
 }

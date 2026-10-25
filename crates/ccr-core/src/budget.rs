@@ -451,6 +451,7 @@ mod tests {
             order: id as usize,
             held_back: false,
             expiring: None,
+            left_at_stop: false,
         }
     }
 

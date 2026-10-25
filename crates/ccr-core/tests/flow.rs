@@ -776,16 +776,29 @@ fn stale_switch_back_requests_are_skipped() {
         reason: Reason::PreferredAvailable,
         wait: false,
     };
-    let skipped = || SwapOutcome::Skipped {
-        why: "no account without a weekly limit is ready to swap back to".into(),
-    };
+    let skipped = |why: &str| SwapOutcome::Skipped { why: why.into() };
     // a has a weekly limit, but no other account is known to be without one.
     store.set_weekly_limit(a, WeeklyLimitSetting::Yes).unwrap();
-    assert_eq!(swap::run(&store, &env.paths, &req).unwrap(), skipped());
-    // b has no weekly limit, but neither has a any more.
+    assert_eq!(
+        swap::run(&store, &env.paths, &req).unwrap(),
+        skipped("no account without a weekly limit is ready to swap back to")
+    );
+    // b has no weekly limit, but the preference was turned off since.
     store.set_weekly_limit(b, WeeklyLimitSetting::No).unwrap();
+    store
+        .set_setting("prefer_no_weekly_limit", Some("false"))
+        .unwrap();
+    assert_eq!(
+        swap::run(&store, &env.paths, &req).unwrap(),
+        skipped("accounts without a weekly limit no longer go first")
+    );
+    // Back on, but a has no weekly limit any more either.
+    store.set_setting("prefer_no_weekly_limit", None).unwrap();
     store.set_weekly_limit(a, WeeklyLimitSetting::No).unwrap();
-    assert_eq!(swap::run(&store, &env.paths, &req).unwrap(), skipped());
+    assert_eq!(
+        swap::run(&store, &env.paths, &req).unwrap(),
+        skipped("the account in use has no weekly limit")
+    );
     assert_eq!(store.active_account().unwrap().unwrap().id, a);
 }
 
@@ -1779,6 +1792,28 @@ fn seats_and_an_expiring_week(env: &Env) -> (Store, i64, i64, i64) {
 fn a_weekly_budget_that_would_reset_unused_moves_its_account_ahead() {
     let env = Env::new();
     let (store, a, b, c) = seats_and_an_expiring_week(&env);
+    // d has a weekly limit too and comes before c in the order, but its week is far from over.
+    let d = store
+        .insert_account(
+            "d",
+            &AccountIdentity {
+                account_uuid: Some("ud".into()),
+                email: Some("ud@x.test".into()),
+                org_uuid: Some("org-x".into()),
+                ..Default::default()
+            },
+            AccountState::Parked,
+        )
+        .unwrap();
+    store.save_credential(d, &oauth("d1"), "login").unwrap();
+    store.set_weekly_limit(d, WeeklyLimitSetting::Yes).unwrap();
+    store
+        .record_sample(&Sample {
+            windows: vec![window("seven_day", 90.0, time::now_s() + 86_400 * 6)],
+            ..sample(d, 0.0, 0.0)
+        })
+        .unwrap();
+    store.set_order(&[a, b, d, c]).unwrap();
     assert_eq!(swap::next_target(&store, Some(a)).unwrap().unwrap().id, b);
     let (pool, policy) = swap::load_pool(&store, time::now_s()).unwrap();
     let ranked = ccr_core::scheduler::ranking(&pool, policy, time::now_s());
@@ -1810,6 +1845,66 @@ fn a_weekly_budget_that_would_reset_unused_moves_its_account_ahead() {
         .unwrap()
         .expect("marked");
     assert!((marked - week_reset).abs() <= 5, "{marked} vs {week_reset}");
+}
+
+/// A turn stopped at a limit that the account's readings did not show: the account is not
+/// switched back to on that out-of-date room, only once a newer reading shows it, or after
+/// `LEFT_AT_STOP_HOLD_MS`. Otherwise the swap back would stop the next turn again, every cooldown.
+#[test]
+fn an_account_left_at_a_stop_is_not_switched_back_to_on_old_readings() {
+    let env = Env::new();
+    let (store, a, b, c) = pool(&env);
+    for (account, weekly) in [
+        (a, WeeklyLimitSetting::No),
+        (b, WeeklyLimitSetting::No),
+        (c, WeeklyLimitSetting::Yes),
+    ] {
+        store.set_weekly_limit(account, weekly).unwrap();
+    }
+    // a has room by its last reading; b is at its limit.
+    let now_s = time::now_s();
+    let before = time::now_ms() - 60_000;
+    store
+        .record_sample(&five_only(a, 20.0, now_s + 3 * 3600, before))
+        .unwrap();
+    store
+        .record_sample(&five_only(b, 100.0, now_s + 3 * 3600, before))
+        .unwrap();
+    let stop = SwapRequest {
+        from: Some(a),
+        to: None,
+        reason: Reason::StopFailure,
+        wait: false,
+    };
+    assert_eq!(
+        swap::run(&store, &env.paths, &stop).unwrap(),
+        SwapOutcome::Swapped {
+            from: Some(a),
+            to: c
+        }
+    );
+    store
+        .set_meta(swap::META_LAST_SWAP_AT, time::now_ms() - 3_600_000)
+        .unwrap();
+    assert!(
+        statusline::sync(&store, &env.paths).unwrap().is_none(),
+        "a's room is out of date"
+    );
+    let latest = store.last_sample(a).unwrap();
+    let hold_over = time::now_ms() + swap::LEFT_AT_STOP_HOLD_MS;
+    assert!(!swap::left_at_stop(&store, a, latest.as_ref(), hold_over).unwrap());
+
+    // A newer reading of a with room, from a usage check say.
+    store
+        .record_sample(&five_only(a, 20.0, now_s + 3 * 3600, time::now_ms() + 1000))
+        .unwrap();
+    let req = statusline::sync(&store, &env.paths)
+        .unwrap()
+        .expect("a has room by a newer reading");
+    assert_eq!(
+        (req.from, req.reason),
+        (Some(c), Reason::PreferredAvailable)
+    );
 }
 
 /// Accounts without a weekly limit come first even over a weekly budget that would reset unused:

@@ -138,7 +138,7 @@ After an upgrade from an older cc-rotate, accounts that had the same priority sh
 When the account in use reaches a limit, cc-rotate picks the next account that is below all of its limits:
 
 1. Accounts without a weekly limit, whatever their plan.
-   Turn this off with `cc-rotate-ctl config prefer_no_weekly_limit false`.
+   Turn this off with `cc-rotate-ctl config prefer_no_weekly_limit false`: then accounts with and without a weekly limit, and those not known yet, are treated alike, and cc-rotate never swaps back (see below).
 2. Then accounts whose weekly budget would otherwise reset unused (see below), the soonest reset first, then accounts whose weekly limit is not known yet, then accounts with one.
 3. Then the account in use, then accounts whose 5-hour window is already running and at least 10 points below the swap threshold, the one that resets soonest first.
 4. Then your order.
@@ -153,9 +153,12 @@ cc-rotate finds out whether an account has a weekly limit from the usage Claude 
 Until then it is not known yet.
 If that guess is wrong, set it yourself in the account's **More** dialog or with `cc-rotate-ctl weekly-limit <label> yes|no` (`auto` goes back to detecting it).
 
-Otherwise the account in use is kept until it reaches a limit.
-The one exception: while an account with a weekly limit is in use, cc-rotate swaps back to an account without one as soon as one is ready again, so weekly budget is only spent while no account without a weekly limit can be used.
-That includes an account you picked by hand, and an account spending a weekly budget that would otherwise reset unused, so pause an account if you want it left alone.
+The account in use is kept until it reaches a limit, with one exception.
+While the account in use has a weekly limit, or it is not known yet whether it has one, cc-rotate swaps back to an account without a weekly limit as soon as one is ready again.
+So weekly budget is only spent while no account without a weekly limit can be used.
+That includes an account you picked by hand and an account spending a weekly budget that would otherwise reset unused.
+To keep using such an account, pause the accounts without a weekly limit, or turn off `prefer_no_weekly_limit`.
+An account that a session stopped on at a usage limit is not swapped back to until cc-rotate has a newer reading of it, or 5 hours have passed, so a limit that Claude Code does not report cannot make it swap back and forth.
 cc-rotate never swaps back for anything else: not for an account higher in your order, and not to even out usage.
 
 To pick the next account by your order alone, turn on **Pick the next account by my order alone** in the app's **Settings**, or run `cc-rotate-ctl config strict_order true`.
