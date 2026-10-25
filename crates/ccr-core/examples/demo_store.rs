@@ -147,9 +147,10 @@ fn main() -> Result<()> {
             if s.five_resets == 0 {
                 s.five_resets = t_s + 5 * 3600;
             }
-            s.five += 16.0 + (t / 600_000 % 5) as f64;
+            // A reading every 10 minutes, as often as the forecast needs to see a pace.
+            s.five += (16.0 + (t / 600_000 % 5) as f64) / 2.0;
             if s.weekly {
-                s.week += 1.1;
+                s.week += 0.55;
             }
         }
         if s.five_resets != 0 {
@@ -162,7 +163,7 @@ fn main() -> Result<()> {
                 windows: windows(s),
             })?;
         }
-        t += 20 * 60_000;
+        t += 10 * 60_000;
     }
 
     // A recent usage check of every account not in use, as the app makes in the background, so
