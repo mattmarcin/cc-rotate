@@ -1,7 +1,8 @@
 //! Copies accounts from the real cc-rotate store into a scratch store for an end-to-end test
 //! (`tests/e2e/wait-at-limit.py`). Each copy keeps the account's access token, which must still
 //! be valid, and gets a dummy refresh token, so nothing using the copy can renew the login, which
-//! would retire the real one. Never prints a secret.
+//! would retire the real one. Never prints a secret. The real store is only read: it is never
+//! migrated, and a store whose schema differs from this build's is refused.
 //!
 //!   cargo run -p ccr-core --example e2e_stage -- <scratch data dir> <scratch profile> <map file> <label>...
 //!
@@ -24,7 +25,7 @@ fn main() -> Result<()> {
     if std::env::var_os("CC_ROTATE_DATA_DIR").is_some() {
         bail!("unset CC_ROTATE_DATA_DIR: the accounts come from the real store");
     }
-    let (real, _) = ccr_core::open(None)?;
+    let real = Store::open_read_only(&ccr_core::Paths::default_data_dir()?.join("store.db"))?;
     let scratch = Store::open(&std::path::Path::new(data_dir).join("store.db"))?;
     scratch.set_setting("usage_checks", Some("false"))?;
     scratch.set_setting("profile_dir", Some(profile))?;
