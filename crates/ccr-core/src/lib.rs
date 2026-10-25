@@ -6,6 +6,7 @@
 pub mod credfile;
 pub mod credstore;
 pub mod doctor;
+pub mod herdr;
 pub mod lock;
 pub mod login;
 pub mod paths;

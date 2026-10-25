@@ -38,11 +38,24 @@ pub fn spawn_swap(req: &SwapRequest, profile: Option<&Path>) -> Result<()> {
     )
 }
 
+/// Start `cc-rotate-ctl herdr-report` in the background so the SessionStart hook returns at once
+/// while the report waits for herdr to see Claude Code running.
+pub fn spawn_herdr_report(pane_id: &str, session_id: &str, seq: u64) -> Result<()> {
+    spawn_ctl(
+        |cmd| {
+            cmd.args(["herdr-report", "--seq", &seq.to_string(), "--"])
+                .args([pane_id, session_id]);
+        },
+        "starting the background herdr report",
+    )
+}
+
 /// Start this executable in the background with the arguments `args` adds.
-/// It must outlive the statusline process that starts it, so it leaves Claude Code's job object
-/// if allowed (Windows) or its process group (Unix), and a signal sent to that process's group
-/// when Claude Code times it out does not reach it. It must not hold Claude Code's pipes either:
-/// Claude Code sees the end of a statusline's output only once every copy of the pipe is closed.
+/// It must outlive the statusline or hook process that starts it, so it leaves Claude Code's job
+/// object if allowed (Windows) or its process group (Unix), and a signal sent to that process's
+/// group when Claude Code times it out does not reach it. It must not hold Claude Code's pipes
+/// either: Claude Code sees the end of a statusline's or hook's output only once every copy of
+/// the pipe is closed.
 fn spawn_ctl(args: impl Fn(&mut Command), what: &str) -> Result<()> {
     let exe = std::env::current_exe()?;
     let build = || {

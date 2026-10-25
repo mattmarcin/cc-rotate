@@ -1,9 +1,11 @@
 mod format;
+mod herdr;
 mod process;
 
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use ccr_core::scheduler::Reason;
@@ -136,11 +138,25 @@ enum Command {
         #[command(subcommand)]
         hook: HookCommand,
     },
+    /// Tell herdr how to resume a session (started in the background by `hook session-start`).
+    #[command(hide = true)]
+    HerdrReport {
+        /// Orders cc-rotate's reports for the pane; herdr ignores an older one.
+        #[arg(long)]
+        seq: u64,
+        /// Give up after this many milliseconds of herdr not accepting the report yet.
+        #[arg(long, default_value_t = herdr::DEFAULT_TIMEOUT.as_millis() as u64)]
+        timeout_ms: u64,
+        pane: String,
+        session: String,
+    },
 }
 
 #[derive(Subcommand)]
 enum HookCommand {
     StopFailure,
+    /// Report `cc-rotate --resume <id>` to herdr when the session runs in a herdr pane.
+    SessionStart,
 }
 
 fn main() -> ExitCode {
@@ -168,6 +184,27 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Command::Hook {
+            hook: HookCommand::SessionStart,
+        } => {
+            // Never fails Claude Code's startup: errors only go to the log.
+            if let Err(e) = herdr::session_start(read_stdin) {
+                process::log_error("hook session-start", &e);
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::HerdrReport {
+            seq,
+            timeout_ms,
+            pane,
+            session,
+        } => match herdr::report(&pane, &session, seq, Duration::from_millis(timeout_ms)) {
+            Ok(()) => Ok(ExitCode::SUCCESS),
+            Err(e) => {
+                process::log_error("herdr report", &e);
+                Ok(ExitCode::FAILURE)
+            }
+        },
         command => {
             let (store, paths) = ccr_core::open(cli.profile)?;
             dispatch(command, &store, &paths)
@@ -389,7 +426,9 @@ fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> 
             println!();
         }
         Command::Dashboard => process::launch_app()?,
-        Command::Statusline { .. } | Command::Hook { .. } => unreachable!(),
+        Command::Statusline { .. } | Command::Hook { .. } | Command::HerdrReport { .. } => {
+            unreachable!()
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
