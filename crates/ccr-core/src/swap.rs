@@ -262,8 +262,9 @@ fn unsure(store: &Store, pending: &PendingSwap, raw: &str) -> Result<DeadSwap> {
     Ok(DeadSwap::Unsure)
 }
 
-/// Write a login into the profile under Claude Code's refresh and credentials locks (the caller
-/// holds the swap lock).
+/// Write a pool account's login into the profile under Claude Code's refresh and credentials
+/// locks (the caller holds the swap lock). The profile is no longer signed in to an account
+/// outside the pool, so Claude Code's renewals of this login are stored again, as after a swap.
 fn write_profile_login(store: &Store, paths: &Paths, oauth: &serde_json::Value) -> Result<()> {
     let timeout = Duration::from_millis(store.settings()?.lock_timeout_ms);
     let opts = LockOptions::claude(timeout);
@@ -272,6 +273,7 @@ fn write_profile_login(store: &Store, paths: &Paths, oauth: &serde_json::Value) 
     let _storage = DirLock::acquire(&paths.storage_lock(), LockOptions::claude_storage(timeout))?;
     let creds = paths.credentials();
     creds.write_oauth(oauth)?;
+    store.set_meta(META_PROFILE_FOREIGN, "0")?;
     if let Some(marker) = creds.change_marker()? {
         store.set_meta(META_CRED_SEEN, marker)?;
     }
@@ -1019,24 +1021,38 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
     })
 }
 
+/// What became of a fresh login of the active account (`install_active_login`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActiveLogin {
+    /// Written into the profile.
+    Written,
+    /// Not written: a swap that stopped half way leaves the profile's login unidentified, and
+    /// the profile may hold the only copy of another account's login.
+    Unidentified,
+    /// Not written: settling a swap that stopped half way made another account active, so the
+    /// profile's login is that account's.
+    NoLongerActive,
+}
+
 /// Write a fresh login for the account that is already active (a re-login of the active
-/// account), under Claude Code's refresh locks like any swap.
-///
-/// Returns false, writing nothing, while a swap that stopped half way leaves the profile's login
-/// unidentified: the profile may hold the only copy of another account's login. The fresh login
-/// is stored for the account by then, and settling the swap takes it from there.
+/// account), under Claude Code's refresh locks like any swap. The fresh login is stored for the
+/// account before this is called, so when it is not written, nothing is lost.
 pub fn install_active_login(
     store: &Store,
     paths: &Paths,
+    account_id: i64,
     oauth: &serde_json::Value,
-) -> Result<bool> {
+) -> Result<ActiveLogin> {
     let timeout = Duration::from_millis(store.settings()?.lock_timeout_ms);
     let _swap_lock = DirLock::acquire(&paths.swap_lock(), LockOptions::claude(timeout))?;
     if finish_dead_swap(store, paths, Settler::Locked)? == DeadSwap::Unsure {
-        return Ok(false);
+        return Ok(ActiveLogin::Unidentified);
+    }
+    if store.active_account()?.map(|a| a.id) != Some(account_id) {
+        return Ok(ActiveLogin::NoLongerActive);
     }
     write_profile_login(store, paths, oauth)?;
-    Ok(true)
+    Ok(ActiveLogin::Written)
 }
 
 enum Choice {

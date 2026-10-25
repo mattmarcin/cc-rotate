@@ -210,7 +210,8 @@ pub fn import(
     let mut activated = false;
     let current = store.account(id)?.expect("account just written");
     if current.state == AccountState::Active {
-        if !swap::install_active_login(store, paths, &oauth)? {
+        if swap::install_active_login(store, paths, id, &oauth)? == swap::ActiveLogin::Unidentified
+        {
             store.log_event(
                 kind::ERROR,
                 None,

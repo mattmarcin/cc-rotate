@@ -1672,11 +1672,66 @@ fn a_relogin_does_not_overwrite_an_unidentified_login() {
     let target = store.credential(b).unwrap().unwrap();
     mark_pending(&store, &target.refresh_fp, Some(a), b);
     credfile::write_oauth(&env.cred_file(), &oauth("whose")).unwrap();
-    assert!(!swap::install_active_login(&store, &env.paths, &oauth("a-fresh")).unwrap());
+    assert_eq!(
+        swap::install_active_login(&store, &env.paths, a, &oauth("a-fresh")).unwrap(),
+        swap::ActiveLogin::Unidentified
+    );
     assert_eq!(refresh_of(&env.file_doc()), "refresh-whose");
 
     // Without a stopped swap it is written as before.
     store.delete_meta(swap::META_SWAP_PENDING).unwrap();
-    assert!(swap::install_active_login(&store, &env.paths, &oauth("a-fresh")).unwrap());
+    assert_eq!(
+        swap::install_active_login(&store, &env.paths, a, &oauth("a-fresh")).unwrap(),
+        swap::ActiveLogin::Written
+    );
     assert_eq!(refresh_of(&env.file_doc()), "refresh-a-fresh");
+}
+
+/// A swap from a to b stopped after writing b's login, and then a is signed in again. Settling
+/// the swap makes b active, so a's fresh login is not written over b's: the store and the profile
+/// would disagree, and b's renewals would be stored as a's.
+#[test]
+fn a_relogin_of_an_account_a_settled_swap_left_does_not_overwrite_the_new_active() {
+    let env = Env::new();
+    let (store, a, b, _) = pool(&env);
+    let target = store.credential(b).unwrap().unwrap();
+    mark_pending(&store, &target.refresh_fp, Some(a), b);
+    credfile::write_oauth(&env.cred_file(), &target.oauth).unwrap();
+    store
+        .save_credential(a, &oauth("a-fresh"), "login")
+        .unwrap();
+
+    assert_eq!(
+        swap::install_active_login(&store, &env.paths, a, &oauth("a-fresh")).unwrap(),
+        swap::ActiveLogin::NoLongerActive
+    );
+    assert_eq!(store.active_account().unwrap().unwrap().id, b);
+    assert_eq!(refresh_of(&env.file_doc()), "refresh-b1");
+    assert_eq!(
+        store.credential(a).unwrap().unwrap().oauth["refreshToken"],
+        "refresh-a-fresh"
+    );
+}
+
+/// The profile was signed in to an account outside the pool, and then the active account is
+/// signed in again: its login is in the profile now, so Claude Code's renewals of it are stored.
+#[test]
+fn a_relogin_ends_a_foreign_login_in_the_profile() {
+    let env = Env::new();
+    let (store, a, _, _) = pool(&env);
+    store.set_meta(swap::META_PROFILE_FOREIGN, "1").unwrap();
+    store
+        .save_credential(a, &oauth("a-fresh"), "login")
+        .unwrap();
+    assert_eq!(
+        swap::install_active_login(&store, &env.paths, a, &oauth("a-fresh")).unwrap(),
+        swap::ActiveLogin::Written
+    );
+
+    credfile::write_oauth(&env.cred_file(), &oauth("a-renewed")).unwrap();
+    statusline::sync(&store, &env.paths).unwrap();
+    assert_eq!(
+        store.credential(a).unwrap().unwrap().oauth["refreshToken"],
+        "refresh-a-renewed"
+    );
 }
