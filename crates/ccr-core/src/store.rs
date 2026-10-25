@@ -293,7 +293,8 @@ pub struct Account {
 }
 
 const ACCOUNT_COLS: &str = "id, label, email, account_uuid, org_uuid, org_name, subscription_type, \
-    rate_limit_tier, state, position, added_at, last_login_at, weekly_limit, weekly_cap, use_expiring,     keep_running";
+    rate_limit_tier, state, position, added_at, last_login_at, weekly_limit, weekly_cap, use_expiring, \
+    keep_running";
 
 fn parse_col<T: FromStr<Err = anyhow::Error>>(row: &Row, i: usize) -> rusqlite::Result<T> {
     let text: String = row.get(i)?;

@@ -210,7 +210,7 @@ A window is then already counting down when the account is needed, so the accoun
 Rotation also uses windows that are already running before fresh ones (see **Which account is used next**), so these accounts are used first.
 It only helps on days when you use more than your accounts give at once; with room to spare, it changes nothing.
 
-Each request costs about a tenth of a cent at API prices (a few thousand cached tokens and a one-word reply), counts toward that account's limits, and runs at most about five times a day per account.
+Each request costs about a tenth of a cent at API prices (a few thousand cached tokens and a one-word reply), counts toward that account's limits, and goes out about five times a day per account, plus a retry every 15 minutes while one doesn't go through (for example while the account is at a limit).
 This is the one case where cc-rotate has Claude Code send a prompt you didn't type, so it's off until you turn it on.
 Check that requests like this are fine under your plan's terms before you do.
 
@@ -218,7 +218,7 @@ Check that requests like this are fine under your plan's terms before you do.
 - `cc-rotate-ctl warm-up <label>` starts an account's window once, now.
 - The desktop app sends the requests, so it has to be running, with usage checks on.
 - It skips an account that is in use, paused, on hold, or at a weekly limit.
-- If a request ever uses another model, takes more than one turn or costs more than 2 cents, cc-rotate stops sending them and says so in the activity log and in the account's **More** dialog, until you save that dialog with the box ticked (or run `cc-rotate-ctl keep-running <label> yes`).
+- If a request ever uses another model, takes more than one turn or costs more than 2 cents, cc-rotate stops sending them and says so in the activity log and in the account's **More** dialog, until you click **Start again** there (or run `cc-rotate-ctl keep-running <label> yes`).
 
 ### How long your accounts last
 

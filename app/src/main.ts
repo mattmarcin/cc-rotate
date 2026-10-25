@@ -199,9 +199,13 @@ function checkText(a: AccountView): string {
   return c.not_before && c.not_before > Date.now() ? `${read}, next after ${clock(c.not_before)}` : read;
 }
 
+/** A warm-up's problem is shown this long after its last try (`WARM_PROBLEM_SHOWN_MS`). */
+const WARM_PROBLEM_SHOWN_MS = 6 * 3_600_000;
+
 function warmText(a: AccountView): string {
   const c = a.usage_check;
-  if (c.warm_problem) return `last try failed: ${c.warm_problem}`;
+  const recent = c.warm_attempt_at !== null && Date.now() - c.warm_attempt_at < WARM_PROBLEM_SHOWN_MS;
+  if (c.warm_problem && recent) return `last try failed: ${c.warm_problem}`;
   return c.warmed_at ? `last started its window ${ago(c.warmed_at)}` : "hasn't started a window yet";
 }
 
@@ -1290,8 +1294,15 @@ function openManage(a: AccountView) {
     });
   const useExpiring = h("input", { type: "checkbox", checked: a.use_expiring });
   const keepRunning = h("input", { type: "checkbox", checked: a.keep_running });
-  const checksOff = state.snap?.settings.usage_checks === false;
   const warmStopped = state.snap?.warm_ups_blocked ?? null;
+  const warmPaused = state.snap?.warm_ups_paused ?? null;
+  const restart = h("button", { class: "link" }, "Start again");
+  restart.addEventListener("click", () =>
+    api
+      .setKeepRunning(a.id, true)
+      .then(() => (say("Keeping 5-hour windows running again"), d.close(), refresh()))
+      .catch((e) => say(String(e), "error")),
+  );
   const details = h(
     "dl",
     { class: "facts info" },
@@ -1356,9 +1367,9 @@ function openManage(a: AccountView) {
           "small",
           { class: "muted" },
           "While it's not in use, starts its next window with a short Haiku request as soon as one ends, so a window is already counting down when it's needed.",
-          checksOff ? " Needs usage checks, which are off in Settings." : "",
         ),
-        warmStopped && h("small", { class: "warn" }, `Stopped because ${warmStopped}. Save with this ticked to start again.`),
+        a.keep_running && warmStopped && h("small", { class: "warn" }, `Stopped because ${warmStopped}. `, restart),
+        a.keep_running && !warmStopped && warmPaused && h("small", { class: "warn" }, `Not running now: ${warmPaused}.`),
       ),
       h("label", null, h("span", null, "Label"), label),
     ),
@@ -1383,8 +1394,7 @@ function openManage(a: AccountView) {
         await api.setUseExpiring(a.id, useExpiring.checked);
         a.use_expiring = useExpiring.checked;
       }
-      // Saving it ticked also starts warm-ups again after they stopped.
-      if (keepRunning.checked !== a.keep_running || (keepRunning.checked && warmStopped)) {
+      if (keepRunning.checked !== a.keep_running) {
         await api.setKeepRunning(a.id, keepRunning.checked);
         a.keep_running = keepRunning.checked;
       }

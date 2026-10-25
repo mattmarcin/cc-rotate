@@ -161,8 +161,13 @@ pub fn forecast(
         for c in &mut pool {
             // An account the user keeps running gets its next window as soon as one ends, while
             // it is not in use (section 23).
-            let kept =
-                c.account.keep_running && c.account.state == AccountState::Parked && !c.held_back;
+            let kept = c.account.keep_running
+                && c.account.state == AccountState::Parked
+                && !c.held_back
+                // Another limit keeps it out of use, and warm-ups skip it.
+                && c.windows.iter().all(|w| {
+                    !w.blocking() || (w.kind == WindowKind::Session && w.model.is_none())
+                });
             for w in &mut c.windows {
                 if let Some(r) = w.resets_at.filter(|&r| r <= t) {
                     w.pct = 0.0;

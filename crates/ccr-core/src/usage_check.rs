@@ -73,6 +73,9 @@ const WARM_MODEL: &str = "haiku";
 const WARM_MAX_COST_USD: f64 = 0.02;
 /// After a warm-up whose prompt did not go through, the next one waits this long.
 const WARM_RETRY_MS: i64 = 15 * 60_000;
+/// A warm-up's problem is shown this long after its last try: past a window's length, the
+/// account has likely been used since.
+pub const WARM_PROBLEM_SHOWN_MS: i64 = 6 * 3_600_000;
 /// A 5-hour window starts at its first request, rounded down to 10 minutes.
 const WINDOW_START_STEP_MS: i64 = 10 * 60_000;
 const FIVE_HOURS_MS: i64 = 5 * 3_600_000;
@@ -427,10 +430,18 @@ pub fn next_warm_up(store: &Store, paths: &Paths, now_ms: i64) -> Result<Option<
         // A window a warm-up started runs whether or not the reading after it came through; a
         // reading since says when it really ends (the prompt may have landed in a window that
         // was already running).
+        // Only a reading that shows a window running since the warm-up counts: one without it
+        // may lag behind the request.
         let read_since = |t: i64| {
-            store
-                .last_sample(c.account.id)
-                .map(|s| s.is_some_and(|s| s.ts > t))
+            store.last_sample(c.account.id).map(|s| {
+                s.is_some_and(|s| {
+                    s.ts > t
+                        && s.windows.iter().any(|w| {
+                            w.name == scheduler::FIVE_HOUR
+                                && w.resets_at.is_some_and(|r| r * 1000 > t)
+                        })
+                })
+            })
         };
         let started = match st.warmed_at {
             Some(t) => window_end_ms(t) > now_ms && !read_since(t)?,
@@ -479,14 +490,15 @@ pub fn warm_up(
             });
         }
     }
-    let claude = login::claude_executable(store)?;
+    // Found by each run, so a missing `claude` is a warm-up that failed (and is retried later),
+    // not an error before anything is recorded.
     warm_up_with(
         store,
         paths,
         account_id,
         trigger,
-        &|scratch| run_prompt(&claude, scratch, RUN_TIMEOUT),
-        &|scratch| run_claude(&claude, scratch, RUN_TIMEOUT),
+        &|scratch| run_prompt(&login::claude_executable(store)?, scratch, RUN_TIMEOUT),
+        &|scratch| run_claude(&login::claude_executable(store)?, scratch, RUN_TIMEOUT),
     )
 }
 
@@ -523,7 +535,7 @@ fn warm_up_with(
         Some(Prompted::Unexpected { why }) => WarmOutcome::Unexpected { why, check },
         None => WarmOutcome::Skipped {
             why: match check {
-                CheckOutcome::Skipped { why } => why,
+                CheckOutcome::Skipped { why } | CheckOutcome::Failed { why } => why,
                 other => describe(&other),
             },
         },
@@ -587,11 +599,6 @@ fn job(
     {
         return skipped("Anthropic asked to wait before the next check");
     }
-    // A warm-up's prompt does not ask the usage endpoint, so its wait only holds up the
-    // reading after it, which is left out.
-    let usage_wait = st
-        .not_before
-        .filter(|&t| prompt.is_some() && trigger != Trigger::Manual && t > now);
     // A skip below is about this account: count it as an attempt, so the background moves on
     // to the next account instead of picking this one every minute.
     let attempted = |store: &Store, why: &str| -> Result<CheckOutcome> {
@@ -635,9 +642,16 @@ fn job(
         return skipped("keeping its 5-hour window running is off");
     }
     st = state(store, account_id)?;
+    // A warm-up's prompt does not ask the usage endpoint, so the endpoint's wait, or the
+    // back-off after a failed reading, only holds up the reading after it, which is left out.
+    // From the state read under the lock, so a check that just stored one is seen.
+    let usage_wait = st
+        .not_before
+        .filter(|&t| prompt.is_some() && trigger != Trigger::Manual && t > now);
     let stored = match store.credential(account_id) {
         Ok(Some(c)) => c,
-        Ok(None) => return skipped("it has no saved login"),
+        // Counted as a try, so a held-back account without a login is not picked every minute.
+        Ok(None) => return attempted(store, "it has no saved login"),
         Err(e) => {
             let why = format!("its saved login can't be read: {e:#}");
             st.last_attempt_at = Some(time::now_ms());
@@ -705,7 +719,7 @@ fn job(
             );
             st.held_back = true;
             st.problem = Some(why.clone());
-            note_verdict(store, &mut st, verdict.as_ref(), account_id, started)?;
+            note_verdict(store, &mut st, verdict.as_ref(), account_id, usage_started)?;
             save_state(store, account_id, &st)?;
             return Ok(CheckOutcome::Failed { why });
         }
@@ -722,6 +736,11 @@ fn job(
         .as_ref()
         .and_then(|r| Some((r.extra_usage.clone()?, r.fetched_at_ms)));
     let debug_log = std::fs::read_to_string(scratch.dir.join(DEBUG_FILE)).unwrap_or_default();
+    let warm_refused = warm.as_ref().and_then(|_| {
+        rate_limited(
+            &std::fs::read_to_string(scratch.dir.join(WARM_DEBUG_FILE)).unwrap_or_default(),
+        )
+    });
     let credman = cfg!(windows) && credstore::windows_credman_enabled(&scratch.dir, None);
     let timed_out = ran.as_ref().is_ok_and(|r| r.timed_out)
         || warm
@@ -743,7 +762,12 @@ fn job(
     } else if dead {
         CheckOutcome::LoginRejected
     } else if let Some(until) = usage_wait {
-        CheckOutcome::RateLimited { until }
+        CheckOutcome::Skipped {
+            why: format!(
+                "the reading waits until {}",
+                time::local(until / 1000, "%H:%M")
+            ),
+        }
     } else if let Some(report) = report {
         match (&account.account_uuid, &report.account_uuid) {
             (Some(expected), Some(got)) if expected != got => {
@@ -828,7 +852,8 @@ fn job(
                 "Claude Code started keeping logins in Windows Credential Manager, which usage checks don't support",
             )?;
         }
-        note_verdict(s, &mut st, verdict.as_ref(), account_id, started)?;
+        // After the prompt returned: a window it started may start that late, never earlier.
+        note_verdict(s, &mut st, verdict.as_ref(), account_id, usage_started)?;
         match &outcome {
             CheckOutcome::Read { windows } => {
                 let last = s.last_sample(account_id)?;
@@ -863,6 +888,10 @@ fn job(
                 st.problem = Some("Anthropic rejected the saved login".into());
             }
             CheckOutcome::Skipped { .. } => {}
+        }
+        if let Some(wait) = warm_refused {
+            // The prompt run asked the usage endpoint after all and was refused: wait as asked.
+            st.not_before = st.not_before.max(Some(now + wait));
         }
         if st.held_back && st.problem.is_none() {
             st.problem = Some(if timed_out {
@@ -937,7 +966,7 @@ fn block_warm_ups(store: &Store, reason: &str) -> Result<()> {
         None,
         None,
         Some("warm_up"),
-        Some(json!({ "message": format!("Keeping 5-hour windows running stopped because {reason}. Turn it on again for an account in its More dialog, or with `cc-rotate-ctl keep-running <label> yes`, to start it again.") })),
+        Some(json!({ "message": format!("Keeping 5-hour windows running stopped because {reason}. Click Start again in an account's More dialog, or run `cc-rotate-ctl keep-running <label> yes`.") })),
     )?;
     Ok(())
 }
@@ -2659,12 +2688,13 @@ mod tests {
             &never,
         )
         .unwrap();
-        assert_eq!(
-            out,
-            WarmOutcome::Sent {
-                cost_usd: 0.0009,
-                check: CheckOutcome::RateLimited { until }
-            }
+        let WarmOutcome::Sent { cost_usd, check } = &out else {
+            panic!("{out:?}")
+        };
+        assert_eq!(*cost_usd, 0.0009);
+        assert!(
+            matches!(check, CheckOutcome::Skipped { why } if why.starts_with("the reading waits until")),
+            "{check:?}"
         );
         assert_eq!(state(&e.store, a).unwrap().not_before, Some(until));
         assert_eq!(
@@ -2697,6 +2727,85 @@ mod tests {
         let due = |at: i64| next_warm_up(&e.store, &e.paths, at).unwrap();
         assert_eq!(due(now), None);
         assert_eq!(due(now + 3_600_000 + 60_000), Some(a));
+    }
+
+    /// Without `claude` to run, a warm-up fails like any other that did not go through, and is
+    /// retried later instead of every minute.
+    #[test]
+    fn a_warm_up_without_claude_is_retried_later() {
+        let e = env();
+        let a = account(&e, "a", "ua", AccountState::Parked);
+        let b = account(&e, "b", "ub", AccountState::Parked);
+        e.store.set_keep_running(a, true).unwrap();
+        let nowhere = e.paths.data_dir.join("no-claude-here");
+        e.store
+            .set_setting("claude_path", Some(&nowhere.display().to_string()))
+            .unwrap();
+        let out = warm_up(&e.store, &e.paths, a, Trigger::WarmUp).unwrap();
+        assert!(matches!(out, WarmOutcome::Failed { .. }), "{out:?}");
+        let st = state(&e.store, a).unwrap();
+        assert!(st.warm_attempt_at.is_some() && st.warm_problem.is_some());
+        assert!(!st.held_back, "nothing ran, so the login is not in doubt");
+        assert_eq!(scratch_dirs_left(&e), 0);
+        assert_eq!(
+            next_job(&e.store, &e.paths, time::now_ms()).unwrap(),
+            Some(Due::Check(b))
+        );
+    }
+
+    /// A reading after a warm-up that shows no window (it may lag behind the request) does not
+    /// undo the window the warm-up started.
+    #[test]
+    fn a_reading_without_the_window_does_not_undo_a_warm_up() {
+        let e = env();
+        let now = time::now_ms();
+        let a = account(&e, "a", "ua", AccountState::Parked);
+        e.store.set_keep_running(a, true).unwrap();
+        save_state(
+            &e.store,
+            a,
+            &CheckState {
+                warmed_at: Some(now - 60_000),
+                warm_attempt_at: Some(now - 60_000),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // The window before the warm-up, carried in the reading after it.
+        e.store
+            .record_sample(&reading(a, now, &[("five_hour", 0.0, now / 1000 - 600)]))
+            .unwrap();
+        let due = |at: i64| next_warm_up(&e.store, &e.paths, at).unwrap();
+        assert_eq!(due(now + WARM_RETRY_MS), None);
+        assert_eq!(due(window_end_ms(now - 60_000) + 1), Some(a));
+    }
+
+    /// Should the prompt run ask the usage endpoint and be refused, the wait is kept.
+    #[test]
+    fn a_refusal_in_the_prompt_run_is_kept() {
+        let e = env();
+        let a = account(&e, "a", "ua", AccountState::Parked);
+        e.store.set_keep_running(a, true).unwrap();
+        let prompt = |dir: &Path| {
+            std::fs::write(
+                dir.join(WARM_DEBUG_FILE),
+                "[ERROR] fetchUtilization failed: 429\\n[DEBUG] 429 remembered for this bearer; not asking again for 1800s\\n",
+            )
+            .unwrap();
+            Ok(Run {
+                exit_code: Some(0),
+                stdout: HAIKU_RESULT.into(),
+                ..Default::default()
+            })
+        };
+        let usage = fake(Fake {
+            stamp: Some("ua".into()),
+            ..Default::default()
+        });
+        let before = time::now_ms();
+        warm_up_with(&e.store, &e.paths, a, Trigger::WarmUp, &prompt, &usage).unwrap();
+        let not_before = state(&e.store, a).unwrap().not_before.expect("a wait");
+        assert!(not_before >= before + 1_800_000, "{}", not_before - before);
     }
 
     #[cfg(unix)]

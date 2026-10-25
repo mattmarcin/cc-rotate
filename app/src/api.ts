@@ -75,6 +75,8 @@ export interface CheckState {
   held_back: boolean;
   /** When a warm-up last started the account's 5-hour window (epoch ms). */
   warmed_at: number | null;
+  /** When the last warm-up started (epoch ms). */
+  warm_attempt_at: number | null;
   /** Why the last warm-up's request didn't go through. */
   warm_problem: string | null;
 }
@@ -225,8 +227,10 @@ export interface Snapshot {
   last_event_id: number;
   /** How long the pool lasts at the account in use's current pace, while it is being used. */
   forecast: { pace: number; runs_out_at: number | null; free_again_at: number | null } | null;
-  /** Why warm-ups stopped until an account's "Keep its 5-hour window running" is saved on again. */
+  /** Why warm-ups stopped until the user starts them again. */
   warm_ups_blocked: string | null;
+  /** Why warm-ups don't run now (stopped, or usage checks off or stopped). */
+  warm_ups_paused: string | null;
 }
 
 export interface EventRow {

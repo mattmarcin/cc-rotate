@@ -119,6 +119,8 @@ pub struct Snapshot {
     /// Why warm-ups stopped until the user turns keeping a window running on again (spec
     /// section 23), if they did.
     pub warm_ups_blocked: Option<String>,
+    /// Why warm-ups do not run now, if they don't (`usage_check::warm_ups_paused`).
+    pub warm_ups_paused: Option<String>,
 }
 
 pub fn snapshot(store: &Store, paths: &Paths) -> Result<Snapshot> {
@@ -269,6 +271,7 @@ pub fn snapshot_at(store: &Store, paths: &Paths, now_ms: i64) -> Result<Snapshot
         last_event_id: store.events(1)?.first().map(|e| e.id).unwrap_or(0),
         forecast,
         warm_ups_blocked: crate::usage_check::warm_ups_blocked(store)?,
+        warm_ups_paused: crate::usage_check::warm_ups_paused(store, paths)?,
     })
 }
 

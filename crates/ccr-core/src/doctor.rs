@@ -449,7 +449,7 @@ fn warm_ups_check(store: &Store, paths: &Paths, accounts: &[Account]) -> Option<
             name,
             Status::Warn,
             format!(
-                "Stopped: {reason}. Save an account's More dialog with it ticked, or run `cc-rotate-ctl keep-running <label> yes`, to start it again."
+                "Stopped: {reason}. Click Start again in an account's More dialog, or run `cc-rotate-ctl keep-running <label> yes`."
             ),
         ));
     }
@@ -467,7 +467,14 @@ fn warm_ups_check(store: &Store, paths: &Paths, accounts: &[Account]) -> Option<
             continue;
         };
         last = last.max(st.warmed_at);
-        if let Some(problem) = st.warm_problem.filter(|_| a.state == AccountState::Parked) {
+        // Only a recent one: an account in use since starts its windows by itself.
+        let recent = st
+            .warm_attempt_at
+            .is_some_and(|t| time::now_ms() - t < usage_check::WARM_PROBLEM_SHOWN_MS);
+        if let Some(problem) = st
+            .warm_problem
+            .filter(|_| a.state == AccountState::Parked && recent)
+        {
             failing.push(format!("{}: {problem}", a.label));
         }
     }

@@ -1043,6 +1043,10 @@ dialog.drawer {
   color: var(--amber);
 }
 
+.check-field small .link {
+  font-size: inherit;
+}
+
 input[type="text"],
 input[type="email"],
 input[type="number"],
