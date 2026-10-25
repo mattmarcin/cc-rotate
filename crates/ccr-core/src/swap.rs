@@ -1021,10 +1021,22 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
 
 /// Write a fresh login for the account that is already active (a re-login of the active
 /// account), under Claude Code's refresh locks like any swap.
-pub fn install_active_login(store: &Store, paths: &Paths, oauth: &serde_json::Value) -> Result<()> {
+///
+/// Returns false, writing nothing, while a swap that stopped half way leaves the profile's login
+/// unidentified: the profile may hold the only copy of another account's login. The fresh login
+/// is stored for the account by then, and settling the swap takes it from there.
+pub fn install_active_login(
+    store: &Store,
+    paths: &Paths,
+    oauth: &serde_json::Value,
+) -> Result<bool> {
     let timeout = Duration::from_millis(store.settings()?.lock_timeout_ms);
     let _swap_lock = DirLock::acquire(&paths.swap_lock(), LockOptions::claude(timeout))?;
-    write_profile_login(store, paths, oauth)
+    if finish_dead_swap(store, paths, Settler::Locked)? == DeadSwap::Unsure {
+        return Ok(false);
+    }
+    write_profile_login(store, paths, oauth)?;
+    Ok(true)
 }
 
 enum Choice {

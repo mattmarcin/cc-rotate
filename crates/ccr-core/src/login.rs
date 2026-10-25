@@ -210,7 +210,15 @@ pub fn import(
     let mut activated = false;
     let current = store.account(id)?.expect("account just written");
     if current.state == AccountState::Active {
-        swap::install_active_login(store, paths, &oauth)?;
+        if !swap::install_active_login(store, paths, &oauth)? {
+            store.log_event(
+                kind::ERROR,
+                None,
+                Some(id),
+                Some("login"),
+                Some(json!({ "message": format!("Saved the new login of {}, but did not put it into the profile yet: a swap stopped half way and cc-rotate is still finding out which account the profile is signed in to.", current.label) })),
+            )?;
+        }
     } else if !has_active && current.state == AccountState::Parked {
         let outcome = swap::run(
             store,
