@@ -96,20 +96,12 @@ try {
 $ctl = Join-Path $BinDir "cc-rotate-ctl.exe"
 Write-Host "Installed to $BinDir"
 
-# --remove-alias drops the cc-rotate PowerShell function older versions added; it would hide
-# the cc-rotate command.
-$profileDir = (& $ctl config profile_dir 2>$null | Select-Object -First 1)
-if ($profileDir -and (Test-Path (Join-Path $profileDir "settings.json"))) {
-  Write-Host "The rotation profile at $profileDir is already set up; leaving it as it is."
-  Write-Host "To rebuild it from your template profile, run: cc-rotate-ctl setup --force"
-  & $ctl setup --remove-alias
-  if ($LASTEXITCODE -ne 0) { throw "cc-rotate-ctl setup --remove-alias failed" }
-} else {
-  $setupArgs = @("setup", "--remove-alias")
-  if ($Template) { $setupArgs += @("--from", $Template) }
-  & $ctl @setupArgs
-  if ($LASTEXITCODE -ne 0) { throw "cc-rotate-ctl setup failed" }
-}
+# --keep-existing leaves an existing rotation profile as it is on an upgrade. --remove-alias drops
+# the cc-rotate PowerShell function older versions added; it would hide the cc-rotate command.
+$setupArgs = @("setup", "--keep-existing", "--remove-alias")
+if ($Template) { $setupArgs += @("--from", $Template) }
+& $ctl @setupArgs
+if ($LASTEXITCODE -ne 0) { throw "cc-rotate-ctl setup failed" }
 
 $pathDirs = $env:PATH -split ";" | ForEach-Object { $_.TrimEnd("\") }
 if ($pathDirs -notcontains $BinDir.TrimEnd("\")) {

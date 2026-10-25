@@ -184,7 +184,7 @@ When Claude Code reports one, cc-rotate records it too and only counts it while 
 | `cc-rotate-ctl doctor` | Check the profile, the store and Claude Code. |
 | `cc-rotate-ctl backup <file>` | Print a daily backup of the profile's login file, decrypted. It contains tokens, so keep the output private. |
 | `cc-rotate-ctl config [key] [value]` | Show or change settings. `--unset` restores a default. |
-| `cc-rotate-ctl setup` | Create the rotation profile. `--from <dir>` picks the template, `--force` rebuilds it. `--remove-alias` removes the `cc-rotate` PowerShell function older versions added; with an existing profile, that is all it does. |
+| `cc-rotate-ctl setup` | Create the rotation profile. `--from <dir>` picks the template, `--force` rebuilds it. `--remove-alias` removes the `cc-rotate` PowerShell function older versions added; with an existing profile, that is all it does. `--keep-existing` leaves an existing profile as it is instead of failing. |
 | `cc-rotate-ctl dashboard` | Open the desktop app. |
 
 ### Settings

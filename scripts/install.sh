@@ -68,14 +68,11 @@ fi
 ctl="$bin_dir/cc-rotate-ctl"
 echo "Installed to $bin_dir"
 
-profile_dir=$("$ctl" config profile_dir 2>/dev/null | head -n 1 || true)
-if [ -n "$profile_dir" ] && [ -f "$profile_dir/settings.json" ]; then
-  echo "The rotation profile at $profile_dir is already set up; leaving it as it is."
-  echo "To rebuild it from your template profile, run: cc-rotate-ctl setup --force"
-elif [ -n "$template" ]; then
-  "$ctl" setup --from "$template"
+# --keep-existing leaves an existing rotation profile as it is on an upgrade.
+if [ -n "$template" ]; then
+  "$ctl" setup --keep-existing --from "$template"
 else
-  "$ctl" setup
+  "$ctl" setup --keep-existing
 fi
 
 case ":$PATH:" in
