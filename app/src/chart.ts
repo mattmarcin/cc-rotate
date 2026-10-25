@@ -15,6 +15,15 @@ export function accountColor(index: number): string {
   return palette[index % palette.length];
 }
 
+/** A color per account that stays the same when the order changes: by the order accounts were added. */
+export function colorFor(accounts: { id: number }[]): (id: number) => string {
+  const ids = accounts.map((a) => a.id).sort((a, b) => a - b);
+  return (id) => accountColor(Math.max(0, ids.indexOf(id)));
+}
+
+/** The window each chart metric shows. */
+const WINDOW: Record<Metric, string> = { weekly: "seven_day", five_hour: "five_hour" };
+
 function css(name: string): string {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 }
@@ -22,13 +31,11 @@ function css(name: string): string {
 /** Points for one account, with a drop to 0 inserted wherever a window reset between samples. */
 function points(samples: Sample[], metric: Metric, nowS: number): [number, number][] {
   const out: [number, number][] = [];
-  const value = (s: Sample) => (metric === "weekly" ? s.week_pct : s.five_pct);
-  const resets = (s: Sample) => (metric === "weekly" ? s.week_resets_at : s.five_resets_at);
   samples.forEach((s, i) => {
-    const v = value(s);
-    if (v === null) return;
-    out.push([Math.floor(s.ts / 1000), v]);
-    const r = resets(s);
+    const w = s.windows.find((x) => x.name === WINDOW[metric]);
+    if (!w) return;
+    out.push([Math.floor(s.ts / 1000), w.pct]);
+    const r = w.resets_at;
     const nextTs = i + 1 < samples.length ? samples[i + 1].ts / 1000 : nowS;
     if (r !== null && r < nextTs && r > s.ts / 1000) out.push([r, 0]);
   });
@@ -39,6 +46,7 @@ export interface ChartInput {
   accounts: Account[];
   samples: Sample[];
   swaps: EventRow[];
+  color: (id: number) => string;
   metric: Metric;
   sinceMs: number;
   threshold: number;
@@ -79,7 +87,7 @@ export class UsageChart {
     const grid = css("--line");
     const swaps = input.swaps.map((e) => ({
       x: e.ts / 1000,
-      to: input.accounts.findIndex((a) => a.id === e.account_to),
+      color: input.accounts.some((a) => a.id === e.account_to) ? input.color(e.account_to!) : ink,
     }));
     const threshold = input.threshold;
 
@@ -110,9 +118,9 @@ export class UsageChart {
       ],
       series: [
         {},
-        ...input.accounts.map((a, i) => ({
+        ...input.accounts.map((a) => ({
           label: a.label,
-          stroke: accountColor(i),
+          stroke: input.color(a.id),
           width: 2,
           spanGaps: true,
           points: { show: false },
@@ -138,7 +146,7 @@ export class UsageChart {
             for (const s of swaps) {
               if (s.x < sinceS) continue;
               const x = u.valToPos(s.x, "x", true);
-              ctx.strokeStyle = s.to >= 0 ? accountColor(s.to) : ink;
+              ctx.strokeStyle = s.color;
               ctx.beginPath();
               ctx.moveTo(x, u.bbox.top);
               ctx.lineTo(x, u.bbox.top + u.bbox.height);

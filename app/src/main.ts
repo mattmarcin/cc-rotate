@@ -9,10 +9,12 @@ import {
   type EventRow,
   type LoginProgress,
   type Snapshot,
+  type WeeklyLimitSetting,
+  type WindowUsage,
 } from "./api";
-import { UsageChart, accountColor, type Metric } from "./chart";
+import { UsageChart, colorFor, type Metric } from "./chart";
 import { h, replace, type Child } from "./dom";
-import { ago, clock, pct, plural, until } from "./format";
+import { ago, clock, ordinal, pct, plural, until } from "./format";
 
 interface UiState {
   snap: Snapshot | null;
@@ -21,9 +23,22 @@ interface UiState {
   metric: Metric;
   rangeDays: 1 | 7;
   busy: boolean;
+  /** A row is being dragged; renders wait until it is dropped. */
+  dragging: boolean;
+  /** The account whose order handle should have focus after the next render. */
+  focusGrip: number | null;
 }
 
-const state: UiState = { snap: null, events: [], showRoutine: false, metric: "weekly", rangeDays: 7, busy: false };
+const state: UiState = {
+  snap: null,
+  events: [],
+  showRoutine: false,
+  metric: "weekly",
+  rangeDays: 7,
+  busy: false,
+  dragging: false,
+  focusGrip: null,
+};
 
 const ROUTINE = new Set(["sync", "swap_skipped"]);
 
@@ -119,6 +134,20 @@ async function act<T>(work: () => Promise<T>, done?: (result: T) => string | nul
 }
 
 const labelOf = (id: number | null) => state.snap?.accounts.find((a) => a.id === id)?.label ?? "another account";
+
+/** Colors stay with an account when the order changes. */
+let colorOf = (_id: number) => "";
+
+/** The 5-hour and weekly windows on all models, when the latest reading has them. */
+const fiveOf = (a: AccountView) => a.windows.find((w) => w.kind === "session" && w.model === null);
+const weekOf = (a: AccountView) => a.windows.find((w) => w.kind === "weekly" && w.model === null);
+/** Windows limited to one model, or of a kind cc-rotate does not know. */
+const otherWindows = (a: AccountView) => a.windows.filter((w) => w.model !== null || w.kind === "other");
+const blocking = (a: AccountView) => a.windows.some((w) => w.applies && w.pct >= w.threshold);
+/** No weekly limit: the 5-hour window is what runs out. */
+const noWeekly = (a: AccountView) => a.weekly.effective === "none";
+
+const WEEKLY_TEXT = { none: "no weekly limit", unknown: "not known yet", has: "has a weekly limit" } as const;
 
 function level(used: number, threshold: number): "ok" | "warn" | "over" {
   if (used >= threshold) return "over";
@@ -225,64 +254,88 @@ function renderOverview() {
     replace(summary);
     return;
   }
-  const t = snap.settings;
   replace(
     bank,
-    snap.accounts.map((a, i) => {
-      const weekLeft = Math.max(0, 100 - a.usage.weekly);
-      const fiveLeft = Math.max(0, 100 - a.usage.five_hour);
-      const blocked = a.usage.weekly >= t.swap_threshold_7d || a.usage.five_hour >= t.swap_threshold_5h;
+    snap.accounts.map((a) => {
+      const five = fiveOf(a);
+      const week = weekOf(a);
+      // The tall tank is the budget that runs out first: the weekly one, or the 5-hour one for
+      // an account without a weekly limit.
+      const tankWindow = noWeekly(a) ? five : week;
+      const tankLeft = Math.max(0, 100 - (tankWindow?.pct ?? 0));
+      const fiveLeft = Math.max(0, 100 - (five?.pct ?? 0));
       const tone =
-        a.state === "needs_login" ? "dead" : a.state === "paused" ? "paused" : blocked ? "over" : a.state === "active" ? "active" : level(a.usage.weekly, t.swap_threshold_7d);
+        a.state === "needs_login"
+          ? "dead"
+          : a.state === "paused"
+            ? "paused"
+            : blocking(a)
+              ? "over"
+              : a.state === "active"
+                ? "active"
+                : level(tankWindow?.pct ?? 0, tankWindow?.threshold ?? 100);
       const title = [
         `${a.label}${a.email ? ` (${a.email})` : ""}`,
-        `${stateText(a)}`,
-        `Week: ${pct(a.usage.weekly)} used`,
-        `5-hour: ${pct(a.usage.five_hour)} used`,
+        [stateText(a), a.plan].filter(Boolean).join(", "),
+        noWeekly(a) ? "No weekly limit" : `Week: ${week ? `${pct(week.pct)} used` : "no reading"}`,
+        `5-hour: ${five ? `${pct(five.pct)} used` : "no reading"}`,
+        ...otherWindows(a).map((w) => `${w.label}: ${pct(w.pct)} used`),
       ].join("\n");
+      const sub =
+        a.state === "needs_login"
+          ? "Log in"
+          : a.state === "paused"
+            ? "Paused"
+            : !a.last_sample_at
+              ? "No reading"
+              : noWeekly(a)
+                ? `${pct(tankLeft)} of 5h`
+                : `${pct(tankLeft)} left`;
       return h(
         "div",
-        { class: `cell ${tone}`, role: "listitem", title, style: { "--series": accountColor(i) } },
-        h("div", { class: "tank" }, h("div", { class: "fill", style: { height: `${a.state === "needs_login" ? 0 : weekLeft}%` } })),
+        { class: `cell ${tone}${noWeekly(a) ? " no-weekly" : ""}`, role: "listitem", title },
+        h("div", { class: "tank" }, h("div", { class: "fill", style: { height: `${a.state === "needs_login" ? 0 : tankLeft}%` } })),
         h("div", { class: "five", "aria-hidden": "true" }, h("span", { style: { width: `${a.state === "needs_login" ? 0 : fiveLeft}%` } })),
         h("div", { class: "cell-label" }, a.label),
-        h(
-          "div",
-          { class: "cell-sub tnum" },
-          a.state === "needs_login" ? "Log in" : a.state === "paused" ? "Paused" : a.last_sample ? `${pct(weekLeft)} left` : "No reading",
-        ),
+        h("div", { class: "cell-sub tnum" }, sub),
       );
     }),
   );
 
   const active = snap.accounts.find((a) => a.id === snap.active_id);
-  const usable = snap.pool.usable;
-  const unavailable = snap.accounts.length - usable;
-  const left = snap.pool.weekly_accounts_left;
+  const p = snap.pool;
+  const unavailable = snap.accounts.length - p.usable;
   const swapEvent = state.events.find((e) => e.kind === "swap" && e.account_to === snap.active_id);
+  const headline =
+    p.weekly_limited > 0
+      ? `${p.weekly_accounts_left.toFixed(1)} of ${p.weekly_limited} accounts' weekly use left`
+      : `${plural(p.usable, "account")}, none with a weekly limit`;
   replace(
     summary,
-    h("p", { class: "headline" }, `${left.toFixed(1)} of ${usable} accounts' weekly use left`),
+    h("p", { class: "headline" }, headline),
     h(
       "dl",
       { class: "facts" },
       h("dt", null, "Using"),
       h("dd", null, active ? active.label : "No account", active && swapEvent ? h("span", { class: "muted" }, ` since ${clock(swapEvent.ts)}`) : null),
-      h("dt", null, "Ready next"),
-      h("dd", null, snap.pool.eligible ? plural(snap.pool.eligible, "account") : "None"),
+      h("dt", null, "Next"),
+      h("dd", null, snap.next ? [snap.next.label, h("span", { class: "muted" }, ` - ${snap.next.reason}`)] : "None ready"),
+      p.weekly_limited > 0 && p.no_weekly_limit > 0 && h("dt", null, "No weekly limit"),
+      p.weekly_limited > 0 && p.no_weekly_limit > 0 && h("dd", null, plural(p.no_weekly_limit, "account")),
       unavailable > 0 && h("dt", null, "Unavailable"),
       unavailable > 0 && h("dd", null, `${unavailable}`, h("span", { class: "muted" }, " paused or logged out")),
       h("dt", null, "Swaps"),
-      h("dd", null, String(snap.pool.swaps_24h), h("span", { class: "muted" }, " in the last 24 hours")),
+      h("dd", null, String(p.swaps_24h), h("span", { class: "muted" }, " in the last 24 hours")),
     ),
   );
 }
 
 // ---- accounts table --------------------------------------------------------------------
 
-function meter(used: number, resetsAt: number | null | undefined, threshold: number, live: boolean) {
-  const lvl = level(used, threshold);
-  const reset = resetsAt && resetsAt * 1000 > Date.now() ? `resets in ${until(resetsAt)}` : live ? "window reset" : "no reading yet";
+function meter(w: WindowUsage | undefined, live: boolean) {
+  const used = w?.pct ?? 0;
+  const lvl = level(used, w?.threshold ?? 100);
+  const reset = w?.resets_at && w.resets_at * 1000 > Date.now() ? `resets in ${until(w.resets_at)}` : live && w ? "window reset" : "no reading yet";
   return h(
     "div",
     { class: `meter ${lvl}` },
@@ -291,15 +344,196 @@ function meter(used: number, resetsAt: number | null | undefined, threshold: num
   );
 }
 
+function weeklyCell(a: AccountView) {
+  const week = weekOf(a);
+  const main =
+    week || !noWeekly(a)
+      ? meter(week, !!a.last_sample_at)
+      : h(
+          "div",
+          { class: "meter-text none" },
+          h("strong", null, "No weekly limit"),
+          h("span", { class: "muted" }, a.weekly.setting === "no" ? "set by you" : "detected from its usage"),
+        );
+  const others = otherWindows(a);
+  return [
+    main,
+    others.length > 0 &&
+      h(
+        "ul",
+        { class: "scoped" },
+        others.map((w) =>
+          h(
+            "li",
+            { class: `${w.applies ? "" : "muted"} ${w.applies && w.pct >= w.threshold ? "over" : ""}`.trim() || null },
+            `${w.label[0].toUpperCase()}${w.label.slice(1)} ${pct(w.pct)}`,
+            !w.applies && h("span", null, ", not for this model"),
+          ),
+        ),
+      ),
+  ];
+}
+
+const GRIP = () => {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 10 16");
+  svg.setAttribute("width", "10");
+  svg.setAttribute("height", "16");
+  svg.setAttribute("aria-hidden", "true");
+  for (const [cx, cy] of [
+    [2.5, 3],
+    [7.5, 3],
+    [2.5, 8],
+    [7.5, 8],
+    [2.5, 13],
+    [7.5, 13],
+  ]) {
+    const dot = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+    dot.setAttribute("cx", String(cx));
+    dot.setAttribute("cy", String(cy));
+    dot.setAttribute("r", "1.4");
+    svg.append(dot);
+  }
+  return svg;
+};
+
+/** Order saves run one after another, so quick key presses are never dropped. */
+let orderSaves = Promise.resolve();
+let pendingOrderSaves = 0;
+
+/** Save a new order: optimistic in the UI, then written to the store. */
+function saveOrder(ids: number[], moved: AccountView) {
+  const snap = state.snap;
+  if (!snap) return;
+  const before = snap.accounts.map((a) => a.id);
+  if (ids.every((id, i) => id === before[i])) return;
+  snap.accounts.sort((x, y) => ids.indexOf(x.id) - ids.indexOf(y.id));
+  renderOverview();
+  renderAccounts();
+  pendingOrderSaves += 1;
+  orderSaves = orderSaves
+    .then(() => api.setOrder(ids))
+    .then(() => say(`${moved.label} is now ${ordinal(ids.indexOf(moved.id) + 1)} in the order`))
+    .catch((e) => say(String(e), "error"))
+    .finally(() => {
+      pendingOrderSaves -= 1;
+      // Refresh once the last save landed, so an earlier one never shows a stale order.
+      if (pendingOrderSaves === 0) refresh();
+    });
+}
+
+function moveBy(a: AccountView, delta: number) {
+  const ids = state.snap?.accounts.map((x) => x.id) ?? [];
+  const from = ids.indexOf(a.id);
+  const to = Math.max(0, Math.min(ids.length - 1, from + delta));
+  if (from < 0 || to === from) return;
+  ids.splice(from, 1);
+  ids.splice(to, 0, a.id);
+  state.focusGrip = a.id;
+  saveOrder(ids, a);
+}
+
+/** Drag a row by its handle. Pointer events rather than HTML drag and drop, which the desktop
+ * webviews handle differently (or hand to the window as a file drop). */
+function startDrag(e: PointerEvent, a: AccountView) {
+  if (e.button !== 0 || state.busy) return;
+  const grip = e.currentTarget as HTMLElement;
+  const row = grip.closest("tr")!;
+  const body = row.parentElement!;
+  const rows = [...body.children] as HTMLTableRowElement[];
+  if (rows.length < 2) return;
+  e.preventDefault();
+  const from = rows.indexOf(row);
+  const boxes = rows.map((r) => r.getBoundingClientRect());
+  const height = boxes[from].height;
+  const startY = e.clientY;
+  let to = from;
+  let moved = false;
+
+  const update = (clientY: number) => {
+    const min = boxes[0].top - boxes[from].top;
+    const max = boxes[boxes.length - 1].bottom - boxes[from].bottom;
+    const dy = Math.max(min, Math.min(max, clientY - startY));
+    if (!moved && Math.abs(dy) < 3) return;
+    if (!moved) {
+      moved = true;
+      state.dragging = true;
+      row.classList.add("dragging");
+      body.classList.add("sorting");
+      document.body.classList.add("grabbing");
+    }
+    row.style.transform = `translateY(${dy}px)`;
+    const center = boxes[from].top + height / 2 + dy;
+    to = from;
+    boxes.forEach((b, i) => {
+      const mid = b.top + b.height / 2;
+      if (i < from && center < mid) to = Math.min(to, i);
+      if (i > from && center > mid) to = Math.max(to, i);
+    });
+    rows.forEach((r, i) => {
+      if (i === from) return;
+      const shift = from < to && i > from && i <= to ? -height : to < from && i >= to && i < from ? height : 0;
+      r.style.transform = shift ? `translateY(${shift}px)` : "";
+    });
+  };
+  const finish = (commit: boolean) => {
+    grip.removeEventListener("pointermove", onMove);
+    grip.removeEventListener("pointerup", onUp);
+    grip.removeEventListener("pointercancel", onCancel);
+    window.removeEventListener("keydown", onKey, true);
+    rows.forEach((r) => (r.style.transform = ""));
+    row.classList.remove("dragging");
+    body.classList.remove("sorting");
+    document.body.classList.remove("grabbing");
+    const wasDragging = state.dragging;
+    state.dragging = false;
+    if (commit && moved && to !== from) {
+      const ids = rows.map((r) => Number(r.dataset.id));
+      ids.splice(from, 1);
+      ids.splice(to, 0, a.id);
+      saveOrder(ids, a);
+    } else if (wasDragging) {
+      renderAccounts();
+    }
+  };
+  const onMove = (ev: PointerEvent) => update(ev.clientY);
+  const onUp = () => finish(true);
+  const onCancel = () => finish(false);
+  const onKey = (ev: KeyboardEvent) => {
+    if (ev.key === "Escape") {
+      ev.preventDefault();
+      ev.stopPropagation();
+      finish(false);
+    }
+  };
+  grip.setPointerCapture(e.pointerId);
+  grip.addEventListener("pointermove", onMove);
+  grip.addEventListener("pointerup", onUp);
+  grip.addEventListener("pointercancel", onCancel);
+  window.addEventListener("keydown", onKey, true);
+}
+
+function gripKeys(e: KeyboardEvent, a: AccountView) {
+  const count = state.snap?.accounts.length ?? 0;
+  const at = state.snap?.accounts.findIndex((x) => x.id === a.id) ?? 0;
+  const delta =
+    e.key === "ArrowUp" ? -1 : e.key === "ArrowDown" ? 1 : e.key === "Home" ? -at : e.key === "End" ? count - 1 - at : 0;
+  if (delta === 0) return;
+  e.preventDefault();
+  moveBy(a, delta);
+}
+
 function renderAccounts() {
+  if (state.dragging) return;
   const snap = state.snap;
   if (!snap || snap.accounts.length === 0) {
     replace(accountsBody, h("p", { class: "muted empty" }, "No accounts yet."));
     return;
   }
-  const t = snap.settings;
+  const count = snap.accounts.length;
+  const active = document.activeElement as HTMLElement | null;
+  const hadFocus = active && accountsBody.contains(active) ? active.dataset.grip : undefined;
   const rows = snap.accounts.map((a, i) => {
-    const s = a.last_sample;
     const actions = [];
     if (a.state === "parked")
       actions.push(h("button", { class: "link", onclick: () => act(() => api.swapNow(a.id), () => `Swapped to ${a.label}`) }, "Use now"));
@@ -308,27 +542,51 @@ function renderAccounts() {
     if (a.state === "needs_login") actions.push(h("button", { class: "link", onclick: () => openLogin(a) }, "Log in again"));
     actions.push(h("button", { class: "link quiet-link", onclick: () => openManage(a), "aria-label": `More for ${a.label}` }, "More"));
 
+    const grip = h(
+      "button",
+      {
+        class: "grip",
+        type: "button",
+        title: "Drag to change the order, or use the arrow keys",
+        "aria-label": `${a.label}, ${ordinal(i + 1)} of ${count} in the order. Press the up or down arrow to move it.`,
+        "data-grip": a.id,
+        onpointerdown: (e: PointerEvent) => startDrag(e, a),
+        onkeydown: (e: KeyboardEvent) => gripKeys(e, a),
+      },
+      GRIP(),
+    );
+
     return h(
       "tr",
-      { class: a.state === "active" ? "is-active" : "" },
+      { class: a.state === "active" ? "is-active" : "", "data-id": a.id, title: a.reason ? `${a.rank ? `${ordinal(a.rank)} pick: ` : ""}${a.reason}` : null },
+      h("td", { class: "order" }, grip),
       h(
         "td",
         null,
         h(
           "div",
           { class: "who" },
-          h("span", { class: "swatch", style: { background: accountColor(i) }, "aria-hidden": "true" }),
-          h("div", null, h("div", { class: "who-label" }, a.label), h("div", { class: "muted who-email" }, a.email ?? "")),
+          h("span", { class: "swatch", style: { background: colorOf(a.id) }, "aria-hidden": "true" }),
+          h(
+            "div",
+            null,
+            h("div", { class: "who-label" }, a.label, a.plan && h("span", { class: "plan" }, a.plan)),
+            h("div", { class: "muted who-email" }, a.email ?? ""),
+          ),
         ),
       ),
       h(
         "td",
         null,
         h("span", { class: `badge ${a.state}${a.state === "parked" && !a.eligible ? " resting" : ""}` }, stateText(a)),
-        h("div", { class: "muted updated", title: s ? new Date(s.ts).toLocaleString() : "" }, s ? `read ${ago(s.ts)}` : "never read"),
+        h(
+          "div",
+          { class: "muted updated", title: a.last_sample_at ? new Date(a.last_sample_at).toLocaleString() : "" },
+          a.last_sample_at ? `read ${ago(a.last_sample_at)}` : "never read",
+        ),
       ),
-      h("td", null, meter(a.usage.five_hour, s?.five_resets_at, t.swap_threshold_5h, !!s)),
-      h("td", null, meter(a.usage.weekly, s?.week_resets_at, t.swap_threshold_7d, !!s)),
+      h("td", null, meter(fiveOf(a), !!a.last_sample_at)),
+      h("td", null, weeklyCell(a)),
       h("td", { class: "actions" }, actions),
     );
   });
@@ -340,11 +598,33 @@ function renderAccounts() {
       h(
         "thead",
         null,
-        h("tr", null, h("th", null, "Account"), h("th", null, "State"), h("th", null, "5-hour limit"), h("th", null, "Weekly limit"), h("th", null, h("span", { class: "sr" }, "Actions"))),
+        h(
+          "tr",
+          null,
+          h("th", { class: "order" }, h("span", { class: "sr" }, "Order")),
+          h("th", null, "Account"),
+          h("th", null, "State"),
+          h("th", null, "5-hour limit"),
+          h("th", null, "Weekly limit"),
+          h("th", null, h("span", { class: "sr" }, "Actions")),
+        ),
       ),
       h("tbody", null, rows),
     ),
+    h(
+      "p",
+      { class: "muted table-note" },
+      snap.settings.prefer_no_weekly_limit
+        ? "Accounts are used in this order, with the ones without a weekly limit first. Drag the handles to change it."
+        : "Accounts are used in this order. Drag the handles to change it.",
+    ),
   );
+  // Keep keyboard focus on the same account's handle across re-renders.
+  const keep = state.focusGrip ?? (hadFocus ? Number(hadFocus) : null);
+  if (keep !== null) {
+    accountsBody.querySelector<HTMLElement>(`[data-grip="${keep}"]`)?.focus();
+    state.focusGrip = null;
+  }
 }
 
 // ---- chart -----------------------------------------------------------------------------
@@ -374,13 +654,14 @@ async function renderChart() {
   chartEmpty.hidden = samples.length > 0;
   replace(
     chartLegend,
-    snap.accounts.map((a, i) => h("span", { class: "key" }, h("i", { style: { background: accountColor(i) } }), a.label)),
+    snap.accounts.map((a) => h("span", { class: "key" }, h("i", { style: { background: colorOf(a.id) } }), a.label)),
     h("span", { class: "key swap-key" }, h("i"), "Swap"),
   );
   chart.render({
     accounts: snap.accounts,
     samples,
     swaps: state.events.filter((e) => e.kind === "swap" && e.account_from !== null && e.ts >= sinceMs),
+    color: colorOf,
     metric: state.metric,
     sinceMs,
     threshold: state.metric === "weekly" ? snap.settings.swap_threshold_7d : snap.settings.swap_threshold_5h,
@@ -392,6 +673,8 @@ async function renderChart() {
 const REASONS: Record<string, string> = {
   threshold_5h: "at the 5-hour limit",
   threshold_7d: "at the weekly limit",
+  threshold_other: "at a usage limit",
+  preferred_available: "because a better ranked account is ready again",
   stop_failure: "after a turn hit a limit",
   dead_login: "because its login stopped working",
   manual: "by hand",
@@ -405,10 +688,13 @@ function describe(e: EventRow): { parts: Child[]; tone?: "warn" | "danger" } {
   const to = nb(labelOf(e.account_to));
   const detail = (k: string) => (e.detail?.[k] as string | undefined) ?? "";
   switch (e.kind) {
-    case "swap":
+    case "swap": {
+      const pick = detail("pick");
+      const why = pick ? h("small", { class: "why" }, `Picked: ${pick}`) : null;
       return e.account_from
-        ? { parts: ["Swapped from ", from, " to ", to, ` ${REASONS[e.reason ?? ""] ?? ""}`.trimEnd()] }
-        : { parts: ["Started using ", to] };
+        ? { parts: ["Swapped from ", from, " to ", to, ` ${REASONS[e.reason ?? ""] ?? ""}`.trimEnd(), why] }
+        : { parts: ["Started using ", to, why] };
+    }
     case "swap_skipped":
       return { parts: [`Swap skipped: ${detail("why")}`] };
     case "login":
@@ -427,6 +713,14 @@ function describe(e: EventRow): { parts: Child[]; tone?: "warn" | "danger" } {
       if (e.reason === "removed") return { parts: ["Removed ", nb(detail("label") || "an account")] };
       if (e.reason === "paused") return { parts: ["Paused ", from] };
       if (e.reason === "parked") return { parts: ["Resumed ", from] };
+      if (e.reason === "order") return { parts: ["Changed the order of the accounts"] };
+      if (e.reason === "weekly_limit") {
+        const value = detail("weekly_limit");
+        const who = nb(detail("label") || labelOf(e.account_from));
+        if (value === "yes") return { parts: ["Marked ", who, " as having a weekly limit"] };
+        if (value === "no") return { parts: ["Marked ", who, " as having no weekly limit"] };
+        return { parts: ["Detecting the weekly limit of ", who, " from its usage again"] };
+      }
       return { parts: [from, ` is now ${e.reason ?? "updated"}`] };
     case "error":
       return { parts: [detail("message") || "Something went wrong"], tone: "danger" };
@@ -444,7 +738,8 @@ function dayName(ts: number): string {
 }
 
 function renderActivity() {
-  const items = state.events.filter((e) => state.showRoutine || !ROUTINE.has(e.kind));
+  const routine = (e: EventRow) => ROUTINE.has(e.kind) || (e.kind === "state" && e.reason === "order");
+  const items = state.events.filter((e) => state.showRoutine || !routine(e));
   if (items.length === 0) {
     replace(activity, h("li", { class: "muted empty" }, "Swaps, logins and problems show up here."));
     return;
@@ -649,6 +944,8 @@ function openManage(a: AccountView) {
     d.close();
     act(work, () => message);
   };
+  const accounts = state.snap?.accounts ?? [];
+  const at = accounts.findIndex((x) => x.id === a.id);
   const quick = h(
     "div",
     { class: "quick" },
@@ -657,6 +954,36 @@ function openManage(a: AccountView) {
     a.state === "paused" && h("button", { class: "btn small", onclick: run(() => api.setPaused(a.id, false), `Resumed ${a.label}`) }, "Resume"),
     h("button", { class: "btn small", onclick: () => (d.close(), openLogin(a)) }, a.state === "needs_login" ? "Log in again" : "Re-login"),
   );
+  const order = h(
+    "div",
+    { class: "order-row" },
+    h("span", null, `${ordinal(at + 1)} of ${accounts.length} in your order`),
+    h(
+      "div",
+      { class: "order-buttons" },
+      h("button", { class: "btn small", disabled: at <= 0, onclick: () => (d.close(), moveBy(a, -1)) }, "Move up"),
+      h("button", { class: "btn small", disabled: at >= accounts.length - 1, onclick: () => (d.close(), moveBy(a, 1)) }, "Move down"),
+    ),
+  );
+  const weekly = h(
+    "select",
+    {
+      onchange: (e: Event) => {
+        const value = (e.target as HTMLSelectElement).value as WeeklyLimitSetting;
+        api
+          .setWeeklyLimit(a.id, value)
+          .then(() => (say(`Saved the weekly limit of ${a.label}`), refresh()))
+          .catch((err) => say(String(err), "error"));
+      },
+    },
+    (
+      [
+        ["auto", `Detect it (${WEEKLY_TEXT[a.weekly.detected]})`],
+        ["yes", "It has a weekly limit"],
+        ["no", "It has no weekly limit"],
+      ] as const
+    ).map(([value, text]) => h("option", { value, selected: a.weekly.setting === value }, text)),
+  );
   const details = h(
     "dl",
     { class: "facts info" },
@@ -664,8 +991,10 @@ function openManage(a: AccountView) {
     h("dd", null, a.email ?? "unknown"),
     a.org_name && h("dt", null, "Organization"),
     a.org_name && h("dd", null, a.org_name),
-    a.subscription_type && h("dt", null, "Plan"),
-    a.subscription_type && h("dd", null, a.subscription_type),
+    a.plan && h("dt", null, "Plan"),
+    a.plan && h("dd", null, a.plan),
+    h("dt", null, "Picked"),
+    h("dd", null, a.rank ? `${ordinal(a.rank)} (${a.reason})` : `not now (${a.reason || "unavailable"})`),
     h("dt", null, "Login saved"),
     h("dd", null, a.login_updated_at ? ago(a.login_updated_at) : "never"),
   );
@@ -673,7 +1002,13 @@ function openManage(a: AccountView) {
     a.label,
     details,
     quick,
-    h("div", { class: "fields" }, h("label", null, h("span", null, "Label"), label)),
+    order,
+    h(
+      "div",
+      { class: "fields" },
+      h("label", null, h("span", null, "Weekly limit"), weekly, h("small", { class: "muted" }, "Accounts without one are used first. cc-rotate detects it from the usage Claude Code reports.")),
+      h("label", null, h("span", null, "Label"), label),
+    ),
     error,
     h("div", { class: "dialog-actions spread" }, remove, h("div", null, close, save)),
   );
@@ -733,11 +1068,27 @@ async function openHealth() {
       );
       return h("label", null, h("span", null, text), input, h("small", { class: "muted" }, hint));
     };
+    const prefer = h("input", { type: "checkbox", id: "prefer-no-weekly", checked: snap.settings.prefer_no_weekly_limit });
+    prefer.addEventListener("change", () =>
+      api
+        .setSetting("prefer_no_weekly_limit", String(prefer.checked))
+        .then(() => (say(prefer.checked ? "Accounts without a weekly limit are used first" : "Accounts are used in your order"), refresh()))
+        .catch((e) => say(String(e), "error")),
+    );
     replace(
       settingsForm,
-      field("swap_threshold_5h", "Swap at 5-hour usage (%)", snap.settings.swap_threshold_5h, "Swap before the 5-hour limit is reached.", 1, 100),
-      field("swap_threshold_7d", "Swap at weekly usage (%)", snap.settings.swap_threshold_7d, "Swap before the weekly limit is reached.", 1, 100),
+      field("swap_threshold_5h", "Swap at 5-hour usage (%)", snap.settings.swap_threshold_5h, "Swap before a 5-hour limit is reached.", 1, 100),
+      field("swap_threshold_7d", "Swap at weekly usage (%)", snap.settings.swap_threshold_7d, "Swap before a weekly limit is reached, on all models or on one.", 1, 100),
       field("swap_cooldown_s", "Minimum time between swaps (seconds)", snap.settings.swap_cooldown_s, "Limit swaps caused by usage readings.", 0, 3600),
+      field(
+        "switch_back_dwell_s",
+        "Switch back after (seconds)",
+        snap.settings.switch_back_dwell_s,
+        "How long an account stays in use before cc-rotate switches back to a better ranked one that is ready again.",
+        0,
+        86400,
+      ),
+      h("label", { class: "check", for: "prefer-no-weekly" }, prefer, "Use accounts without a weekly limit first"),
     );
   }
   api.autostartEnabled().then((on) => (autostart.checked = on)).catch(() => (autostart.disabled = true));
@@ -773,8 +1124,11 @@ async function refresh() {
   refreshing = (async () => {
     try {
       const [snap, events] = await Promise.all([api.snapshot(), api.events(300)]);
+      // An order the user just changed is still being saved; this read may predate it.
+      if (pendingOrderSaves > 0) return;
       state.snap = snap;
       state.events = events;
+      colorOf = colorFor(snap.accounts);
       renderTop();
       renderOverview();
       renderAccounts();

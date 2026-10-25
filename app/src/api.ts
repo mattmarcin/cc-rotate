@@ -4,9 +4,31 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 export type AccountState = "active" | "parked" | "needs_login" | "paused";
 
-export interface Usage {
-  five_hour: number;
-  weekly: number;
+export type WindowKind = "session" | "weekly" | "other";
+
+/** One usage window of an account's latest reading, as it stands now. */
+export interface WindowUsage {
+  name: string;
+  /** Mid-sentence name: "5-hour", "weekly", "Opus weekly". */
+  label: string;
+  kind: WindowKind;
+  /** The model family the window is limited to; null for all models. */
+  model: string | null;
+  /** The last reading, or 0 once the window has reset. */
+  pct: number;
+  resets_at: number | null;
+  threshold: number;
+  /** Whether the window limits the model the rotation profile is using. */
+  applies: boolean;
+}
+
+export type WeeklyLimit = "none" | "unknown" | "has";
+export type WeeklyLimitSetting = "auto" | "yes" | "no";
+
+export interface SampleWindow {
+  name: string;
+  pct: number;
+  resets_at: number | null;
 }
 
 export interface Sample {
@@ -14,10 +36,8 @@ export interface Sample {
   account_id: number;
   profile: string;
   session_id: string | null;
-  five_pct: number | null;
-  five_resets_at: number | null;
-  week_pct: number | null;
-  week_resets_at: number | null;
+  model: string | null;
+  windows: SampleWindow[];
 }
 
 export interface Account {
@@ -30,25 +50,43 @@ export interface Account {
   subscription_type: string | null;
   rate_limit_tier: string | null;
   state: AccountState;
-  priority: number;
+  /** Place in the user's order: lower is used first. */
+  position: number;
+  weekly_limit: WeeklyLimitSetting;
   added_at: number;
   last_login_at: number | null;
 }
 
 export interface AccountView extends Account {
-  usage: Usage;
-  last_sample: Sample | null;
+  /** "Max 5x", "Team Premium", "Pro", or the raw subscription type. */
+  plan: string | null;
+  windows: WindowUsage[];
+  weekly: { setting: WeeklyLimitSetting; detected: WeeklyLimit; effective: WeeklyLimit };
+  last_sample_at: number | null;
   login_expires_at: number | null;
   login_updated_at: number | null;
   refresh_expires_at: number | null;
   eligible: boolean;
   available_at: number | null;
+  /** Place in the pick order among the accounts usable now. */
+  rank: number | null;
+  reason: string;
+}
+
+export interface Ranked {
+  account_id: number;
+  label: string;
+  rank: number | null;
+  eligible: boolean;
+  reason: string;
 }
 
 export interface Settings {
   swap_threshold_5h: number;
   swap_threshold_7d: number;
   swap_cooldown_s: number;
+  prefer_no_weekly_limit: boolean;
+  switch_back_dwell_s: number;
   lock_timeout_ms: number;
   sample_retention_days: number;
   statusline_downstream: string | null;
@@ -59,9 +97,15 @@ export interface Settings {
 export interface Snapshot {
   now_ms: number;
   active_id: number | null;
+  /** In the user's order. */
   accounts: AccountView[];
+  ranking: Ranked[];
+  next: { account_id: number; label: string; reason: string } | null;
+  model: string | null;
   pool: {
     weekly_accounts_left: number;
+    weekly_limited: number;
+    no_weekly_limit: number;
     usable: number;
     eligible: number;
     exhausted: boolean;
@@ -133,6 +177,8 @@ export const api = {
   setPaused: (id: number, paused: boolean) => invoke<void>("set_paused", { id, paused }),
   removeAccount: (id: number) => invoke<void>("remove_account", { id }),
   renameAccount: (id: number, label: string) => invoke<void>("rename_account", { id, label }),
+  setOrder: (ids: number[]) => invoke<void>("set_order", { ids }),
+  setWeeklyLimit: (id: number, value: WeeklyLimitSetting) => invoke<void>("set_weekly_limit", { id, value }),
   doctor: () => invoke<Check[]>("doctor"),
   setSetting: (key: string, value: string | null) => invoke<void>("set_setting", { key, value }),
   appInfo: () => invoke<AppInfo>("app_info"),
