@@ -139,9 +139,9 @@ When the account in use reaches a limit, cc-rotate picks the next account that i
 1. Accounts whose weekly budget would otherwise reset unused (see below), the soonest reset first.
 2. Then accounts without a weekly limit, then accounts whose weekly limit is not known yet, then accounts with one.
    Turn this off with `cc-rotate-ctl config prefer_no_weekly_limit false`.
-3. Then the account in use, then accounts whose 5-hour window is already running (with at least 10 points left), the one that resets soonest first.
+3. Then the account in use, then accounts whose 5-hour window is already running and at least 10 points below the swap threshold, the one that resets soonest first.
 4. Then your order.
-5. Then accounts whose running window is closer to a limit than that, since each would last only minutes.
+5. Then accounts whose running 5-hour window is closer to the threshold than that, since each would last only minutes.
 6. Then, between accounts in the same place, the one with the most room left.
 
 A 5-hour window starts with an account's first request and resets 5 hours later, and whatever is left in it then is lost.
@@ -156,7 +156,7 @@ cc-rotate also swaps back by itself when an account in a better group than the o
 For example, while every account without a weekly limit is at its limit, cc-rotate uses one with a weekly limit, and it swaps back as soon as one without a limit has reset.
 It waits until the account in use has been in use for at least `switch_back_dwell_s` (10 minutes by default).
 That includes an account you picked by hand, so pause an account if you want it left alone.
-Among accounts without a weekly limit, or among accounts with one, it never swaps back, and accounts never swap just to even out usage.
+Within the same group it never swaps back, and accounts never swap just to even out usage.
 Accounts whose weekly budget would reset unused are the exception: one whose week resets sooner is swapped back to.
 
 To always go back to the account highest in your order as soon as it is ready instead, turn on **Always go back to accounts higher in my order** in the app's **Settings**, or run `cc-rotate-ctl config strict_order true`.

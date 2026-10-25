@@ -12,9 +12,9 @@
 //! 2. With `prefer_no_weekly_limit` on: accounts without a weekly limit, then accounts whose
 //!    weekly limit is not known yet, then accounts with one.
 //! 3. Within those (`Policy::place`): the account in use, then accounts whose 5-hour window is
-//!    already running with `RUNNING_MARGIN` to spare, the soonest reset first, then the user's
-//!    order (`position`), then running windows closer to a limit. With `strict_order` on, the
-//!    user's order alone.
+//!    already running with `RUNNING_MARGIN` points to spare, the soonest reset first, then the
+//!    user's order (`position`), then running 5-hour windows closer to their limit. With
+//!    `strict_order` on, the user's order alone.
 //! 4. The most room before a threshold, then the label.
 //!
 //! Only the first two (and the order, with `strict_order`) decide whether a better account is
@@ -48,9 +48,9 @@ pub fn model_family(model: &str) -> Option<&'static str> {
 /// least this many points below its threshold, so it is not left again a moment later.
 pub const SWITCH_BACK_MARGIN: f64 = 5.0;
 
-/// A running 5-hour window goes before fresh accounts only with every window that applies at
-/// least this many points below its threshold. With less, it would last minutes: another swap
-/// soon after for a few points.
+/// A running 5-hour window goes before fresh accounts only while it is at least this many
+/// points below its threshold. With less, it would last minutes: another swap soon after for a
+/// few points. Only the 5-hour window counts: what is left of it is what a reset loses.
 pub const RUNNING_MARGIN: f64 = 10.0;
 
 /// "No weekly limit" needs this many distinct 5-hour windows, within `NO_LIMIT_LOOKBACK_S`,
@@ -440,6 +440,15 @@ impl Candidate {
             .filter(|&r| r > now_s)
     }
 
+    /// Whether a 5-hour window is running at `now_s`: one that resets later, or one in use whose
+    /// reading gave no reset time.
+    pub fn session_running(&self, now_s: i64) -> bool {
+        self.session_reset(now_s).is_some()
+            || self
+                .five_hour()
+                .is_some_and(|w| w.resets_at.is_none() && w.pct > 0.0)
+    }
+
     pub fn usable(&self) -> bool {
         matches!(
             self.account.state,
@@ -453,15 +462,10 @@ impl Candidate {
     }
 
     fn has_margin(&self) -> bool {
-        self.room_at_least(SWITCH_BACK_MARGIN)
-    }
-
-    /// Every window that applies is at least `points` below its threshold.
-    fn room_at_least(&self, points: f64) -> bool {
         self.windows
             .iter()
             .filter(|w| w.applies)
-            .all(|w| w.pct <= w.threshold - points)
+            .all(|w| w.pct <= w.threshold - SWITCH_BACK_MARGIN)
     }
 }
 
@@ -525,17 +529,25 @@ impl Policy {
     /// Where an account goes among accounts of the same rank, best first. The account in use
     /// comes first: it is kept until a limit. Then accounts whose 5-hour window is already
     /// running with `RUNNING_MARGIN` to spare, the soonest reset first, since what is left in a
-    /// window is lost when it resets. Then accounts with no window running, in the user's
-    /// order. Last, running windows close to a limit, which would only last minutes. With
-    /// `strict_order` the rank already holds the order, and this changes nothing.
+    /// window is lost when it resets (a running window without a known reset time goes last of
+    /// these). Then accounts with no window running, in the user's order. Last, running windows
+    /// close to their limit, which would only last minutes, the most room first (the tie-break
+    /// after `place`). With `strict_order` the rank already holds the order, and this changes
+    /// nothing.
     pub fn place(&self, c: &Candidate, now_s: i64) -> (u8, i64) {
         if self.strict_order || c.account.state == AccountState::Active {
             return (0, 0);
         }
-        match c.session_reset(now_s) {
-            Some(reset) if c.room_at_least(RUNNING_MARGIN) => (1, reset),
-            Some(reset) => (3, reset),
-            None => (2, c.account.position),
+        if !c.session_running(now_s) {
+            return (2, c.account.position);
+        }
+        let room = c
+            .five_hour()
+            .map_or(self.thresholds.session, WindowUsage::room);
+        if room >= RUNNING_MARGIN {
+            (1, c.session_reset(now_s).unwrap_or(i64::MAX))
+        } else {
+            (3, 0)
         }
     }
 
@@ -727,14 +739,16 @@ fn open_reason(c: &Candidate, policy: Policy, tied: bool, now_s: i64) -> String 
     parts.push(match policy.place(c, now_s) {
         _ if policy.strict_order => in_order(),
         (0, _) => "in use".into(),
-        (1, reset) => format!(
-            "5-hour window already running, resets in {}",
-            time::span(reset - now_s)
-        ),
-        (3, reset) => format!(
-            "close to a limit, 5-hour window resets in {}",
-            time::span(reset - now_s)
-        ),
+        (1 | 3, _) => {
+            let mut text = match policy.place(c, now_s).0 {
+                1 => "5-hour window already running".to_string(),
+                _ => "5-hour window close to its limit".to_string(),
+            };
+            if let Some(reset) = c.session_reset(now_s) {
+                text.push_str(&format!(", resets in {}", time::span(reset - now_s)));
+            }
+            text
+        }
         _ => in_order(),
     });
     if tied {
@@ -1117,7 +1131,7 @@ mod tests {
         assert_eq!(reason(2), "no weekly limit, 2nd in your order");
         assert_eq!(
             reason(5),
-            "no weekly limit, close to a limit, 5-hour window resets in 10m"
+            "no weekly limit, 5-hour window close to its limit, resets in 10m"
         );
 
         // A better tier still comes first, running window or not.
@@ -1328,6 +1342,92 @@ mod tests {
         assert_eq!(model_family("Opus 4.5"), Some("opus"));
         assert_eq!(model_family("claude-sonnet-5-5"), Some("sonnet"));
         assert_eq!(model_family("Mystery"), None);
+    }
+
+    /// Only the 5-hour window decides whether a running window goes before fresh accounts: a
+    /// weekly window near its cap leaves a nearly unused 5-hour window first. A reading with
+    /// usage but no reset time is a running window too, after those with one, and windows
+    /// close to their limit go by the most room.
+    #[test]
+    fn the_running_margin_is_about_the_five_hour_window() {
+        let max = |id, position, windows: &[(&str, f64, i64)]| {
+            let mut c = cand(
+                acct(id, &format!("m{id}"), AccountState::Parked, position),
+                WeeklyLimit::Has,
+                windows,
+            );
+            c.account.weekly_cap = Some(50.0);
+            c.windows = window_usage(
+                Some(&sample(windows)),
+                NOW,
+                T.for_account(&c.account),
+                Some("claude-opus-4-1"),
+            );
+            c
+        };
+        let pool = vec![
+            max(1, 0, &[]),
+            max(
+                2,
+                1,
+                &[
+                    ("five_hour", 5.0, NOW + 3600),
+                    ("seven_day", 42.0, NOW + 86_400),
+                ],
+            ),
+        ];
+        assert_eq!(POLICY.place(&pool[1], NOW), (1, NOW + 3600));
+        assert_eq!(pick(&pool, POLICY, None, NOW).unwrap().account.id, 2);
+
+        let mut unknown_reset = cand(
+            acct(3, "u", AccountState::Parked, 0),
+            WeeklyLimit::None,
+            &[],
+        );
+        unknown_reset.windows = window_usage(
+            Some(&Sample {
+                windows: vec![SampleWindow {
+                    name: "five_hour".into(),
+                    pct: 40.0,
+                    resets_at: None,
+                }],
+                ..sample(&[])
+            }),
+            NOW,
+            T,
+            None,
+        );
+        let known = cand(
+            acct(4, "k", AccountState::Parked, 1),
+            WeeklyLimit::None,
+            &[("five_hour", 60.0, NOW + 4 * 3600)],
+        );
+        let fresh = cand(
+            acct(5, "f", AccountState::Parked, 2),
+            WeeklyLimit::None,
+            &[],
+        );
+        let pool = vec![unknown_reset, known, fresh];
+        let order: Vec<i64> = ranking(&pool, POLICY, NOW)
+            .iter()
+            .map(|r| r.account_id)
+            .collect();
+        assert_eq!(order, vec![4, 3, 5]);
+        assert_eq!(
+            ranking(&pool, POLICY, NOW)[1].reason,
+            "no weekly limit, 5-hour window already running"
+        );
+
+        let near = |id, pct, resets_in| {
+            cand(
+                acct(id, &format!("n{id}"), AccountState::Parked, 0),
+                WeeklyLimit::None,
+                &[("five_hour", pct, NOW + resets_in)],
+            )
+        };
+        // 1 point left resetting in 5 minutes, 9 points left resetting in 4 hours.
+        let pool = vec![near(6, 97.0, 300), near(7, 89.0, 4 * 3600)];
+        assert_eq!(pick(&pool, POLICY, None, NOW).unwrap().account.id, 7);
     }
 
     /// A day of status line ticks on a pool of two Team seats (no weekly limit) and one Max

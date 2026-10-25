@@ -784,7 +784,7 @@ function renderAccounts() {
             ? "Used top to bottom, accounts without a weekly limit first."
             : "Used top to bottom."
           : snap.settings.prefer_no_weekly_limit
-            ? "Accounts without a weekly limit first. Within those, the account in use stays until a limit, then accounts whose 5-hour window is already running, then top to bottom."
+            ? "Accounts without a weekly limit first. Within each group, the account in use stays until a limit, then accounts whose 5-hour window is already running, then top to bottom."
             : "The account in use stays until a limit, then accounts whose 5-hour window is already running, then top to bottom.",
         snap.settings.use_expiring_weekly ? "An account whose weekly budget would go unused goes first." : null,
         "Drag to reorder.",
