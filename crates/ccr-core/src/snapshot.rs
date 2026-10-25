@@ -158,9 +158,13 @@ pub fn snapshot_at(store: &Store, paths: &Paths, now_ms: i64) -> Result<Snapshot
         .iter()
         .filter(|c| c.weekly_limit != WeeklyLimit::None)
         .collect();
+    // Up to each account's cap: the rest of a capped week is the user's, not the pool's.
     let weekly_accounts_left = limited
         .iter()
-        .map(|c| (100.0 - c.weekly().map_or(0.0, |w| w.pct)).max(0.0) / 100.0)
+        .map(|c| {
+            let limit = c.account.weekly_cap.map_or(100.0, |cap| cap.min(100.0));
+            (limit - c.weekly().map_or(0.0, |w| w.pct)).max(0.0) / 100.0
+        })
         .sum::<f64>();
     let eligible = pool.iter().filter(|c| c.eligible()).count();
     let active = pool

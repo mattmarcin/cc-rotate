@@ -630,8 +630,11 @@ pub fn load_pool(store: &Store, now_s: i64) -> Result<(Vec<Candidate>, Policy)> 
         });
     }
     if policy.use_expiring_weekly {
-        let rates = crate::budget::rates(store, now_s * 1000)?;
-        let expiring = crate::budget::expiring(&pool, &rates, policy.thresholds.session, now_s);
+        // The cached rates only: the status line must stay fast (`budget::refresh_rates`).
+        let rates = crate::budget::cached_rates(store)?;
+        let promoted = crate::budget::promoted(store, &pool)?;
+        let expiring =
+            crate::budget::expiring(&pool, &rates, &promoted, policy.thresholds.session, now_s);
         for c in &mut pool {
             c.expiring = expiring.get(&c.account.id).copied();
         }
@@ -1003,6 +1006,9 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
     // not land on an account that was used up elsewhere. Then the target's account lock is
     // taken, which waits for a background check of it to finish, and the target is settled
     // again under it. An account whose lock or leftovers keep it busy is passed over.
+    // Relearn the rates that decide which budgets would expire, off the status line (best effort:
+    // the cached ones serve otherwise).
+    let _ = crate::budget::refresh_rates(store, time::now_ms());
     let mut checked: Vec<serde_json::Value> = Vec::new();
     let mut checked_ids: Vec<i64> = Vec::new();
     let mut passed_over: Vec<i64> = Vec::new();
@@ -1219,11 +1225,20 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
     }
     let marker = creds.change_marker().ok().flatten();
 
+    // Taken for its expiring budget: it stays ahead after its 5-hour limit this week.
+    let promoted_until = pool
+        .iter()
+        .find(|c| c.account.id == target.id)
+        .and_then(|c| policy.expiring(c))
+        .map(|e| e.resets_at);
     let committed = store.immediate(|s| {
         if let Some(account) = &active {
             s.set_state(account.id, outgoing_state)?;
         }
         s.set_state(target.id, AccountState::Active)?;
+        if let Some(reset) = promoted_until {
+            s.set_meta(&crate::budget::promoted_key(target.id), reset)?;
+        }
         s.set_meta(META_LAST_SWAP_AT, now)?;
         s.set_meta(META_PROFILE_FOREIGN, "0")?;
         s.set_meta(META_ACTIVE_SINCE, now)?;

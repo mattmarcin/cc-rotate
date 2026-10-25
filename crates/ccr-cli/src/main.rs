@@ -263,6 +263,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
 fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> {
     match command {
         Command::Status { json } => {
+            let _ = ccr_core::budget::refresh_rates(store, time::now_ms());
             if let Some(req) = statusline::sync(store, paths)? {
                 swap::run(store, paths, &req)?;
             }

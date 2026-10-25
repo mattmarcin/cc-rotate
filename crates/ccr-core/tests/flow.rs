@@ -1786,10 +1786,26 @@ fn a_weekly_budget_that_would_reset_unused_moves_its_account_ahead() {
         first.reason
     );
 
+    // A swap that takes it for its budget remembers that for this week, so it is taken back
+    // after its 5-hour limit.
+    assert_eq!(
+        swap::run(&store, &env.paths, &manual(None)).unwrap(),
+        SwapOutcome::Swapped {
+            from: Some(a),
+            to: c
+        }
+    );
+    let week_reset = time::now_s() + 86_400 * 3;
+    let marked = store
+        .meta_i64(&ccr_core::budget::promoted_key(c))
+        .unwrap()
+        .expect("marked");
+    assert!((marked - week_reset).abs() <= 5, "{marked} vs {week_reset}");
+
     store
         .set_setting("use_expiring_weekly", Some("false"))
         .unwrap();
-    assert_eq!(swap::next_target(&store, Some(a)).unwrap().unwrap().id, b);
+    assert_eq!(swap::next_target(&store, Some(c)).unwrap().unwrap().id, a);
 }
 
 /// The account in use is spending a weekly budget that would otherwise reset unused: the seats

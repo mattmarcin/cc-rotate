@@ -22,10 +22,14 @@ use crate::store::{AccountState, Sample, Store};
 
 /// How far back the rates are learned from.
 pub const LEARN_DAYS: i64 = 28;
-/// The learned rates are reused for this long (they move slowly; the status line must stay
-/// fast).
+/// The learned rates are relearned after this long (they move slowly).
 const RATES_TTL_MS: i64 = 10 * 60_000;
 const META_RATES: &str = "budget_rates";
+/// The weekly reset (epoch seconds) of the window in which a swap took the account because its
+/// budget would otherwise reset unused (`promoted_key`).
+const META_PROMOTED_PREFIX: &str = "budget_promoted:";
+/// Reset times this close are the same reset (the status line and `/usage` round differently).
+const SAME_RESET_S: i64 = 60;
 
 /// The guess before readings: a full 5-hour window costs a tenth of the weekly budget. On the
 /// low side on purpose: a cheaper window means more hours are needed, so the account moves
@@ -41,13 +45,17 @@ const PRIOR_ACTIVITY: f64 = 10.0 / 24.0;
 
 /// Two readings further apart than this do not show a rate: the account may have sat idle.
 const MAX_GAP_MS: i64 = 20 * 60_000;
+/// Two changes of the 5-hour window further apart than this are not one stretch of use: the
+/// sessions may have sat open and idle in between.
+const MAX_STRETCH_MS: i64 = 30 * 60_000;
 /// Less weekly budget left than this is not worth moving an account ahead for.
 pub const MIN_LEFT: f64 = 5.0;
 /// An account moves ahead once spending its budget, and that of every account resetting
 /// before it, would take this share of the working hours left before its reset.
 pub const ENTER: f64 = 0.75;
-/// The account in use stays ahead while the share is at least this, so it is not left and
-/// taken back as its own spending lowers the share.
+/// An account that moved ahead this week stays ahead while the share is at least this, so it
+/// is not given up as its own spending lowers the share, and is taken back after its 5-hour
+/// limit.
 pub const STAY: f64 = 0.3;
 const HOURS_PER_WEEK: usize = 168;
 
@@ -110,13 +118,27 @@ impl Rates {
     }
 }
 
-/// The learned rates, recomputed from the readings when the stored ones are older than
-/// `RATES_TTL_MS`.
-pub fn rates(store: &Store, now_ms: i64) -> Result<Rates> {
+/// The last learned rates, whatever their age, or the guesses before any were learned. Only
+/// reads: the status line and the snapshot use this; `refresh_rates` relearns them.
+pub fn cached_rates(store: &Store) -> Result<Rates> {
+    Ok(store
+        .meta(META_RATES)?
+        .and_then(|v| serde_json::from_str::<Rates>(&v).ok())
+        .filter(|r| r.activity.len() == HOURS_PER_WEEK)
+        .unwrap_or_default())
+}
+
+/// The learned rates, relearned from the readings when the stored ones are older than
+/// `RATES_TTL_MS` (or from a clock that has since been set back). It reads weeks of readings,
+/// so it runs off the status line: before a swap, in the app, and in `status` and `next`.
+pub fn refresh_rates(store: &Store, now_ms: i64) -> Result<Rates> {
     if let Some(cached) = store
         .meta(META_RATES)?
         .and_then(|v| serde_json::from_str::<Rates>(&v).ok())
-        .filter(|r| now_ms - r.computed_at < RATES_TTL_MS && r.activity.len() == HOURS_PER_WEEK)
+        .filter(|r| {
+            (0..RATES_TTL_MS).contains(&(now_ms - r.computed_at))
+                && r.activity.len() == HOURS_PER_WEEK
+        })
     {
         return Ok(cached);
     }
@@ -126,12 +148,32 @@ pub fn rates(store: &Store, now_ms: i64) -> Result<Rates> {
         by_account.push((account.id, store.account_samples_since(account.id, since)?));
     }
     let rates = learn(&by_account, now_ms);
-    // A cache: losing the write only means computing again.
-    let _ = store.set_meta(META_RATES, serde_json::to_string(&rates)?);
+    store.set_meta(META_RATES, serde_json::to_string(&rates)?)?;
     Ok(rates)
 }
 
+/// The meta key recording that a swap took the account for its expiring weekly budget.
+pub fn promoted_key(account_id: i64) -> String {
+    format!("{META_PROMOTED_PREFIX}{account_id}")
+}
+
+/// The weekly reset of the window in which each account was taken for its expiring budget.
+pub fn promoted(store: &Store, pool: &[Candidate]) -> Result<HashMap<i64, i64>> {
+    let mut out = HashMap::new();
+    for c in pool.iter().filter(|c| c.weekly_limit == WeeklyLimit::Has) {
+        if let Some(reset) = store.meta_i64(&promoted_key(c.account.id))? {
+            out.insert(c.account.id, reset);
+        }
+    }
+    Ok(out)
+}
+
 /// Learn the rates from each account's readings, oldest first.
+///
+/// Readings report whole or half points and repeat between changes, so rates are measured
+/// over stretches from one change of the 5-hour window to the next: the 5-hour points, the
+/// weekly points and the time between two changes. A stretch longer than `MAX_STRETCH_MS`, a
+/// gap between readings longer than `MAX_GAP_MS`, a new window or a drop starts afresh.
 pub fn learn(by_account: &[(i64, Vec<Sample>)], now_ms: i64) -> Rates {
     let mut rates = Rates {
         computed_at: now_ms,
@@ -141,28 +183,46 @@ pub fn learn(by_account: &[(i64, Vec<Sample>)], now_ms: i64) -> Rates {
     let mut first_ms = now_ms;
     for (id, samples) in by_account {
         let (mut five, mut weekly_five, mut weekly, mut hours) = (0.0, 0.0, 0.0, 0.0);
-        if let Some(s) = samples.first() {
+        let mut anchor: Option<&Sample> = None;
+        let mut prev: Option<&Sample> = None;
+        for s in samples.iter().filter(|s| s.ts <= now_ms) {
             first_ms = first_ms.min(s.ts);
-        }
-        for pair in samples.windows(2) {
-            let (a, b) = (&pair[0], &pair[1]);
-            let gap = b.ts - a.ts;
-            if gap <= 0 || gap > MAX_GAP_MS {
-                continue;
-            }
-            let Some(d5) = delta(a, b, "five_hour") else {
+            let Some(now_five) = window(s, "five_hour") else {
                 continue;
             };
+            let restart = match (anchor, prev) {
+                (Some(a), Some(p)) => {
+                    let then = window(a, "five_hour").expect("an anchor has a 5-hour window");
+                    s.ts - p.ts > MAX_GAP_MS
+                        || !same_reset(then.resets_at, now_five.resets_at)
+                        || now_five.pct < then.pct
+                }
+                _ => true,
+            };
+            prev = Some(s);
+            if restart {
+                anchor = Some(s);
+                continue;
+            }
+            let a = anchor.expect("not restarting means an anchor");
+            let then = window(a, "five_hour").expect("an anchor has a 5-hour window");
+            let d5 = now_five.pct - then.pct;
             if d5 <= 0.0 {
                 continue;
             }
-            five += d5;
-            hours += gap as f64 / 3_600_000.0;
-            active_hours.push(b.ts / 3_600_000);
-            if let Some(dw) = delta(a, b, "seven_day").filter(|d| *d >= 0.0) {
-                weekly_five += d5;
-                weekly += dw;
+            let span = s.ts - a.ts;
+            if span > 0 && span <= MAX_STRETCH_MS {
+                five += d5;
+                hours += span as f64 / 3_600_000.0;
+                active_hours.extend(a.ts / 3_600_000..=s.ts / 3_600_000);
+                if let (Some(w0), Some(w1)) = (window(a, "seven_day"), window(s, "seven_day")) {
+                    if same_reset(w0.resets_at, w1.resets_at) && w1.pct >= w0.pct {
+                        weekly_five += d5;
+                        weekly += w1.pct - w0.pct;
+                    }
+                }
             }
+            anchor = Some(s);
         }
         rates.accounts.insert(
             *id,
@@ -182,21 +242,25 @@ pub fn learn(by_account: &[(i64, Vec<Sample>)], now_ms: i64) -> Rates {
     }
     let (first_h, now_h) = (first_ms / 3_600_000, now_ms / 3_600_000);
     let mut seen = [0.0f64; HOURS_PER_WEEK];
-    for h in first_h..now_h {
+    for h in first_h..=now_h {
         seen[h.rem_euclid(HOURS_PER_WEEK as i64) as usize] += 1.0;
     }
     for b in 0..HOURS_PER_WEEK {
-        rates.activity[b] = (worked[b] + PRIOR_ACTIVITY) / (seen[b] + 1.0);
+        rates.activity[b] = ((worked[b] + PRIOR_ACTIVITY) / (seen[b] + 1.0)).min(1.0);
     }
     rates
 }
 
-/// How much a window grew from one reading to the next, when both readings are of the same
-/// window (the same reset time).
-fn delta(a: &Sample, b: &Sample, name: &str) -> Option<f64> {
-    let wa = a.windows.iter().find(|w| w.name == name)?;
-    let wb = b.windows.iter().find(|w| w.name == name)?;
-    (wa.resets_at == wb.resets_at).then_some(wb.pct - wa.pct)
+fn window<'a>(s: &'a Sample, name: &str) -> Option<&'a crate::store::SampleWindow> {
+    s.windows.iter().find(|w| w.name == name)
+}
+
+fn same_reset(a: Option<i64>, b: Option<i64>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => (a - b).abs() <= SAME_RESET_S,
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 /// An account whose weekly budget would reset unused unless it is used now.
@@ -217,19 +281,24 @@ pub struct Expiring {
 ///
 /// Only one account is in use at a time, so the accounts are taken in the order their weekly
 /// windows reset: an account must be used now when its hours, together with the hours of
-/// every account resetting before it, take `ENTER` of the working hours left before its reset
-/// (`STAY` for the account in use).
+/// every account resetting before it, take `ENTER` of the working hours it has left before its
+/// reset. `STAY` applies instead to the account in use and to one a swap took for its budget in
+/// this weekly window (`promoted`, weekly resets by account id). An account blocked by another
+/// window has only the working hours after that window resets; one blocked until its weekly
+/// reset, or on hold, cannot spend anything and does not count.
 pub fn expiring(
     pool: &[Candidate],
     rates: &Rates,
+    promoted: &HashMap<i64, i64>,
     session_threshold: f64,
     now_s: i64,
 ) -> HashMap<i64, Expiring> {
-    let mut spendable: Vec<(&Candidate, f64, f64, i64)> = pool
+    let mut spendable: Vec<(&Candidate, f64, f64, i64, i64)> = pool
         .iter()
         .filter(|c| {
             c.weekly_limit == WeeklyLimit::Has
                 && matches!(c.account.state, AccountState::Parked | AccountState::Active)
+                && !c.held_back
         })
         .filter_map(|c| {
             let week = c.weekly()?;
@@ -238,25 +307,32 @@ pub fn expiring(
             if left < MIN_LEFT {
                 return None;
             }
+            let from = c.blocked_until().filter(|&u| u > now_s).unwrap_or(now_s);
+            if from >= resets_at {
+                return None;
+            }
             let r = rates.account(c.account.id);
             // The most a 5-hour window lets through, spread over its five hours.
             let five_per_hour = r.five_per_hour.min(session_threshold / 5.0);
             let per_hour = r.weekly_per_5h * five_per_hour;
-            (per_hour > 0.0).then(|| (c, left, left / per_hour, resets_at))
+            (per_hour > 0.0).then(|| (c, left, left / per_hour, from, resets_at))
         })
         .collect();
-    spendable.sort_by_key(|&(c, _, _, resets_at)| (resets_at, c.account.id));
+    spendable.sort_by_key(|&(c, _, _, _, resets_at)| (resets_at, c.account.id));
 
     let mut out = HashMap::new();
     let mut needed = 0.0;
-    for (c, left, hours, resets_at) in spendable {
+    for (c, left, hours, from, resets_at) in spendable {
         needed += hours;
-        let available = rates.working_hours(now_s, resets_at);
+        let available = rates.working_hours(from, resets_at);
         if available <= 0.0 {
             continue;
         }
         let share = needed / available;
-        let bar = if c.account.state == AccountState::Active {
+        let taken = promoted
+            .get(&c.account.id)
+            .is_some_and(|&r| same_reset(Some(r), Some(resets_at)));
+        let bar = if c.account.state == AccountState::Active || taken {
             STAY
         } else {
             ENTER
@@ -286,6 +362,7 @@ mod tests {
     const T: Thresholds = Thresholds {
         session: 98.0,
         weekly: 98.0,
+        weekly_cap: None,
     };
 
     fn account(id: i64, state: AccountState) -> Account {
@@ -338,6 +415,10 @@ mod tests {
         }
     }
 
+    fn none() -> HashMap<i64, i64> {
+        HashMap::new()
+    }
+
     /// Working every hour, 1 weekly point per hour of use (10 five-hour points an hour at 0.1).
     fn always_working() -> Rates {
         Rates {
@@ -350,14 +431,14 @@ mod tests {
     fn a_budget_that_fits_easily_stays_in_reserve() {
         // 38 points left at 1 an hour need 38 hours; 100 hours remain.
         let pool = [weekly(1, AccountState::Parked, 60.0, 100)];
-        assert!(expiring(&pool, &always_working(), 98.0, NOW).is_empty());
+        assert!(expiring(&pool, &always_working(), &none(), 98.0, NOW).is_empty());
     }
 
     #[test]
     fn a_budget_that_needs_most_of_the_time_left_moves_ahead() {
         // 78 points need 78 of the 100 hours left.
         let pool = [weekly(1, AccountState::Parked, 20.0, 100)];
-        let out = expiring(&pool, &always_working(), 98.0, NOW);
+        let out = expiring(&pool, &always_working(), &none(), 98.0, NOW);
         let e = out[&1];
         assert!((e.hours_needed - 78.0).abs() < 1e-6, "{e:?}");
         assert!((e.hours_available - 100.0).abs() < 1e-6, "{e:?}");
@@ -371,7 +452,7 @@ mod tests {
             activity: vec![PRIOR_ACTIVITY; HOURS_PER_WEEK],
             ..Rates::default()
         };
-        assert!(expiring(&pool, &rates, 98.0, NOW).contains_key(&1));
+        assert!(expiring(&pool, &rates, &none(), 98.0, NOW).contains_key(&1));
     }
 
     #[test]
@@ -382,7 +463,7 @@ mod tests {
             weekly(1, AccountState::Parked, 50.0, 100),
             weekly(2, AccountState::Parked, 50.0, 120),
         ];
-        let out = expiring(&pool, &always_working(), 98.0, NOW);
+        let out = expiring(&pool, &always_working(), &none(), 98.0, NOW);
         assert!(!out.contains_key(&1));
         assert!(out.contains_key(&2));
     }
@@ -392,22 +473,60 @@ mod tests {
         // 40 of 100 hours: below the bar to move ahead, above the bar to stay.
         let parked = [weekly(1, AccountState::Parked, 58.0, 100)];
         let active = [weekly(1, AccountState::Active, 58.0, 100)];
-        assert!(expiring(&parked, &always_working(), 98.0, NOW).is_empty());
-        assert!(expiring(&active, &always_working(), 98.0, NOW).contains_key(&1));
+        assert!(expiring(&parked, &always_working(), &none(), 98.0, NOW).is_empty());
+        assert!(expiring(&active, &always_working(), &none(), 98.0, NOW).contains_key(&1));
     }
 
     #[test]
     fn little_left_or_no_weekly_limit_is_never_moved_ahead() {
-        let mut none = weekly(2, AccountState::Parked, 0.0, 10);
-        none.weekly_limit = WeeklyLimit::None;
-        let pool = [weekly(1, AccountState::Parked, 95.0, 1), none];
-        assert!(expiring(&pool, &always_working(), 98.0, NOW).is_empty());
+        let mut unlimited = weekly(2, AccountState::Parked, 0.0, 10);
+        unlimited.weekly_limit = WeeklyLimit::None;
+        let pool = [weekly(1, AccountState::Parked, 95.0, 1), unlimited];
+        assert!(expiring(&pool, &always_working(), &none(), 98.0, NOW).is_empty());
     }
 
     #[test]
     fn a_paused_account_is_left_alone() {
         let pool = [weekly(1, AccountState::Paused, 0.0, 50)];
-        assert!(expiring(&pool, &always_working(), 98.0, NOW).is_empty());
+        assert!(expiring(&pool, &always_working(), &none(), 98.0, NOW).is_empty());
+    }
+
+    #[test]
+    fn an_account_taken_for_its_budget_is_taken_back_after_its_5_hour_limit() {
+        // 40 of 100 hours: parked, below the bar to move ahead; taken by a swap this week, it
+        // keeps the lower bar.
+        let pool = [weekly(1, AccountState::Parked, 58.0, 100)];
+        let reset = NOW + 100 * 3600;
+        let taken = HashMap::from([(1, reset + 30)]);
+        assert!(expiring(&pool, &always_working(), &taken, 98.0, NOW).contains_key(&1));
+        // Taken in an earlier week: it does not count.
+        let earlier = HashMap::from([(1, reset - 7 * 86_400)]);
+        assert!(expiring(&pool, &always_working(), &earlier, 98.0, NOW).is_empty());
+    }
+
+    #[test]
+    fn an_account_that_cannot_spend_before_its_reset_does_not_count() {
+        // X is blocked until its weekly reset (another window at its limit): it cannot spend,
+        // and must not push Y, which alone needs 48 of its 124 hours, ahead.
+        let mut x = weekly(1, AccountState::Parked, 20.0, 100);
+        x.windows.push(crate::scheduler::WindowUsage {
+            name: "seven_day_opus".into(),
+            label: "Opus weekly".into(),
+            kind: crate::scheduler::WindowKind::Weekly,
+            model: Some("opus".into()),
+            pct: 100.0,
+            resets_at: Some(NOW + 100 * 3600),
+            threshold: 98.0,
+            applies: true,
+        });
+        let y = weekly(2, AccountState::Parked, 50.0, 124);
+        let out = expiring(&[x, y], &always_working(), &none(), 98.0, NOW);
+        assert!(out.is_empty(), "{out:?}");
+
+        let mut held = weekly(1, AccountState::Parked, 20.0, 100);
+        held.held_back = true;
+        let y = weekly(2, AccountState::Parked, 50.0, 124);
+        assert!(expiring(&[held, y], &always_working(), &none(), 98.0, NOW).is_empty());
     }
 
     fn reading(ts_min: i64, five: f64, five_reset: i64, week: Option<(f64, i64)>) -> Sample {
@@ -461,6 +580,25 @@ mod tests {
         assert!(rates.activity[worked] > PRIOR_ACTIVITY);
     }
 
+    /// Readings in whole points, a minute apart, repeating between changes: 15 five-hour points
+    /// an hour (a change every 4 minutes) and a weekly point every 10 of them. Pairs of
+    /// readings mostly show no change; the rates must still come out right.
+    #[test]
+    fn coarse_readings_give_the_true_rates() {
+        let mut samples = Vec::new();
+        for minute in 0..=240i64 {
+            let five = (minute / 4) as f64;
+            let week = (10.0 + ((minute / 4) / 10) as f64, NOW + 86_400);
+            samples.push(reading(minute, five, NOW + 5 * 3600, Some(week)));
+        }
+        let rates = learn(&[(1, samples)], (NOW + 4 * 3600) * 1000);
+        let r = rates.account(1);
+        // 60 five-hour points in 4 hours, with the 2 guessed hours at 10: (60 + 20) / 6.
+        assert!((r.five_per_hour - 80.0 / 6.0).abs() < 0.01, "{r:?}");
+        // 6 weekly points for 60 five-hour points: 0.1, which is also the guess.
+        assert!((r.weekly_per_5h - 0.1).abs() < 0.005, "{r:?}");
+    }
+
     #[test]
     fn readings_across_a_reset_or_a_long_gap_are_not_a_rate() {
         let samples = vec![
@@ -472,6 +610,21 @@ mod tests {
         ];
         let r = learn(&[(1, samples)], (NOW + 7200) * 1000).account(1);
         assert_eq!(r, AccountRates::default());
+    }
+
+    #[test]
+    fn the_chance_of_working_never_goes_above_certain() {
+        let samples = vec![
+            reading(0, 1.0, NOW + 3600, None),
+            reading(5, 3.0, NOW + 3600, None),
+            reading(10, 5.0, NOW + 3600, None),
+        ];
+        let rates = learn(&[(1, samples)], (NOW + 11 * 60) * 1000);
+        assert!(
+            rates.activity.iter().all(|&p| p <= 1.0),
+            "{:?}",
+            rates.activity
+        );
     }
 
     #[test]

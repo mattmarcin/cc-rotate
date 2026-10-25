@@ -90,6 +90,11 @@ fn run(app: &AppHandle, store: &Store, paths: &Paths, watch: &mut Watch) {
                 watch.last_version = None;
             }
         }
+        // Relearn the rates that decide which weekly budgets would expire (cheap while the
+        // learned ones are fresh), so the status line never has to.
+        if tick % CHECK_EVERY_S == 0 {
+            let _ = ccr_core::budget::refresh_rates(store, time::now_ms());
+        }
         if tick % CHECK_EVERY_S == 0 {
             start_due_check(store, paths, &watch.checking);
         }

@@ -1143,6 +1143,7 @@ function openManage(a: AccountView) {
   close.addEventListener("click", () => d.close());
   save.addEventListener("click", async () => {
     try {
+      if (cap.validity.badInput || !cap.checkValidity()) throw new Error("Use a number from 1 to 100, or leave it empty.");
       const capValue = cap.value.trim() === "" ? null : Number(cap.value);
       if (capValue !== a.weekly_cap) await api.setWeeklyCap(a.id, capValue);
       if (label.value.trim() !== a.label) await api.renameAccount(a.id, label.value.trim());

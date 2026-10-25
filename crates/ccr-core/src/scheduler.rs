@@ -7,13 +7,16 @@
 //! model in use is at or above its threshold.
 //!
 //! Ranking, best first:
-//! 1. With `prefer_no_weekly_limit` on: accounts without a weekly limit, then accounts whose
+//! 1. Accounts whose weekly budget would otherwise reset unused (`budget::expiring`), the
+//!    soonest reset first.
+//! 2. With `prefer_no_weekly_limit` on: accounts without a weekly limit, then accounts whose
 //!    weekly limit is not known yet, then accounts with one.
-//! 2. The user's order (`position`).
-//! 3. The most room before a threshold, then the label.
+//! 3. The user's order (`position`).
+//! 4. The most room before a threshold, then the label.
 //!
-//! Only the first two decide whether a better account is worth switching back to; the third
-//! only breaks ties when picking, so equally ranked accounts never swap just to balance.
+//! Only the first three decide whether a better account is worth switching back to; the last
+//! only breaks ties when picking, so equally ranked accounts never swap just to balance. An
+//! account's weekly cap (`Account::weekly_cap`) lowers its weekly thresholds.
 
 use std::cmp::Ordering;
 
@@ -131,6 +134,8 @@ pub struct Thresholds {
     pub session: f64,
     /// For weekly windows, on all models or on one (`swap_threshold_7d`).
     pub weekly: f64,
+    /// The account's weekly cap, when lower than `weekly`: it applies to weekly windows only.
+    pub weekly_cap: Option<f64>,
 }
 
 impl Thresholds {
@@ -138,9 +143,7 @@ impl Thresholds {
     /// takes its place.
     pub fn for_account(&self, account: &Account) -> Thresholds {
         Thresholds {
-            weekly: account
-                .weekly_cap
-                .map_or(self.weekly, |cap| cap.min(self.weekly)),
+            weekly_cap: account.weekly_cap,
             ..*self
         }
     }
@@ -149,7 +152,8 @@ impl Thresholds {
     pub fn for_kind(&self, kind: WindowKind) -> f64 {
         match kind {
             WindowKind::Session => self.session,
-            WindowKind::Weekly => self.weekly,
+            WindowKind::Weekly => self.weekly_cap.map_or(self.weekly, |c| c.min(self.weekly)),
+            // A cap keeps part of the week for the user; it is no margin for unknown windows.
             WindowKind::Other => self.session.min(self.weekly),
         }
     }
@@ -160,6 +164,7 @@ impl From<&Settings> for Thresholds {
         Self {
             session: s.swap_threshold_5h,
             weekly: s.swap_threshold_7d,
+            weekly_cap: None,
         }
     }
 }
@@ -713,6 +718,7 @@ mod tests {
     const T: Thresholds = Thresholds {
         session: 98.0,
         weekly: 98.0,
+        weekly_cap: None,
     };
     const POLICY: Policy = Policy {
         thresholds: T,
@@ -810,10 +816,19 @@ mod tests {
         let mixed = Thresholds {
             session: 90.0,
             weekly: 95.0,
+            weekly_cap: None,
         };
         assert_eq!(mixed.for_kind(WindowKind::Session), 90.0);
         assert_eq!(mixed.for_kind(WindowKind::Weekly), 95.0);
         assert_eq!(mixed.for_kind(WindowKind::Other), 90.0);
+        // A weekly cap lowers weekly windows only.
+        let capped = Thresholds {
+            weekly_cap: Some(50.0),
+            ..mixed
+        };
+        assert_eq!(capped.for_kind(WindowKind::Weekly), 50.0);
+        assert_eq!(capped.for_kind(WindowKind::Other), 90.0);
+        assert_eq!(capped.for_kind(WindowKind::Session), 90.0);
 
         assert_eq!(window_label("five_hour"), "5-hour");
         assert_eq!(window_label("seven_day"), "weekly");
