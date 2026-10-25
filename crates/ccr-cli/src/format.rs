@@ -268,6 +268,11 @@ pub fn events(store: &Store, events: &[Event]) -> String {
 }
 
 pub fn doctor(checks: &[Check]) -> String {
+    let width = checks
+        .iter()
+        .map(|c| c.name.chars().count())
+        .max()
+        .unwrap_or(0);
     let mut out = String::new();
     for c in checks {
         let mark = match c.status {
@@ -275,7 +280,25 @@ pub fn doctor(checks: &[Check]) -> String {
             Status::Warn => "\x1b[33mwarn\x1b[0m",
             Status::Fail => "\x1b[31mfail\x1b[0m",
         };
-        let _ = writeln!(out, "{mark}  {:<20} {}", c.name, c.detail);
+        let _ = writeln!(out, "{mark}  {:<width$}  {}", c.name, c.detail);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every detail starts in the same column, however long the longest check's name is.
+    #[test]
+    fn doctor_details_line_up() {
+        let check = |name: &str| Check {
+            name: name.into(),
+            status: Status::Ok,
+            detail: "detail".into(),
+        };
+        let out = doctor(&[check("Profile"), check("Claude Code login storage")]);
+        let columns: Vec<usize> = out.lines().map(|l| l.find("detail").unwrap()).collect();
+        assert_eq!(columns[0], columns[1], "{out}");
+    }
 }
