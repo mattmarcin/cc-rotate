@@ -1014,19 +1014,147 @@ fn observe_mode_works_in_the_default_profile() {
     let (store, _, b, _) = pool(&env);
     let default = env.paths.home.join(".claude");
     std::fs::create_dir_all(&default).unwrap();
-    std::fs::write(
-        env.paths.home.join(".claude.json"),
-        json!({"oauthAccount": {"accountUuid": "ub"}}).to_string(),
-    )
-    .unwrap();
-    let account = statusline::observe(
-        &store,
-        &default,
-        &env.paths.home,
-        &five_hour_input(55.0, time::now_s() + 3600),
-        time::now_ms(),
-    )
-    .unwrap();
-    assert_eq!(account.map(|a| a.id), Some(b));
+    let signed_in = |org: &str| {
+        std::fs::write(
+            env.paths.home.join(".claude.json"),
+            json!({"oauthAccount": {"accountUuid": "ub", "organizationUuid": org}}).to_string(),
+        )
+        .unwrap();
+    };
+    let observe = |pct: f64| {
+        statusline::observe(
+            &store,
+            &default,
+            &env.paths.home,
+            &five_hour_input(pct, time::now_s() + 3600),
+            time::now_ms(),
+        )
+        .unwrap()
+    };
+    signed_in("org-x");
+    assert_eq!(observe(55.0).map(|a| a.id), Some(b));
     assert_eq!(store.last_sample(b).unwrap().unwrap().windows[0].pct, 55.0);
+
+    // The same person in another organization (a personal plan next to the Team seat).
+    signed_in("personal-org");
+    assert!(observe(90.0).is_none());
+    assert_eq!(store.last_sample(b).unwrap().unwrap().windows[0].pct, 55.0);
+}
+
+/// A status line reading from session `session`, whose API time so far is `api_ms`.
+fn session_input(session: &str, api_ms: u64, pct: f64, resets_at: i64) -> StatusInput {
+    StatusInput::parse(&format!(
+        r#"{{"session_id":"{session}","cost":{{"total_api_duration_ms":{api_ms}}},"rate_limits":{{"five_hour":{{"used_percentage":{pct},"resets_at":{resets_at}}}}}}}"#
+    ))
+}
+
+/// With the default settings (guard and cooldown both 120 s): a session that has been idle
+/// since before a swap keeps reporting the old account's usage for as long as it stays idle.
+/// Its reading is never recorded for the new account, so it cannot walk the rotation through the
+/// pool; once it makes a request, its readings count again.
+#[test]
+fn a_session_idle_since_before_a_swap_is_ignored_however_long_it_idles() {
+    let env = Env::new();
+    let (store, a, b, _) = pool(&env);
+    let now = time::now_ms();
+    let a_resets = time::now_s() + 3 * 86_400;
+    // The idle session's last reading on a, before the swap.
+    statusline::tick(
+        &store,
+        &env.paths,
+        &session_input("idle", 5000, 99.0, a_resets),
+        now,
+    )
+    .unwrap();
+    let swapped = swap::run(
+        &store,
+        &env.paths,
+        &SwapRequest {
+            from: Some(a),
+            to: None,
+            reason: Reason::FiveHour,
+            wait: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        swapped,
+        SwapOutcome::Swapped {
+            from: Some(a),
+            to: b
+        }
+    );
+
+    for later in [125_000, 600_000, 3_600_000] {
+        let tick = statusline::tick(
+            &store,
+            &env.paths,
+            &session_input("idle", 5000, 99.0, a_resets),
+            now + later,
+        )
+        .unwrap();
+        assert!(tick.swap.is_none(), "after {later} ms: {:?}", tick.swap);
+    }
+    assert!(
+        store.last_sample(b).unwrap().is_none(),
+        "a's usage is never recorded as b's"
+    );
+
+    // The session makes a request on b: its reading is b's.
+    statusline::tick(
+        &store,
+        &env.paths,
+        &session_input("idle", 7000, 12.0, time::now_s() + 4 * 3600),
+        now + 3_700_000,
+    )
+    .unwrap();
+    assert_eq!(store.last_sample(b).unwrap().unwrap().windows[0].pct, 12.0);
+}
+
+/// A session that ran on the old account and whose first request on the new one is refused at
+/// the limit: its reading changed (the new account's reset time), so it counts, even though a
+/// refused request may add no API time.
+#[test]
+fn a_changed_reading_counts_even_without_new_api_time() {
+    let env = Env::new();
+    let (store, a, b, c) = pool(&env);
+    let now = time::now_ms();
+    let a_resets = time::now_s() + 1800;
+    store
+        .record_sample(&five_only(a, 99.0, a_resets, now))
+        .unwrap();
+    statusline::tick(
+        &store,
+        &env.paths,
+        &session_input("busy", 5000, 99.0, a_resets),
+        now,
+    )
+    .unwrap();
+    swap::run(
+        &store,
+        &env.paths,
+        &SwapRequest {
+            from: Some(a),
+            to: None,
+            reason: Reason::FiveHour,
+            wait: false,
+        },
+    )
+    .unwrap();
+    let req = statusline::tick(
+        &store,
+        &env.paths,
+        &session_input("busy", 5000, 100.0, time::now_s() + 7200),
+        now + 31_000,
+    )
+    .unwrap()
+    .swap
+    .expect("b arrived used up");
+    assert_eq!(
+        swap::run(&store, &env.paths, &req).unwrap(),
+        SwapOutcome::Swapped {
+            from: Some(b),
+            to: c
+        }
+    );
 }

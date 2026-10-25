@@ -37,8 +37,8 @@ struct ConfigView {
 enum Found {
     /// Nothing usable: no identity, no cached reading, or one that cannot be attributed.
     Nothing,
-    /// Signed in to an account that is not in the pool (it may be added later).
-    NotInPool,
+    /// Signed in to this account, which is not in the pool (it may be added later).
+    NotInPool(String),
     /// A reading for a pool account, recorded if it is newer than the account's latest.
     Reading(Sample),
 }
@@ -61,7 +61,7 @@ pub fn import(store: &Store, paths: &Paths, now_ms: i64) -> Result<usize> {
             continue;
         };
         let key = format!("{META_SEEN_PREFIX}{}", config.display());
-        if store.meta_i64(&key)? == Some(mtime) {
+        if unchanged(store, &key, mtime)? {
             continue;
         }
         let Ok(bytes) = std::fs::read(&config) else {
@@ -70,19 +70,40 @@ pub fn import(store: &Store, paths: &Paths, now_ms: i64) -> Result<usize> {
         let Ok(view) = serde_json::from_slice::<ConfigView>(&bytes) else {
             continue;
         };
-        match reading(store, &dir, &view, now_ms)? {
-            // Read again next time: the account may join the pool meanwhile.
-            Found::NotInPool => continue,
+        let seen = match reading(store, &dir, &view, now_ms)? {
+            // Read again once the account joins the pool, even if the file never changes.
+            Found::NotInPool(uuid) => format!("{mtime}:{uuid}"),
             Found::Reading(sample) => {
                 if store.record_sample(&sample)? {
                     recorded += 1;
                 }
+                mtime.to_string()
             }
-            Found::Nothing => {}
-        }
-        store.set_meta(&key, mtime)?;
+            Found::Nothing => mtime.to_string(),
+        };
+        store.set_meta(&key, seen)?;
     }
     Ok(recorded)
+}
+
+/// Whether a config was read at this modification time already, and nothing that would change
+/// the outcome happened since: `<mtime>`, or `<mtime>:<account uuid>` for a profile signed in
+/// to an account that was not in the pool then (and still is not).
+fn unchanged(store: &Store, key: &str, mtime: i64) -> Result<bool> {
+    let Some(seen) = store.meta(key)? else {
+        return Ok(false);
+    };
+    let (at, outside) = match seen.split_once(':') {
+        Some((at, uuid)) => (at, Some(uuid)),
+        None => (seen.as_str(), None),
+    };
+    if at.parse::<i64>().ok() != Some(mtime) {
+        return Ok(false);
+    }
+    Ok(match outside {
+        Some(uuid) => store.account_by_uuid(uuid)?.is_none(),
+        None => true,
+    })
 }
 
 /// A profile whose status line is cc-rotate's own (not observe mode) is a rotation profile, or a
@@ -122,7 +143,7 @@ fn reading(store: &Store, dir: &Path, view: &ConfigView, now_ms: i64) -> Result<
         return Ok(Found::Nothing);
     }
     let Some(account) = store.account_by_uuid(uuid)? else {
-        return Ok(Found::NotInPool);
+        return Ok(Found::NotInPool(uuid.to_string()));
     };
     // Limits belong to an organization, and one person can be a member of several with the
     // same account id (a personal plan and a Team seat, say).
