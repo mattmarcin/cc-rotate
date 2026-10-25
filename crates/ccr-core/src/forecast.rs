@@ -19,10 +19,8 @@ pub const HORIZON_S: i64 = 24 * 3600;
 const STEP_S: i64 = 300;
 /// The pace is measured over the last hour of readings.
 const PACE_WINDOW_MS: i64 = 60 * 60_000;
-/// Readings spanning less than this do not show a pace yet.
+/// Use that started less than this long ago does not show a pace yet.
 const MIN_PACE_SPAN_MS: i64 = 15 * 60_000;
-/// Two readings further apart than this do not show a pace.
-const MAX_GAP_MS: i64 = 20 * 60_000;
 const FIVE_HOUR_S: i64 = 5 * 3600;
 const WEEK_S: i64 = 7 * 86_400;
 
@@ -38,40 +36,65 @@ pub struct Forecast {
 }
 
 /// How hard the pool was used in the last hour, as a multiple of each account's usual pace:
-/// `None` while the readings show no use, or span too little time to tell.
+/// `None` while the readings show no use, or the use started less than `MIN_PACE_SPAN_MS` ago.
+///
+/// Several sessions report the same account and an idle one keeps repeating its last values,
+/// so only rises above the highest reading of each 5-hour window count. The time runs from the
+/// first counted rise to now: background checks or other profiles' readings do not stretch it,
+/// and the pace fades once nothing is used any more.
 pub fn pace(store: &Store, rates: &Rates, now_ms: i64) -> Result<Option<f64>> {
-    let (mut first, mut last) = (i64::MAX, i64::MIN);
+    let mut first = i64::MAX;
     let mut usual_hours = 0.0;
     for account in store.accounts()? {
-        let samples = store.account_samples_since(account.id, now_ms - PACE_WINDOW_MS)?;
-        if let (Some(a), Some(b)) = (samples.first(), samples.last()) {
-            first = first.min(a.ts);
-            last = last.max(b.ts);
-        }
         let usual = rates.account(account.id).five_per_hour;
-        for pair in samples.windows(2) {
-            let (a, b) = (&pair[0], &pair[1]);
-            if b.ts - a.ts > MAX_GAP_MS {
+        // The highest reading of the current window so far: (reset, percent, when).
+        let mut high: Option<(Option<i64>, f64, i64)> = None;
+        for s in store.account_samples_since(account.id, now_ms - PACE_WINDOW_MS)? {
+            if s.ts > now_ms {
                 continue;
             }
-            let five = |s: &crate::store::Sample| {
-                s.windows
-                    .iter()
-                    .find(|w| w.name == scheduler::FIVE_HOUR)
-                    .map(|w| (w.pct, w.resets_at))
+            let Some(w) = s.windows.iter().find(|w| w.name == scheduler::FIVE_HOUR) else {
+                continue;
             };
-            if let (Some((pa, ra)), Some((pb, rb))) = (five(a), five(b)) {
-                if ra == rb && pb > pa {
-                    usual_hours += (pb - pa) / usual;
+            match high {
+                Some((reset, pct, at)) if same_reset(reset, w.resets_at) => {
+                    if w.pct > pct {
+                        usual_hours += (w.pct - pct) / usual;
+                        first = first.min(at);
+                        high = Some((reset, w.pct, s.ts));
+                    }
                 }
+                // An older window: a stale session's reading.
+                Some((reset, _, _)) if older(w.resets_at, reset) => {}
+                _ => high = Some((w.resets_at, w.pct, s.ts)),
             }
         }
     }
-    let span = last.saturating_sub(first);
-    if span < MIN_PACE_SPAN_MS || usual_hours <= 0.0 {
+    let span = now_ms.saturating_sub(first);
+    if usual_hours <= 0.0 || span < MIN_PACE_SPAN_MS {
         return Ok(None);
     }
-    Ok(Some(usual_hours / (span as f64 / 3_600_000.0)))
+    Ok(Some(
+        usual_hours / (span.min(PACE_WINDOW_MS) as f64 / 3_600_000.0),
+    ))
+}
+
+/// Reset times this close are the same reset (the status line and `/usage` round differently).
+fn same_reset(a: Option<i64>, b: Option<i64>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => (a - b).abs() <= 60,
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// Whether window reset `a` is of a window before `b`.
+fn older(a: Option<i64>, b: Option<i64>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => a < b - 60,
+        (None, Some(_)) => true,
+        _ => false,
+    }
 }
 
 /// Play the pool forward from `now_s` at `pace` on the account in use.
