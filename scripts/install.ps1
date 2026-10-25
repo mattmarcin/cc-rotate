@@ -32,16 +32,20 @@ function Require($command, $hint) {
   }
 }
 
-# A running cc-rotate.exe (one per open session) cannot be overwritten, but it can be renamed.
+# A running cc-rotate.exe (one per open session) cannot be overwritten or deleted, but it can be
+# renamed. Each upgrade renames it to a name of its own, since a copy an earlier upgrade renamed
+# may still be running too, and deletes the renamed copies that no longer run.
 function Install-Exe($name) {
   $source = Join-Path $repo "target\release\$name"
   $target = Join-Path $BinDir $name
+  Get-ChildItem -LiteralPath $BinDir -Filter "$name.*old" | ForEach-Object {
+    Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+  }
   try {
     Copy-Item $source $target -Force
   } catch {
-    $old = "$target.old"
-    Remove-Item $old -Force -ErrorAction SilentlyContinue
-    Move-Item $target $old -Force
+    $old = "$target.$([DateTime]::UtcNow.ToString('yyyyMMddHHmmssfff')).old"
+    Move-Item -LiteralPath $target $old
     Copy-Item $source $target -Force
   }
 }
@@ -68,15 +72,27 @@ if (-not $SkipApp) {
 }
 
 New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
-$running = Get-Process cc-rotate-app -ErrorAction SilentlyContinue
+$app = Join-Path $BinDir "cc-rotate-app.exe"
+$running = @()
+if (-not $SkipApp) {
+  $running = @(Get-Process cc-rotate-app -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $app })
+}
 if ($running) {
   Write-Host "Closing the running cc-rotate app so it can be updated..."
   $running | Stop-Process -Force
-  Start-Sleep -Milliseconds 800
+  $running | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
 }
-Install-Exe "cc-rotate.exe"
-Install-Exe "cc-rotate-ctl.exe"
-if (-not $SkipApp) { Install-Exe "cc-rotate-app.exe" }
+try {
+  Install-Exe "cc-rotate.exe"
+  Install-Exe "cc-rotate-ctl.exe"
+  if (-not $SkipApp) { Install-Exe "cc-rotate-app.exe" }
+} finally {
+  # Started again even if an install step failed, with whichever build is in place.
+  if ($running) {
+    Write-Host "Starting the cc-rotate app again..."
+    Start-Process -FilePath $app
+  }
+}
 $ctl = Join-Path $BinDir "cc-rotate-ctl.exe"
 Write-Host "Installed to $BinDir"
 
