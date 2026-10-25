@@ -788,3 +788,44 @@ fn an_active_account_without_an_identity_does_not_take_another_accounts_login() 
     assert_eq!(store.active_account().unwrap().unwrap().id, b);
     assert_eq!(stored_refresh(&store, a), "refresh-a1");
 }
+
+/// A re-login of a while Claude Code identifies a renewal of a: the identification stores the
+/// renewal, then the re-login writes its fresh login into the profile. The profile and the store
+/// agree afterwards, so swaps are not held back by a change nobody will identify.
+#[test]
+fn a_relogin_racing_an_identification_leaves_the_store_and_the_profile_agreeing() {
+    let e = env();
+    let (store, a, b) = identified_pool(&e, "ua");
+    profile_login(&e, "a2");
+    statusline::sync(&store, &e.paths).unwrap();
+    // The re-login stores the fresh login (under the account lock only), then the
+    // identification of the renewal finishes.
+    store.save_credential(a, &oauth("afresh"), "login").unwrap();
+    e.answer("ua", 10.0);
+    assert_eq!(settle(&store, &e), swap::Settle::Settled);
+    assert_eq!(
+        swap::install_active_login(&store, &e.paths, a, &oauth("afresh")).unwrap(),
+        swap::ActiveLogin::Written
+    );
+    statusline::sync(&store, &e.paths).unwrap();
+    assert_eq!(stored_refresh(&store, a), "refresh-afresh");
+
+    let out = swap::run(
+        &store,
+        &e.paths,
+        &SwapRequest {
+            from: Some(a),
+            to: Some(b),
+            reason: Reason::Manual,
+            wait: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        SwapOutcome::Swapped {
+            from: Some(a),
+            to: b
+        }
+    );
+}
