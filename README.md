@@ -1,7 +1,7 @@
 # cc-rotate
 
 Run one Claude Code profile on a pool of your own Claude accounts.
-When the account in use gets close to one of its usage limits, cc-rotate switches the profile to another account in place.
+When the account in use gets close to one of its usage limits, cc-rotate swaps the profile to another account in place.
 Running sessions keep going on their next request, with no restart and no proxy.
 
 Because every session lives in one profile, sessions can see and message each other, and their history lives in one place.
@@ -29,7 +29,7 @@ Because every session lives in one profile, sessions can see and message each ot
 - Before picking an account, cc-rotate also reads the last usage Claude Code saw in each of your other Claude Code profiles, so an account an agent used up in its own profile is not picked.
   If an account still turns out to be used up right after a swap, cc-rotate moves on at once instead of waiting out the 2-minute minimum between swaps.
 - Accounts that are not in use get a usage check from time to time: cc-rotate runs Claude Code's own `/usage` with that account's login in a scratch folder, which shows how much of each limit is used without sending a prompt or using any of the account's limits.
-  A swap also checks the account it is about to use first when its last reading is more than 15 minutes old.
+  A swap also checks the account it is about to use first when its usage data is more than 15 minutes old.
 
 cc-rotate never sends a request to Anthropic itself.
 All traffic is the unmodified Claude Code talking to Anthropic: your sessions, the sign-ins, and the usage checks.
@@ -76,7 +76,7 @@ cd cc-rotate
 sh scripts/install.sh
 ```
 
-The script builds `cc-rotate`, `cc-rotate-ctl` and the desktop app `cc-rotate-app`, copies them to `~/.local/bin`, and creates the rotation profile from `~/.claude`.
+The script builds `cc-rotate`, `cc-rotate-ctl` and the desktop app `cc-rotate-app`, copies them to `~/.local/bin`, and creates the cc-rotate profile from `~/.claude`.
 
 | Windows | Linux and macOS | What it does |
 |---|---|---|
@@ -84,7 +84,7 @@ The script builds `cc-rotate`, `cc-rotate-ctl` and the desktop app `cc-rotate-ap
 | `-Template <dir>` | `--template <dir>` | Copy settings from a different Claude Code profile. |
 | `-SkipApp` | `--skip-app` | Install only the command-line tools (no Node.js needed). |
 
-Running the script again upgrades the executables and leaves your rotation profile and logins alone.
+Running the script again upgrades the executables and leaves your cc-rotate profile and logins alone.
 On Windows it also removes the `cc-rotate` PowerShell function that older versions added, because that function would hide the new `cc-rotate` command.
 
 ## Add your accounts
@@ -97,10 +97,10 @@ cc-rotate-ctl login --email account1@example.com --label account1
 ```
 
 A browser window opens on Claude's sign-in page.
-Your browser signs in as whichever claude.ai account it is currently logged in to, so switch accounts there first if needed.
+Your browser signs in with the claude.ai account it's signed in to, so switch accounts there first if needed.
 A separate browser profile per account makes this painless.
 
-The first account you add becomes the active one.
+The first account you add is the one in use.
 
 These are fresh logins, separate from any other Claude Code profiles you already use, so adding an account here never logs you out anywhere else.
 
@@ -116,15 +116,15 @@ Open a new terminal and start Claude Code on the pool:
 cc-rotate
 ```
 
-`cc-rotate` starts `claude` with the rotation profile and passes its arguments through, so `cc-rotate --resume <id>` and the rest work as usual, in any shell.
-The status line starts with the active account's label, and your own status line still shows after it.
+`cc-rotate` starts `claude` with the cc-rotate profile and passes its arguments through, so `cc-rotate --resume <id>` and the rest work as usual, in any shell.
+The status line starts with the label of the account in use, and your own status line still shows after it.
 
 Start it in a project folder, not your home folder.
 Claude Code does not run status lines in the home folder (trust there lasts for one run and is never saved), so cc-rotate cannot see usage or swap accounts for a session started there.
 The `cc-rotate` command warns you, and `cc-rotate-ctl doctor` lists any such session.
 
 The desktop app shows every account with its plan, how much of each limit is used, when each resets, which account is used next and why, usage over the last day or week with swaps marked, and an activity log.
-It lives in the tray, starts when you sign in to your computer (you can turn that off in **Health**), and sends a notification when an account needs a new login, when no account is left to swap to, and when an account is ready again after that.
+It lives in the tray, starts when you sign in to your computer (you can turn that off in **Settings**), and sends a notification when an account is signed out, when no account is left to swap to, and when an account is ready again after that.
 
 ### Which account is used next
 
@@ -144,24 +144,24 @@ cc-rotate finds out whether an account has a weekly limit from the usage Claude 
 Until then it is not known yet.
 If that guess is wrong, set it yourself in the account's **More** dialog or with `cc-rotate-ctl weekly-limit <label> yes|no` (`auto` goes back to detecting it).
 
-cc-rotate also switches back by itself: when an account that ranks above the one in use is ready again (for example once its 5-hour window has reset), it swaps to it, as long as the account in use has been in use for at least `switch_back_dwell_s` (10 minutes by default).
+cc-rotate also swaps back by itself: when an account higher in your order than the one in use is ready again (for example once its 5-hour window has reset), it swaps to it, as long as the account in use has been in use for at least `switch_back_dwell_s` (10 minutes by default).
 That includes an account you picked by hand, so pause an account if you want it left alone.
 Accounts in the same place never swap just to even out usage.
 
 `cc-rotate-ctl next --explain` lists every account in the order it would be used, with the reason for each.
 
-cc-rotate knows how much of each limit an account has used from four places: the status line of sessions in the rotation profile, the status line of your other profiles if you turn on observe mode for them (see **Tracking your other profiles too**), the last `/usage` reading Claude Code saved in each of your other profiles, and usage checks.
+cc-rotate knows how much of each limit an account has used from four places: the status line of sessions in the cc-rotate profile, the status line of your other profiles if you turn on observe mode for them (see **Tracking your other profiles too**), the last `/usage` reading Claude Code saved in each of your other profiles, and usage checks.
 
 Usage checks read the accounts that are not in use:
 - While the app runs, it checks one account a minute that has not been read for `usage_check_interval_s` (an hour by default), in the order the accounts would be used.
-- Before a swap uses an account whose last reading is older than `usage_check_max_age_s` (15 minutes), the swap checks it first and picks again if it turns out to be used up, up to three accounts per swap.
+- Before a swap uses an account whose usage data is older than `usage_check_max_age_s` (15 minutes), the swap checks it first and picks again if it turns out to be used up, up to three accounts per swap.
 - `cc-rotate-ctl check` checks every account that is not in use now, and the app's **More** dialog has **Check usage** for one.
 - Anthropic only answers a few usage requests per login in a while, and asks to wait, sometimes up to an hour, when there were too many. cc-rotate does not check that account again before then.
 - If Claude Code renews the account's login during a check, cc-rotate stores the renewed login, as it does for the account in use.
 - Paused accounts are only checked when you ask, and `cc-rotate-ctl config usage_checks false` turns the automatic checks off.
 - If a check is interrupted while Claude Code may have been renewing a login, that account is not used until its next check confirms the login still works.
 - When the status line reports the account in use at a limit but cannot be sure the reading is that account's (a session that has not made a request since the last swap still shows the account it used before), the swap first checks the account in use. That check uses a copy of its login that Claude Code cannot renew.
-- When the login in the rotation profile changes without cc-rotate writing it (Claude Code renewed it, or someone ran `/login` there), cc-rotate asks Claude Code whose it is the same way before it stores it, so another account's login is never stored as the account in use's. Until Claude Code answers, for at most 10 minutes, cc-rotate does not swap. With usage checks off, it stores the new login as the account in use's right away.
+- When the login in the cc-rotate profile changes without cc-rotate writing it (Claude Code renewed it, or someone ran `/login` there), cc-rotate asks Claude Code whose it is the same way before it stores it, so another account's login is never stored as the account in use's. Until Claude Code answers, for at most 10 minutes, cc-rotate does not swap. With usage checks off, it stores the new login as the account in use's right away.
 
 An account used up elsewhere since its last reading can still be picked.
 When the first readings after a swap show that, cc-rotate swaps again without waiting for `swap_cooldown_s` (it still waits 30 seconds between swap requests, so many sessions reporting at once start one swap).
@@ -189,7 +189,7 @@ When Claude Code reports one, cc-rotate records it too and only counts it while 
 | `cc-rotate-ctl doctor` | Check the profile, the store and Claude Code. |
 | `cc-rotate-ctl backup <file>` | Print a daily backup of the profile's login file, decrypted. It contains tokens, so keep the output private. |
 | `cc-rotate-ctl config [key] [value]` | Show or change settings. `--unset` restores a default. |
-| `cc-rotate-ctl setup` | Create the rotation profile. `--from <dir>` picks the template, `--force` rebuilds it. `--remove-alias` removes the `cc-rotate` PowerShell function older versions added; with an existing profile, that is all it does. `--keep-existing` leaves an existing profile as it is instead of failing. |
+| `cc-rotate-ctl setup` | Create the cc-rotate profile. `--from <dir>` picks the template, `--force` rebuilds it. `--remove-alias` removes the `cc-rotate` PowerShell function older versions added; with an existing profile, that is all it does. `--keep-existing` leaves an existing profile as it is instead of failing. |
 | `cc-rotate-ctl dashboard` | Open the desktop app. |
 
 ### Settings
@@ -198,17 +198,17 @@ When Claude Code reports one, cc-rotate records it too and only counts it while 
 |---|---|---|
 | `swap_threshold_5h` | 98 | Swap when a 5-hour limit reaches this percentage. |
 | `swap_threshold_7d` | 98 | Swap when a weekly limit, for all models or for one, reaches this percentage. Limits of a kind cc-rotate does not know use the lower of the two thresholds. |
-| `swap_cooldown_s` | 120 | Minimum seconds between swaps caused by usage readings. |
+| `swap_cooldown_s` | 120 | Minimum seconds between swaps at a limit and swaps back. |
 | `prefer_no_weekly_limit` | true | Use accounts without a weekly limit before the ones with one. |
-| `switch_back_dwell_s` | 600 | How long an account stays in use before cc-rotate switches back to a better ranked account that is ready again. |
+| `switch_back_dwell_s` | 600 | How long an account stays in use before cc-rotate swaps back to an account higher in your order that is ready again. |
 | `lock_timeout_ms` | 30000 | How long a swap waits for Claude Code to finish renewing a login. |
 | `sample_retention_days` | 90 | How long usage history is kept. |
 | `statusline_downstream` | your old status line | The status line command shown after cc-rotate's label. |
-| `profile_dir` | `~/.claude-rotate` | The rotation profile, recorded by `setup`. |
+| `profile_dir` | `~/.claude-rotate` | The cc-rotate profile, recorded by `setup`. |
 | `claude_path` | found on `PATH` | The `claude` executable to use for logins, usage checks and `cc-rotate`. |
-| `usage_checks` | true | Check the usage of accounts not in use with Claude Code's `/usage`, and ask Claude Code whose a changed login in the rotation profile is. |
+| `usage_checks` | true | Check the usage of accounts not in use with Claude Code's `/usage`, and ask Claude Code whose a changed login in the cc-rotate profile is. |
 | `usage_check_interval_s` | 3600 | How often the app checks each account that is not in use (at least 300). |
-| `usage_check_max_age_s` | 900 | A swap checks the account it picked first when its last reading is older than this. |
+| `usage_check_max_age_s` | 900 | A swap checks the account it picked first when its usage data is older than this. 0 checks every time. |
 
 ### Tracking your other profiles too
 
@@ -233,14 +233,14 @@ It never touches that profile's login and never swaps anything.
 [herdr](https://github.com/herdrdev/herdr) brings your panes back when it restarts and resumes the Claude Code sessions in them.
 On its own it resumes them with `claude --resume <id>`, which starts them on your default profile instead of the pool.
 
-cc-rotate fixes that with a `SessionStart` hook in the rotation profile.
+cc-rotate fixes that with a `SessionStart` hook in the cc-rotate profile.
 When a session starts in a herdr pane, the hook tells herdr to resume it with `cc-rotate --resume <id>` instead.
 When herdr restarts, the restored pane types that command into a fresh shell, so the session comes back on the pool.
 When you quit Claude Code in a pane, herdr forgets the command, just as it forgets its own.
 
 - It needs herdr 0.9.2 or newer, and `cc-rotate` on your `PATH`, since herdr types the bare command name.
 - `cc-rotate-ctl setup` adds the hook.
-  For a rotation profile set up before cc-rotate supported herdr, run `cc-rotate-ctl setup --force` once to add it.
+  For a cc-rotate profile set up before cc-rotate supported herdr, run `cc-rotate-ctl setup --force` once to add it.
 - A pane is covered once its session starts, resumes, compacts or is cleared with `/clear` after the hook is in place.
 - Sessions that were already running before you upgraded are not covered: herdr still resumes them with plain `claude`.
   Quit them and resume them once with `cc-rotate --resume <id>` to cover them.
@@ -259,13 +259,13 @@ When you quit Claude Code in a pane, herdr forgets the command, just as it forge
 
 - Run `cc-rotate-ctl doctor` first. Its **Usage checks** line says when an account's last check failed and why.
 - Errors from the status line and hooks go to `logs/cc-rotate.log` in the data folder (see **Platforms**).
-- An account marked **needs login** had its login rejected by Anthropic. Sign it in again with `cc-rotate-ctl login --relogin <label>`.
+- An account marked **Signed out** had its login rejected by Anthropic. Choose **Sign in again** in the app, or run `cc-rotate-ctl login --relogin <label>`.
 - A daily encrypted backup of the profile's login file is kept in `backups` in the data folder.
   `cc-rotate-ctl backup <file>` prints one decrypted.
 
 ## Uninstall
 
-1. Quit the app from its tray icon, and turn off **Start when I sign in** in **Health** first if you enabled it.
+1. Quit the app from its tray icon, and turn off **Start cc-rotate when I sign in** in **Settings** first if you enabled it.
 2. Delete `cc-rotate`, `cc-rotate-ctl` and `cc-rotate-app` (with `.exe` on Windows) from `~/.local/bin`.
 3. Delete `~/.claude-rotate` (the profile) and the data folder (the store, its key and every saved login).
 
