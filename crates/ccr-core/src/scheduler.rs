@@ -134,6 +134,17 @@ pub struct Thresholds {
 }
 
 impl Thresholds {
+    /// The thresholds for one account: its weekly cap, when lower than the weekly threshold,
+    /// takes its place.
+    pub fn for_account(&self, account: &Account) -> Thresholds {
+        Thresholds {
+            weekly: account
+                .weekly_cap
+                .map_or(self.weekly, |cap| cap.min(self.weekly)),
+            ..*self
+        }
+    }
+
     /// Windows of an unknown kind get the stricter of the two thresholds.
     pub fn for_kind(&self, kind: WindowKind) -> f64 {
         match kind {
@@ -356,6 +367,8 @@ pub struct Candidate {
     /// Its login is not used until a usage check settles whether it still works
     /// (`usage_check::CheckState::held_back`).
     pub held_back: bool,
+    /// Its weekly budget would reset unused unless it is used now (`budget::expiring`).
+    pub expiring: Option<crate::budget::Expiring>,
 }
 
 impl Candidate {
@@ -428,6 +441,8 @@ impl Candidate {
 pub struct Policy {
     pub thresholds: Thresholds,
     pub prefer_no_weekly_limit: bool,
+    /// Accounts whose weekly budget would reset unused come first (`Candidate::expiring`).
+    pub use_expiring_weekly: bool,
 }
 
 impl From<&Settings> for Policy {
@@ -435,28 +450,41 @@ impl From<&Settings> for Policy {
         Self {
             thresholds: Thresholds::from(s),
             prefer_no_weekly_limit: s.prefer_no_weekly_limit,
+            use_expiring_weekly: s.use_expiring_weekly,
         }
     }
 }
 
 impl Policy {
-    /// 0 for no weekly limit, 1 for not known yet, 2 for a weekly limit; all 0 when the
-    /// preference is off.
+    /// The account's weekly budget would reset unused unless it is used now, and that counts.
+    pub fn expiring<'a>(&self, c: &'a Candidate) -> Option<&'a crate::budget::Expiring> {
+        c.expiring.as_ref().filter(|_| self.use_expiring_weekly)
+    }
+
+    /// 0 for an account whose weekly budget would reset unused; then 1 for no weekly limit, 2
+    /// for not known yet, 3 for a weekly limit, all 1 when the preference is off.
     pub fn tier(&self, c: &Candidate) -> u8 {
-        if !self.prefer_no_weekly_limit {
+        if self.expiring(c).is_some() {
             return 0;
         }
+        if !self.prefer_no_weekly_limit {
+            return 1;
+        }
         match c.weekly_limit {
-            WeeklyLimit::None => 0,
-            WeeklyLimit::Unknown => 1,
-            WeeklyLimit::Has => 2,
+            WeeklyLimit::None => 1,
+            WeeklyLimit::Unknown => 2,
+            WeeklyLimit::Has => 3,
         }
     }
 
     /// The rank that decides switching back: lower is better. Room is deliberately not part
-    /// of it.
+    /// of it. Accounts whose weekly budget would reset unused go by their reset, the soonest
+    /// first, since only one account is in use at a time.
     pub fn rank(&self, c: &Candidate) -> (u8, i64) {
-        (self.tier(c), c.account.position)
+        match self.expiring(c) {
+            Some(e) => (0, e.resets_at),
+            None => (self.tier(c), c.account.position),
+        }
     }
 
     fn pick_order(&self, a: &Candidate, b: &Candidate) -> Ordering {
@@ -602,7 +630,7 @@ pub fn ranking(candidates: &[Candidate], policy: Policy, now_s: i64) -> Vec<Rank
             label: c.account.label.clone(),
             rank: Some(i + 1),
             eligible: c.eligible(),
-            reason: open_reason(c, policy, tied),
+            reason: open_reason(c, policy, tied, now_s),
         });
     }
     for c in blocked.into_iter().chain(rest) {
@@ -617,7 +645,14 @@ pub fn ranking(candidates: &[Candidate], policy: Policy, now_s: i64) -> Vec<Rank
     out
 }
 
-fn open_reason(c: &Candidate, policy: Policy, tied: bool) -> String {
+fn open_reason(c: &Candidate, policy: Policy, tied: bool, now_s: i64) -> String {
+    if let Some(e) = policy.expiring(c) {
+        return format!(
+            "weekly budget expires in {} with {:.0}% left",
+            time::span(e.resets_at - now_s),
+            e.left
+        );
+    }
     let mut parts: Vec<String> = Vec::new();
     if policy.prefer_no_weekly_limit {
         parts.push(match (c.weekly_limit, c.weekly()) {
@@ -682,6 +717,7 @@ mod tests {
     const POLICY: Policy = Policy {
         thresholds: T,
         prefer_no_weekly_limit: true,
+        use_expiring_weekly: true,
     };
     const NOW: i64 = 1_800_000_000;
 
@@ -698,6 +734,7 @@ mod tests {
             state,
             position,
             weekly_limit: WeeklyLimitSetting::Auto,
+            weekly_cap: None,
             added_at: 0,
             last_login_at: None,
         }
@@ -728,6 +765,7 @@ mod tests {
             weekly_detected: weekly,
             weekly_limit: weekly,
             held_back: false,
+            expiring: None,
             account,
         }
     }

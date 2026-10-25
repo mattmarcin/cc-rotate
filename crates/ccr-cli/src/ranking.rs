@@ -73,6 +73,46 @@ pub fn weekly_limit(store: &Store, label: &str, value: Option<&str>) -> Result<(
     Ok(())
 }
 
+/// `weekly-cap <account> [<percent>|off]`.
+pub fn weekly_cap(store: &Store, label: &str, value: Option<&str>) -> Result<()> {
+    let account = store.find_account(label)?;
+    if let Some(value) = value {
+        let cap = match value {
+            "off" | "none" | "default" => None,
+            v => Some(
+                v.trim_end_matches('%')
+                    .parse::<f64>()
+                    .map_err(|_| anyhow::anyhow!("Use a number from 1 to 100, or off."))?,
+            ),
+        };
+        store.set_weekly_cap(account.id, cap)?;
+        store.log_event(
+            kind::STATE,
+            Some(account.id),
+            None,
+            Some("weekly_cap"),
+            Some(json!({ "label": account.label, "weekly_cap": cap })),
+        )?;
+    }
+    let account = store.find_account(label)?;
+    let threshold = store.settings()?.swap_threshold_7d;
+    match account.weekly_cap {
+        Some(cap) if cap < threshold => println!(
+            "{}: rotation stops using it at {cap:.0}% weekly usage",
+            account.label
+        ),
+        Some(cap) => println!(
+            "{}: {cap:.0}%, but rotation already stops at {threshold:.0}% (Settings)",
+            account.label
+        ),
+        None => println!(
+            "{}: rotation stops using it at {threshold:.0}% weekly usage (Settings)",
+            account.label
+        ),
+    }
+    Ok(())
+}
+
 /// `next [--explain] [--json]`.
 pub fn next(store: &Store, paths: &Paths, explain: bool, json: bool) -> Result<()> {
     // Count what the other profiles read since, as the next swap will.

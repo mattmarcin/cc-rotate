@@ -40,6 +40,8 @@ pub struct AccountView {
     pub rank: Option<usize>,
     /// Why the account is where it is in the pick order.
     pub reason: String,
+    /// Its weekly budget would reset unused unless it is used now (`budget::expiring`).
+    pub expiring: Option<crate::budget::Expiring>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -146,6 +148,7 @@ pub fn snapshot_at(store: &Store, paths: &Paths, now_ms: i64) -> Result<Snapshot
             available_at: c.blocked_until(),
             rank: ranked.and_then(|r| r.rank),
             reason: ranked.map(|r| r.reason.clone()).unwrap_or_default(),
+            expiring: policy.expiring(c).copied(),
             account: c.account.clone(),
         });
     }

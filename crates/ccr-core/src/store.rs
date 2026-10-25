@@ -21,7 +21,8 @@ use crate::{credfile, time};
 /// 2: logins sealed with the platform-independent format in `secret`.
 /// 3: usage windows as rows (`sample_windows`), the account order (`position`, formerly
 ///    `priority`) and the per-account weekly limit override.
-const SCHEMA_VERSION: i64 = 3;
+/// 4: the per-account weekly cap (`weekly_cap`).
+const SCHEMA_VERSION: i64 = 4;
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE accounts (
@@ -124,6 +125,13 @@ INSERT INTO sample_windows (sample_id, account_id, name, pct, resets_at)
 DROP TABLE samples_v2;
 "#;
 
+/// Schema 4: rotation stops using an account once its weekly usage reaches `weekly_cap`, when
+/// that is below `swap_threshold_7d`; NULL uses the setting.
+const SCHEMA_V4: &str = r#"
+ALTER TABLE accounts ADD COLUMN weekly_cap REAL
+    CHECK (weekly_cap IS NULL OR (weekly_cap >= 1 AND weekly_cap <= 100));
+"#;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountState {
@@ -204,12 +212,15 @@ pub struct Account {
     /// from the old `priority`; reordering numbers every account from 1.
     pub position: i64,
     pub weekly_limit: WeeklyLimitSetting,
+    /// Rotation stops using the account once its weekly usage reaches this (percent), when it
+    /// is below `swap_threshold_7d`: the rest is kept for the user's own use.
+    pub weekly_cap: Option<f64>,
     pub added_at: i64,
     pub last_login_at: Option<i64>,
 }
 
 const ACCOUNT_COLS: &str = "id, label, email, account_uuid, org_uuid, org_name, subscription_type, \
-    rate_limit_tier, state, position, added_at, last_login_at, weekly_limit";
+    rate_limit_tier, state, position, added_at, last_login_at, weekly_limit, weekly_cap";
 
 fn parse_col<T: FromStr<Err = anyhow::Error>>(row: &Row, i: usize) -> rusqlite::Result<T> {
     let text: String = row.get(i)?;
@@ -233,6 +244,7 @@ fn account_from_row(row: &Row) -> rusqlite::Result<Account> {
         added_at: row.get(10)?,
         last_login_at: row.get(11)?,
         weekly_limit: parse_col(row, 12)?,
+        weekly_cap: row.get(13)?,
     })
 }
 
@@ -374,6 +386,9 @@ pub struct Settings {
     pub usage_check_interval_s: i64,
     /// A swap first checks the account it picked when its latest reading is older than this.
     pub usage_check_max_age_s: i64,
+    /// Move an account with a weekly limit ahead while its weekly budget would otherwise reset
+    /// unused (`budget`).
+    pub use_expiring_weekly: bool,
 }
 
 pub const SETTING_KEYS: &[&str] = &[
@@ -390,6 +405,7 @@ pub const SETTING_KEYS: &[&str] = &[
     "usage_checks",
     "usage_check_interval_s",
     "usage_check_max_age_s",
+    "use_expiring_weekly",
 ];
 
 pub struct Store {
@@ -499,6 +515,10 @@ impl Store {
             if version < 3 {
                 s.conn.execute_batch(SCHEMA_V3)?;
                 s.conn.pragma_update(None, "user_version", 3)?;
+            }
+            if version < 4 {
+                s.conn.execute_batch(SCHEMA_V4)?;
+                s.conn.pragma_update(None, "user_version", 4)?;
             }
             Ok(())
         })
@@ -638,6 +658,9 @@ impl Store {
                 .unwrap_or(true),
             usage_check_interval_s: int("usage_check_interval_s", 3600)?,
             usage_check_max_age_s: int("usage_check_max_age_s", 900)?,
+            use_expiring_weekly: get("use_expiring_weekly")?
+                .and_then(|v| parse_bool(&v))
+                .unwrap_or(true),
         })
     }
 
@@ -876,6 +899,23 @@ impl Store {
         let n = self.conn.execute(
             "UPDATE accounts SET weekly_limit = ?2 WHERE id = ?1",
             params![id, setting.as_str()],
+        )?;
+        if n == 0 {
+            bail!("account {id} does not exist");
+        }
+        Ok(())
+    }
+
+    /// Set or clear (`None`) the account's weekly cap, in percent from 1 to 100.
+    pub fn set_weekly_cap(&self, id: i64, cap: Option<f64>) -> Result<()> {
+        if let Some(c) = cap {
+            if !(1.0..=100.0).contains(&c) {
+                bail!("Use a number from 1 to 100.");
+            }
+        }
+        let n = self.conn.execute(
+            "UPDATE accounts SET weekly_cap = ?2 WHERE id = ?1",
+            params![id, cap],
         )?;
         if n == 0 {
             bail!("account {id} does not exist");
@@ -1297,7 +1337,7 @@ fn validate_setting(key: &str, value: &str) -> Result<Option<String>> {
                 bail!("Use 0 or more.");
             }
         }
-        "prefer_no_weekly_limit" | "usage_checks" => {
+        "prefer_no_weekly_limit" | "usage_checks" | "use_expiring_weekly" => {
             let v = parse_bool(value).context("expected true or false")?;
             return Ok(Some(v.to_string()));
         }
@@ -1729,7 +1769,7 @@ mod tests {
             .conn()
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, SCHEMA_VERSION);
 
         let accounts = s.accounts().unwrap();
         let labels: Vec<_> = accounts.iter().map(|a| a.label.as_str()).collect();

@@ -42,6 +42,7 @@ fn main() {
             commands::rename_account,
             commands::set_order,
             commands::set_weekly_limit,
+            commands::set_weekly_cap,
             commands::doctor,
             commands::other_profiles,
             commands::set_setting,

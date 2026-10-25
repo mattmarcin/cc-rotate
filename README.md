@@ -135,10 +135,11 @@ After an upgrade from an older cc-rotate, accounts that had the same priority sh
 
 When the account in use reaches a limit, cc-rotate picks the next account that is below all of its limits:
 
-1. Accounts without a weekly limit first, then accounts whose weekly limit is not known yet, then accounts with one.
+1. Accounts whose weekly budget would otherwise reset unused (see below), the soonest reset first.
+2. Then accounts without a weekly limit, then accounts whose weekly limit is not known yet, then accounts with one.
    Turn this off with `cc-rotate-ctl config prefer_no_weekly_limit false`, and only your order counts.
-2. Then your order.
-3. Then, between accounts in the same place, the one with the most room left.
+3. Then your order.
+4. Then, between accounts in the same place, the one with the most room left.
 
 cc-rotate finds out whether an account has a weekly limit from the usage Claude Code reports: an account that reported a weekly limit has one, and an account that went through two separate 5-hour windows in the last 8 days without ever reporting one has none.
 Until then it is not known yet.
@@ -147,6 +148,22 @@ If that guess is wrong, set it yourself in the account's **More** dialog or with
 cc-rotate also swaps back by itself: when an account higher in your order than the one in use is ready again (for example once its 5-hour window has reset), it swaps to it, as long as the account in use has been in use for at least `switch_back_dwell_s` (10 minutes by default).
 That includes an account you picked by hand, so pause an account if you want it left alone.
 Accounts in the same place never swap just to even out usage.
+
+### Weekly budget that would go unused
+
+Whatever an account with a weekly limit hasn't used by its weekly reset is lost.
+It can only be used as fast as its 5-hour limit allows, and only while you're working, so leaving it for last can mean there isn't time to use it.
+cc-rotate works out how many hours of use the rest of each weekly budget takes and how many working hours are left before the reset.
+When the account would otherwise run out of time, it moves to the front, early enough to use its budget.
+Until then its budget stays in reserve for when every other account is at a limit.
+The accounts are taken in the order their weeks reset, since only one is in use at a time.
+
+It learns from your usage how much of the weekly budget a 5-hour window costs on each account, how fast you use an account, and when you usually work.
+Until it has seen enough, it assumes a full 5-hour window costs a tenth of the week and that you work 10 hours a day, which errs on the side of starting early.
+Turn it off with `cc-rotate-ctl config use_expiring_weekly false`, or in **Settings**.
+
+To keep part of an account's week for yourself, set where rotation stops using it, in its **More** dialog or with `cc-rotate-ctl weekly-cap <label> 70` (`off` goes back to the setting).
+cc-rotate then treats 70% as that account's weekly limit, and only plans to use its budget up to there.
 
 `cc-rotate-ctl next --explain` lists every account in the order it would be used, with the reason for each.
 
@@ -185,6 +202,7 @@ When Claude Code reports one, cc-rotate records it too and only counts it while 
 | `cc-rotate-ctl order [<label>...]` | Show the order accounts are used in, or put the listed accounts first, in that order. |
 | `cc-rotate-ctl move <label> --to <n>` | Move an account to place `n` in the order (1 is used first). |
 | `cc-rotate-ctl weekly-limit <label> [auto\|yes\|no]` | Show or set whether an account has a weekly limit (`auto` detects it). |
+| `cc-rotate-ctl weekly-cap <label> [<percent>\|off]` | Show or set the weekly usage at which rotation stops using an account, keeping the rest of its week for you. |
 | `cc-rotate-ctl events` | Recent swaps, logins and problems. |
 | `cc-rotate-ctl doctor` | Check the profile, the store and Claude Code. |
 | `cc-rotate-ctl backup <file>` | Print a daily backup of the profile's login file, decrypted. It contains tokens, so keep the output private. |
@@ -200,6 +218,7 @@ When Claude Code reports one, cc-rotate records it too and only counts it while 
 | `swap_threshold_7d` | 98 | Swap when a weekly limit, for all models or for one, reaches this percentage. Limits of a kind cc-rotate does not know use the lower of the two thresholds. |
 | `swap_cooldown_s` | 120 | Minimum seconds between swaps at a limit and swaps back. |
 | `prefer_no_weekly_limit` | true | Use accounts without a weekly limit before the ones with one. |
+| `use_expiring_weekly` | true | Move an account ahead when its weekly budget would otherwise reset unused. |
 | `switch_back_dwell_s` | 600 | How long an account stays in use before cc-rotate swaps back to an account higher in your order that is ready again. |
 | `lock_timeout_ms` | 30000 | How long a swap waits for Claude Code to finish renewing a login. |
 | `sample_retention_days` | 90 | How long usage history is kept. |

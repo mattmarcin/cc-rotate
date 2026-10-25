@@ -369,7 +369,7 @@ pub fn identify_changed_login(store: &Store, paths: &Paths) -> Result<Settle> {
     }
     enum Verdict {
         Own,
-        Adopt(Account),
+        Adopt(Box<Account>),
         Foreign(Option<String>),
     }
     let verdict = match who {
@@ -380,7 +380,7 @@ pub fn identify_changed_login(store: &Store, paths: &Paths) -> Result<Settle> {
                 .into_iter()
                 .find(|a| a.id != changed.active.id && who.is(a) == Some(true))
             {
-                Some(account) => Verdict::Adopt(account),
+                Some(account) => Verdict::Adopt(Box::new(account)),
                 // Nothing to compare the active account with: stored as before.
                 None if active_is.is_none() => Verdict::Own,
                 None => Verdict::Foreign(who.uuid),
@@ -612,8 +612,12 @@ pub fn load_pool(store: &Store, now_s: i64) -> Result<(Vec<Candidate>, Policy)> 
             .position(|&p| p == account.position)
             .unwrap_or_default();
         let sample = store.last_sample(account.id)?;
-        let windows =
-            scheduler::window_usage(sample.as_ref(), now_s, policy.thresholds, model.as_deref());
+        let windows = scheduler::window_usage(
+            sample.as_ref(),
+            now_s,
+            policy.thresholds.for_account(&account),
+            model.as_deref(),
+        );
         let detected = detect_weekly_limit(store, account.id, now_s)?;
         pool.push(Candidate {
             weekly_limit: scheduler::weekly_limit(account.weekly_limit, detected),
@@ -621,8 +625,16 @@ pub fn load_pool(store: &Store, now_s: i64) -> Result<(Vec<Candidate>, Policy)> 
             windows,
             order,
             held_back: usage_check::state(store, account.id)?.held_back,
+            expiring: None,
             account,
         });
+    }
+    if policy.use_expiring_weekly {
+        let rates = crate::budget::rates(store, now_s * 1000)?;
+        let expiring = crate::budget::expiring(&pool, &rates, policy.thresholds.session, now_s);
+        for c in &mut pool {
+            c.expiring = expiring.get(&c.account.id).copied();
+        }
     }
     Ok((pool, policy))
 }
@@ -845,6 +857,10 @@ pub fn left_resets(store: &Store) -> Result<Vec<i64>> {
 /// means the cooldown applies as usual.
 pub fn arrived_over_limit(store: &Store, account_id: i64, now_ms: i64) -> Result<bool> {
     let policy = Policy::from(&store.settings()?);
+    let thresholds = match store.account(account_id)? {
+        Some(account) => policy.thresholds.for_account(&account),
+        None => policy.thresholds,
+    };
     let model = store.meta(META_PROFILE_MODEL)?;
     let mut others: Vec<i64> = Vec::new();
     for account in store.accounts()? {
@@ -866,7 +882,7 @@ pub fn arrived_over_limit(store: &Store, account_id: i64, now_ms: i64) -> Result
         .collect();
     Ok(!own.is_empty()
         && own.iter().all(|s| {
-            scheduler::window_usage(Some(s), now_ms / 1000, policy.thresholds, model.as_deref())
+            scheduler::window_usage(Some(s), now_ms / 1000, thresholds, model.as_deref())
                 .iter()
                 .any(scheduler::WindowUsage::blocking)
         }))

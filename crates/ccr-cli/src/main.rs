@@ -114,6 +114,12 @@ enum Command {
         #[arg(value_parser = ["auto", "yes", "no"])]
         value: Option<String>,
     },
+    /// Show or set the weekly usage (percent) at which rotation stops using an account, keeping
+    /// the rest of its week for you: a number from 1 to 100, or off to use the setting.
+    WeeklyCap {
+        account: String,
+        value: Option<String>,
+    },
     /// Show recent swaps, sign-ins and errors.
     Events {
         #[arg(long, default_value_t = 30)]
@@ -418,6 +424,9 @@ fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> 
         Command::Move { account, to } => ranking::move_to(store, &account, to)?,
         Command::WeeklyLimit { account, value } => {
             ranking::weekly_limit(store, &account, value.as_deref())?
+        }
+        Command::WeeklyCap { account, value } => {
+            ranking::weekly_cap(store, &account, value.as_deref())?
         }
         Command::Events { limit, json } => {
             let events = store.events(limit)?;
