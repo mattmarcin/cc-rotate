@@ -143,7 +143,7 @@ pub fn use_before_reset(store: &Store, label: &str, value: Option<&str>) -> Resu
         (true, false) => {
             "moves ahead when its weekly budget would reset unused, once that's turned on in Settings"
         }
-        (false, _) => "never moves ahead for its weekly budget; it's used in your order",
+        (false, _) => "never moves ahead for its weekly budget; it's used like any other account",
     };
     println!("{}: {text}", account.label);
     Ok(())

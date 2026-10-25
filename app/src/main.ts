@@ -1378,7 +1378,7 @@ async function openSettings() {
     prefer.addEventListener("change", () =>
       api
         .setSetting("prefer_no_weekly_limit", String(prefer.checked))
-        .then(() => (say(prefer.checked ? "Accounts without a weekly limit are used first" : "Accounts are used in your order"), refresh()))
+        .then(() => (say(prefer.checked ? "Accounts without a weekly limit are used first" : "Accounts with and without a weekly limit are used alike"), refresh()))
         .catch((e) => say(String(e), "error")),
     );
     replace(

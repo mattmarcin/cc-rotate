@@ -11,12 +11,14 @@
 //! whose weekly budget would reset unused move ahead as they do live. Ticks with demand get
 //! the threshold triggers; the others only what the app's background sync applies.
 //!
-//! Use by other profiles, usage checks and model-scoped windows other than the starting
-//! readings are left out, so the numbers compare policies; they do not predict the pool.
+//! Other profiles' readings, usage checks and model-scoped windows other than the starting
+//! readings are left out, though a rise after the rotation profile returns to an account
+//! includes other profiles' use in between. Weekly limits are detected as of the end of the
+//! period, and no account starts out moved ahead for its weekly budget. So the numbers compare policies; they do not predict the pool.
 //!
 //! The store (by default the real one) is copied with `VACUUM INTO` from a read-only
 //! connection, and only the copy is opened as a `Store`, so the real one is never migrated or
-//! written.
+//! written (SQLite may create its `-wal` and `-shm` files).
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -116,7 +118,11 @@ fn replay(store: &Store, days: i64) -> Result<()> {
         .context("no readings in the period")?;
     let start_s = start_ms.max(first_rotate.ts) / 1000;
     let end_s = end_ms / 1000;
-    let total: f64 = demand.range(start_s..end_s).map(|(_, d)| d).sum();
+    // `play` starts at the minute `start_s` falls in.
+    let total: f64 = demand
+        .range(start_s - start_s % STEP_S..end_s)
+        .map(|(_, d)| d)
+        .sum();
     println!(
         "Replaying {} to {} ({:.1} h of readings): {:.1} hours of use at the usual pace.",
         time::local(start_s, "%a %b %-d %H:%M"),
@@ -295,6 +301,8 @@ fn play(
 
     let mut out = Outcome::default();
     let mut active = first_active;
+    // Accounts moved ahead for their weekly budget during the replay. The store's own marks
+    // are not loaded: they are as of now, not as of the start.
     let mut promoted: HashMap<i64, i64> = HashMap::new();
     let mut timing = Timing {
         cooldown_ms: settings.swap_cooldown_s * 1000,

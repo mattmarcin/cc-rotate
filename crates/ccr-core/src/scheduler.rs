@@ -12,8 +12,9 @@
 //! 2. With `prefer_no_weekly_limit` on: accounts without a weekly limit, then accounts whose
 //!    weekly limit is not known yet, then accounts with one.
 //! 3. Within those (`Policy::place`): the account in use, then accounts whose 5-hour window is
-//!    already running, the soonest reset first, then the user's order (`position`). With
-//!    `strict_order` on, the user's order alone.
+//!    already running with `RUNNING_MARGIN` to spare, the soonest reset first, then the user's
+//!    order (`position`), then running windows closer to a limit. With `strict_order` on, the
+//!    user's order alone.
 //! 4. The most room before a threshold, then the label.
 //!
 //! Only the first two (and the order, with `strict_order`) decide whether a better account is
@@ -46,6 +47,11 @@ pub fn model_family(model: &str) -> Option<&'static str> {
 /// A better ranked account is only switched back to while every window that applies is at
 /// least this many points below its threshold, so it is not left again a moment later.
 pub const SWITCH_BACK_MARGIN: f64 = 5.0;
+
+/// A running 5-hour window goes before fresh accounts only with every window that applies at
+/// least this many points below its threshold. With less, it would last minutes: another swap
+/// soon after for a few points.
+pub const RUNNING_MARGIN: f64 = 10.0;
 
 /// "No weekly limit" needs this many distinct 5-hour windows, within `NO_LIMIT_LOOKBACK_S`,
 /// without a single weekly window. A real request on a capped account reports the weekly window
@@ -447,10 +453,15 @@ impl Candidate {
     }
 
     fn has_margin(&self) -> bool {
+        self.room_at_least(SWITCH_BACK_MARGIN)
+    }
+
+    /// Every window that applies is at least `points` below its threshold.
+    fn room_at_least(&self, points: f64) -> bool {
         self.windows
             .iter()
             .filter(|w| w.applies)
-            .all(|w| w.pct <= w.threshold - SWITCH_BACK_MARGIN)
+            .all(|w| w.pct <= w.threshold - points)
     }
 }
 
@@ -513,16 +524,16 @@ impl Policy {
 
     /// Where an account goes among accounts of the same rank, best first. The account in use
     /// comes first: it is kept until a limit. Then accounts whose 5-hour window is already
-    /// running with `SWITCH_BACK_MARGIN` to spare, the soonest reset first, since what is left
-    /// in a window is lost when it resets. Then accounts with no window running, in the user's
-    /// order. Last, running windows close to a limit, which would only last a moment. With
+    /// running with `RUNNING_MARGIN` to spare, the soonest reset first, since what is left in a
+    /// window is lost when it resets. Then accounts with no window running, in the user's
+    /// order. Last, running windows close to a limit, which would only last minutes. With
     /// `strict_order` the rank already holds the order, and this changes nothing.
     pub fn place(&self, c: &Candidate, now_s: i64) -> (u8, i64) {
         if self.strict_order || c.account.state == AccountState::Active {
             return (0, 0);
         }
         match c.session_reset(now_s) {
-            Some(reset) if c.has_margin() => (1, reset),
+            Some(reset) if c.room_at_least(RUNNING_MARGIN) => (1, reset),
             Some(reset) => (3, reset),
             None => (2, c.account.position),
         }
@@ -1066,7 +1077,8 @@ mod tests {
                 5,
                 AccountState::Parked,
                 4,
-                &[("five_hour", 95.0, NOW + 600)],
+                // 8 points from its threshold: close to a limit, after the fresh accounts.
+                &[("five_hour", 90.0, NOW + 600)],
             ),
             seat(
                 6,
@@ -1078,6 +1090,7 @@ mod tests {
                 7,
                 AccountState::Parked,
                 6,
+                // At its limit: blocked, so after every account that can be used.
                 &[("five_hour", 99.0, NOW + 1800)],
             ),
         ];

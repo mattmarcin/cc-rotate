@@ -1848,6 +1848,7 @@ fn a_weekly_cap_keeps_the_rest_of_the_week_for_you() {
     store
         .set_setting("prefer_no_weekly_limit", Some("false"))
         .unwrap();
+    store.set_setting("strict_order", Some("true")).unwrap();
     store.set_order(&[c, b, a]).unwrap();
     store.record_sample(&sample(c, 10.0, 55.0)).unwrap();
     assert_eq!(swap::next_target(&store, Some(a)).unwrap().unwrap().id, c);

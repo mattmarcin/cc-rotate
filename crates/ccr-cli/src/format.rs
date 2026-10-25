@@ -289,6 +289,9 @@ pub fn next(snap: &Snapshot, explain: bool) -> String {
         order.push("accounts whose 5-hour window is already running, the soonest reset first");
     }
     order.push("your order");
+    if !s.strict_order {
+        order.push("running windows close to a limit");
+    }
     order.push("the most room");
     let _ = writeln!(out, "\n{DIM}Order: {}.{RESET}", order.join(", then "));
     out
