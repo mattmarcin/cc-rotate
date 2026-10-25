@@ -15,7 +15,7 @@ use crate::{plan, time};
 pub struct AccountView {
     #[serde(flatten)]
     pub account: Account,
-    /// "Max 5x", "Team Premium", "Pro", or the raw subscription type.
+    /// "Max 5x", "Max 20x", "Team 5x", "Pro", or the raw subscription type.
     pub plan: Option<String>,
     /// Every window of the latest reading, as it stands now (0 once a window has reset).
     pub windows: Vec<WindowUsage>,
