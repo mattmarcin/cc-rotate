@@ -1125,13 +1125,15 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
     // active account's: it keeps the login it has stored.
     let foreign = store.meta(META_PROFILE_FOREIGN)?.as_deref() == Some("1");
     // The login identified above may have changed since, while this swap checked accounts (a
-    // renewal, or a `/login`): identified first, by the next swap request.
+    // renewal, or a `/login`): identified first, by the next swap request. Only a change nobody
+    // has seen: one already dealt with must never hold every swap back.
     if let (Some(account), Some(oauth)) = (&active, &previous) {
         let fp = credfile::oauth_fingerprint(oauth);
         if !foreign
             && !credfile::is_dead(oauth)
             && fp.is_some()
             && fp != store.credential_meta(account.id)?.map(|m| m.refresh_fp)
+            && creds.change_marker()? != store.meta(META_CRED_SEEN)?
             && usage_check::identifies_logins(store, paths)?
         {
             return skip(
@@ -1295,6 +1297,9 @@ pub fn install_active_login(
     if store.active_account()?.map(|a| a.id) != Some(account_id) {
         return Ok(ActiveLogin::NoLongerActive);
     }
+    // Stored again under the swap lock: an identification of the profile's previous login may
+    // have stored that one over it meanwhile, and the profile and the store must agree.
+    store.save_credential(account_id, oauth, "login")?;
     write_profile_login(store, paths, oauth)?;
     Ok(ActiveLogin::Written)
 }
