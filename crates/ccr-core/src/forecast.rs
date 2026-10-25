@@ -175,6 +175,7 @@ mod tests {
     const T: Thresholds = Thresholds {
         session: 98.0,
         weekly: 98.0,
+        weekly_cap: None,
     };
     const POLICY: Policy = Policy {
         thresholds: T,
