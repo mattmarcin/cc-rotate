@@ -9,18 +9,29 @@ pub const PROFILE_DIR_NAME: &str = ".claude-rotate";
 ///
 /// `data_dir` holds cc-rotate's own state (store, locks, staging, backups).
 /// `profile_dir` is the Claude Code config directory (`CLAUDE_CONFIG_DIR`) that the pool backs.
+/// `home` is where the user's other Claude Code profiles (`~/.claude*`) are looked for.
 #[derive(Debug, Clone)]
 pub struct Paths {
     pub data_dir: PathBuf,
     pub profile_dir: PathBuf,
+    pub home: PathBuf,
 }
 
 impl Paths {
+    /// Paths for the user's home directory (empty when it cannot be determined, which finds no
+    /// other profiles).
     pub fn new(data_dir: impl Into<PathBuf>, profile_dir: impl Into<PathBuf>) -> Self {
         Self {
             data_dir: data_dir.into(),
             profile_dir: profile_dir.into(),
+            home: dirs::home_dir().unwrap_or_default(),
         }
+    }
+
+    /// Look for the other profiles in `home` instead (tests use a scratch directory).
+    pub fn with_home(mut self, home: impl Into<PathBuf>) -> Self {
+        self.home = home.into();
+        self
     }
 
     /// `CC_ROTATE_DATA_DIR`, else the platform's local data directory plus `cc-rotate`.

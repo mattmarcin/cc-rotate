@@ -12,6 +12,7 @@ pub mod login;
 pub mod paths;
 pub mod plan;
 pub mod profile_account;
+pub mod profile_usage;
 pub mod profiles;
 pub mod scheduler;
 pub mod secret;
@@ -21,6 +22,7 @@ pub mod statusline;
 pub mod store;
 pub mod swap;
 pub mod time;
+pub mod usage_report;
 
 use std::path::PathBuf;
 

@@ -26,6 +26,48 @@ pub fn span(secs: i64) -> String {
     }
 }
 
+/// Epoch seconds from an RFC 3339 timestamp (`2026-10-24T18:00:00Z`, with an optional fraction
+/// and offset), the form Claude Code's status line and usage readings use.
+pub fn parse_rfc3339(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    if b.len() < 19 || b[4] != b'-' || b[7] != b'-' || (b[10] != b'T' && b[10] != b' ') {
+        return None;
+    }
+    let n = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
+    let (y, mo, d, h, mi, se) = (
+        n(0..4)?,
+        n(5..7)?,
+        n(8..10)?,
+        n(11..13)?,
+        n(14..16)?,
+        n(17..19)?,
+    );
+    let mut rest = &s[19..];
+    if let Some(stripped) = rest.strip_prefix('.') {
+        let digits = stripped
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(stripped.len());
+        rest = &stripped[digits..];
+    }
+    let offset = match rest {
+        "" | "Z" | "z" => 0,
+        o if o.len() == 6 && (o.starts_with('+') || o.starts_with('-')) => {
+            let sign = if o.starts_with('-') { -1 } else { 1 };
+            sign * (o[1..3].parse::<i64>().ok()? * 3600 + o[4..6].parse::<i64>().ok()? * 60)
+        }
+        _ => return None,
+    };
+    // Days from civil (Howard Hinnant's algorithm).
+    let y = if mo <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (mo + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + h * 3600 + mi * 60 + se - offset)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -36,5 +78,18 @@ mod tests {
         assert_eq!(span(20), "1m");
         assert_eq!(span(3 * 3600 + 12 * 60), "3h 12m");
         assert_eq!(span(2 * 86_400 + 4 * 3600 + 5), "2d 4h");
+    }
+
+    #[test]
+    fn rfc3339_offsets() {
+        assert_eq!(parse_rfc3339("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(parse_rfc3339("1970-01-01T01:00:00+01:00"), Some(0));
+        assert_eq!(parse_rfc3339("2000-03-01T00:00:00.123Z"), Some(951_868_800));
+        // The usage endpoint's form: microseconds and a numeric offset.
+        assert_eq!(
+            parse_rfc3339("2026-10-25T05:00:00.147485+00:00"),
+            parse_rfc3339("2026-10-25T05:00:00Z")
+        );
+        assert_eq!(parse_rfc3339("garbage"), None);
     }
 }

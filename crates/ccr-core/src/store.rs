@@ -1039,22 +1039,33 @@ impl Store {
     }
 
     pub fn samples_since(&self, since_ms: i64) -> Result<Vec<Sample>> {
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT {SAMPLE_COLS} FROM samples WHERE ts >= ?1 ORDER BY ts, id"
+        self.samples_matching(None, since_ms)
+    }
+
+    /// One account's samples taken at or after `since_ms`, oldest first.
+    pub fn account_samples_since(&self, account_id: i64, since_ms: i64) -> Result<Vec<Sample>> {
+        self.samples_matching(Some(account_id), since_ms)
+    }
+
+    fn samples_matching(&self, account_id: Option<i64>, since_ms: i64) -> Result<Vec<Sample>> {
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT {SAMPLE_COLS} FROM samples
+             WHERE ts >= ?1 AND (?2 IS NULL OR account_id = ?2) ORDER BY ts, id"
         ))?;
         let mut samples: Vec<(i64, Sample)> = stmt
-            .query_map([since_ms], sample_from_row)?
+            .query_map(params![since_ms, account_id], sample_from_row)?
             .collect::<rusqlite::Result<_>>()?;
         let index: std::collections::HashMap<i64, usize> = samples
             .iter()
             .enumerate()
             .map(|(i, (id, _))| (*id, i))
             .collect();
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT w.sample_id, w.name, w.pct, w.resets_at FROM sample_windows w
-             JOIN samples s ON s.id = w.sample_id WHERE s.ts >= ?1 ORDER BY w.name",
+             JOIN samples s ON s.id = w.sample_id
+             WHERE s.ts >= ?1 AND (?2 IS NULL OR s.account_id = ?2) ORDER BY w.name",
         )?;
-        let rows = stmt.query_map([since_ms], |r| {
+        let rows = stmt.query_map(params![since_ms, account_id], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 SampleWindow {

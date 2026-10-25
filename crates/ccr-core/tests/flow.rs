@@ -25,9 +25,12 @@ impl Env {
         let root = tempfile::tempdir().unwrap();
         let data = root.path().join("data");
         let profile = root.path().join("profile");
+        let home = root.path().join("home");
         std::fs::create_dir_all(&profile).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
         Env {
-            paths: Paths::new(data, profile),
+            // The user's other profiles are looked for in a scratch home, never the real one.
+            paths: Paths::new(data, profile).with_home(home),
             _root: root,
         }
     }
@@ -814,4 +817,127 @@ fn background_sync_switches_back_too() {
         }
     );
     assert!(statusline::sync(&store, &env.paths).unwrap().is_none());
+}
+
+/// A status line reading of only the 5-hour window.
+fn five_hour_input(pct: f64, resets_at: i64) -> StatusInput {
+    StatusInput::parse(&format!(
+        r#"{{"session_id":"s","rate_limits":{{"five_hour":{{"used_percentage":{pct},"resets_at":{resets_at}}}}}}}"#
+    ))
+}
+
+/// The account swapped to turns out to be used up already (another profile used it since its
+/// last reading). It is left on the next reading instead of after the swap cooldown, and only
+/// while it has not had a reading below its threshold since it became active.
+#[test]
+fn an_account_found_used_up_after_a_swap_is_left_at_once() {
+    let env = Env::new();
+    let (store, a, b, c) = pool(&env);
+    let threshold = |from| SwapRequest {
+        from: Some(from),
+        to: None,
+        reason: Reason::FiveHour,
+        wait: false,
+    };
+    store
+        .record_sample(&five_only(a, 99.0, time::now_s() + 1800, time::now_ms()))
+        .unwrap();
+    assert!(matches!(
+        swap::run(&store, &env.paths, &threshold(a)).unwrap(),
+        SwapOutcome::Swapped { to, .. } if to == b
+    ));
+
+    let now = time::now_ms();
+    let tick = statusline::tick(
+        &store,
+        &env.paths,
+        &five_hour_input(100.0, time::now_s() + 7200),
+        now,
+    )
+    .unwrap();
+    let req = tick
+        .swap
+        .expect("a used-up account is left within the cooldown");
+    assert_eq!(req.reason, Reason::FiveHour);
+    assert_eq!(
+        swap::run(&store, &env.paths, &req).unwrap(),
+        SwapOutcome::Swapped {
+            from: Some(b),
+            to: c
+        }
+    );
+    let event = store.last_event_of(kind::SWAP).unwrap().unwrap();
+    assert_eq!(event.detail.unwrap()["arrived_over_limit"], true);
+
+    // c is fine at first and only then reaches its threshold: that is ordinary use, and the
+    // cooldown applies.
+    let resets = time::now_s() + 9000;
+    statusline::tick(
+        &store,
+        &env.paths,
+        &five_hour_input(40.0, resets),
+        now + 1000,
+    )
+    .unwrap();
+    let tick = statusline::tick(
+        &store,
+        &env.paths,
+        &five_hour_input(99.0, resets),
+        now + 40_000,
+    )
+    .unwrap();
+    assert!(tick.swap.is_none(), "within the cooldown");
+    assert_eq!(
+        swap::run(&store, &env.paths, &threshold(c)).unwrap(),
+        SwapOutcome::Skipped {
+            why: "within the swap cooldown".into()
+        }
+    );
+}
+
+/// An agent used account b up in b's own profile, so b's last reading in the pool is out of date.
+/// Claude Code's cached `/usage` reading in that profile says so, and the swap goes to c.
+#[test]
+fn a_swap_skips_an_account_its_own_profile_used_up() {
+    let env = Env::new();
+    let (store, _, b, c) = pool(&env);
+    store
+        .record_sample(&five_only(
+            b,
+            10.0,
+            time::now_s() + 3600,
+            time::now_ms() - 3_600_000,
+        ))
+        .unwrap();
+    let profile = env.paths.home.join(".claude-b");
+    std::fs::create_dir_all(&profile).unwrap();
+    let fetched_at = time::now_ms() - 60_000;
+    std::fs::write(
+        profile.join(".claude.json"),
+        json!({
+            "oauthAccount": {"accountUuid": "ub", "emailAddress": "ub@x.test"},
+            "cachedUsageUtilization": {
+                "fetchedAtMs": fetched_at,
+                "accountUuid": "ub",
+                "utilization": {"limits": [{
+                    "kind": "session", "percent": 100,
+                    "resets_at": "2099-01-01T00:00:00Z"
+                }]}
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        swap::run(&store, &env.paths, &manual(None)).unwrap(),
+        SwapOutcome::Swapped {
+            from: Some(store.account_by_label("a").unwrap().unwrap().id),
+            to: c
+        }
+    );
+    let reading = store.last_sample(b).unwrap().unwrap();
+    assert_eq!(reading.profile, ".claude-b");
+    assert_eq!(reading.ts, fetched_at);
+    assert_eq!(reading.windows[0].pct, 100.0);
 }

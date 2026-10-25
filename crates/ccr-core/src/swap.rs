@@ -117,6 +117,23 @@ pub fn next_target(store: &Store, exclude: Option<i64>) -> Result<Option<Account
     Ok(scheduler::pick(&pool, policy, exclude).map(|c| c.account.clone()))
 }
 
+/// Whether the active account was already over a threshold when it became active: it has
+/// readings since then, and every one of them has a window that applies at or above its
+/// threshold. Its last reading before the swap was out of date, for example because another
+/// profile used it meanwhile. `scheduler::Timing::leaves_at_once` lets such an account go
+/// without waiting out the swap cooldown.
+pub fn arrived_over_limit(store: &Store, account_id: i64, now_ms: i64) -> Result<bool> {
+    let policy = Policy::from(&store.settings()?);
+    let model = store.meta(META_PROFILE_MODEL)?;
+    let samples = store.account_samples_since(account_id, active_since(store)?)?;
+    Ok(!samples.is_empty()
+        && samples.iter().all(|s| {
+            scheduler::window_usage(Some(s), now_ms / 1000, policy.thresholds, model.as_deref())
+                .iter()
+                .any(scheduler::WindowUsage::blocking)
+        }))
+}
+
 /// When the active account became active (epoch ms), falling back to the last swap for stores
 /// written before this was recorded.
 pub fn active_since(store: &Store) -> Result<i64> {
@@ -150,11 +167,19 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
             return skip(store, req, "the active account already changed");
         }
     }
+    let mut arrived_full = false;
     if req.reason.respects_cooldown() {
         if let Some(last) = store.meta_i64(META_LAST_SWAP_AT)? {
             let cooldown_ms = settings.swap_cooldown_s * 1000;
             if now - last < cooldown_ms {
-                return skip(store, req, "within the swap cooldown");
+                arrived_full = req.reason.is_threshold()
+                    && match active_id {
+                        Some(id) => arrived_over_limit(store, id, now)?,
+                        None => false,
+                    };
+                if !arrived_full {
+                    return skip(store, req, "within the swap cooldown");
+                }
             }
         }
     }
@@ -167,6 +192,10 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
             "the active account has not been in use long enough to switch back",
         );
     }
+
+    // What the user's other profiles read since, so an account an agent used up there is not
+    // picked. Best effort: an unreadable profile must not stop the swap.
+    let _ = crate::profile_usage::import(store, paths, now);
 
     let now_s = now / 1000;
     let (pool, policy) = load_pool(store, now_s)?;
@@ -312,6 +341,9 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
         }
         if let Some(why) = &why {
             detail["why"] = json!(why);
+        }
+        if arrived_full {
+            detail["arrived_over_limit"] = json!(true);
         }
         s.log_event(
             kind::SWAP,

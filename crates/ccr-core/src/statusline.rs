@@ -11,7 +11,6 @@ use anyhow::Result;
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 
-use crate::credfile;
 use crate::paths::Paths;
 use crate::profile_account;
 use crate::scheduler::{self, Reason, Timing};
@@ -20,6 +19,7 @@ use crate::swap::{
     self, META_ACTIVE_SINCE, META_CRED_SEEN, META_LAST_SWAP_AT, META_LAST_SWAP_FROM_RESETS,
     META_PROFILE_FOREIGN, META_PROFILE_MODEL, SwapRequest,
 };
+use crate::{credfile, time};
 
 pub const META_LAST_TICK_AT: &str = "statusline_last_tick_at";
 pub const META_LAST_TICK_HAD_USAGE: &str = "statusline_last_tick_had_usage";
@@ -85,50 +85,9 @@ fn epoch_seconds<'de, D: Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Erro
             .parse::<f64>()
             .ok()
             .map(|n| n as i64)
-            .or_else(|| parse_iso8601(&s)),
+            .or_else(|| time::parse_rfc3339(&s)),
         None => None,
     })
-}
-
-/// Minimal RFC 3339 parser (`2026-10-24T18:00:00Z`, optional fraction and offset).
-fn parse_iso8601(s: &str) -> Option<i64> {
-    let b = s.as_bytes();
-    if b.len() < 19 || b[4] != b'-' || b[7] != b'-' || (b[10] != b'T' && b[10] != b' ') {
-        return None;
-    }
-    let n = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
-    let (y, mo, d, h, mi, se) = (
-        n(0..4)?,
-        n(5..7)?,
-        n(8..10)?,
-        n(11..13)?,
-        n(14..16)?,
-        n(17..19)?,
-    );
-    let mut rest = &s[19..];
-    if let Some(stripped) = rest.strip_prefix('.') {
-        let digits = stripped
-            .find(|c: char| !c.is_ascii_digit())
-            .unwrap_or(stripped.len());
-        rest = &stripped[digits..];
-    }
-    let offset = match rest {
-        "" | "Z" | "z" => 0,
-        o if o.len() == 6 && (o.starts_with('+') || o.starts_with('-')) => {
-            let sign = if o.starts_with('-') { -1 } else { 1 };
-            sign * (o[1..3].parse::<i64>().ok()? * 3600 + o[4..6].parse::<i64>().ok()? * 60)
-        }
-        _ => return None,
-    };
-    // Days from civil (Howard Hinnant's algorithm).
-    let y = if mo <= 2 { y - 1 } else { y };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let mp = (mo + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    Some(days * 86_400 + h * 3600 + mi * 60 + se - offset)
 }
 
 impl StatusInput {
@@ -211,8 +170,8 @@ pub fn tick(store: &Store, paths: &Paths, input: &StatusInput, now_ms: i64) -> R
     }
 
     let (pool, policy) = swap::load_pool(store, now_ms / 1000)?;
-    if let Some(reason) = scheduler::decide(&pool, policy, timing(store, now_ms)?, dead_login, true)
-    {
+    let timing = timing(store, active.id, now_ms)?;
+    if let Some(reason) = scheduler::decide(&pool, policy, timing, dead_login, true) {
         if reason != Reason::PreferredAvailable {
             result.pool_exhausted = scheduler::pick(&pool, policy, Some(active.id)).is_none();
         }
@@ -235,18 +194,24 @@ pub fn tick(store: &Store, paths: &Paths, input: &StatusInput, now_ms: i64) -> R
     Ok(result)
 }
 
-/// The throttling state a decision needs: the last swap, the last request, and how long the
-/// active account has been active.
-fn timing(store: &Store, now_ms: i64) -> Result<Timing> {
+/// The throttling state a decision needs: the last swap, the last request, how long the active
+/// account has been active, and whether it was already over a threshold when it became active.
+fn timing(store: &Store, active_id: i64, now_ms: i64) -> Result<Timing> {
     let settings = store.settings()?;
-    Ok(Timing {
+    let mut timing = Timing {
         now_ms,
         last_swap_ms: store.meta_i64(META_LAST_SWAP_AT)?.unwrap_or(0),
         active_since_ms: swap::active_since(store)?,
         last_request_ms: store.meta_i64(META_SWAP_REQUESTED_AT)?.unwrap_or(0),
         cooldown_ms: settings.swap_cooldown_s * 1000,
         dwell_ms: settings.switch_back_dwell_s * 1000,
-    })
+        arrived_over_limit: false,
+    };
+    // Only matters during the cooldown, which keeps the readings to look at few.
+    if timing.cooling_down() {
+        timing.arrived_over_limit = swap::arrived_over_limit(store, active_id, now_ms)?;
+    }
+    Ok(timing)
 }
 
 /// Observe-only tick for a profile outside the pool: record a sample for whichever pool
@@ -299,10 +264,11 @@ fn is_stale_reading(store: &Store, sample: &Sample, now_ms: i64) -> Result<bool>
 }
 
 /// Write-back outside a statusline tick, for callers that run while no interactive session
-/// does (the desktop app's watcher, `cc-rotate-ctl status`). Returns a swap request when the
-/// profile's login turned out to be dead, or when a better ranked account is usable again
-/// (the same switch-back rule and throttling as a tick, but no threshold triggers, since
-/// those need a live reading).
+/// does (the desktop app's watcher, `cc-rotate-ctl status`). It also records the usage the
+/// user's other profiles read (`profile_usage`), which the tick leaves out to stay within its
+/// time budget. Returns a swap request when the profile's login turned out to be dead, or when
+/// a better ranked account is usable again (the same switch-back rule and throttling as a tick,
+/// but no threshold triggers, since those need a live reading).
 pub fn sync(store: &Store, paths: &Paths) -> Result<Option<SwapRequest>> {
     sync_at(store, paths, crate::time::now_ms())
 }
@@ -310,12 +276,13 @@ pub fn sync(store: &Store, paths: &Paths) -> Result<Option<SwapRequest>> {
 pub fn sync_at(store: &Store, paths: &Paths, now_ms: i64) -> Result<Option<SwapRequest>> {
     let mut dead_login = false;
     sync_profile_login(store, paths, &mut dead_login)?;
+    crate::profile_usage::import(store, paths, now_ms)?;
     let Some(active) = store.active_account()? else {
         return Ok(None);
     };
     let (pool, policy) = swap::load_pool(store, now_ms / 1000)?;
-    let Some(reason) = scheduler::decide(&pool, policy, timing(store, now_ms)?, dead_login, false)
-    else {
+    let timing = timing(store, active.id, now_ms)?;
+    let Some(reason) = scheduler::decide(&pool, policy, timing, dead_login, false) else {
         return Ok(None);
     };
     store.set_meta(META_SWAP_REQUESTED_AT, now_ms)?;
@@ -498,13 +465,5 @@ mod tests {
     fn tolerates_garbage() {
         assert!(StatusInput::parse("not json").rate_limits.is_none());
         assert!(StatusInput::parse("{}").rate_limits.is_none());
-    }
-
-    #[test]
-    fn iso8601_offsets() {
-        assert_eq!(parse_iso8601("1970-01-01T00:00:00Z"), Some(0));
-        assert_eq!(parse_iso8601("1970-01-01T01:00:00+01:00"), Some(0));
-        assert_eq!(parse_iso8601("2000-03-01T00:00:00.123Z"), Some(951_868_800));
-        assert_eq!(parse_iso8601("garbage"), None);
     }
 }

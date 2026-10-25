@@ -13,7 +13,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::credstore::Credentials;
-use crate::paths::{self, Paths};
+use crate::paths::Paths;
 use crate::store::Store;
 use crate::{credfile, profile_account};
 
@@ -33,23 +33,35 @@ pub struct FoundProfile {
 
 /// The `.claude.json` that goes with a profile directory: the default profile (`~/.claude`)
 /// keeps it in the home directory, every other profile keeps it inside.
-pub fn config_file_for(dir: &Path) -> PathBuf {
-    match paths::home_dir() {
-        Ok(home) if is_default_profile(dir) && home.join(".claude.json").is_file() => {
-            home.join(".claude.json")
-        }
-        _ => dir.join(".claude.json"),
+pub fn config_file_for(dir: &Path, home: &Path) -> PathBuf {
+    if is_default_profile(dir, home) && home.join(".claude.json").is_file() {
+        home.join(".claude.json")
+    } else {
+        dir.join(".claude.json")
     }
 }
 
-/// Whether `dir` is the profile Claude Code uses when `CLAUDE_CONFIG_DIR` is unset.
-fn is_default_profile(dir: &Path) -> bool {
-    let default = paths::default_template_dir()
-        .ok()
-        .and_then(|d| dunce::canonicalize(d).ok());
-    dunce::canonicalize(dir)
-        .ok()
-        .is_some_and(|d| Some(d) == default)
+/// Whether `dir` is the profile Claude Code uses when `CLAUDE_CONFIG_DIR` is unset (`~/.claude`).
+pub fn is_default_profile(dir: &Path, home: &Path) -> bool {
+    let default = dunce::canonicalize(home.join(".claude")).ok();
+    default.is_some() && dunce::canonicalize(dir).ok() == default
+}
+
+/// Every `.claude*` directory in the home directory other than the rotation profile, sorted.
+pub fn profile_dirs(rotation: &Paths) -> Result<Vec<PathBuf>> {
+    let rotation_dir = dunce::canonicalize(&rotation.profile_dir).ok();
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(&rotation.home)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with(".claude"))
+        })
+        .filter(|p| dunce::canonicalize(p).ok() != rotation_dir)
+        .collect();
+    dirs.sort();
+    Ok(dirs)
 }
 
 pub fn short_name(dir: &Path) -> String {
@@ -67,34 +79,19 @@ pub fn short_name(dir: &Path) -> String {
 /// Every `.claude*` profile in the home directory, other than the rotation profile, that knows
 /// which account it belongs to. Profiles naming the same account are listed once.
 pub fn discover(store: &Store, rotation: &Paths) -> Result<Vec<FoundProfile>> {
-    discover_in(store, rotation, &paths::home_dir()?)
-}
-
-pub fn discover_in(store: &Store, rotation: &Paths, home: &Path) -> Result<Vec<FoundProfile>> {
-    let rotation_dir = dunce::canonicalize(&rotation.profile_dir).ok();
-    let mut dirs: Vec<PathBuf> = std::fs::read_dir(home)?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .is_some_and(|n| n.to_string_lossy().starts_with(".claude"))
-        })
-        .collect();
-    dirs.sort();
-
+    let home = &rotation.home;
     let mut found: Vec<FoundProfile> = Vec::new();
-    for dir in dirs {
-        if dunce::canonicalize(&dir).ok() == rotation_dir {
-            continue;
-        }
-        let Some(ident) = profile_account::read(&config_file_for(&dir)).ok().flatten() else {
+    for dir in profile_dirs(rotation)? {
+        let Some(ident) = profile_account::read(&config_file_for(&dir, home))
+            .ok()
+            .flatten()
+        else {
             continue;
         };
         if ident.email.is_none() && ident.account_uuid.is_none() {
             continue;
         }
-        let oauth = Credentials::new(&dir, is_default_profile(&dir))
+        let oauth = Credentials::new(&dir, is_default_profile(&dir, home))
             .read_oauth()
             .ok()
             .flatten();
@@ -186,9 +183,10 @@ mod tests {
         store
             .insert_account("home-acct", &ident, AccountState::Parked)
             .unwrap();
-        let rotation = Paths::new(home.path().join("data"), home.path().join(".claude-rotate"));
+        let rotation = Paths::new(home.path().join("data"), home.path().join(".claude-rotate"))
+            .with_home(home.path());
 
-        let found = discover_in(&store, &rotation, home.path()).unwrap();
+        let found = discover(&store, &rotation).unwrap();
         let names: Vec<_> = found.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(
             names,

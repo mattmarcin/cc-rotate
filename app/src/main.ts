@@ -147,6 +147,27 @@ const blocking = (a: AccountView) => a.windows.some((w) => w.applies && w.pct >=
 /** No weekly limit: the 5-hour window is what runs out. */
 const noWeekly = (a: AccountView) => a.weekly.effective === "none";
 
+/** The other profile a reading came from, by its short name ("work" for `.claude-work`). */
+function readIn(source: string | null): string | null {
+  if (!source || source === "rotate") return null;
+  if (source === ".claude") return "main";
+  return source.replace(/^\.claude-/, "").replace(/^\./, "");
+}
+
+/** "read 5m ago", or "read 5m ago in work" for a reading another profile reported. */
+function readText(a: AccountView): string {
+  if (!a.last_sample_at) return "never read";
+  const other = readIn(a.last_sample_source);
+  return `read ${ago(a.last_sample_at)}${other ? ` in ${other}` : ""}`;
+}
+
+function readTitle(a: AccountView): string {
+  if (!a.last_sample_at) return "";
+  const other = readIn(a.last_sample_source);
+  const at = new Date(a.last_sample_at).toLocaleString();
+  return other ? `${at}, from the ${other} profile` : at;
+}
+
 const WEEKLY_TEXT = { none: "no weekly limit", unknown: "not known yet", has: "has a weekly limit" } as const;
 
 function level(used: number, threshold: number): "ok" | "warn" | "over" {
@@ -581,8 +602,8 @@ function renderAccounts() {
         h("span", { class: `badge ${a.state}${a.state === "parked" && !a.eligible ? " resting" : ""}` }, stateText(a)),
         h(
           "div",
-          { class: "muted updated", title: a.last_sample_at ? new Date(a.last_sample_at).toLocaleString() : "" },
-          a.last_sample_at ? `read ${ago(a.last_sample_at)}` : "never read",
+          { class: "muted updated", title: readTitle(a) },
+          readText(a),
         ),
       ),
       h("td", null, meter(fiveOf(a), !!a.last_sample_at)),
@@ -691,8 +712,11 @@ function describe(e: EventRow): { parts: Child[]; tone?: "warn" | "danger" } {
     case "swap": {
       const pick = detail("pick");
       const why = pick ? h("small", { class: "why" }, `Picked: ${pick}`) : null;
+      const arrived = e.detail?.arrived_over_limit
+        ? h("small", { class: "why" }, `${labelOf(e.account_from)} was already at this limit when cc-rotate switched to it.`)
+        : null;
       return e.account_from
-        ? { parts: ["Swapped from ", from, " to ", to, ` ${REASONS[e.reason ?? ""] ?? ""}`.trimEnd(), why] }
+        ? { parts: ["Swapped from ", from, " to ", to, ` ${REASONS[e.reason ?? ""] ?? ""}`.trimEnd(), arrived, why] }
         : { parts: ["Started using ", to, why] };
     }
     case "swap_skipped":
