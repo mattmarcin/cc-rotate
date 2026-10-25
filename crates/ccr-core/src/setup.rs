@@ -7,6 +7,7 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use crate::credfile;
+use crate::herdr;
 use crate::paths;
 use crate::store::Store;
 
@@ -258,15 +259,41 @@ fn build_settings(
     let hooks = hooks
         .as_object_mut()
         .context("settings.hooks is not an object")?;
-    let stop_failure = hooks.entry("StopFailure").or_insert_with(|| json!([]));
-    let list = stop_failure
-        .as_array_mut()
-        .context("settings.hooks.StopFailure is not an array")?;
-    list.retain(|group| !group.to_string().contains("cc-rotate-ctl"));
-    list.push(json!({
-        "hooks": [{ "type": "command", "command": format!("{ctl} hook stop-failure"), "timeout": 60 }]
-    }));
+    set_ctl_hook(
+        hooks,
+        "StopFailure",
+        json!({
+            "hooks": [{ "type": "command", "command": format!("{ctl} hook stop-failure"), "timeout": 60 }]
+        }),
+    )?;
+    // Reports `cc-rotate --resume <id>` to herdr when the session runs in a herdr pane (spec
+    // section 19); outside herdr it exits at once.
+    set_ctl_hook(
+        hooks,
+        "SessionStart",
+        json!({
+            "matcher": herdr::SESSION_START_MATCHER,
+            "hooks": [{
+                "type": "command",
+                "command": format!("{ctl} {}", herdr::SESSION_START_HOOK_ARGS),
+                "timeout": 10
+            }]
+        }),
+    )?;
     Ok((settings, downstream))
+}
+
+/// Make `group` the only hook group for `event` that runs `cc-rotate-ctl`, keeping every other
+/// group (the user's own hooks, herdr's) as it was.
+fn set_ctl_hook(hooks: &mut Map<String, Value>, event: &str, group: Value) -> Result<()> {
+    let list = hooks
+        .entry(event)
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .with_context(|| format!("settings.hooks.{event} is not an array"))?;
+    list.retain(|g| !g.to_string().contains("cc-rotate-ctl"));
+    list.push(group);
+    Ok(())
 }
 
 /// The executable as it should appear at the start of a statusline or hook command.
@@ -603,6 +630,56 @@ mod tests {
         assert_eq!(remove_block("Set-Alias x y\n"), None);
     }
 
+    /// The SessionStart hook joins herdr's (and the user's) hooks, and rebuilding from a template
+    /// that already has cc-rotate's hooks (or an older version of them) leaves exactly one of each.
+    #[test]
+    fn session_start_hook_is_added_once_beside_herdr() {
+        let root = tempfile::tempdir().unwrap();
+        let template = root.path().join("tpl");
+        let profile = root.path().join("rot");
+        std::fs::create_dir_all(&template).unwrap();
+        let herdr_group = json!({
+            "matcher": "^(startup|resume|clear|compact|fork)$",
+            "hooks": [{
+                "type": "command",
+                "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"C:\\x\\.claude\\hooks\\herdr-agent-state.ps1\" session",
+                "timeout": 10
+            }]
+        });
+        let user_group =
+            json!({"matcher": "startup", "hooks": [{"type": "command", "command": "echo hi"}]});
+        let stale_ctl = json!({"hooks": [{"type": "command", "command": "/old/cc-rotate-ctl hook session-start", "timeout": 5}]});
+        std::fs::write(
+            template.join("settings.json"),
+            json!({"hooks": {"SessionStart": [herdr_group, user_group, stale_ctl]}}).to_string(),
+        )
+        .unwrap();
+        let ctl = if cfg!(windows) {
+            r"C:\bin\cc-rotate-ctl.exe"
+        } else {
+            "/opt/bin/cc-rotate-ctl"
+        };
+        let ctl_cmd = command_path(Path::new(ctl));
+        let rewrite = PathRewriter::new(&template, &profile);
+
+        let (first, _) = build_settings(&template, &rewrite, Path::new(ctl)).unwrap();
+        let expected_ctl = json!({
+            "matcher": herdr::SESSION_START_MATCHER,
+            "hooks": [{"type": "command", "command": format!("{ctl_cmd} hook session-start"), "timeout": 10}]
+        });
+        assert_eq!(
+            first["hooks"]["SessionStart"],
+            json!([herdr_group, user_group, expected_ctl])
+        );
+        assert!(herdr::session_start_hook_installed(&first));
+        assert_eq!(first["hooks"]["StopFailure"].as_array().unwrap().len(), 1);
+
+        // Rebuilding from settings that already carry cc-rotate's hooks changes nothing.
+        std::fs::write(template.join("settings.json"), first.to_string()).unwrap();
+        let (second, _) = build_settings(&template, &rewrite, Path::new(ctl)).unwrap();
+        assert_eq!(second, first);
+    }
+
     #[test]
     fn setup_builds_profile() {
         let root = tempfile::tempdir().unwrap();
@@ -679,6 +756,10 @@ mod tests {
             settings["hooks"]["StopFailure"][0]["hooks"][0]["command"],
             format!("{ctl_cmd} hook stop-failure")
         );
+        assert_eq!(
+            settings["hooks"]["SessionStart"][1]["hooks"][0]["command"],
+            format!("{ctl_cmd} hook session-start")
+        );
         let config: Value =
             serde_json::from_str(&std::fs::read_to_string(profile.join(".claude.json")).unwrap())
                 .unwrap();
@@ -712,6 +793,10 @@ mod tests {
         )
         .unwrap();
         assert!(again.mcp_servers.is_empty());
+        let rebuilt: Value =
+            serde_json::from_str(&std::fs::read_to_string(profile.join("settings.json")).unwrap())
+                .unwrap();
+        assert_eq!(rebuilt["hooks"], settings["hooks"], "--force is idempotent");
         let merged: Value =
             serde_json::from_str(&std::fs::read_to_string(profile.join(".claude.json")).unwrap())
                 .unwrap();
