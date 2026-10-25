@@ -267,10 +267,10 @@ fn is_stale_reading(store: &Store, sample: &Sample, now_ms: i64) -> Result<bool>
         return Ok(false);
     }
     let old = swap::left_resets(store)?;
-    Ok(sample
-        .windows
-        .iter()
-        .any(|w| w.resets_at.is_some_and(|r| old.contains(&r))))
+    Ok(sample.windows.iter().any(|w| {
+        w.resets_at
+            .is_some_and(|r| old.iter().any(|&o| swap::same_reset(o, r)))
+    }))
 }
 
 /// Write-back outside a statusline tick, for callers that run while no interactive session

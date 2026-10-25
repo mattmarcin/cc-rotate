@@ -147,7 +147,7 @@ pub enum Attribution {
 /// a reset time differently.
 const SAME_RESET_S: i64 = 60;
 
-fn same_reset(a: i64, b: i64) -> bool {
+pub fn same_reset(a: i64, b: i64) -> bool {
     (a - b).abs() <= SAME_RESET_S
 }
 
@@ -177,7 +177,11 @@ pub fn note_known_resets(
         .filter_map(|w| w.resets_at)
         .filter(|&r| r > now_s)
         .collect();
-    if fresh.is_empty() {
+    let known = known_resets(store, account_id, now_s)?;
+    if fresh
+        .iter()
+        .all(|&r| known.iter().any(|&k| same_reset(k, r)))
+    {
         return Ok(());
     }
     store.immediate(|s| {
@@ -203,36 +207,63 @@ pub fn attribute(
     active_id: i64,
     now_s: i64,
 ) -> Result<Attribution> {
-    let mut others: Vec<i64> = Vec::new();
-    for account in store.accounts()? {
-        if account.id != active_id {
-            if let Some(last) = store.last_sample(account.id)? {
-                others.extend(
-                    last.windows
-                        .iter()
-                        .filter_map(|w| w.resets_at)
-                        .filter(|&r| r > now_s),
-                );
-            }
-        }
-    }
+    let others = others_latest(store, active_id)?;
+    let other_resets: Vec<i64> = others
+        .iter()
+        .flat_map(|s| &s.windows)
+        .filter_map(|w| w.resets_at)
+        .filter(|&r| r > now_s)
+        .collect();
     let resets: Vec<i64> = sample.windows.iter().filter_map(|w| w.resets_at).collect();
     let among = |set: &[i64]| {
         resets
             .iter()
             .any(|&r| set.iter().any(|&k| same_reset(k, r)))
     };
-    if !among(&others) {
+    if !among(&other_resets) {
         return Ok(Attribution::Own);
     }
     let own = known_resets(store, active_id, now_s)?;
-    Ok(if among(&own) {
-        Attribution::Own
-    } else if own.is_empty() {
-        Attribution::Ambiguous
-    } else {
-        Attribution::Elsewhere
-    })
+    if !among(&own) {
+        return Ok(if own.is_empty() {
+            Attribution::Ambiguous
+        } else {
+            Attribution::Elsewhere
+        });
+    }
+    // Reset times are aligned, so another account's can be the active one's too; then the
+    // values decide. A session still showing another account repeats that account's latest
+    // reading exactly; a genuine reading of the active account is that only by coincidence.
+    if copies_another(sample, &others) {
+        let active_latest = store.last_sample(active_id)?;
+        let is_active_latest =
+            active_latest.is_some_and(|l| crate::store::same_windows(&l.windows, &sample.windows));
+        if !is_active_latest {
+            return Ok(Attribution::Elsewhere);
+        }
+    }
+    Ok(Attribution::Own)
+}
+
+/// The latest reading of every account other than `account_id`.
+pub fn others_latest(store: &Store, account_id: i64) -> Result<Vec<Sample>> {
+    let mut out = Vec::new();
+    for account in store.accounts()? {
+        if account.id != account_id {
+            if let Some(last) = store.last_sample(account.id)? {
+                out.push(last);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Whether a reading repeats one of these readings exactly (same windows, reset times and
+/// percentages): what a session still showing that account reports.
+pub fn copies_another(sample: &Sample, others: &[Sample]) -> bool {
+    others
+        .iter()
+        .any(|o| crate::store::same_windows(&o.windows, &sample.windows))
 }
 
 /// The reset times the stale-reading guard currently knows (`META_LAST_SWAP_FROM_RESETS`).
@@ -271,9 +302,10 @@ pub fn arrived_over_limit(store: &Store, account_id: i64, now_ms: i64) -> Result
         .account_samples_since(account_id, active_since(store)?)?
         .into_iter()
         .filter(|s| {
-            !s.windows
-                .iter()
-                .any(|w| w.resets_at.is_some_and(|r| others.contains(&r)))
+            !s.windows.iter().any(|w| {
+                w.resets_at
+                    .is_some_and(|r| others.iter().any(|&o| same_reset(o, r)))
+            })
         })
         .collect();
     Ok(!own.is_empty()
