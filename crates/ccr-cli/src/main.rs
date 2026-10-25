@@ -125,7 +125,7 @@ enum Command {
     /// Show the status and recent events live, until you press q.
     ///
     /// Redraws in place every few seconds. Read-only: it never swaps, syncs logins or starts
-    /// Claude Code. Piped, it prints the status once.
+    /// Claude Code. Without a terminal for input and output, it prints the status once.
     Watch {
         /// Seconds between redraws.
         #[arg(long, value_name = "SECONDS", default_value_t = 2,
