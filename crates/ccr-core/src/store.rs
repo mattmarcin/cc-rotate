@@ -1278,37 +1278,6 @@ impl Store {
         Ok(Some(sample))
     }
 
-    /// The latest reading one session reported for an account at or after `since_ms`.
-    pub fn session_sample_since(
-        &self,
-        session_id: &str,
-        account_id: i64,
-        since_ms: i64,
-    ) -> Result<Option<Sample>> {
-        let row = self
-            .conn
-            .query_row(
-                &format!(
-                    "SELECT {SAMPLE_COLS} FROM samples
-                     WHERE account_id = ?1 AND ts >= ?2 AND session_id = ?3
-                     ORDER BY ts DESC, id DESC LIMIT 1"
-                ),
-                params![account_id, since_ms, session_id],
-                sample_from_row,
-            )
-            .optional()?;
-        let Some((id, mut sample)) = row else {
-            return Ok(None);
-        };
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT name, pct, resets_at FROM sample_windows WHERE sample_id = ?1 ORDER BY name",
-        )?;
-        sample.windows = stmt
-            .query_map([id], window_from_row)?
-            .collect::<rusqlite::Result<_>>()?;
-        Ok(Some(sample))
-    }
-
     pub fn samples_since(&self, since_ms: i64) -> Result<Vec<Sample>> {
         self.samples_matching(None, since_ms)
     }

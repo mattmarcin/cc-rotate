@@ -56,12 +56,11 @@ pub enum WakeReason {
     LimitReset,
 }
 
-/// Whether to wake `ws` now. A session is woken on an account with room that the profile moved
-/// to since its turn stopped, or that a swap put in the profile just before (the turn's request
-/// still carried the previous account's login). It is never woken twice on one account in an
-/// episode of stops, so it cannot be woken in a loop, even while readings wrongly show room on
-/// several accounts. Once the limit that stopped it resets, Claude Code continues the session
-/// itself, unless the user turned that off: then cc-rotate wakes it.
+/// Whether to wake `ws` now. A session is woken on an account with room other than the one whose
+/// limit stopped its turn (`stopped_on`). It is never woken twice on one account in an episode
+/// of stops, so it cannot be woken in a loop, even while readings wrongly show room on several
+/// accounts. Once the limit that stopped it resets, Claude Code continues the session itself,
+/// unless the user turned that off: then cc-rotate wakes it.
 pub fn decide(store: &Store, paths: &Paths, ws: &WaitingSession, now_ms: i64) -> Result<Decision> {
     if now_ms - ws.since_ms >= MAX_WAIT_MS {
         return Ok(Decision::TimedOut);
@@ -72,7 +71,7 @@ pub fn decide(store: &Store, paths: &Paths, ws: &WaitingSession, now_ms: i64) ->
     if ws.woken_accounts.contains(&active.id) {
         return Ok(Decision::Wait);
     }
-    if ws.account_id != Some(active.id) || landed_just_before(store, active.id, ws.since_ms)? {
+    if ws.account_id != Some(active.id) {
         let (pool, _) = swap::load_pool(store, now_ms / 1000)?;
         let has_room = pool
             .iter()
@@ -91,32 +90,45 @@ pub fn decide(store: &Store, paths: &Paths, ws: &WaitingSession, now_ms: i64) ->
     Ok(Decision::Wait)
 }
 
-/// A swap from another account to `account_id` landed at most `LANDED_GRACE_MS` before
-/// `since_ms` (a first activation, from no account, does not count).
-fn landed_just_before(store: &Store, account_id: i64, since_ms: i64) -> Result<bool> {
-    Ok(store.last_event_of(kind::SWAP)?.is_some_and(|e| {
-        e.account_to == Some(account_id)
-            && e.account_from.is_some()
-            && e.ts >= since_ms - LANDED_GRACE_MS
-            && e.ts <= since_ms
-    }))
+/// The account whose limit stopped a turn when `active_id` was in the profile: the account a swap
+/// left at most `LANDED_GRACE_MS` before, when one landed on `active_id` then (the turn's request
+/// still carried that account's login), else `active_id`. A first activation, from no account,
+/// does not count.
+pub fn stopped_on(store: &Store, active_id: i64, since_ms: i64) -> Result<i64> {
+    Ok(store
+        .last_event_of(kind::SWAP)?
+        .filter(|e| {
+            e.account_to == Some(active_id)
+                && e.ts >= since_ms - LANDED_GRACE_MS
+                && e.ts <= since_ms
+        })
+        .and_then(|e| e.account_from)
+        .unwrap_or(active_id))
 }
 
-/// The limit that stopped the session has reset: the session's reading at the stop (else the
-/// account's first one since) was at a limit, and that limit's reset time has passed.
+/// The first reading of `account` taken at or after `since_ms` that is at a limit: the reading
+/// of a stop. Idle sessions repeat earlier numbers with a fresh time, so a reading with room says
+/// nothing about the stop.
+pub fn limit_reading_since(
+    store: &Store,
+    account: &Account,
+    since_ms: i64,
+) -> Result<Option<Sample>> {
+    for sample in store.account_samples_since(account.id, since_ms)? {
+        if blocking(store, account, &sample, sample.ts / 1000)? {
+            return Ok(Some(sample));
+        }
+    }
+    Ok(None)
+}
+
+/// The limit that stopped the session has reset: the stop's reading was at a limit, and that
+/// limit's reset time has passed.
 fn limit_reset(store: &Store, ws: &WaitingSession, account: &Account, now_ms: i64) -> Result<bool> {
-    let at_stop = match store.session_sample_since(&ws.session_id, account.id, ws.since_ms)? {
-        Some(s) => Some(s),
-        None => store
-            .account_samples_since(account.id, ws.since_ms)?
-            .into_iter()
-            .next(),
-    };
-    let Some(sample) = at_stop else {
+    let Some(sample) = limit_reading_since(store, account, ws.since_ms)? else {
         return Ok(false);
     };
-    let blocked_then = blocking(store, account, &sample, sample.ts / 1000)?;
-    Ok(blocked_then && !blocking(store, account, &sample, now_ms / 1000)?)
+    Ok(!blocking(store, account, &sample, now_ms / 1000)?)
 }
 
 /// Whether `sample` has a window at its threshold for `account` at `at_s` (a window counts as
@@ -218,7 +230,11 @@ pub fn note_reading(
     let Some(account) = store.account(account_id)? else {
         return Ok(());
     };
-    if blocking(store, &account, sample, now_ms / 1000)? {
+    // Room now, and already at the stop (or the wake): a session idling at a limit repeats its
+    // reading, which shows room once the limit's reset time passes, but not before it.
+    if blocking(store, &account, sample, after / 1000)?
+        || blocking(store, &account, sample, now_ms / 1000)?
+    {
         return Ok(());
     }
     store.immediate(|s| {

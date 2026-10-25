@@ -195,17 +195,26 @@ fn a_swap_that_landed_just_before_the_stop_wakes_at_once() {
     reading(&e.store, e.b, 10.0, now - 120_000);
     swap_to_b(&e);
     // The turn's request still carried a's login: it stops moments after the swap, with b in
-    // the profile.
+    // the profile, and the stop is a's.
     let since = time::now_ms() + 5_000;
-    let ws = e.store.start_waiting("s1", since, Some(e.b), None).unwrap();
+    let on = waiting::stopped_on(&e.store, e.b, since).unwrap();
+    assert_eq!(on, e.a);
+    let ws = e.store.start_waiting("s1", since, Some(on), None).unwrap();
     assert_eq!(
         woken(waiting::decide(&e.store, &e.paths, &ws, since).unwrap()).0,
+        e.b
+    );
+    // However long it waits (another swap may come and go), it stays a's stop.
+    assert_eq!(
+        woken(waiting::decide(&e.store, &e.paths, &ws, since + 600_000).unwrap()).0,
         e.b
     );
 
     // Long after the swap, a stop on b is b's own limit.
     let later = time::now_ms() + 600_000;
-    let ws = e.store.start_waiting("s2", later, Some(e.b), None).unwrap();
+    let on = waiting::stopped_on(&e.store, e.b, later).unwrap();
+    assert_eq!(on, e.b);
+    let ws = e.store.start_waiting("s2", later, Some(on), None).unwrap();
     waits(waiting::decide(&e.store, &e.paths, &ws, later).unwrap());
 }
 
@@ -217,8 +226,45 @@ fn a_first_activation_just_before_the_stop_is_no_reason_to_wake() {
     e.store
         .log_event(kind::SWAP, None, Some(e.a), Some("manual"), None)
         .unwrap();
-    let ws = stop(&e, "s1", time::now_ms() + 1_000);
+    let since = time::now_ms() + 1_000;
+    assert_eq!(waiting::stopped_on(&e.store, e.a, since).unwrap(), e.a);
+    let ws = stop(&e, "s1", since);
     waits(waiting::decide(&e.store, &e.paths, &ws, ws.since_ms).unwrap());
+}
+
+#[test]
+fn an_idle_session_repeating_its_limit_reading_after_the_reset_is_not_working() {
+    let e = env();
+    let now = time::now_ms();
+    stop(&e, "s1", now);
+    // Its at-limit reading, repeated by an idle tick two minutes after the limit reset: room
+    // now, but not at the stop, so the session is still stopped and its hook keeps waiting.
+    let resets = now / 1000 + 60;
+    let repeat = five_hour(e.a, Some("s1"), 100.0, now + 120_000, resets);
+    waiting::note_reading(&e.store, "s1", e.a, &repeat, now + 120_000).unwrap();
+    assert_eq!(
+        e.store.waiting_session("s1").unwrap().unwrap().state,
+        WaitingState::Waiting
+    );
+}
+
+#[test]
+fn the_reading_of_a_stop_is_the_first_at_a_limit_since() {
+    let e = env();
+    let now = time::now_ms();
+    let a = e.store.account(e.a).unwrap().unwrap();
+    // An idle session's pre-limit numbers, then the stop's reading.
+    reading(&e.store, e.a, 85.0, now + 1_000);
+    assert!(
+        waiting::limit_reading_since(&e.store, &a, now)
+            .unwrap()
+            .is_none()
+    );
+    reading(&e.store, e.a, 100.0, now + 2_000);
+    let found = waiting::limit_reading_since(&e.store, &a, now)
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.ts, now + 2_000);
 }
 
 #[test]

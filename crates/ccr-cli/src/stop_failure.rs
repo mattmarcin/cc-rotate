@@ -22,6 +22,10 @@ use crate::process;
 /// Exit code that makes Claude Code wake the session with the hook's stderr.
 const WAKE: u8 = 2;
 
+/// How long the hook waits when it cannot tell whether its session is still open (it found
+/// none of its parent processes).
+const UNWATCHED_MAX_WAIT_MS: i64 = 6 * 3600 * 1000;
+
 pub fn run(profile: Option<PathBuf>, input: &str) -> Result<ExitCode> {
     let payload: Value = serde_json::from_str(input).unwrap_or_default();
     if payload.get("error").and_then(Value::as_str) != Some("rate_limit") {
@@ -59,18 +63,23 @@ pub fn run(profile: Option<PathBuf>, input: &str) -> Result<ExitCode> {
 
     let now = time::now_ms();
     let recorded = store.immediate(|s| {
-        let ws = s.start_waiting(
-            session,
-            now,
-            active.as_ref().map(|a| a.id),
-            Some(waiting::this_hook()),
-        )?;
+        // The account whose limit stopped the turn: the one a swap just left, when the turn's
+        // request still carried its login.
+        let stopped_on = match &active {
+            Some(a) => Some(waiting::stopped_on(s, a.id, now)?),
+            None => None,
+        };
+        let ws = s.start_waiting(session, now, stopped_on, Some(waiting::this_hook()))?;
+        let label = match stopped_on {
+            Some(id) => s.account(id)?.map(|a| a.label),
+            None => None,
+        };
         s.log_event(
             kind::SESSION,
-            active.as_ref().map(|a| a.id),
+            stopped_on,
             None,
             Some("waiting"),
-            Some(json!({ "session": session, "label": active.as_ref().map(|a| &a.label) })),
+            Some(json!({ "session": session, "label": label })),
         )?;
         Ok(ws)
     });
@@ -91,7 +100,7 @@ pub fn run(profile: Option<PathBuf>, input: &str) -> Result<ExitCode> {
     let mut decision = decide(&store, &paths, &ws, now);
     if matches!(decision, Decision::Wait) {
         if let Some(a) = &active {
-            wait_for_reading(&store, a.id, now);
+            wait_for_limit_reading(&store, a, now);
         }
         decision = decide(&store, &paths, &ws, time::now_ms());
         if !matches!(decision, Decision::Wake(..)) {
@@ -99,13 +108,20 @@ pub fn run(profile: Option<PathBuf>, input: &str) -> Result<ExitCode> {
         }
     }
     loop {
-        match decision {
-            Decision::Wake(account, reason) => return wake(&store, &ws, &account, reason),
+        match &decision {
+            Decision::Wake(account, reason) => match wake(&store, &ws, account, *reason) {
+                Ok(code) => return Ok(code),
+                // Not recorded, so not woken: try again next time.
+                Err(e) => process::log_error("hook stop-failure", &e),
+            },
             Decision::TimedOut => return stop_waiting(&store, &ws),
             Decision::Wait => {}
         }
         std::thread::sleep(Duration::from_millis(waiting::POLL_MS));
-        if !session_alive.all_alive() {
+        // Without the processes to watch, a closed session cannot be told apart: wait less.
+        let unwatched_too_long =
+            session_alive.is_empty() && time::now_ms() - ws.since_ms >= UNWATCHED_MAX_WAIT_MS;
+        if !session_alive.all_alive() || unwatched_too_long {
             return stop_waiting(&store, &ws);
         }
         match still_ours(&store, &ws) {
@@ -131,13 +147,13 @@ fn decide(store: &Store, paths: &Paths, ws: &WaitingSession, now_ms: i64) -> Dec
     })
 }
 
-/// Wait, at most `waiting::READING_WAIT_MS`, for the status line to record a reading of the
-/// account taken since the stop.
-fn wait_for_reading(store: &Store, account_id: i64, since_ms: i64) {
+/// Wait, at most `waiting::READING_WAIT_MS`, for the status line to record the reading of the
+/// stop: one of the account, taken since, at a limit. Other sessions' idle readings do not count.
+fn wait_for_limit_reading(store: &Store, account: &Account, since_ms: i64) {
     let deadline = Instant::now() + Duration::from_millis(waiting::READING_WAIT_MS);
     while Instant::now() < deadline {
-        match store.last_sample(account_id) {
-            Ok(Some(s)) if s.ts >= since_ms => return,
+        match waiting::limit_reading_since(store, account, since_ms) {
+            Ok(Some(_)) => return,
             _ => std::thread::sleep(Duration::from_millis(250)),
         }
     }
@@ -164,6 +180,8 @@ fn stop_waiting(store: &Store, ws: &WaitingSession) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Wake the session, unless another process settled the stop first (the session is working
+/// again, or a later stop replaced it).
 fn wake(
     store: &Store,
     ws: &WaitingSession,
