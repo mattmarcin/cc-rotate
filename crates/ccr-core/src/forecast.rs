@@ -19,6 +19,9 @@ pub const HORIZON_S: i64 = 24 * 3600;
 const STEP_S: i64 = 300;
 /// The pace is measured over the last hour of readings.
 const PACE_WINDOW_MS: i64 = 60 * 60_000;
+/// Readings this far back give each 5-hour window's highest value before the hour, so the first
+/// fresh reading of the hour is not counted from a stale session's older value.
+const SEED_MS: i64 = 6 * 3_600_000;
 /// Use that started less than this long ago does not show a pace yet.
 const MIN_PACE_SPAN_MS: i64 = 15 * 60_000;
 const FIVE_HOUR_S: i64 = 5 * 3600;
@@ -39,17 +42,19 @@ pub struct Forecast {
 /// `None` while the readings show no use, or the use started less than `MIN_PACE_SPAN_MS` ago.
 ///
 /// Several sessions report the same account and an idle one keeps repeating its last values,
-/// so only rises above the highest reading of each 5-hour window count. The time runs from the
-/// first counted rise to now: background checks or other profiles' readings do not stretch it,
-/// and the pace fades once nothing is used any more.
+/// so only rises above the highest reading of each 5-hour window count, that highest reading
+/// known from before the hour too. Work is taken to have started the typical gap between rises
+/// before the first rise of the hour, and the pace is the use of the rises over the time from
+/// then to now: open idle sessions, background checks or other profiles' readings do not
+/// stretch it, and the pace fades once nothing is used any more.
 pub fn pace(store: &Store, rates: &Rates, now_ms: i64) -> Result<Option<f64>> {
-    let mut first = i64::MAX;
-    let mut usual_hours = 0.0;
+    // Every rise of the hour: when, and how many usual hours of use it shows.
+    let mut rises: Vec<(i64, f64)> = Vec::new();
     for account in store.accounts()? {
         let usual = rates.account(account.id).five_per_hour;
-        // The highest reading of the current window so far: (reset, percent, when).
-        let mut high: Option<(Option<i64>, f64, i64)> = None;
-        for s in store.account_samples_since(account.id, now_ms - PACE_WINDOW_MS)? {
+        // The highest reading of the current window so far: (reset, percent).
+        let mut high: Option<(Option<i64>, f64)> = None;
+        for s in store.account_samples_since(account.id, now_ms - SEED_MS)? {
             if s.ts > now_ms {
                 continue;
             }
@@ -57,26 +62,37 @@ pub fn pace(store: &Store, rates: &Rates, now_ms: i64) -> Result<Option<f64>> {
                 continue;
             };
             match high {
-                Some((reset, pct, at)) if same_reset(reset, w.resets_at) => {
+                Some((reset, pct)) if same_reset(reset, w.resets_at) => {
                     if w.pct > pct {
-                        usual_hours += (w.pct - pct) / usual;
-                        first = first.min(at);
-                        high = Some((reset, w.pct, s.ts));
+                        if s.ts >= now_ms - PACE_WINDOW_MS {
+                            rises.push((s.ts, (w.pct - pct) / usual));
+                        }
+                        high = Some((reset, w.pct));
                     }
                 }
                 // An older window: a stale session's reading.
-                Some((reset, _, _)) if older(w.resets_at, reset) => {}
-                _ => high = Some((w.resets_at, w.pct, s.ts)),
+                Some((reset, _)) if older(w.resets_at, reset) => {}
+                _ => high = Some((w.resets_at, w.pct)),
             }
         }
     }
-    let span = now_ms.saturating_sub(first);
-    if usual_hours <= 0.0 || span < MIN_PACE_SPAN_MS {
+    // What the first rise shows built up before it, while the readings repeated the value
+    // before (which an idle session does too): work is taken to have started the typical gap
+    // between rises before it. One rise alone shows no pace.
+    rises.sort_by_key(|&(ts, _)| ts);
+    if rises.len() < 2 {
         return Ok(None);
     }
-    Ok(Some(
-        usual_hours / (span.min(PACE_WINDOW_MS) as f64 / 3_600_000.0),
-    ))
+    let mut gaps: Vec<i64> = rises.windows(2).map(|r| r[1].0 - r[0].0).collect();
+    gaps.sort_unstable();
+    let typical = gaps[gaps.len() / 2];
+    let start = (rises[0].0 - typical).max(now_ms - PACE_WINDOW_MS);
+    let span = now_ms - start;
+    let used: f64 = rises.iter().map(|&(_, hours)| hours).sum();
+    if used <= 0.0 || span < MIN_PACE_SPAN_MS {
+        return Ok(None);
+    }
+    Ok(Some(used / (span as f64 / 3_600_000.0)))
 }
 
 /// Reset times this close are the same reset (the status line and `/usage` round differently).

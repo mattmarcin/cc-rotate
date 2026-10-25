@@ -211,7 +211,8 @@ fn status(app: &AppHandle, store: &Store, paths: &Paths, watch: &mut Watch) {
         }
         // Room again only when the pool would last well past the warning, so a forecast that
         // wavers around the hour does not warn again.
-        None if snap.forecast.is_none_or(|f| {
+        // No forecast at all (the pool already out, or idle) is no sign of room.
+        None if snap.forecast.is_some_and(|f| {
             f.runs_out_at
                 .is_none_or(|t| t - now_s > 2 * RUNNING_OUT_WARNING_S)
         }) =>

@@ -1936,3 +1936,78 @@ fn the_pace_ignores_an_idle_session_and_fades_when_work_stops() {
         .unwrap();
     assert!(later < pace * 0.8, "{later} vs {pace}");
 }
+
+/// An idle session repeating an older value of the window (20%) next to a working one (60% to
+/// 64% over 80 minutes), readings 15 seconds apart: the pace must not depend on which session's
+/// reading happens to be the oldest of the hour.
+#[test]
+fn the_pace_does_not_depend_on_which_reading_is_oldest() {
+    let env = Env::new();
+    let (store, a, _, _) = pool(&env);
+    let end = time::now_ms() - 60_000;
+    let reset = time::now_s() + 3 * 3600;
+    for quarter in 0..=320i64 {
+        let ts = end - (320 - quarter) * 15_000;
+        let (session, pct) = if quarter % 2 == 0 {
+            ("w", 60.0 + (4 * quarter / 320) as f64)
+        } else {
+            ("i", 20.0)
+        };
+        store
+            .record_sample(&Sample {
+                ts,
+                account_id: a,
+                profile: "rotate".into(),
+                session_id: Some(session.into()),
+                model: None,
+                windows: vec![window("five_hour", pct, reset)],
+            })
+            .unwrap();
+    }
+    let rates = ccr_core::budget::Rates::default();
+    let paces: Vec<f64> = [0, 5_000, 10_000, 20_000, 25_000]
+        .iter()
+        .map(|d| {
+            ccr_core::forecast::pace(&store, &rates, end + d)
+                .unwrap()
+                .unwrap_or(0.0)
+        })
+        .collect();
+    let (lo, hi) = paces
+        .iter()
+        .fold((f64::MAX, 0.0f64), |(lo, hi), &p| (lo.min(p), hi.max(p)));
+    assert!(hi <= 1.0 && hi - lo < 0.15, "{paces:?}");
+}
+
+/// Sessions open and idle for 45 minutes, then 5 minutes of work: use that started less than 15
+/// minutes ago shows no pace yet.
+#[test]
+fn idle_sessions_before_work_do_not_count_as_time_used() {
+    let env = Env::new();
+    let (store, a, _, _) = pool(&env);
+    let now = time::now_ms();
+    let reset = time::now_s() + 3 * 3600;
+    for minutes_ago in (0..=50i64).rev() {
+        let pct = if minutes_ago > 5 {
+            20.0
+        } else {
+            25.0 - minutes_ago as f64
+        };
+        store
+            .record_sample(&Sample {
+                ts: now - minutes_ago * 60_000,
+                account_id: a,
+                profile: "rotate".into(),
+                session_id: Some("w".into()),
+                model: None,
+                windows: vec![window("five_hour", pct, reset)],
+            })
+            .unwrap();
+    }
+    let rates = ccr_core::budget::Rates::default();
+    assert!(
+        ccr_core::forecast::pace(&store, &rates, now)
+            .unwrap()
+            .is_none()
+    );
+}
