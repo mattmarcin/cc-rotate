@@ -294,6 +294,15 @@ pub fn run(store: &Store, paths: &Paths) -> Vec<Check> {
         ),
     });
     checks.push(usage_checks_check(store, &accounts));
+    if crate::swap::pending_swap(store).ok().flatten().is_some()
+        && !crate::lock::is_held(&paths.swap_lock(), crate::lock::CLAUDE_STALE)
+    {
+        checks.push(check(
+            "Swap",
+            Status::Warn,
+            "a swap stopped half way, and cc-rotate has not yet told which account the profile is signed in to; until it does, it stores nothing from the profile and does not swap (your sessions keep working). It asks Claude Code once a minute, which needs the `claude` command to run and the network",
+        ));
+    }
 
     checks
 }

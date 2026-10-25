@@ -174,6 +174,7 @@ pub fn import(
             }
             // A fresh login settles whatever earlier checks of the account left open.
             usage_check::forget(s, account.id)?;
+            usage_check::discard_leftovers(paths, account.id);
             Ok((account.id, false))
         }
         None => {

@@ -137,6 +137,8 @@ export interface Snapshot {
     next_available_at: number | null;
     swaps_24h: number;
     needs_login: string[];
+    /** A swap stopped half way and is not settled yet. */
+    swap_unsettled: boolean;
   };
   settings: Settings;
   profile_dir: string;

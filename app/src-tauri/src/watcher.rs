@@ -56,6 +56,25 @@ fn run(app: &AppHandle, store: &Store, paths: &Paths, watch: &mut Watch) {
     loop {
         // Keep the store's copy of the active login current even when no interactive session
         // is running a statusline (for example only `claude -p` jobs).
+        if tick % SYNC_EVERY_S == 0
+            && !watch.swapping.load(Ordering::Acquire)
+            && statusline::needs_settling(store, paths, time::now_ms()).unwrap_or(false)
+        {
+            // A swap stopped half way: settling it may run Claude Code, so off this thread.
+            watch.swapping.store(true, Ordering::Release);
+            let swapping = watch.swapping.clone();
+            std::thread::spawn(move || {
+                if let Ok((store, paths)) = ccr_core::open(None) {
+                    if let Ok(_lock) = ccr_core::lock::DirLock::acquire(
+                        &paths.swap_lock(),
+                        ccr_core::lock::LockOptions::claude(Duration::ZERO),
+                    ) {
+                        let _ = swap::finish_dead_swap(&store, &paths, swap::Settler::Locked);
+                    }
+                }
+                swapping.store(false, Ordering::Release);
+            });
+        }
         if tick % SYNC_EVERY_S == 0 && !watch.swapping.load(Ordering::Acquire) {
             if let Ok(Some(req)) = statusline::sync(store, paths) {
                 // On its own thread: it may check accounts first, which takes seconds.

@@ -35,6 +35,69 @@ pub fn alive(pid: u32) -> bool {
     rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+/// When the process `pid` started, as an opaque text that is the same for the same process and
+/// differs once its id is reused. `None` when it cannot be told.
+#[cfg(windows)]
+pub fn start_time(pid: u32) -> Option<String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // SAFETY: plain Win32 calls on a handle opened and closed here.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return None;
+        }
+        let zero = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+        let ok = GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user);
+        CloseHandle(handle);
+        (ok != 0).then(|| {
+            (((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64).to_string()
+        })
+    }
+}
+
+/// When the process `pid` started: its start time in clock ticks since boot on Linux, else what
+/// `ps` reports. `None` when it cannot be told.
+#[cfg(unix)]
+pub fn start_time(pid: u32) -> Option<String> {
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        // Field 22, counted after the command name, which may itself contain spaces.
+        let after = stat.rsplit_once(')')?.1;
+        return after.split_whitespace().nth(19).map(str::to_string);
+    }
+    let out = Command::new("ps")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !text.is_empty()).then_some(text)
+}
+
+/// Whether any process of the process group `pgid` is running (Unix; never on Windows, where a
+/// check's tree dies with its job).
+#[cfg(unix)]
+pub fn group_alive(pgid: u32) -> bool {
+    let Ok(pgid) = i32::try_from(pgid) else {
+        return false;
+    };
+    // SAFETY: kill with signal 0 only checks; a negative id names the group.
+    let rc = unsafe { libc::kill(-pgid, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(windows)]
+pub fn group_alive(_pgid: u32) -> bool {
+    false
+}
+
 /// A child and everything it starts. On Windows the child runs in a job object that kills the
 /// whole tree when the job is closed, which also happens when this process dies; on Unix it runs
 /// in its own process group.
@@ -146,5 +209,15 @@ mod tests {
     fn this_process_is_alive() {
         assert!(alive(std::process::id()));
         assert!(!alive(u32::MAX - 7));
+    }
+
+    #[test]
+    fn start_times_identify_a_process() {
+        let own = start_time(std::process::id()).expect("this process has a start time");
+        assert_eq!(
+            start_time(std::process::id()).as_deref(),
+            Some(own.as_str())
+        );
+        assert_eq!(start_time(u32::MAX - 7), None);
     }
 }

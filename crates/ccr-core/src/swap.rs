@@ -28,8 +28,286 @@ pub const META_LAST_SWAP_AT: &str = "last_swap_at";
 /// of each other add to it, so a session that has not made a request since two swaps ago is
 /// recognized too.
 pub const META_LAST_SWAP_FROM_RESETS: &str = "last_swap_from_resets";
-/// The fingerprint of the login a swap is writing into the profile, until it commits.
-pub const META_SWAP_PENDING_FP: &str = "swap_pending_fp";
+/// The swap that is writing a login into the profile, until it commits (JSON `PendingSwap`).
+pub const META_SWAP_PENDING: &str = "swap_pending";
+
+/// A swap between writing the target's login into the profile and committing.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct PendingSwap {
+    /// Fingerprint of the login being written.
+    pub fp: String,
+    pub from: Option<i64>,
+    pub to: i64,
+    /// When (epoch ms).
+    #[serde(default)]
+    pub at: i64,
+}
+
+pub fn pending_swap(store: &Store) -> Result<Option<PendingSwap>> {
+    Ok(store
+        .meta(META_SWAP_PENDING)?
+        .and_then(|v| serde_json::from_str(&v).ok()))
+}
+
+/// Who settles a swap that died half way, which decides what it may do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Settler {
+    /// A status line tick: does not hold the swap lock, must stay fast, so it only acts when the
+    /// profile's login says for certain what happened.
+    Tick,
+    /// Holds the swap lock (a swap, `cc-rotate-ctl finish-swap`, the app): may ask Claude Code
+    /// which account the profile's login belongs to.
+    Locked,
+}
+
+/// What became of a swap that died half way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeadSwap {
+    /// None was pending (or one is still running).
+    Nothing,
+    Settled,
+    /// The profile's login could not be identified yet: until it is, nothing may be stored from
+    /// the profile and no swap may run.
+    Unsure,
+}
+
+/// Settle a swap that died between writing the target's login into the profile and committing
+/// (a crash, a power cut, a failed write that could not be undone). It only acts on certainty:
+/// - the profile has exactly the outgoing account's login: the write never happened, and the
+///   mark is cleared;
+/// - it has exactly the target's: the swap is completed (states only; the outgoing account's
+///   login was stored before the write);
+/// - it has no usable login (Anthropic rejected whichever it was, or a `/logout`): with the swap
+///   lock held, the outgoing account's stored login, which the swap saved before writing, is put
+///   back, and the target is held back until a check settles whether its login still works;
+/// - anything else (a renewal since, a `/login`): with the swap lock held, Claude Code is asked
+///   whose login it is (`usage_check::identify_profile_login`, with a copy it cannot renew).
+///
+/// `Unsure` otherwise: then nothing is stored from the profile and no swap runs, so no login
+/// that cannot be identified is ever overwritten or filed under an account; the sessions go on
+/// with whatever login the profile has.
+pub fn finish_dead_swap(store: &Store, paths: &Paths, settler: Settler) -> Result<DeadSwap> {
+    let Some(raw) = store.meta(META_SWAP_PENDING)? else {
+        return Ok(DeadSwap::Nothing);
+    };
+    let Ok(pending) = serde_json::from_str::<PendingSwap>(&raw) else {
+        store.delete_meta(META_SWAP_PENDING)?;
+        return Ok(DeadSwap::Settled);
+    };
+    if settler == Settler::Tick
+        && crate::lock::is_held(&paths.swap_lock(), crate::lock::CLAUDE_STALE)
+    {
+        return Ok(DeadSwap::Nothing);
+    }
+    let creds = paths.credentials();
+    // A Keychain that cannot be read now may hold the live login while the file is stale.
+    if !creds.complete().unwrap_or(false) {
+        return Ok(DeadSwap::Unsure);
+    }
+    let Ok(oauth) = creds.read_oauth() else {
+        return Ok(DeadSwap::Unsure);
+    };
+    let file_fp = oauth.as_ref().and_then(credfile::oauth_fingerprint);
+    let outgoing_fp = match pending.from {
+        Some(id) => store.credential_meta(id)?.map(|m| m.refresh_fp),
+        None => None,
+    };
+    enum Verdict {
+        NeverWritten,
+        Written,
+        Foreign,
+        NoLogin,
+    }
+    let verdict = if file_fp.is_some() && file_fp == outgoing_fp {
+        Verdict::NeverWritten
+    } else if file_fp.as_deref() == Some(pending.fp.as_str()) {
+        Verdict::Written
+    } else if settler == Settler::Tick {
+        return Ok(DeadSwap::Unsure);
+    } else if oauth.as_ref().is_none_or(credfile::is_dead) {
+        Verdict::NoLogin
+    } else {
+        let account = |id: Option<i64>| -> Result<Option<Account>> {
+            Ok(match id {
+                Some(id) => store.account(id)?,
+                None => None,
+            })
+        };
+        let (to, from) = (account(Some(pending.to))?, account(pending.from)?);
+        // The same person can be a member of several organizations with one account id and
+        // email: the organization must match too where both are known.
+        let is = |who: &crate::usage_check::Who, a: &Option<Account>| -> Option<bool> {
+            let a = a.as_ref()?;
+            let person = match (&a.account_uuid, &who.uuid, &a.email, &who.email) {
+                (Some(x), Some(y), _, _) => x == y,
+                (_, _, Some(x), Some(y)) => x.eq_ignore_ascii_case(y),
+                _ => return None,
+            };
+            let org = match (&a.org_uuid, &who.org_uuid) {
+                (Some(x), Some(y)) => x == y,
+                _ => true,
+            };
+            Some(person && org)
+        };
+        match crate::usage_check::identify_profile_login(store, paths)? {
+            Some(who) => match (is(&who, &to), is(&who, &from)) {
+                (Some(true), _) => Verdict::Written,
+                (_, Some(true)) => Verdict::NeverWritten,
+                // Only when neither account could be one whose identity is unknown.
+                (Some(false), Some(false)) | (Some(false), None) if pending.from.is_none() => {
+                    Verdict::Foreign
+                }
+                (Some(false), Some(false)) => Verdict::Foreign,
+                _ => return unsure(store, &pending, &raw),
+            },
+            None => return unsure(store, &pending, &raw),
+        }
+    };
+    // Putting the outgoing login back writes the profile, under Claude Code's locks.
+    let restored = match (&verdict, pending.from) {
+        (Verdict::NoLogin, Some(from)) => match store.credential(from)? {
+            Some(login) => {
+                write_profile_login(store, paths, &login.oauth)?;
+                true
+            }
+            None => false,
+        },
+        _ => false,
+    };
+    store.immediate(|s| {
+        // Only the swap read above: a newer one may have replaced the mark meanwhile.
+        if s.meta(META_SWAP_PENDING)?.as_deref() != Some(raw.as_str()) {
+            return Ok(());
+        }
+        match verdict {
+            Verdict::NeverWritten => {}
+            Verdict::Written => {
+                let now = time::now_ms();
+                if let Some(from) = pending.from {
+                    if s.account(from)?
+                        .is_some_and(|a| a.state == AccountState::Active)
+                    {
+                        s.set_state(from, AccountState::Parked)?;
+                    }
+                }
+                if s.account(pending.to)?.is_some() {
+                    // Only the states: the login in the profile is stored by the write-back that
+                    // follows, like any renewal of the active account's.
+                    s.set_state(pending.to, AccountState::Active)?;
+                    s.set_meta(META_LAST_SWAP_AT, now)?;
+                    s.set_meta(META_ACTIVE_SINCE, now)?;
+                    s.log_event(
+                        kind::SWAP,
+                        pending.from,
+                        Some(pending.to),
+                        Some("completed"),
+                        Some(json!({ "why": "a swap that stopped after writing the login was completed" })),
+                    )?;
+                }
+            }
+            Verdict::NoLogin => {
+                // Whichever login was rejected: the target's, if the write happened, is checked
+                // with a renewal before it is used again; the outgoing one, if it is the dead
+                // one, fails in the profile and is handled as any dead login.
+                if s.account(pending.to)?.is_some() {
+                    crate::usage_check::hold_back(s, pending.to)?;
+                }
+                if !restored {
+                    if let Some(from) = pending.from {
+                        if s.account(from)?.is_some() {
+                            crate::usage_check::hold_back(s, from)?;
+                        }
+                    }
+                }
+                s.log_event(
+                    kind::ERROR,
+                    pending.from,
+                    Some(pending.to),
+                    Some("swap"),
+                    Some(json!({ "message": "A swap stopped half way and the login in the profile was then rejected; cc-rotate put the previous account's login back and checks the other one before using it." })),
+                )?;
+            }
+            Verdict::Foreign => {
+                s.set_meta(META_PROFILE_FOREIGN, "1")?;
+                s.log_event(
+                    kind::FOREIGN_LOGIN,
+                    pending.from,
+                    None,
+                    Some("login_in_profile"),
+                    Some(json!({ "why": "after a swap stopped half way, the profile holds a login of an account outside the pool" })),
+                )?;
+            }
+        }
+        s.delete_meta(META_SWAP_PENDING)
+    })?;
+    Ok(DeadSwap::Settled)
+}
+
+/// Still unsure: tell the user once it has lasted a while, with what to do.
+fn unsure(store: &Store, pending: &PendingSwap, raw: &str) -> Result<DeadSwap> {
+    const REPORT_AFTER_MS: i64 = 10 * 60_000;
+    const META_REPORTED: &str = "dead_swap_reported";
+    if time::now_ms() - pending.at > REPORT_AFTER_MS
+        && store.meta(META_REPORTED)?.as_deref() != Some(raw)
+    {
+        store.set_meta(META_REPORTED, raw)?;
+        store.log_event(
+            kind::ERROR,
+            pending.from,
+            Some(pending.to),
+            Some("swap"),
+            Some(json!({ "message": "A swap stopped half way and cc-rotate cannot tell yet which account the profile is signed in to, so it stores nothing from the profile and does not swap. It asks Claude Code once a minute, which needs the `claude` command to run and the network; your sessions keep working meanwhile." })),
+        )?;
+    }
+    Ok(DeadSwap::Unsure)
+}
+
+/// Write a login into the profile under Claude Code's refresh and credentials locks (the caller
+/// holds the swap lock).
+fn write_profile_login(store: &Store, paths: &Paths, oauth: &serde_json::Value) -> Result<()> {
+    let timeout = Duration::from_millis(store.settings()?.lock_timeout_ms);
+    let opts = LockOptions::claude(timeout);
+    let _refresh = DirLock::acquire(&paths.refresh_lock(), opts)?;
+    let _legacy = DirLock::acquire(&paths.legacy_refresh_lock(), opts)?;
+    let _storage = DirLock::acquire(&paths.storage_lock(), LockOptions::claude_storage(timeout))?;
+    let creds = paths.credentials();
+    creds.write_oauth(oauth)?;
+    if let Some(marker) = creds.change_marker()? {
+        store.set_meta(META_CRED_SEEN, marker)?;
+    }
+    Ok(())
+}
+
+/// Put the outgoing login back after a failed write or commit, and say whether the profile is
+/// verifiably back to it. Only when the profile still has this swap's target (or nothing it
+/// could have changed): another swap may have taken over a lock this one held too long.
+fn restore_outgoing(
+    creds: &crate::credstore::Credentials,
+    previous: Option<&serde_json::Value>,
+    target_fp: &str,
+) -> bool {
+    let now = creds.read_oauth().ok().flatten();
+    let now_fp = now.as_ref().and_then(credfile::oauth_fingerprint);
+    let previous_fp = previous.and_then(credfile::oauth_fingerprint);
+    if now_fp == previous_fp {
+        return true;
+    }
+    if now_fp.as_deref() != Some(target_fp) {
+        return false;
+    }
+    let Some(previous) = previous else {
+        return false;
+    };
+    creds.write_oauth(previous).is_ok()
+        && creds
+            .read_oauth()
+            .ok()
+            .flatten()
+            .as_ref()
+            .and_then(credfile::oauth_fingerprint)
+            == previous_fp
+}
+
 /// Prefix of the meta keys holding, per account, the reset times known to be its own windows'
 /// (a JSON list of epoch seconds; only those still ahead count). See `attribute`.
 pub const META_OWN_RESETS_PREFIX: &str = "own_resets:";
@@ -290,9 +568,17 @@ fn needs_confirmation(store: &Store, active_id: i64, now_ms: i64) -> Result<bool
         return Ok(false);
     };
     let own = known_resets(store, active_id, now_ms / 1000)?;
+    let others: Vec<i64> = others_latest(store, active_id)?
+        .iter()
+        .flat_map(|s| &s.windows)
+        .filter_map(|w| w.resets_at)
+        .collect();
+    // Unsure when the reset time is not known to be the account's own, or is another account's
+    // too (aligned reset times).
     Ok(active.windows.iter().filter(|w| w.blocking()).any(|w| {
-        w.resets_at
-            .is_none_or(|r| !own.iter().any(|&k| same_reset(k, r)))
+        w.resets_at.is_none_or(|r| {
+            !own.iter().any(|&k| same_reset(k, r)) || others.iter().any(|&o| same_reset(o, r))
+        })
     }))
 }
 
@@ -369,6 +655,15 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
         Err(LockError::Busy(_)) => return skip(store, req, "another swap is in progress"),
         Err(e) => return Err(e.into()),
     };
+    // An earlier swap that stopped half way. While the profile's login is unidentified, no swap
+    // runs: it would overwrite the only copy of that login, or file it under the wrong account.
+    if finish_dead_swap(store, paths, Settler::Locked)? == DeadSwap::Unsure {
+        return skip(
+            store,
+            req,
+            "an earlier swap stopped half way, and the login in the profile cannot be identified yet",
+        );
+    }
 
     let now = time::now_ms();
     let active = store.active_account()?;
@@ -412,6 +707,8 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
     // A threshold swap that rests on a reading the status line could not attribute for sure
     // (section 8) first reads the account in use's own usage (section 20.4). When that is not
     // possible, the swap goes ahead as the reading says.
+    // Checks and the confirmation share one time budget: sessions may be waiting at a limit.
+    let check_deadline = Instant::now() + PRE_SWAP_CHECK_BUDGET;
     let mut confirmed = None;
     if req.reason.is_threshold() {
         if let Some(account) = &active {
@@ -445,7 +742,6 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
     // not land on an account that was used up elsewhere. Then the target's account lock is
     // taken, which waits for a background check of it to finish, and the target is settled
     // again under it. An account whose lock or leftovers keep it busy is passed over.
-    let check_deadline = Instant::now() + PRE_SWAP_CHECK_BUDGET;
     let mut checked: Vec<serde_json::Value> = Vec::new();
     let mut checked_ids: Vec<i64> = Vec::new();
     let mut passed_over: Vec<i64> = Vec::new();
@@ -454,7 +750,13 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
         attempts += 1;
         let last_try = req.to.is_some() || attempts >= MAX_PICK_ATTEMPTS;
         let (mut pool, policy) = load_pool(store, time::now_s())?;
+        let some_ready = scheduler::pick(&pool, policy, active_id).is_some();
         pool.retain(|c| !passed_over.contains(&c.account.id));
+        if req.to.is_none() && some_ready && scheduler::pick(&pool, policy, active_id).is_none() {
+            // The accounts that could take over are only busy (a check of them running): not an
+            // exhausted pool, so no such event or notification.
+            return skip(store, req, "the accounts that could take over are busy");
+        }
         let target = match choose(store, req, &pool, policy, active.as_ref())? {
             Choice::Target(account) => account,
             Choice::Done(outcome) => return Ok(outcome),
@@ -590,7 +892,10 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
     let creds = paths.credentials();
     let previous = creds.read_oauth()?;
     let mut outgoing_state = AccountState::Parked;
-    if let Some(account) = &active {
+    // A login of an account outside the pool (a `/login` in the profile) is never stored as the
+    // active account's: it keeps the login it has stored.
+    let foreign = store.meta(META_PROFILE_FOREIGN)?.as_deref() == Some("1");
+    if let Some(account) = active.as_ref().filter(|_| !foreign) {
         match &previous {
             Some(oauth) if !credfile::is_dead(oauth) => {
                 store.save_credential(account.id, oauth, "swap_out")?
@@ -606,18 +911,30 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
     backup_daily(store, paths, now).context("backing up the profile's credentials")?;
     // Until the swap commits, the store still names the outgoing account as active; a status
     // line write-back meanwhile must not store the target's login as the outgoing account's.
-    store.set_meta(META_SWAP_PENDING_FP, &target_login.refresh_fp)?;
-    if let Err(e) = creds.write_oauth(&target_login.oauth) {
-        let _ = store.delete_meta(META_SWAP_PENDING_FP);
-        return Err(e);
-    }
-    let marker = creds.change_marker()?;
-
+    // Everything that can fail is read before the write; after it, only the commit can, and its
+    // failure restores the outgoing login.
     let from_sample = match active_id {
         Some(id) => store.last_sample(id)?,
         None => None,
     };
     let previous_swap = store.meta_i64(META_LAST_SWAP_AT)?;
+    let pending = PendingSwap {
+        fp: target_login.refresh_fp.clone(),
+        from: active_id,
+        to: target.id,
+        at: now,
+    };
+    store.set_meta(META_SWAP_PENDING, serde_json::to_string(&pending)?)?;
+    if let Err(e) = creds.write_oauth(&target_login.oauth) {
+        // The write may have landed anyway (a Keychain read-back that failed): only a verified
+        // restore clears the mark; otherwise `finish_dead_swap` settles it.
+        if restore_outgoing(&creds, previous.as_ref(), &target_login.refresh_fp) {
+            let _ = store.delete_meta(META_SWAP_PENDING);
+        }
+        return Err(e);
+    }
+    let marker = creds.change_marker().ok().flatten();
+
     let committed = store.immediate(|s| {
         if let Some(account) = &active {
             s.set_state(account.id, outgoing_state)?;
@@ -670,7 +987,7 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
         if let Some(outcome) = confirmed {
             detail["confirmed"] = json!(outcome);
         }
-        s.delete_meta(META_SWAP_PENDING_FP)?;
+        s.delete_meta(META_SWAP_PENDING)?;
         s.log_event(
             kind::SWAP,
             active_id,
@@ -682,11 +999,11 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
     });
 
     if let Err(e) = committed {
-        // Put the outgoing login back so the profile and the store agree again.
-        if let Some(oauth) = &previous {
-            let _ = creds.write_oauth(oauth);
+        // Put the outgoing login back so the profile and the store agree again; keep the mark
+        // unless that is verified, so `finish_dead_swap` settles it.
+        if restore_outgoing(&creds, previous.as_ref(), &target_login.refresh_fp) {
+            let _ = store.delete_meta(META_SWAP_PENDING);
         }
-        let _ = store.delete_meta(META_SWAP_PENDING_FP);
         drop(storage_lock);
         drop(legacy_lock);
         drop(refresh_lock);
@@ -706,17 +1023,8 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
 /// account), under Claude Code's refresh locks like any swap.
 pub fn install_active_login(store: &Store, paths: &Paths, oauth: &serde_json::Value) -> Result<()> {
     let timeout = Duration::from_millis(store.settings()?.lock_timeout_ms);
-    let opts = LockOptions::claude(timeout);
-    let _swap_lock = DirLock::acquire(&paths.swap_lock(), opts)?;
-    let _refresh = DirLock::acquire(&paths.refresh_lock(), opts)?;
-    let _legacy = DirLock::acquire(&paths.legacy_refresh_lock(), opts)?;
-    let _storage = DirLock::acquire(&paths.storage_lock(), LockOptions::claude_storage(timeout))?;
-    let creds = paths.credentials();
-    creds.write_oauth(oauth)?;
-    if let Some(marker) = creds.change_marker()? {
-        store.set_meta(META_CRED_SEEN, marker)?;
-    }
-    Ok(())
+    let _swap_lock = DirLock::acquire(&paths.swap_lock(), LockOptions::claude(timeout))?;
+    write_profile_login(store, paths, oauth)
 }
 
 enum Choice {

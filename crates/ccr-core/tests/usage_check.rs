@@ -378,3 +378,97 @@ fn a_threshold_swap_on_an_unsure_reading_confirms_first() {
     );
     assert_eq!(store.active_account().unwrap().unwrap().id, a);
 }
+
+/// After a swap from a to b died half way, the profile's login was renewed, so its fingerprint
+/// is neither account's. Claude Code identifies it (from a copy it cannot renew), and the swap is
+/// completed or forgotten accordingly.
+#[test]
+fn a_dead_swap_is_settled_by_asking_claude_code_whose_login_it_is() {
+    for (who, active_after) in [("ub", "b"), ("ua", "a")] {
+        let e = env();
+        let store = e.store();
+        let a = add(&store, "a", AccountState::Active);
+        let b = add(&store, "b", AccountState::Parked);
+        let target = store.credential(b).unwrap().unwrap();
+        store
+            .set_meta(
+                swap::META_SWAP_PENDING,
+                serde_json::to_string(&swap::PendingSwap {
+                    fp: target.refresh_fp.clone(),
+                    from: Some(a),
+                    to: b,
+                    at: time::now_ms(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        std::fs::write(
+            e.paths.credentials_file(),
+            json!({"claudeAiOauth": oauth("renewed")}).to_string(),
+        )
+        .unwrap();
+        e.answer(who, 10.0);
+
+        assert_eq!(
+            swap::finish_dead_swap(&store, &e.paths, swap::Settler::Locked).unwrap(),
+            swap::DeadSwap::Settled
+        );
+        assert_eq!(
+            store.active_account().unwrap().unwrap().label,
+            active_after,
+            "the login was {who}'s"
+        );
+        assert!(swap::pending_swap(&store).unwrap().is_none());
+        let received: Value =
+            serde_json::from_str(&std::fs::read_to_string(e.bin.join("received.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            received["claudeAiOauth"]["refreshToken"], "",
+            "never renewable"
+        );
+    }
+}
+
+/// A parked account whose login is the one in the profile (left there by a swap that stopped
+/// half way) is never checked: Claude Code renewing it in the check would sign the profile's
+/// sessions out.
+#[test]
+fn a_check_never_uses_the_login_the_profile_holds() {
+    let e = env();
+    let store = e.store();
+    add(&store, "a", AccountState::Active);
+    let b = add(&store, "b", AccountState::Parked);
+    std::fs::write(
+        e.paths.credentials_file(),
+        json!({"claudeAiOauth": oauth("b1")}).to_string(),
+    )
+    .unwrap();
+    let out = usage_check::check(&store, &e.paths, b, Trigger::Manual).unwrap();
+    assert!(matches!(out, CheckOutcome::Skipped { .. }), "{out:?}");
+    assert!(e.seen().is_empty(), "Claude Code ran: {}", e.seen());
+}
+
+/// No account is checked while a swap is pending: which stored logins are current is not settled.
+#[test]
+fn no_check_runs_while_a_swap_is_pending() {
+    let e = env();
+    let store = e.store();
+    let a = add(&store, "a", AccountState::Active);
+    let b = add(&store, "b", AccountState::Parked);
+    let c = add(&store, "c", AccountState::Parked);
+    store
+        .set_meta(
+            swap::META_SWAP_PENDING,
+            serde_json::to_string(&swap::PendingSwap {
+                fp: "x".into(),
+                from: Some(a),
+                to: b,
+                at: time::now_ms(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    let out = usage_check::check(&store, &e.paths, c, Trigger::Manual).unwrap();
+    assert!(matches!(out, CheckOutcome::Skipped { .. }), "{out:?}");
+    assert!(e.seen().is_empty());
+}

@@ -160,6 +160,11 @@ impl Drop for DirLock {
     }
 }
 
+/// Whether someone holds the lock at `path` now: it exists and its holder keeps it fresh.
+pub fn is_held(path: &Path, stale: Duration) -> bool {
+    path.exists() && !is_stale(path, stale)
+}
+
 fn is_stale(path: &Path, stale: Duration) -> bool {
     let Ok(meta) = std::fs::metadata(path) else {
         return false;
@@ -245,8 +250,19 @@ mod tests {
         let old = SystemTime::now() - Duration::from_secs(1);
         let _lock = DirLock::acquire(&path, opts(0)).unwrap();
         filetime::set_file_mtime(&path, FileTime::from_system_time(old)).unwrap();
-        std::thread::sleep(Duration::from_millis(400));
-        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
-        assert!(modified > old + Duration::from_millis(500));
+        // The holder refreshes every 100 ms; wait for it rather than for a fixed time, which a
+        // busy machine (tests run in parallel) can overrun.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let refreshed = loop {
+            let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+            if modified > old + Duration::from_millis(500) {
+                break true;
+            }
+            if std::time::Instant::now() > deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(refreshed, "the holder did not refresh the lock's mtime");
     }
 }
