@@ -318,7 +318,9 @@ pub struct Expiring {
 /// Only one account is in use at a time, so the accounts are taken in the order their weekly
 /// windows reset: an account must be used now when its hours, together with the hours of
 /// every account resetting before it, take `ENTER` of the working hours it has left before its
-/// reset. `STAY` applies instead to an account already moved ahead in this weekly window
+/// reset. An account the user excluded (`Account::use_expiring` off) is never moved ahead,
+/// and its hours do not count, since its budget is not planned to be spent early.
+/// `STAY` applies instead to an account already moved ahead in this weekly window
 /// (`promoted`, weekly resets by account id): taken by a swap for its budget, or found expiring
 /// while in use (`note_in_use`). An account in use for other reasons (every seat was at a
 /// limit) is not kept: its budget stays in reserve. An account blocked by another
@@ -335,6 +337,7 @@ pub fn expiring(
         .iter()
         .filter(|c| {
             c.weekly_limit == WeeklyLimit::Has
+                && c.account.use_expiring
                 && matches!(c.account.state, AccountState::Parked | AccountState::Active)
                 && !c.held_back
         })
@@ -413,6 +416,7 @@ mod tests {
             position: id,
             weekly_limit: WeeklyLimitSetting::Auto,
             weekly_cap: None,
+            use_expiring: true,
             added_at: 0,
             last_login_at: None,
         }
@@ -521,6 +525,17 @@ mod tests {
         unlimited.weekly_limit = WeeklyLimit::None;
         let pool = [weekly(1, AccountState::Parked, 95.0, 1), unlimited];
         assert!(expiring(&pool, &always_working(), &none(), 98.0, NOW).is_empty());
+    }
+
+    #[test]
+    fn an_excluded_account_is_never_moved_ahead_and_takes_no_time() {
+        // Alone, Y needs 48 of its 124 hours; X (resetting first) would push it ahead, but X is
+        // excluded, so neither moves ahead.
+        let mut x = weekly(1, AccountState::Parked, 20.0, 100);
+        x.account.use_expiring = false;
+        let y = weekly(2, AccountState::Parked, 50.0, 124);
+        let out = expiring(&[x, y], &always_working(), &none(), 98.0, NOW);
+        assert!(out.is_empty(), "{out:?}");
     }
 
     #[test]

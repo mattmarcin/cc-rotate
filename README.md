@@ -182,6 +182,7 @@ The accounts are taken in the order their weeks reset, since only one is in use 
 It learns from your usage how much of the weekly budget a 5-hour window costs on each account, how fast you use an account, and when you usually work.
 Until it has seen enough, it assumes a full 5-hour window costs a tenth of the week and that you work 10 hours a day, which errs on the side of starting early.
 Turn it off with `cc-rotate-ctl config use_expiring_weekly false`, or in **Settings**.
+To leave out one account, untick **Use its weekly budget before it resets** in its **More** dialog, or run `cc-rotate-ctl use-before-reset <label> no`: it's then used in your order like any other.
 
 To keep part of an account's week for yourself, set where rotation stops using it, in its **More** dialog or with `cc-rotate-ctl weekly-cap <label> 70` (`off` goes back to the setting).
 cc-rotate then treats 70% as that account's weekly limit, and only plans to use its budget up to there.
@@ -228,6 +229,7 @@ When its input or output isn't a terminal, it prints the status once and exits.
 | `cc-rotate-ctl order [<label>...]` | Show the order accounts are used in, or put the listed accounts first, in that order. |
 | `cc-rotate-ctl move <label> --to <n>` | Move an account to place `n` in the order (1 is used first). |
 | `cc-rotate-ctl weekly-limit <label> [auto\|yes\|no]` | Show or set whether an account has a weekly limit (`auto` detects it). |
+| `cc-rotate-ctl use-before-reset <label> [yes\|no]` | Show or set whether an account moves ahead when its weekly budget would reset unused. |
 | `cc-rotate-ctl weekly-cap <label> [<percent>\|off]` | Show or set the weekly usage at which rotation stops using an account, keeping the rest of its week for you. |
 | `cc-rotate-ctl events` | Recent swaps, logins and problems. |
 | `cc-rotate-ctl doctor` | Check the profile, the store and Claude Code. |

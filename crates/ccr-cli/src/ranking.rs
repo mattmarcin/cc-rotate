@@ -113,6 +113,33 @@ pub fn weekly_cap(store: &Store, label: &str, value: Option<&str>) -> Result<()>
     Ok(())
 }
 
+/// `use-before-reset <account> [yes|no]`.
+pub fn use_before_reset(store: &Store, label: &str, value: Option<&str>) -> Result<()> {
+    let account = store.find_account(label)?;
+    if let Some(value) = value {
+        let on = value == "yes";
+        store.set_use_expiring(account.id, on)?;
+        store.log_event(
+            kind::STATE,
+            Some(account.id),
+            None,
+            Some("use_expiring"),
+            Some(json!({ "label": account.label, "use_expiring": on })),
+        )?;
+    }
+    let account = store.find_account(label)?;
+    let global = store.settings()?.use_expiring_weekly;
+    let text = match (account.use_expiring, global) {
+        (true, true) => "moves ahead when its weekly budget would reset unused",
+        (true, false) => {
+            "would move ahead when its weekly budget would reset unused, but that's off in Settings"
+        }
+        (false, _) => "never moves ahead for its weekly budget; it's used in your order",
+    };
+    println!("{}: {text}", account.label);
+    Ok(())
+}
+
 /// `next [--explain] [--json]`.
 pub fn next(store: &Store, paths: &Paths, explain: bool, json: bool) -> Result<()> {
     // Count what the other profiles read since, as the next swap will, and relearn the rates.

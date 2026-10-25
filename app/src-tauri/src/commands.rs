@@ -201,6 +201,26 @@ pub async fn set_weekly_cap(id: i64, cap: Option<f64>) -> CmdResult<()> {
     .await
 }
 
+/// Whether the account moves ahead when its weekly budget would reset unused.
+#[tauri::command]
+pub async fn set_use_expiring(id: i64, on: bool) -> CmdResult<()> {
+    blocking(move |s, _| {
+        let account = s
+            .account(id)?
+            .ok_or_else(|| anyhow::anyhow!("That account no longer exists."))?;
+        s.set_use_expiring(id, on)?;
+        s.log_event(
+            kind::STATE,
+            Some(id),
+            None,
+            Some("use_expiring"),
+            Some(serde_json::json!({ "label": account.label, "use_expiring": on })),
+        )?;
+        Ok(())
+    })
+    .await
+}
+
 /// Other Claude Code profiles on this computer, with the account each belongs to.
 #[tauri::command]
 pub async fn other_profiles() -> CmdResult<Vec<FoundProfile>> {

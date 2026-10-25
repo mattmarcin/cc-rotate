@@ -141,6 +141,13 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Show or set whether an account moves ahead when its weekly budget would reset unused:
+    /// yes (the default) or no.
+    UseBeforeReset {
+        account: String,
+        #[arg(value_parser = ["yes", "no"])]
+        value: Option<String>,
+    },
     /// Show recent swaps, sign-ins and errors.
     Events {
         #[arg(long, default_value_t = 30)]
@@ -449,6 +456,9 @@ fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> 
         }
         Command::WeeklyCap { account, value } => {
             ranking::weekly_cap(store, &account, value.as_deref())?
+        }
+        Command::UseBeforeReset { account, value } => {
+            ranking::use_before_reset(store, &account, value.as_deref())?
         }
         Command::Watch { interval } => {
             watch::run(store, paths, Duration::from_secs(interval))?;
