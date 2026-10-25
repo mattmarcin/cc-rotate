@@ -1858,3 +1858,43 @@ fn a_weekly_cap_keeps_the_rest_of_the_week_for_you() {
     assert_eq!(swap::next_target(&store, Some(a)).unwrap().unwrap().id, c);
     assert!(store.set_weekly_cap(c, Some(0.5)).is_err());
 }
+
+/// The pace is the last hour's use of every account, against each account's usual pace, so it
+/// carries across a swap: a used 10 points in its 20 minutes, then b 5 in its 10, at a usual 10
+/// an hour each, over 40 minutes in all: 1.5 usual hours in 2/3 of an hour.
+#[test]
+fn the_pace_counts_every_account_used_in_the_last_hour() {
+    let env = Env::new();
+    let (store, a, b, _) = pool(&env);
+    let now = time::now_ms();
+    let reset = time::now_s() + 3 * 3600;
+    let at = |account: i64, minutes_ago: i64, five: f64| Sample {
+        ts: now - minutes_ago * 60_000,
+        account_id: account,
+        profile: "rotate".into(),
+        session_id: None,
+        model: None,
+        windows: vec![window("five_hour", five, reset)],
+    };
+    for s in [
+        at(a, 40, 10.0),
+        at(a, 20, 20.0),
+        at(b, 10, 5.0),
+        at(b, 0, 10.0),
+    ] {
+        store.record_sample(&s).unwrap();
+    }
+    let rates = ccr_core::budget::Rates::default();
+    let pace = ccr_core::forecast::pace(&store, &rates, now)
+        .unwrap()
+        .unwrap();
+    assert!((pace - 2.25).abs() < 1e-9, "{pace}");
+
+    // Nothing used in the last hour: no pace.
+    let later = now + 2 * 3_600_000;
+    assert!(
+        ccr_core::forecast::pace(&store, &rates, later)
+            .unwrap()
+            .is_none()
+    );
+}

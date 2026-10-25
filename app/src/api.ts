@@ -149,6 +149,8 @@ export interface Snapshot {
   profile_dir: string;
   data_dir: string;
   last_event_id: number;
+  /** How long the pool lasts at the account in use's current pace, while it is being used. */
+  forecast: { pace: number; runs_out_at: number | null; free_again_at: number | null } | null;
 }
 
 export interface EventRow {

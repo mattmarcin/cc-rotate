@@ -97,6 +97,8 @@ pub struct Snapshot {
     pub profile_dir: String,
     pub data_dir: String,
     pub last_event_id: i64,
+    /// How long the pool lasts at the account in use's current pace, while it is being used.
+    pub forecast: Option<crate::forecast::Forecast>,
 }
 
 pub fn snapshot(store: &Store, paths: &Paths) -> Result<Snapshot> {
@@ -180,6 +182,14 @@ pub fn snapshot_at(store: &Store, paths: &Paths, now_ms: i64) -> Result<Snapshot
         .filter(|e| e.kind == kind::SWAP && e.account_from.is_some() && e.ts >= day_ago)
         .count();
 
+    let forecast = match active_id {
+        Some(_) => {
+            let rates = crate::budget::rates(store, now_ms)?;
+            crate::forecast::pace(store, &rates, now_ms)?
+                .map(|pace| crate::forecast::forecast(&pool, policy, &rates, pace, now_s))
+        }
+        None => None,
+    };
     Ok(Snapshot {
         now_ms,
         active_id,
@@ -208,6 +218,7 @@ pub fn snapshot_at(store: &Store, paths: &Paths, now_ms: i64) -> Result<Snapshot
         profile_dir: paths.profile_dir.display().to_string(),
         data_dir: paths.data_dir.display().to_string(),
         last_event_id: store.events(1)?.first().map(|e| e.id).unwrap_or(0),
+        forecast,
     })
 }
 
