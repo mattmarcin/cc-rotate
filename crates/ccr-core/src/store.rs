@@ -584,9 +584,6 @@ pub struct Settings {
     pub swap_cooldown_s: i64,
     /// Rank accounts without a weekly limit before the ones with one.
     pub prefer_no_weekly_limit: bool,
-    /// How long the active account stays in use before cc-rotate switches back to a better
-    /// ranked account that became usable again.
-    pub switch_back_dwell_s: i64,
     pub lock_timeout_ms: u64,
     pub sample_retention_days: i64,
     pub statusline_downstream: Option<String>,
@@ -615,7 +612,6 @@ pub const SETTING_KEYS: &[&str] = &[
     "swap_threshold_7d",
     "swap_cooldown_s",
     "prefer_no_weekly_limit",
-    "switch_back_dwell_s",
     "lock_timeout_ms",
     "sample_retention_days",
     "statusline_downstream",
@@ -913,7 +909,6 @@ impl Store {
             prefer_no_weekly_limit: get("prefer_no_weekly_limit")?
                 .and_then(|v| parse_bool(&v))
                 .unwrap_or(true),
-            switch_back_dwell_s: int("switch_back_dwell_s", 600)?,
             lock_timeout_ms: int("lock_timeout_ms", 30_000)? as u64,
             sample_retention_days: int("sample_retention_days", 90)?,
             statusline_downstream: text("statusline_downstream")?,
@@ -1920,7 +1915,7 @@ fn validate_setting(key: &str, value: &str) -> Result<Option<String>> {
                 bail!("Use a number from 1 to 100.");
             }
         }
-        "swap_cooldown_s" | "switch_back_dwell_s" | "lock_timeout_ms" | "sample_retention_days" => {
+        "swap_cooldown_s" | "lock_timeout_ms" | "sample_retention_days" => {
             let v: i64 = value.parse().map_err(|_| anyhow!("Use a whole number."))?;
             if v < 0 {
                 bail!("Use 0 or more.");

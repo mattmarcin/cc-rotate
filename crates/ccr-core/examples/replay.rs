@@ -306,7 +306,6 @@ fn play(
     let mut promoted: HashMap<i64, i64> = HashMap::new();
     let mut timing = Timing {
         cooldown_ms: settings.swap_cooldown_s * 1000,
-        dwell_ms: settings.switch_back_dwell_s * 1000,
         active_since_ms: start_s * 1000,
         ..Default::default()
     };

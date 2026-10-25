@@ -1466,7 +1466,9 @@ async function openSettings() {
     strictBox.addEventListener("change", () =>
       api
         .setSetting("strict_order", String(strictBox.checked))
-        .then(() => (say(strictBox.checked ? "Accounts higher in your order are used again as soon as they're ready" : "The account in use is kept until a limit"), refresh()))
+        .then(() =>
+          (say(strictBox.checked ? "The next account is picked by your order alone" : "The next account is one whose 5-hour window is already running, when one is"), refresh()),
+        )
         .catch((e) => say(String(e), "error")),
     );
     const avoidPaid = h("input", { type: "checkbox", id: "avoid-extra-usage", checked: snap.settings.avoid_extra_usage });
@@ -1495,16 +1497,13 @@ async function openSettings() {
       field("swap_threshold_5h", "Swap at 5-hour usage (%)", snap.settings.swap_threshold_5h, "Swap before a 5-hour limit is reached.", 1, 100),
       field("swap_threshold_7d", "Swap at weekly usage (%)", snap.settings.swap_threshold_7d, "Also applies to weekly limits on a single model.", 1, 100),
       field("swap_cooldown_s", "Minimum time between swaps (seconds)", snap.settings.swap_cooldown_s, "Applies to swaps at a limit and swaps back.", 0, 3600),
-      field(
-        "switch_back_dwell_s",
-        "Swap back after (seconds)",
-        snap.settings.switch_back_dwell_s,
-        "Minimum time on an account before swapping back to a better one.",
-        0,
-        86400,
+      h(
+        "label",
+        { class: "check", for: "prefer-no-weekly" },
+        prefer,
+        "Use accounts without a weekly limit first, and swap back to one as soon as it's ready",
       ),
-      h("label", { class: "check", for: "prefer-no-weekly" }, prefer, "Use accounts without a weekly limit first"),
-      h("label", { class: "check", for: "strict-order" }, strictBox, "Always go back to accounts higher in my order"),
+      h("label", { class: "check", for: "strict-order" }, strictBox, "Pick the next account by my order alone"),
       h("label", { class: "check", for: "use-expiring" }, expiringBox, "Use weekly budget before it resets"),
       h(
         "label",

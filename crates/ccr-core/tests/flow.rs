@@ -427,11 +427,7 @@ fn swap_waits_for_claude_credentials_write_lock() {
 #[test]
 fn tick_records_usage_and_requests_swap_at_threshold() {
     let env = Env::new();
-    let (store, a, b, c) = pool(&env);
-    // Without readings, b and c would rank above a (an unknown weekly limit ranks above a
-    // known one) and the tick would ask to switch to them; say they have one too.
-    store.set_weekly_limit(b, WeeklyLimitSetting::Yes).unwrap();
-    store.set_weekly_limit(c, WeeklyLimitSetting::Yes).unwrap();
+    let (store, a, _, _) = pool(&env);
     let input = |pct: f64| {
         StatusInput::parse(&format!(
             r#"{{"session_id":"s","rate_limits":{{"five_hour":{{"used_percentage":{pct},"resets_at":{}}},"seven_day":{{"used_percentage":30,"resets_at":{}}}}}}}"#,
@@ -674,9 +670,8 @@ fn manual_login_inside_profile_is_adopted() {
     );
 }
 
-/// Two Team seats ordered first and a Max account last: once the first seat's 5-hour window
-/// has reset and the second has been in use for the dwell time, a tick asks to switch back,
-/// and the swap records why.
+/// Two Team seats ordered first and a Max account last: while the Max account is in use, a tick
+/// asks to switch back to a seat as soon as the cooldown allows, and the swap records why.
 #[test]
 fn tick_switches_back_to_a_preferred_account() {
     let env = Env::new();
@@ -705,9 +700,6 @@ fn tick_switches_back_to_a_preferred_account() {
             .unwrap();
     }
     store.record_sample(&sample(c, 10.0, 20.0)).unwrap();
-    store
-        .set_setting("switch_back_dwell_s", Some("600"))
-        .unwrap();
 
     let input = format!(
         r#"{{"model":{{"id":"claude-opus-4-1"}},"rate_limits":{{"five_hour":{{"used_percentage":12,"resets_at":{}}},"seven_day":{{"used_percentage":21,"resets_at":{}}}}}}}"#,
@@ -719,21 +711,18 @@ fn tick_switches_back_to_a_preferred_account() {
     };
 
     let r = tick(time::now_ms());
-    assert!(r.swap.is_none(), "not before the dwell time");
+    assert!(r.swap.is_none(), "not within the cooldown of the swap to c");
 
-    let later = time::now_ms() + 601_000;
-    let req = tick(later).swap.expect("a better ranked account is ready");
+    let later = time::now_ms() + 121_000;
+    let req = tick(later).swap.expect("a seat is ready");
     assert_eq!(
         (req.from, req.reason),
         (Some(c), Reason::PreferredAvailable)
     );
     assert!(tick(later + 1000).swap.is_none(), "one request at a time");
 
-    // The swap itself re-checks the dwell against the real clock, so pretend c has been
-    // active for a while.
-    store
-        .set_meta(swap::META_ACTIVE_SINCE, time::now_ms() - 700_000)
-        .unwrap();
+    // The swap itself re-checks the cooldown against the real clock, so pretend the swap to c
+    // was a while ago.
     store
         .set_meta(swap::META_LAST_SWAP_AT, time::now_ms() - 700_000)
         .unwrap();
@@ -756,10 +745,7 @@ fn tick_switches_back_to_a_preferred_account() {
         "{detail}"
     );
     assert!(
-        detail["why"]
-            .as_str()
-            .unwrap()
-            .starts_with("a ranks above c"),
+        detail["why"].as_str().unwrap() == "a has no weekly limit, and c has one",
         "{detail}"
     );
     assert_eq!(
@@ -783,62 +769,70 @@ fn tick_switches_back_to_a_preferred_account() {
 #[test]
 fn stale_switch_back_requests_are_skipped() {
     let env = Env::new();
-    let (store, a, _, _) = pool(&env);
-    store
-        .set_meta(swap::META_ACTIVE_SINCE, time::now_ms() - 3_600_000)
-        .unwrap();
+    let (store, a, b, _) = pool(&env);
     let req = SwapRequest {
         from: Some(a),
         to: None,
         reason: Reason::PreferredAvailable,
         wait: false,
     };
-    // a is first in the order and nothing ranks above it.
-    assert_eq!(
-        swap::run(&store, &env.paths, &req).unwrap(),
-        SwapOutcome::Skipped {
-            why: "no better ranked account is ready".into()
-        }
-    );
-    store
-        .set_meta(swap::META_ACTIVE_SINCE, time::now_ms())
-        .unwrap();
-    assert!(matches!(
-        swap::run(&store, &env.paths, &req).unwrap(),
-        SwapOutcome::Skipped { .. }
-    ));
+    let skipped = || SwapOutcome::Skipped {
+        why: "no account without a weekly limit is ready to swap back to".into(),
+    };
+    // a has a weekly limit, but no other account is known to be without one.
+    store.set_weekly_limit(a, WeeklyLimitSetting::Yes).unwrap();
+    assert_eq!(swap::run(&store, &env.paths, &req).unwrap(), skipped());
+    // b has no weekly limit, but neither has a any more.
+    store.set_weekly_limit(b, WeeklyLimitSetting::No).unwrap();
+    store.set_weekly_limit(a, WeeklyLimitSetting::No).unwrap();
+    assert_eq!(swap::run(&store, &env.paths, &req).unwrap(), skipped());
     assert_eq!(store.active_account().unwrap().unwrap().id, a);
 }
 
-/// The app's background sync applies the same switch-back rule without a live reading.
+/// The app's background sync applies the same switch-back rule without a live reading: only an
+/// account with a weekly limit gives way, to one without.
 #[test]
 fn background_sync_switches_back_too() {
     let env = Env::new();
-    let (store, a, b, _) = pool(&env);
+    let (store, a, b, c) = pool(&env);
+    for (account, weekly) in [
+        (a, WeeklyLimitSetting::No),
+        (b, WeeklyLimitSetting::No),
+        (c, WeeklyLimitSetting::Yes),
+    ] {
+        store.set_weekly_limit(account, weekly).unwrap();
+    }
+    let long_ago = || {
+        store
+            .set_meta(swap::META_LAST_SWAP_AT, time::now_ms() - 3_600_000)
+            .unwrap();
+    };
+    // b, a seat, in use: a is first in the order, but the account in use is kept, also with
+    // strict_order.
     swap::run(&store, &env.paths, &manual(Some(b))).unwrap();
-    store
-        .set_meta(swap::META_ACTIVE_SINCE, time::now_ms() - 3_600_000)
-        .unwrap();
-    store
-        .set_meta(swap::META_LAST_SWAP_AT, time::now_ms() - 3_600_000)
-        .unwrap();
-    // a and b are in the same tier, so only strict_order goes back up the order.
+    long_ago();
     assert!(statusline::sync(&store, &env.paths).unwrap().is_none());
     store.set_setting("strict_order", Some("true")).unwrap();
+    assert!(statusline::sync(&store, &env.paths).unwrap().is_none());
+
+    // c, with a weekly limit, in use: a seat is ready, so it takes over.
+    swap::run(&store, &env.paths, &manual(Some(c))).unwrap();
+    long_ago();
     let req = statusline::sync(&store, &env.paths)
         .unwrap()
-        .expect("a ranks above b");
+        .expect("a seat is ready");
     assert_eq!(
         (req.from, req.reason),
-        (Some(b), Reason::PreferredAvailable)
+        (Some(c), Reason::PreferredAvailable)
     );
     assert_eq!(
         swap::run(&store, &env.paths, &req).unwrap(),
         SwapOutcome::Swapped {
-            from: Some(b),
+            from: Some(c),
             to: a
         }
     );
+    long_ago();
     assert!(statusline::sync(&store, &env.paths).unwrap().is_none());
 }
 
@@ -1779,13 +1773,13 @@ fn seats_and_an_expiring_week(env: &Env) -> (Store, i64, i64, i64) {
     (store, a, b, c)
 }
 
-/// An account whose weekly budget would reset unused goes ahead of the seats without a weekly
-/// limit, with the reason; with the setting off, the seats come first as before.
+/// An account whose weekly budget would reset unused goes ahead of the other accounts with a
+/// weekly limit, with the reason, but never ahead of a seat without a weekly limit.
 #[test]
 fn a_weekly_budget_that_would_reset_unused_moves_its_account_ahead() {
     let env = Env::new();
-    let (store, a, _, c) = seats_and_an_expiring_week(&env);
-    assert_eq!(swap::next_target(&store, Some(a)).unwrap().unwrap().id, c);
+    let (store, a, b, c) = seats_and_an_expiring_week(&env);
+    assert_eq!(swap::next_target(&store, Some(a)).unwrap().unwrap().id, b);
     let (pool, policy) = swap::load_pool(&store, time::now_s()).unwrap();
     let ranked = ccr_core::scheduler::ranking(&pool, policy, time::now_s());
     let first = ranked.iter().find(|r| r.account_id == c).unwrap();
@@ -1795,8 +1789,14 @@ fn a_weekly_budget_that_would_reset_unused_moves_its_account_ahead() {
         first.reason
     );
 
-    // A swap that takes it for its budget remembers that for this week, so it is taken back
-    // after its 5-hour limit.
+    // Both seats at their 5-hour limit.
+    let now_s = time::now_s();
+    for seat in [a, b] {
+        store
+            .record_sample(&five_only(seat, 100.0, now_s + 3 * 3600, time::now_ms()))
+            .unwrap();
+    }
+    // A swap that takes it for its budget remembers that for this week.
     assert_eq!(
         swap::run(&store, &env.paths, &manual(None)).unwrap(),
         SwapOutcome::Swapped {
@@ -1810,32 +1810,28 @@ fn a_weekly_budget_that_would_reset_unused_moves_its_account_ahead() {
         .unwrap()
         .expect("marked");
     assert!((marked - week_reset).abs() <= 5, "{marked} vs {week_reset}");
-
-    store
-        .set_setting("use_expiring_weekly", Some("false"))
-        .unwrap();
-    assert_eq!(swap::next_target(&store, Some(c)).unwrap().unwrap().id, a);
 }
 
-/// The account in use is spending a weekly budget that would otherwise reset unused: the seats
-/// that rank above it by the user's order do not take it back.
+/// Accounts without a weekly limit come first even over a weekly budget that would reset unused:
+/// a seat that is ready takes over from the account spending it.
 #[test]
-fn the_account_in_use_keeps_spending_a_budget_that_would_reset_unused() {
+fn a_ready_seat_takes_over_from_a_budget_that_would_reset_unused() {
     let env = Env::new();
     let (store, _, _, c) = seats_and_an_expiring_week(&env);
     swap::run(&store, &env.paths, &manual(Some(c))).unwrap();
-    store
-        .set_setting("switch_back_dwell_s", Some("600"))
-        .unwrap();
     let now_s = time::now_s();
     let input = format!(
         r#"{{"model":{{"id":"claude-opus-4-1"}},"rate_limits":{{"five_hour":{{"used_percentage":12,"resets_at":{}}},"seven_day":{{"used_percentage":21,"resets_at":{}}}}}}}"#,
         now_s + 3600,
         now_s + 86_400 * 3
     );
-    let later = time::now_ms() + 601_000;
+    let later = time::now_ms() + 121_000;
     let tick = statusline::tick(&store, &env.paths, &StatusInput::parse(&input), later).unwrap();
-    assert!(tick.swap.is_none(), "{:?}", tick.swap);
+    let req = tick.swap.expect("a seat is ready");
+    assert_eq!(
+        (req.from, req.reason),
+        (Some(c), Reason::PreferredAvailable)
+    );
 }
 
 /// A weekly cap below the weekly threshold keeps the rest of the account's week for the user:
@@ -2027,15 +2023,31 @@ fn idle_sessions_before_work_do_not_count_as_time_used() {
 #[test]
 fn an_account_left_out_is_not_moved_ahead_for_its_budget() {
     let env = Env::new();
-    let (store, a, b, c) = seats_and_an_expiring_week(&env);
+    let (store, _, _, c) = seats_and_an_expiring_week(&env);
     assert!(
         store.account(c).unwrap().unwrap().use_expiring,
         "on by default"
     );
+    let reason = |store: &Store| {
+        let (pool, policy) = swap::load_pool(store, time::now_s()).unwrap();
+        ccr_core::scheduler::ranking(&pool, policy, time::now_s())
+            .into_iter()
+            .find(|r| r.account_id == c)
+            .unwrap()
+            .reason
+    };
     store.set_use_expiring(c, false).unwrap();
-    assert_eq!(swap::next_target(&store, Some(a)).unwrap().unwrap().id, b);
+    assert!(
+        !reason(&store).starts_with("weekly budget expires"),
+        "{}",
+        reason(&store)
+    );
     store.set_use_expiring(c, true).unwrap();
-    assert_eq!(swap::next_target(&store, Some(a)).unwrap().unwrap().id, c);
+    assert!(
+        reason(&store).starts_with("weekly budget expires"),
+        "{}",
+        reason(&store)
+    );
 }
 
 /// Keeping an account's 5-hour window running is off until the user turns it on, and turning it

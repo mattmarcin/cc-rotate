@@ -185,7 +185,6 @@ export interface Settings {
   login_warning_days: number;
   /** When every account is at a limit, move off an account that would bill extra usage. */
   avoid_extra_usage: boolean;
-  switch_back_dwell_s: number;
   lock_timeout_ms: number;
   sample_retention_days: number;
   statusline_downstream: string | null;

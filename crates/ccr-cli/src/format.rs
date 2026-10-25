@@ -287,11 +287,11 @@ pub fn next(snap: &Snapshot, explain: bool) -> String {
     }
     let s = &snap.settings;
     let mut order: Vec<&str> = Vec::new();
-    if s.use_expiring_weekly {
-        order.push("accounts whose weekly budget would go unused");
-    }
     if s.prefer_no_weekly_limit {
         order.push("accounts without a weekly limit");
+    }
+    if s.use_expiring_weekly {
+        order.push("accounts whose weekly budget would go unused");
     }
     if !s.strict_order {
         order.push("the account in use");

@@ -959,12 +959,6 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
             }
         }
     }
-    if req.reason == Reason::PreferredAvailable
-        && now - active_since(store)? < settings.switch_back_dwell_s * 1000
-    {
-        return skip(store, req, "too soon to swap back");
-    }
-
     // What the user's other profiles read since, so an account an agent used up there is not
     // picked. Best effort: an unreadable profile must not stop the swap.
     let _ = crate::profile_usage::import(store, paths, now);
@@ -1120,10 +1114,14 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
     let outgoing = pool.iter().find(|c| Some(c.account.id) == active_id);
     let why = match (req.reason, outgoing) {
         (Reason::PreferredAvailable, Some(from)) => Some(format!(
-            "{} ranks above {}: {}",
+            "{} has no weekly limit, and {} {}",
             target.label,
             from.account.label,
-            reason_for(target.id).unwrap_or_default()
+            if from.weekly_limit == scheduler::WeeklyLimit::Has {
+                "has one"
+            } else {
+                "may have one"
+            }
         )),
         _ => None,
     };
@@ -1410,7 +1408,7 @@ fn choose(
                     return Ok(Choice::Done(skip(
                         store,
                         req,
-                        "no better ranked account is ready",
+                        "no account without a weekly limit is ready to swap back to",
                     )?));
                 }
             }
