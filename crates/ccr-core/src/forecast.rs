@@ -113,6 +113,31 @@ fn older(a: Option<i64>, b: Option<i64>) -> bool {
     }
 }
 
+/// Start a 5-hour window at `t`, with `pct` of it used: the reading's window, or a new one when
+/// the readings have none.
+fn start_window(c: &mut Candidate, t: i64, pct: f64, policy: Policy) {
+    match c
+        .windows
+        .iter_mut()
+        .find(|w| w.kind == WindowKind::Session && w.model.is_none())
+    {
+        Some(w) => {
+            w.pct = pct;
+            w.resets_at = Some(t + FIVE_HOUR_S);
+        }
+        None => c.windows.push(scheduler::WindowUsage {
+            name: scheduler::FIVE_HOUR.into(),
+            label: scheduler::window_label(scheduler::FIVE_HOUR),
+            kind: WindowKind::Session,
+            model: None,
+            pct,
+            resets_at: Some(t + FIVE_HOUR_S),
+            threshold: policy.thresholds.for_account(&c.account).session,
+            applies: true,
+        }),
+    }
+}
+
 /// Play the pool forward from `now_s` at `pace` on the account in use.
 pub fn forecast(
     pool: &[Candidate],
@@ -134,15 +159,28 @@ pub fn forecast(
     let mut t = now_s;
     while t < now_s + HORIZON_S {
         for c in &mut pool {
+            // An account the user keeps running gets its next window as soon as one ends, while
+            // it is not in use (section 23).
+            let kept = c.account.keep_running
+                && c.account.state == AccountState::Parked
+                && !c.held_back
+                // Another limit keeps it out of use, and warm-ups skip it.
+                && c.windows.iter().all(|w| {
+                    !w.blocking() || (w.kind == WindowKind::Session && w.model.is_none())
+                });
             for w in &mut c.windows {
                 if let Some(r) = w.resets_at.filter(|&r| r <= t) {
                     w.pct = 0.0;
                     w.resets_at = match w.kind {
+                        WindowKind::Session if kept && w.model.is_none() => Some(t + FIVE_HOUR_S),
                         // A 5-hour window starts again with the next request.
                         WindowKind::Session => None,
                         _ => Some(r + WEEK_S),
                     };
                 }
+            }
+            if kept && !c.session_running(t) {
+                start_window(c, t, 0.0, policy);
             }
         }
         if current.is_none_or(|i| pool[i].blocking().is_some()) {
@@ -182,21 +220,8 @@ pub fn forecast(
             }
         }
         // An account without a 5-hour window in its readings gets one as it is used.
-        if !pool[i]
-            .windows
-            .iter()
-            .any(|w| w.kind == WindowKind::Session && w.model.is_none())
-        {
-            pool[i].windows.push(scheduler::WindowUsage {
-                name: scheduler::FIVE_HOUR.into(),
-                label: scheduler::window_label(scheduler::FIVE_HOUR),
-                kind: WindowKind::Session,
-                model: None,
-                pct: five_used,
-                resets_at: Some(t + FIVE_HOUR_S),
-                threshold: policy.thresholds.session,
-                applies: true,
-            });
+        if pool[i].five_hour().is_none() {
+            start_window(&mut pool[i], t, five_used, policy);
         }
         t += STEP_S;
     }
@@ -251,6 +276,7 @@ mod tests {
                 weekly_limit: WeeklyLimitSetting::Auto,
                 weekly_cap: None,
                 use_expiring: true,
+                keep_running: false,
                 added_at: 0,
                 last_login_at: None,
             },
@@ -299,6 +325,24 @@ mod tests {
         ];
         let f = forecast(&pool, POLICY, &same_pace(), 49.0 / 20.0, NOW);
         assert_eq!(f.runs_out_at, None, "{:?}", f);
+    }
+
+    #[test]
+    fn a_seat_kept_running_starts_its_window_before_it_is_used() {
+        // s1 is nearly full and resets in 6 hours; s2 takes over a step later and fills within
+        // the hour, so s2's reset is the first one after the pool runs out.
+        let pool = |keep: bool| {
+            let mut s2 = seat(2, AccountState::Parked, 0.0, None);
+            s2.account.keep_running = keep;
+            [seat(1, AccountState::Active, 95.0, Some(6 * 3600)), s2]
+        };
+        let pace = 98.0 / 20.0;
+        let used = forecast(&pool(false), POLICY, &same_pace(), pace, NOW);
+        let kept = forecast(&pool(true), POLICY, &same_pace(), pace, NOW);
+        assert!(used.runs_out_at.is_some() && kept.runs_out_at.is_some());
+        // Kept running, s2's window started at once instead of when s2 was first used.
+        assert_eq!(kept.free_again_at, Some(NOW + 5 * 3600));
+        assert_eq!(used.free_again_at, Some(NOW + STEP_S + 5 * 3600));
     }
 
     #[test]

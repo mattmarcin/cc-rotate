@@ -369,6 +369,9 @@ pub fn run(store: &Store, paths: &Paths) -> Vec<Check> {
         ),
     });
     checks.push(usage_checks_check(store, &accounts));
+    if let Some(c) = warm_ups_check(store, paths, &accounts) {
+        checks.push(c);
+    }
     if crate::swap::pending_swap(store).ok().flatten().is_some()
         && !crate::lock::is_held(&paths.swap_lock(), crate::lock::CLAUDE_STALE)
     {
@@ -426,6 +429,71 @@ fn usage_checks_check(store: &Store, accounts: &[Account]) -> Check {
         ),
         (true, None) => check(name, Status::Ok, "On. No account checked yet."),
     }
+}
+
+/// Whether warm-ups keep the 5-hour windows running of the accounts the user chose (section
+/// 23); nothing when no account has it on.
+fn warm_ups_check(store: &Store, paths: &Paths, accounts: &[Account]) -> Option<Check> {
+    let name = "Keeping 5-hour windows running";
+    let kept: Vec<&Account> = accounts.iter().filter(|a| a.keep_running).collect();
+    if kept.is_empty() {
+        return None;
+    }
+    let labels = kept
+        .iter()
+        .map(|a| a.label.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if let Ok(Some(reason)) = usage_check::warm_ups_blocked(store) {
+        return Some(check(
+            name,
+            Status::Warn,
+            format!(
+                "Stopped: {reason}. Click Start again in an account's More dialog, or run `cc-rotate-ctl keep-running <label> yes`."
+            ),
+        ));
+    }
+    if let Ok(Some(why)) = usage_check::warm_ups_paused(store, paths) {
+        return Some(check(
+            name,
+            Status::Warn,
+            format!("On for {labels}, but not running: {why}."),
+        ));
+    }
+    let mut failing = Vec::new();
+    let mut last = None;
+    for a in &kept {
+        let Ok(st) = usage_check::state(store, a.id) else {
+            continue;
+        };
+        last = last.max(st.warmed_at);
+        // Only a recent one: an account in use since starts its windows by itself.
+        let recent = st
+            .warm_attempt_at
+            .is_some_and(|t| time::now_ms() - t < usage_check::WARM_PROBLEM_SHOWN_MS);
+        if let Some(problem) = st
+            .warm_problem
+            .filter(|_| a.state == AccountState::Parked && recent)
+        {
+            failing.push(format!("{}: {problem}", a.label));
+        }
+    }
+    Some(match (failing.is_empty(), last) {
+        (false, _) => check(name, Status::Warn, failing.join(". ")),
+        (true, Some(ts)) => check(
+            name,
+            Status::Ok,
+            format!(
+                "On for {labels}. Last started a window {}.",
+                age(time::now_ms() - ts)
+            ),
+        ),
+        (true, None) => check(
+            name,
+            Status::Ok,
+            format!("On for {labels}. No window started yet."),
+        ),
+    })
 }
 
 /// Working folders of the Claude Code sessions registered in the profile (`sessions/<pid>.json`)

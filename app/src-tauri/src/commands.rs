@@ -221,6 +221,26 @@ pub async fn set_use_expiring(id: i64, on: bool) -> CmdResult<()> {
     .await
 }
 
+/// Whether cc-rotate keeps the account's 5-hour window running (spec section 22).
+#[tauri::command]
+pub async fn set_keep_running(id: i64, on: bool) -> CmdResult<()> {
+    blocking(move |s, _| {
+        let account = s
+            .account(id)?
+            .ok_or_else(|| anyhow::anyhow!("That account no longer exists."))?;
+        s.set_keep_running(id, on)?;
+        s.log_event(
+            kind::STATE,
+            Some(id),
+            None,
+            Some("keep_running"),
+            Some(serde_json::json!({ "label": account.label, "keep_running": on })),
+        )?;
+        Ok(())
+    })
+    .await
+}
+
 /// Other Claude Code profiles on this computer, with the account each belongs to.
 #[tauri::command]
 pub async fn other_profiles() -> CmdResult<Vec<FoundProfile>> {

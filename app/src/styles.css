@@ -1033,6 +1033,20 @@ dialog.drawer {
   margin-top: 2px;
 }
 
+.check-field {
+  display: grid;
+  gap: 4px;
+  justify-items: start;
+}
+
+.check-field small.warn {
+  color: var(--amber);
+}
+
+.check-field small .link {
+  font-size: inherit;
+}
+
 input[type="text"],
 input[type="email"],
 input[type="number"],

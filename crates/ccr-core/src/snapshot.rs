@@ -116,6 +116,11 @@ pub struct Snapshot {
     pub last_event_id: i64,
     /// How long the pool lasts at the account in use's current pace, while it is being used.
     pub forecast: Option<crate::forecast::Forecast>,
+    /// Why warm-ups stopped until the user turns keeping a window running on again (spec
+    /// section 23), if they did.
+    pub warm_ups_blocked: Option<String>,
+    /// Why warm-ups do not run now, if they don't (`usage_check::warm_ups_paused`).
+    pub warm_ups_paused: Option<String>,
 }
 
 pub fn snapshot(store: &Store, paths: &Paths) -> Result<Snapshot> {
@@ -212,6 +217,13 @@ pub fn snapshot_at(store: &Store, paths: &Paths, now_ms: i64) -> Result<Snapshot
     let forecast = match active_id {
         Some(_) => {
             let rates = crate::budget::cached_rates(store)?;
+            // Windows are kept running only while warm-ups run.
+            let mut pool = pool.clone();
+            if crate::usage_check::warm_ups_paused(store, paths)?.is_some() {
+                for c in &mut pool {
+                    c.account.keep_running = false;
+                }
+            }
             crate::forecast::pace(store, &rates, now_ms)?
                 .map(|pace| crate::forecast::forecast(&pool, policy, &rates, pace, now_s))
                 // Already out: the pool summary says so, with when one frees up.
@@ -258,6 +270,8 @@ pub fn snapshot_at(store: &Store, paths: &Paths, now_ms: i64) -> Result<Snapshot
         data_dir: paths.data_dir.display().to_string(),
         last_event_id: store.events(1)?.first().map(|e| e.id).unwrap_or(0),
         forecast,
+        warm_ups_blocked: crate::usage_check::warm_ups_blocked(store)?,
+        warm_ups_paused: crate::usage_check::warm_ups_paused(store, paths)?,
     })
 }
 

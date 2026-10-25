@@ -154,8 +154,9 @@ pub fn import(
     let has_active = store.active_account()?.is_some();
     // A usage check may be running Claude Code with this account's previous login; it must not
     // store a renewal of that login over the new one (usage_check).
-    // Long enough for a check that is running to finish (it is killed after RUN_TIMEOUT).
-    let wait = Duration::from_millis(store.settings()?.lock_timeout_ms) + usage_check::RUN_TIMEOUT;
+    // Long enough for a check or warm-up that is running to finish (it is killed after
+    // JOB_TIMEOUT).
+    let wait = Duration::from_millis(store.settings()?.lock_timeout_ms) + usage_check::JOB_TIMEOUT;
     let account_lock = match &existing {
         Some(account) => Some(
             DirLock::acquire(&paths.account_lock(account.id), LockOptions::claude(wait))

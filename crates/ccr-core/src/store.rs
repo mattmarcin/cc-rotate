@@ -26,7 +26,8 @@ use crate::{credfile, time};
 /// 6: sessions stopped at a usage limit (`waiting_sessions`).
 /// 7: what each account's use would cost at API prices (`session_costs`, `account_costs`) and
 ///    its extra usage (`extra_usage`).
-const SCHEMA_VERSION: i64 = 7;
+/// 8: whether cc-rotate keeps an account's 5-hour window running (`keep_running`).
+const SCHEMA_VERSION: i64 = 8;
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE accounts (
@@ -190,6 +191,14 @@ CREATE TABLE extra_usage (
 );
 "#;
 
+/// Schema 8: whether cc-rotate starts the account's next 5-hour window with a small request as
+/// soon as one ends while it is not in use (`usage_check::warm_up`); off unless the user turns
+/// it on for the account.
+const SCHEMA_V8: &str = r#"
+ALTER TABLE accounts ADD COLUMN keep_running INTEGER NOT NULL DEFAULT 0
+    CHECK (keep_running IN (0, 1));
+"#;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountState {
@@ -276,12 +285,16 @@ pub struct Account {
     /// The account moves ahead when its weekly budget would reset unused (`budget::expiring`),
     /// unless the user turned that off for it.
     pub use_expiring: bool,
+    /// cc-rotate starts the account's next 5-hour window with a small request as soon as one
+    /// ends while it is not in use (`usage_check::warm_up`), because the user turned that on.
+    pub keep_running: bool,
     pub added_at: i64,
     pub last_login_at: Option<i64>,
 }
 
 const ACCOUNT_COLS: &str = "id, label, email, account_uuid, org_uuid, org_name, subscription_type, \
-    rate_limit_tier, state, position, added_at, last_login_at, weekly_limit, weekly_cap, use_expiring";
+    rate_limit_tier, state, position, added_at, last_login_at, weekly_limit, weekly_cap, use_expiring, \
+    keep_running";
 
 fn parse_col<T: FromStr<Err = anyhow::Error>>(row: &Row, i: usize) -> rusqlite::Result<T> {
     let text: String = row.get(i)?;
@@ -307,6 +320,7 @@ fn account_from_row(row: &Row) -> rusqlite::Result<Account> {
         weekly_limit: parse_col(row, 12)?,
         weekly_cap: row.get(13)?,
         use_expiring: row.get(14)?,
+        keep_running: row.get(15)?,
     })
 }
 
@@ -555,6 +569,9 @@ pub mod kind {
     /// Every account is at a limit and the one in use runs on paid extra usage
     /// (`extra_usage::scan`); `detail` has its spend so far.
     pub const PAID_USAGE: &str = "paid_usage";
+    /// A warm-up started an account's 5-hour window (`usage_check::warm_up`);
+    /// `detail.cost_usd` is what Claude Code reported it cost at API prices.
+    pub const WARM_UP: &str = "warm_up";
 }
 
 /// Typed view of the `settings` table with defaults applied.
@@ -764,6 +781,10 @@ impl Store {
             if version < 7 {
                 s.conn.execute_batch(SCHEMA_V7)?;
                 s.conn.pragma_update(None, "user_version", 7)?;
+            }
+            if version < 8 {
+                s.conn.execute_batch(SCHEMA_V8)?;
+                s.conn.pragma_update(None, "user_version", 8)?;
             }
             Ok(())
         })
@@ -1173,6 +1194,24 @@ impl Store {
             bail!("account {id} does not exist");
         }
         Ok(())
+    }
+
+    /// Whether cc-rotate keeps the account's 5-hour window running. Turning it on for any
+    /// account lets warm-ups run again after they were stopped (`usage_check::META_WARM_BLOCKED`).
+    pub fn set_keep_running(&self, id: i64, on: bool) -> Result<()> {
+        self.immediate(|s| {
+            let n = s.conn.execute(
+                "UPDATE accounts SET keep_running = ?2 WHERE id = ?1",
+                params![id, on],
+            )?;
+            if n == 0 {
+                bail!("account {id} does not exist");
+            }
+            if on {
+                s.delete_meta(crate::usage_check::META_WARM_BLOCKED)?;
+            }
+            Ok(())
+        })
     }
 
     /// Whether the account moves ahead when its weekly budget would reset unused.

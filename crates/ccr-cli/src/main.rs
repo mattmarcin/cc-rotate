@@ -75,6 +75,14 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Start an account's 5-hour window now: Claude Code sends one short prompt to the smallest
+    /// model with its login, then reads its usage.
+    WarmUp {
+        /// The account (label, email or id).
+        account: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Swap the profile to another account now.
     Swap {
         /// Swap to this account instead of the scheduler's pick.
@@ -148,6 +156,13 @@ enum Command {
     /// Show or set whether an account moves ahead when its weekly budget would reset unused:
     /// yes (the default) or no.
     UseBeforeReset {
+        account: String,
+        #[arg(value_parser = ["yes", "no"])]
+        value: Option<String>,
+    },
+    /// Show or set whether cc-rotate starts an account's next 5-hour window with a short request
+    /// as soon as one ends while it's not in use: yes or no (the default).
+    KeepRunning {
         account: String,
         #[arg(value_parser = ["yes", "no"])]
         value: Option<String>,
@@ -471,6 +486,24 @@ fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> 
         }
         Command::UseBeforeReset { account, value } => {
             ranking::use_before_reset(store, &account, value.as_deref())?
+        }
+        Command::KeepRunning { account, value } => {
+            ranking::keep_running(store, paths, &account, value.as_deref())?
+        }
+        Command::WarmUp { account, json } => {
+            usage_check::sweep(store, paths)?;
+            let account = store.find_account(&account)?;
+            let outcome =
+                usage_check::warm_up(store, paths, account.id, usage_check::Trigger::Manual)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&outcome)?);
+            } else {
+                println!(
+                    "{}: {}",
+                    account.label,
+                    usage_check::describe_warm_up(&outcome)
+                );
+            }
         }
         Command::Watch { interval } => {
             watch::run(store, paths, Duration::from_secs(interval))?;

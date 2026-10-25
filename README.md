@@ -31,9 +31,10 @@ Because every session lives in one profile, sessions can see and message each ot
   If an account still turns out to be used up right after a swap, cc-rotate moves on at once instead of waiting out the 2-minute minimum between swaps.
 - Accounts that are not in use get a usage check from time to time: cc-rotate runs Claude Code's own `/usage` with that account's login in a scratch folder, which shows how much of each limit is used without sending a prompt or using any of the account's limits.
   A swap also checks the account it is about to use first when its usage data is more than 15 minutes old.
+- For accounts you choose, cc-rotate can also keep a 5-hour window running: as soon as one ends while the account isn't in use, Claude Code sends one short Haiku request with its login (see **Keeping 5-hour windows running**).
 
 cc-rotate never sends a request to Anthropic itself.
-All traffic is the unmodified Claude Code talking to Anthropic: your sessions, the sign-ins, and the usage checks.
+All traffic is the unmodified Claude Code talking to Anthropic: your sessions, the sign-ins, the usage checks and, if you turn it on, the short requests that keep 5-hour windows running.
 
 The design, with the Claude Code behavior it relies on, is in [docs/specs/2026-10-24-cc-rotate.md](docs/specs/2026-10-24-cc-rotate.md).
 
@@ -200,6 +201,25 @@ To leave out one account, untick **Use its weekly budget before it resets** in i
 To keep part of an account's week for yourself, set where rotation stops using it, in its **More** dialog or with `cc-rotate-ctl weekly-cap <label> 70` (`off` goes back to the setting).
 cc-rotate then treats 70% as that account's weekly limit, and only plans to use its budget up to there.
 
+### Keeping 5-hour windows running
+
+A 5-hour window starts with an account's first request and resets 5 hours later.
+An account that sits unused has no window running, so when rotation reaches it, its 5 hours only start then.
+For the accounts you choose, cc-rotate starts the next window as soon as the last one ends while the account isn't in use: Claude Code sends one short request ("Reply with the single word OK.") to Haiku with that account's login, with no tools, then reads the account's usage.
+A window is then already counting down when the account is needed, so the account is ready again sooner after rotation uses it up.
+Rotation also uses windows that are already running before fresh ones (see **Which account is used next**), so these accounts are used first.
+It only helps on days when you use more than your accounts give at once; with room to spare, it changes nothing.
+
+Each request costs about a tenth of a cent at API prices (a few thousand cached tokens and a one-word reply), counts toward that account's limits, and goes out about five times a day per account, plus a retry every 15 minutes while one doesn't go through (for example while the account is at a limit).
+This is the one case where cc-rotate has Claude Code send a prompt you didn't type, so it's off until you turn it on.
+Check that requests like this are fine under your plan's terms before you do.
+
+- Turn it on for an account with **Keep its 5-hour window running** in its **More** dialog, or with `cc-rotate-ctl keep-running <label> yes`.
+- `cc-rotate-ctl warm-up <label>` starts an account's window once, now.
+- The desktop app sends the requests, so it has to be running, with usage checks on.
+- It skips an account that is in use, paused, on hold, or at a weekly limit.
+- If a request ever uses another model, takes more than one turn or costs more than 2 cents, cc-rotate stops sending them and says so in the activity log and in the account's **More** dialog, until you click **Start again** there (or run `cc-rotate-ctl keep-running <label> yes`).
+
 ### How long your accounts last
 
 While you work, the dashboard shows how long your accounts last at your current pace ("all at a limit by 3:10 PM, one frees up at 4:30 PM"), and `cc-rotate-ctl status` shows the same.
@@ -280,6 +300,8 @@ When its input or output isn't a terminal, it prints the status once and exits.
 | `cc-rotate-ctl weekly-limit <label> [auto\|yes\|no]` | Show or set whether an account has a weekly limit (`auto` detects it). |
 | `cc-rotate-ctl use-before-reset <label> [yes\|no]` | Show or set whether an account moves ahead when its weekly budget would reset unused. |
 | `cc-rotate-ctl weekly-cap <label> [<percent>\|off]` | Show or set the weekly usage at which rotation stops using an account, keeping the rest of its week for you. |
+| `cc-rotate-ctl keep-running <label> [yes\|no]` | Show or set whether cc-rotate starts an account's next 5-hour window with a short request as soon as one ends. |
+| `cc-rotate-ctl warm-up <label>` | Start an account's 5-hour window now with one short Haiku request, then read its usage. |
 | `cc-rotate-ctl events` | Recent swaps, logins and problems. |
 | `cc-rotate-ctl doctor` | Check the profile, the store and Claude Code. |
 | `cc-rotate-ctl backup <file>` | Print a daily backup of the profile's login file, decrypted. It contains tokens, so keep the output private. |
