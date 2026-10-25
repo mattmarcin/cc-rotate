@@ -35,6 +35,7 @@ fn main() {
             commands::snapshot,
             commands::series,
             commands::events,
+            commands::usage_history,
             commands::swap_now,
             commands::check_usage,
             commands::set_paused,
