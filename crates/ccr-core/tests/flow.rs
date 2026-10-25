@@ -222,7 +222,10 @@ fn first_swap_of_the_day_keeps_an_encrypted_backup() {
 fn scheduler_follows_the_order_and_skips_exhausted() {
     let env = Env::new();
     let (store, a, b, c) = pool(&env);
-    // Usage is usage: b comes first in the order even though c has more weekly budget left.
+    // With strict_order, usage is usage: b comes first in the order even though c has more
+    // room left. (Without it, both windows are running and reset together, so the most room
+    // would decide.)
+    store.set_setting("strict_order", Some("true")).unwrap();
     store.record_sample(&sample(a, 10.0, 40.0)).unwrap();
     store.record_sample(&sample(b, 10.0, 60.0)).unwrap();
     store.record_sample(&sample(c, 50.0, 20.0)).unwrap();
@@ -745,8 +748,11 @@ fn tick_switches_back_to_a_preferred_account() {
     let event = store.last_event_of(kind::SWAP).unwrap().unwrap();
     assert_eq!(event.reason.as_deref(), Some("preferred_available"));
     let detail = event.detail.unwrap();
-    assert_eq!(
-        detail["pick"], "no weekly limit, 1st in your order",
+    // a and b are seats whose windows run and reset together; a wins on its label.
+    let pick = detail["pick"].as_str().unwrap();
+    assert!(
+        pick.starts_with("no weekly limit, 5-hour window already running, resets in ")
+            && pick.ends_with(", tied, 93% room left"),
         "{detail}"
     );
     assert!(
@@ -791,7 +797,7 @@ fn stale_switch_back_requests_are_skipped() {
     assert_eq!(
         swap::run(&store, &env.paths, &req).unwrap(),
         SwapOutcome::Skipped {
-            why: "no account higher in your order is ready".into()
+            why: "no better ranked account is ready".into()
         }
     );
     store
@@ -816,6 +822,9 @@ fn background_sync_switches_back_too() {
     store
         .set_meta(swap::META_LAST_SWAP_AT, time::now_ms() - 3_600_000)
         .unwrap();
+    // a and b are in the same tier, so only strict_order goes back up the order.
+    assert!(statusline::sync(&store, &env.paths).unwrap().is_none());
+    store.set_setting("strict_order", Some("true")).unwrap();
     let req = statusline::sync(&store, &env.paths)
         .unwrap()
         .expect("a ranks above b");
@@ -1839,6 +1848,7 @@ fn a_weekly_cap_keeps_the_rest_of_the_week_for_you() {
     store
         .set_setting("prefer_no_weekly_limit", Some("false"))
         .unwrap();
+    store.set_setting("strict_order", Some("true")).unwrap();
     store.set_order(&[c, b, a]).unwrap();
     store.record_sample(&sample(c, 10.0, 55.0)).unwrap();
     assert_eq!(swap::next_target(&store, Some(a)).unwrap().unwrap().id, c);

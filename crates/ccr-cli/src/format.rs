@@ -284,7 +284,14 @@ pub fn next(snap: &Snapshot, explain: bool) -> String {
     if s.prefer_no_weekly_limit {
         order.push("accounts without a weekly limit");
     }
+    if !s.strict_order {
+        order.push("the account in use");
+        order.push("accounts whose 5-hour window is already running, the soonest reset first");
+    }
     order.push("your order");
+    if !s.strict_order {
+        order.push("running windows close to a limit");
+    }
     order.push("the most room");
     let _ = writeln!(out, "\n{DIM}Order: {}.{RESET}", order.join(", then "));
     out

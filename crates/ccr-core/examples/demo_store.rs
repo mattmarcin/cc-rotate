@@ -95,10 +95,11 @@ fn main() -> Result<()> {
     rank.sort_by_key(|&i| (sims[i].weekly, i));
     let place = |i: usize| rank.iter().position(|&r| r == i).unwrap_or(usize::MAX);
 
-    // A week of rotation the way the scheduler does it: the first account in that order whose
-    // 5-hour window has room carries the load, the pool swaps on at the threshold, after
-    // checking the account it is about to use, and switches back once an earlier account's
-    // window resets.
+    // A week of rotation the way the scheduler does it: the account in use carries the load
+    // until its 5-hour threshold, then the pool swaps on, after checking the account it is
+    // about to use, to the best group, there to a running window (the soonest reset first),
+    // else the first in the order. It switches back once an account in a better group (no
+    // weekly limit) resets.
     let mut t = week_start;
     let mut current = rank[0];
     let mut since = t;
@@ -113,12 +114,23 @@ fn main() -> Result<()> {
         // Working hours: the 15 hours before now, and the same hours on earlier days.
         let busy = (now - t) / hour % 24 < 15;
         let usable = |s: &Sim| s.five < 98.0 && s.week < 98.0;
-        let best = rank.iter().copied().find(|&i| usable(&sims[i]));
+        let best = rank
+            .iter()
+            .copied()
+            .filter(|&i| i != current && usable(&sims[i]))
+            .min_by_key(|&i| {
+                let s = &sims[i];
+                match s.five_resets {
+                    0 => (s.weekly, 1, place(i) as i64),
+                    reset => (s.weekly, 0, reset),
+                }
+            });
         let (next, reason) = if !usable(&sims[current]) {
             (best, "threshold_5h")
         } else {
             (
-                best.filter(|&b| place(b) < place(current) && t - since >= hour / 6),
+                // Only an account without a weekly limit is worth leaving one with a limit for.
+                best.filter(|&b| !sims[b].weekly && sims[current].weekly && t - since >= hour / 6),
                 "preferred_available",
             )
         };

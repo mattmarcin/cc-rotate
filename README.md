@@ -138,17 +138,29 @@ When the account in use reaches a limit, cc-rotate picks the next account that i
 
 1. Accounts whose weekly budget would otherwise reset unused (see below), the soonest reset first.
 2. Then accounts without a weekly limit, then accounts whose weekly limit is not known yet, then accounts with one.
-   Turn this off with `cc-rotate-ctl config prefer_no_weekly_limit false`, and only your order counts.
-3. Then your order.
-4. Then, between accounts in the same place, the one with the most room left.
+   Turn this off with `cc-rotate-ctl config prefer_no_weekly_limit false`.
+3. Then the account in use, then accounts whose 5-hour window is already running and at least 10 points below the swap threshold, the one that resets soonest first.
+4. Then your order.
+5. Then accounts whose running 5-hour window is closer to the threshold than that, since each would last only minutes.
+6. Then, between accounts in the same place, the one with the most room left.
+
+A 5-hour window starts with an account's first request and resets 5 hours later, and whatever is left in it then is lost.
+So cc-rotate uses up windows that are already running before it starts new ones, and keeps the account in use until it reaches a limit.
+How much you can use over a day stays the same, and there are fewer swaps.
 
 cc-rotate finds out whether an account has a weekly limit from the usage Claude Code reports: an account that reported a weekly limit has one, and an account that went through two separate 5-hour windows in the last 8 days without ever reporting one has none.
 Until then it is not known yet.
 If that guess is wrong, set it yourself in the account's **More** dialog or with `cc-rotate-ctl weekly-limit <label> yes|no` (`auto` goes back to detecting it).
 
-cc-rotate also swaps back by itself: when an account higher in your order than the one in use is ready again (for example once its 5-hour window has reset), it swaps to it, as long as the account in use has been in use for at least `switch_back_dwell_s` (10 minutes by default).
+cc-rotate also swaps back by itself when an account in a better group than the one in use is ready again (steps 1 and 2 above).
+For example, while every account without a weekly limit is at its limit, cc-rotate uses one with a weekly limit, and it swaps back as soon as one without a limit has reset.
+It waits until the account in use has been in use for at least `switch_back_dwell_s` (10 minutes by default).
 That includes an account you picked by hand, so pause an account if you want it left alone.
-Accounts in the same place never swap just to even out usage.
+Within the same group it never swaps back, and accounts never swap just to even out usage.
+Accounts whose weekly budget would reset unused are the exception: one whose week resets sooner is swapped back to.
+
+To always go back to the account highest in your order as soon as it is ready instead, turn on **Always go back to accounts higher in my order** in the app's **Settings**, or run `cc-rotate-ctl config strict_order true`.
+Then only your order counts within a group (steps 3 and 5 are skipped), and that costs a swap each time an account higher up resets.
 
 `cc-rotate-ctl next --explain` lists every account in the order it would be used, with the reason for each.
 
@@ -183,7 +195,7 @@ The accounts are taken in the order their weeks reset, since only one is in use 
 It learns from your usage how much of the weekly budget a 5-hour window costs on each account, how fast you use an account, and when you usually work.
 Until it has seen enough, it assumes a full 5-hour window costs a tenth of the week and that you work 10 hours a day, which errs on the side of starting early.
 Turn it off with `cc-rotate-ctl config use_expiring_weekly false`, or in **Settings**.
-To leave out one account, untick **Use its weekly budget before it resets** in its **More** dialog, or run `cc-rotate-ctl use-before-reset <label> no`: it's then used in your order like any other.
+To leave out one account, untick **Use its weekly budget before it resets** in its **More** dialog, or run `cc-rotate-ctl use-before-reset <label> no`: it's then used like any other account.
 
 To keep part of an account's week for yourself, set where rotation stops using it, in its **More** dialog or with `cc-rotate-ctl weekly-cap <label> 70` (`off` goes back to the setting).
 cc-rotate then treats 70% as that account's weekly limit, and only plans to use its budget up to there.
@@ -269,7 +281,8 @@ When its input or output isn't a terminal, it prints the status once and exits.
 | `swap_cooldown_s` | 120 | Minimum seconds between swaps at a limit and swaps back. |
 | `prefer_no_weekly_limit` | true | Use accounts without a weekly limit before the ones with one. |
 | `use_expiring_weekly` | true | Move an account ahead when its weekly budget would otherwise reset unused. |
-| `switch_back_dwell_s` | 600 | How long an account stays in use before cc-rotate swaps back to an account higher in your order that is ready again. |
+| `strict_order` | false | Go by your order alone within a group, and swap back to an account higher in it as soon as it is ready. |
+| `switch_back_dwell_s` | 600 | How long an account stays in use before cc-rotate swaps back to a better ranked account that is ready again. |
 | `lock_timeout_ms` | 30000 | How long a swap waits for Claude Code to finish renewing a login. |
 | `sample_retention_days` | 90 | How long usage history is kept. |
 | `statusline_downstream` | your old status line | The status line command shown after cc-rotate's label. |

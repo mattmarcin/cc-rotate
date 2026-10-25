@@ -149,7 +149,7 @@ pub fn forecast(
             if let Some(i) = current {
                 pool[i].account.state = AccountState::Parked;
             }
-            current = scheduler::pick(&pool, policy, None)
+            current = scheduler::pick(&pool, policy, None, t)
                 .map(|c| c.account.id)
                 .and_then(|id| pool.iter().position(|c| c.account.id == id));
             match current {
@@ -220,6 +220,7 @@ mod tests {
         thresholds: T,
         prefer_no_weekly_limit: true,
         use_expiring_weekly: false,
+        strict_order: false,
     };
 
     fn seat(id: i64, state: AccountState, five: f64, resets_in_s: Option<i64>) -> Candidate {

@@ -210,7 +210,8 @@ pub fn tick(store: &Store, paths: &Paths, input: &StatusInput, now_ms: i64) -> R
     let timing = timing(store, active.id, now_ms)?;
     if let Some(reason) = scheduler::decide(&pool, policy, timing, dead_login, true) {
         if reason != Reason::PreferredAvailable {
-            result.pool_exhausted = scheduler::pick(&pool, policy, Some(active.id)).is_none();
+            result.pool_exhausted =
+                scheduler::pick(&pool, policy, Some(active.id), now_ms / 1000).is_none();
         }
         store.set_meta(META_SWAP_REQUESTED_AT, now_ms)?;
         result.swap = Some(SwapRequest {
@@ -223,7 +224,8 @@ pub fn tick(store: &Store, paths: &Paths, input: &StatusInput, now_ms: i64) -> R
         .iter()
         .any(|c| c.account.id == active.id && c.blocking().is_some())
     {
-        result.pool_exhausted = scheduler::pick(&pool, policy, Some(active.id)).is_none();
+        result.pool_exhausted =
+            scheduler::pick(&pool, policy, Some(active.id), now_ms / 1000).is_none();
     }
 
     store.prune(now_ms)?;

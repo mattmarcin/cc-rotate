@@ -1448,7 +1448,7 @@ mod tests {
         assert!(state(&e.store, a).unwrap().held_back);
         let (pool, policy) = swap::load_pool(&e.store, time::now_s()).unwrap();
         assert!(
-            scheduler::pick(&pool, policy, None).is_none(),
+            scheduler::pick(&pool, policy, None, time::now_s()).is_none(),
             "a held-back account is not picked"
         );
         assert_eq!(

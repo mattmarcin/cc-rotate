@@ -663,8 +663,9 @@ pub fn detect_weekly_limit(store: &Store, account_id: i64, now_s: i64) -> Result
 
 /// The account the scheduler would pick right now, excluding `exclude`.
 pub fn next_target(store: &Store, exclude: Option<i64>) -> Result<Option<Account>> {
-    let (pool, policy) = load_pool(store, time::now_s())?;
-    Ok(scheduler::pick(&pool, policy, exclude).map(|c| c.account.clone()))
+    let now_s = time::now_s();
+    let (pool, policy) = load_pool(store, now_s)?;
+    Ok(scheduler::pick(&pool, policy, exclude, now_s).map(|c| c.account.clone()))
 }
 
 /// Where a status line reading of the active account belongs.
@@ -1016,10 +1017,14 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
     let (target, _target_lock, pool, policy) = loop {
         attempts += 1;
         let last_try = req.to.is_some() || attempts >= MAX_PICK_ATTEMPTS;
-        let (mut pool, policy) = load_pool(store, time::now_s())?;
-        let some_ready = scheduler::pick(&pool, policy, active_id).is_some();
+        let now_s = time::now_s();
+        let (mut pool, policy) = load_pool(store, now_s)?;
+        let some_ready = scheduler::pick(&pool, policy, active_id, now_s).is_some();
         pool.retain(|c| !passed_over.contains(&c.account.id));
-        if req.to.is_none() && some_ready && scheduler::pick(&pool, policy, active_id).is_none() {
+        if req.to.is_none()
+            && some_ready
+            && scheduler::pick(&pool, policy, active_id, now_s).is_none()
+        {
             // The accounts that could take over are only busy (a check of them running): not an
             // exhausted pool, so no such event or notification.
             return skip(
@@ -1028,7 +1033,7 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
                 "the accounts that could take over are being checked",
             );
         }
-        let target = match choose(store, req, &pool, policy, active.as_ref())? {
+        let target = match choose(store, req, &pool, policy, active.as_ref(), now_s)? {
             Choice::Target(account) => account,
             Choice::Done(outcome) => return Ok(outcome),
         };
@@ -1079,9 +1084,10 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
         }
         // Under the lock: a check that finished while it was awaited may have found the target
         // used up, or its login rejected, or one in doubt.
-        let (mut pool, policy) = load_pool(store, time::now_s())?;
+        let now_s = time::now_s();
+        let (mut pool, policy) = load_pool(store, now_s)?;
         pool.retain(|c| !passed_over.contains(&c.account.id));
-        match choose(store, req, &pool, policy, active.as_ref())? {
+        match choose(store, req, &pool, policy, active.as_ref(), now_s)? {
             Choice::Target(settled) if settled.id == target.id => {
                 if req.to.is_some() && usage_check::state(store, target.id)?.held_back {
                     return Err(anyhow!(
@@ -1373,6 +1379,7 @@ fn choose(
     pool: &[Candidate],
     policy: Policy,
     active: Option<&Account>,
+    now_s: i64,
 ) -> Result<Choice> {
     let target = match req.to {
         Some(id) => {
@@ -1397,18 +1404,18 @@ fn choose(
             }
         }
         None if req.reason == Reason::PreferredAvailable => {
-            match scheduler::switch_back_target(pool, policy) {
+            match scheduler::switch_back_target(pool, policy, now_s) {
                 Some(c) => c.account.clone(),
                 None => {
                     return Ok(Choice::Done(skip(
                         store,
                         req,
-                        "no account higher in your order is ready",
+                        "no better ranked account is ready",
                     )?));
                 }
             }
         }
-        None => match scheduler::pick(pool, policy, active.map(|a| a.id)) {
+        None => match scheduler::pick(pool, policy, active.map(|a| a.id), now_s) {
             Some(c) => c.account.clone(),
             None => {
                 return Ok(Choice::Done(pool_exhausted(

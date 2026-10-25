@@ -538,6 +538,8 @@ pub struct Settings {
     pub use_expiring_weekly: bool,
     /// Warn this many days before an account's sign-in ends; 0 turns the warning off.
     pub login_warning_days: i64,
+    /// Go by the user's order alone (`scheduler::Policy::strict_order`).
+    pub strict_order: bool,
 }
 
 pub const SETTING_KEYS: &[&str] = &[
@@ -556,6 +558,7 @@ pub const SETTING_KEYS: &[&str] = &[
     "usage_check_max_age_s",
     "use_expiring_weekly",
     "login_warning_days",
+    "strict_order",
 ];
 
 pub struct Store {
@@ -848,6 +851,9 @@ impl Store {
                 .and_then(|v| parse_bool(&v))
                 .unwrap_or(true),
             login_warning_days: int("login_warning_days", 5)?,
+            strict_order: get("strict_order")?
+                .and_then(|v| parse_bool(&v))
+                .unwrap_or(false),
         })
     }
 
@@ -1707,7 +1713,7 @@ fn validate_setting(key: &str, value: &str) -> Result<Option<String>> {
                 bail!("Use a whole number of days from 0 to 30.");
             }
         }
-        "prefer_no_weekly_limit" | "usage_checks" | "use_expiring_weekly" => {
+        "prefer_no_weekly_limit" | "usage_checks" | "use_expiring_weekly" | "strict_order" => {
             let v = parse_bool(value).context("expected true or false")?;
             return Ok(Some(v.to_string()));
         }
