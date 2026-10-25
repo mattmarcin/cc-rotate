@@ -38,12 +38,26 @@ pub struct StatusInput {
     pub session_id: Option<String>,
     /// The Claude Code version the session runs (`health::note_claude_version`).
     pub version: Option<String>,
+    /// What the session's use would have cost at API prices so far, as Claude Code estimates it.
+    pub cost: Option<CostInfo>,
     pub model: Option<ModelInfo>,
     /// Every usage window Claude Code reports, by name (`five_hour`, `seven_day`, ...). Kept
     /// generic so a window Claude Code adds later is recorded without a code change; a window
     /// is only present while the API reports it and its reset has not passed.
     #[serde(default, deserialize_with = "lenient_windows")]
     pub rate_limits: Option<BTreeMap<String, Window>>,
+}
+
+/// A session whose process has run this long or less started then, unless it was resumed or
+/// forked, which restores the run time it had (`Store::note_session_cost`).
+const NEW_SESSION_MS: f64 = 60_000.0;
+
+#[derive(Debug, Default, Deserialize)]
+pub struct CostInfo {
+    pub total_cost_usd: Option<f64>,
+    /// How long the session's process has run (wall time), restored with its cost on `--resume`:
+    /// `now - total_duration_ms` is the same for every tick of one process.
+    pub total_duration_ms: Option<f64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -164,9 +178,13 @@ pub fn tick(store: &Store, paths: &Paths, input: &StatusInput, now_ms: i64) -> R
     )?;
 
     if !sync_profile_login(store, paths, &mut dead_login, &mut unidentified)? {
-        // Nothing can be trusted about the profile's login until the swap is settled.
+        // Nothing can be trusted about the profile's login until the swap is settled. The cost
+        // still counts, for the account cc-rotate last put in the profile.
         result.settle_login = settle_due(store, now_ms)?;
         result.active = store.active_account()?;
+        if let Some(active) = &result.active {
+            note_cost(store, input, active.id, now_ms)?;
+        }
         return Ok(result);
     }
     if unidentified && !crate::lock::is_held(&paths.swap_lock(), crate::lock::CLAUDE_STALE) {
@@ -185,8 +203,15 @@ pub fn tick(store: &Store, paths: &Paths, input: &StatusInput, now_ms: i64) -> R
     if let Some(version) = input.version.as_deref() {
         crate::health::note_claude_version(store, version)?;
     }
+    // What the session added to its cost since its last reading was spent on the account in
+    // use, unless its reading is another account's: then the request still carried that one's
+    // login.
+    let mut cost_account = active.id;
     if let Some(sample) = input.sample_for(active.id, "rotate", now_ms) {
-        if !is_stale_reading(store, &sample, now_ms)? {
+        if is_stale_reading(store, &sample, now_ms)? {
+            // It carries the reset times of the account the last swap left.
+            cost_account = left_account(store)?.unwrap_or(active.id);
+        } else {
             match swap::attribute(store, &sample, active.id, now_ms / 1000)? {
                 swap::Attribution::Own => {
                     store.record_sample(&sample)?;
@@ -200,15 +225,28 @@ pub fn tick(store: &Store, paths: &Paths, input: &StatusInput, now_ms: i64) -> R
                 }
                 swap::Attribution::Elsewhere => {
                     result.confirm = confirm_due(store, &sample, active.id, now_ms)?;
+                    cost_account = reading_account(store, &sample, active.id)?.unwrap_or(active.id);
                 }
             }
         }
     }
+    note_cost(store, input, cost_account, now_ms)?;
 
     let (pool, policy) = swap::load_pool(store, now_ms / 1000)?;
     crate::budget::note_in_use(store, &pool)?;
     let timing = timing(store, active.id, now_ms)?;
-    if let Some(reason) = scheduler::decide(&pool, policy, timing, dead_login, true) {
+    // Every account at a limit and the one in use paying: with `avoid_extra_usage` on, move to
+    // one without extra usage first, whatever else the decision would be.
+    let avoid = if dead_login {
+        None
+    } else {
+        avoid_extra_usage(store, &pool, policy, &active, now_ms)?
+    };
+    if let Some(req) = avoid {
+        store.set_meta(META_SWAP_REQUESTED_AT, now_ms)?;
+        result.pool_exhausted = true;
+        result.swap = Some(req);
+    } else if let Some(reason) = scheduler::decide(&pool, policy, timing, dead_login, true) {
         if reason != Reason::PreferredAvailable {
             result.pool_exhausted =
                 scheduler::pick(&pool, policy, Some(active.id), now_ms / 1000).is_none();
@@ -226,6 +264,21 @@ pub fn tick(store: &Store, paths: &Paths, input: &StatusInput, now_ms: i64) -> R
     {
         result.pool_exhausted =
             scheduler::pick(&pool, policy, Some(active.id), now_ms / 1000).is_none();
+    }
+
+    // Paid extra usage judged by an old report: read the account in use again, in place of a
+    // swap that has nowhere to go (a sync runs one thing at a time: a swap, a settling, or a
+    // reading). A swap away from paying goes first.
+    let futile = result.swap.as_ref().is_some_and(|s| {
+        result.pool_exhausted && !matches!(s.reason, Reason::AvoidExtraUsage | Reason::DeadLogin)
+    });
+    if !result.confirm
+        && !result.settle_login
+        && (result.swap.is_none() || futile)
+        && crate::extra_usage::needs_fresh_reading(store, &pool, policy, &active, now_ms)?
+    {
+        result.swap = None;
+        result.confirm = true;
     }
 
     store.prune(now_ms)?;
@@ -249,6 +302,27 @@ fn note_session_working(
         }
         _ => Ok(()),
     }
+}
+
+/// How often a swap away from paid extra usage is asked for while one is on its way.
+const AVOID_EVERY_MS: i64 = 30_000;
+
+/// `extra_usage::avoid_swap`, at most every `AVOID_EVERY_MS`: every session's tick would ask
+/// otherwise, while the swap it asked for is still running.
+fn avoid_extra_usage(
+    store: &Store,
+    pool: &[scheduler::Candidate],
+    policy: scheduler::Policy,
+    active: &Account,
+    now_ms: i64,
+) -> Result<Option<SwapRequest>> {
+    if store
+        .meta_i64(META_SWAP_REQUESTED_AT)?
+        .is_some_and(|t| (0..AVOID_EVERY_MS).contains(&(now_ms - t)))
+    {
+        return Ok(None);
+    }
+    crate::extra_usage::avoid_swap(store, pool, policy, active, now_ms / 1000)
 }
 
 /// When a swap stopped half way, settling it runs Claude Code: ask at most once a minute (one of
@@ -384,7 +458,74 @@ pub fn observe(
         // A profile that never swaps only ever shows its own account.
         swap::note_known_resets(store, account.id, &sample.windows, now_ms / 1000)?;
     }
+    note_cost(store, input, account.id, now_ms)?;
     Ok(Some(account))
+}
+
+/// Count what the session's use cost since its last reading, at API prices, for `account_id`
+/// (`Store::note_session_cost`).
+fn note_cost(store: &Store, input: &StatusInput, account_id: i64, now_ms: i64) -> Result<()> {
+    let Some(cost) = input.cost.as_ref() else {
+        return Ok(());
+    };
+    let (Some(session), Some(total)) = (input.session_id.as_deref(), cost.total_cost_usd) else {
+        return Ok(());
+    };
+    if session.is_empty() {
+        return Ok(());
+    }
+    // Two processes can run one session (resumed twice, each restoring the same total): each
+    // keeps its own count. A process that cannot be told shares one with the session.
+    let process = crate::process::Ancestors::launcher().unwrap_or_default();
+    let new_session = cost
+        .total_duration_ms
+        .is_some_and(|d| d.is_finite() && (0.0..NEW_SESSION_MS).contains(&d));
+    store.note_session_cost(session, &process, total, new_session, account_id, now_ms)?;
+    Ok(())
+}
+
+/// The account a reading that is not the account in use's belongs to: one whose latest reading
+/// it repeats exactly, else the one whose latest reading shares the most windows' reset times
+/// with it, else the account the last swap left.
+fn reading_account(store: &Store, sample: &Sample, active_id: i64) -> Result<Option<i64>> {
+    let mut best: Option<(usize, i64)> = None;
+    for account in store.accounts()? {
+        if account.id == active_id {
+            continue;
+        }
+        let Some(latest) = store.last_sample(account.id)? else {
+            continue;
+        };
+        if crate::store::same_windows(&sample.windows, &latest.windows) {
+            return Ok(Some(account.id));
+        }
+        let shared = sample
+            .windows
+            .iter()
+            .filter(|w| {
+                w.resets_at.is_some_and(|r| {
+                    latest.windows.iter().any(|o| {
+                        o.name == w.name && o.resets_at.is_some_and(|or| swap::same_reset(or, r))
+                    })
+                })
+            })
+            .count();
+        if shared > 0 && best.is_none_or(|(n, _)| shared > n) {
+            best = Some((shared, account.id));
+        }
+    }
+    match best {
+        Some((_, id)) => Ok(Some(id)),
+        None => left_account(store),
+    }
+}
+
+/// The account the last swap left, while it is in the pool.
+fn left_account(store: &Store) -> Result<Option<i64>> {
+    Ok(store
+        .last_event_of(kind::SWAP)?
+        .and_then(|e| e.account_from)
+        .filter(|&id| store.account(id).ok().flatten().is_some()))
 }
 
 /// Shortly after a swap, a session that has not made a request yet still reports the old
@@ -425,6 +566,13 @@ pub fn sync_at(store: &Store, paths: &Paths, now_ms: i64) -> Result<Option<SwapR
     let (pool, policy) = swap::load_pool(store, now_ms / 1000)?;
     crate::budget::note_in_use(store, &pool)?;
     let timing = timing(store, active.id, now_ms)?;
+    // The app runs this when no session ticks, as when every session waits at a limit.
+    if !dead_login {
+        if let Some(req) = avoid_extra_usage(store, &pool, policy, &active, now_ms)? {
+            store.set_meta(META_SWAP_REQUESTED_AT, now_ms)?;
+            return Ok(Some(req));
+        }
+    }
     let Some(reason) = scheduler::decide(&pool, policy, timing, dead_login, false) else {
         return Ok(None);
     };

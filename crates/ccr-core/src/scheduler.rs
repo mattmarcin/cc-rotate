@@ -328,6 +328,9 @@ pub enum Reason {
     DeadLogin,
     Manual,
     Login,
+    /// Every account is at a limit and the one in use runs on paid extra usage: move to one
+    /// without, so sessions wait instead of paying (`avoid_extra_usage`).
+    AvoidExtraUsage,
 }
 
 impl Reason {
@@ -341,6 +344,7 @@ impl Reason {
             Self::DeadLogin => "dead_login",
             Self::Manual => "manual",
             Self::Login => "login",
+            Self::AvoidExtraUsage => "avoid_extra_usage",
         }
     }
 
@@ -354,6 +358,7 @@ impl Reason {
             "dead_login" => Self::DeadLogin,
             "manual" => Self::Manual,
             "login" => Self::Login,
+            "avoid_extra_usage" => Self::AvoidExtraUsage,
             _ => return None,
         })
     }

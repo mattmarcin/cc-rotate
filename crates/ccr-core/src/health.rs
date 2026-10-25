@@ -22,6 +22,7 @@ const DAY_MS: i64 = 86_400_000;
 /// Check everything once. The desktop app calls this every 30 seconds.
 pub fn scan(store: &Store, now_ms: i64) -> Result<()> {
     waiting::scan(store, now_ms)?;
+    crate::extra_usage::scan(store, now_ms)?;
     sign_ins(store, now_ms)
 }
 

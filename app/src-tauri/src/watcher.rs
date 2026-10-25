@@ -305,6 +305,51 @@ fn describe(store: &Store, event: &Event) -> Option<(String, String)> {
                 format!("Sign in to {name} again before then to keep it in rotation."),
             ))
         }
+        kind::PAID_USAGE => {
+            let detail = event.detail.as_ref();
+            let minor = |k: &str| detail.and_then(|d| d.get(k)).and_then(|v| v.as_i64());
+            let currency = detail
+                .and_then(|d| d.get("currency"))
+                .and_then(|v| v.as_str());
+            // The account in use is rarely read, so the figures say when they are from.
+            let as_of = minor("read_at")
+                .map(|t| format!("As of {}, it", time::local(t / 1000, "%b %-d, %-I:%M %p")))
+                .unwrap_or_else(|| "It".into());
+            let spend = match (minor("used"), minor("monthly_limit")) {
+                (Some(used), Some(limit)) => format!(
+                    " {as_of} had used {} of its {} this month.",
+                    ccr_core::extra_usage::money(used, currency),
+                    ccr_core::extra_usage::money(limit, currency)
+                ),
+                (Some(used), None) => format!(
+                    " {as_of} had used {} this month.",
+                    ccr_core::extra_usage::money(used, currency)
+                ),
+                _ => String::new(),
+            };
+            let avoiding = detail
+                .and_then(|d| d.get("avoiding"))
+                .and_then(|v| v.as_bool())
+                == Some(true);
+            let could_move = detail
+                .and_then(|d| d.get("could_move"))
+                .and_then(|v| v.as_bool())
+                == Some(true);
+            let next = if avoiding && could_move {
+                " cc-rotate couldn't move to an account without extra usage. Activity says why."
+            } else if avoiding {
+                " No account without extra usage is ready to move to."
+            } else {
+                " To wait for a reset instead, turn that on in Settings."
+            };
+            Some((
+                "Sessions are using paid extra usage".into(),
+                format!(
+                    "Every account is at a limit, and {} has extra usage on, so its sessions now cost money.{spend}{next}",
+                    label(event.account_from)
+                ),
+            ))
+        }
         kind::SESSION_STUCK => {
             let detail = event.detail.as_ref();
             let version = detail

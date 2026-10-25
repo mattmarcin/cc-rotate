@@ -26,7 +26,7 @@
 use serde_json::{Map, Value};
 
 use crate::scheduler::{self, FIVE_HOUR, SEVEN_DAY};
-use crate::store::SampleWindow;
+use crate::store::{ExtraUsage, SampleWindow};
 use crate::time;
 
 /// The key Claude Code caches the report under in `.claude.json`.
@@ -43,6 +43,8 @@ pub struct CachedReport {
     /// The account Claude Code fetched it for, when it recorded one.
     pub account_uuid: Option<String>,
     pub windows: Vec<SampleWindow>,
+    /// The account's extra usage, when the plan has it (`extra_usage`).
+    pub extra_usage: Option<ExtraUsage>,
 }
 
 /// The report cached in a `.claude.json` document, if it has one.
@@ -61,6 +63,28 @@ pub fn from_cache(cached: &Value) -> Option<CachedReport> {
             .filter(|u| !u.is_empty())
             .map(str::to_string),
         windows: windows(cached.get("utilization")?),
+        extra_usage: cached.get("utilization").and_then(extra_usage),
+    })
+}
+
+/// The `extra_usage` of a report body: amounts in minor units of its currency (cents for USD),
+/// `is_enabled` false while extra usage cannot cover requests.
+pub fn extra_usage(body: &Value) -> Option<ExtraUsage> {
+    let e = body.get("extra_usage")?.as_object()?;
+    let minor = |k: &str| e.get(k).and_then(Value::as_f64).map(|v| v.round() as i64);
+    let text = |k: &str| {
+        e.get(k)
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    Some(ExtraUsage {
+        enabled: e.get("is_enabled")?.as_bool()?,
+        monthly_limit: minor("monthly_limit"),
+        used: minor("used_credits"),
+        utilization: e.get("utilization").and_then(Value::as_f64),
+        currency: text("currency").map(|c| c.to_ascii_uppercase()),
+        disabled_reason: text("disabled_reason"),
     })
 }
 
@@ -191,9 +215,36 @@ mod tests {
         });
         let w = windows(&report);
         assert_eq!(names(&w), vec!["five_hour", "seven_day_fable"]);
+        let extra = extra_usage(&report).unwrap();
+        assert!(extra.enabled);
+        assert_eq!(extra.monthly_limit, Some(10));
+        assert_eq!(extra.used, None);
         assert_eq!(w[0].pct, 100.0);
         assert_eq!(w[0].resets_at, time::parse_rfc3339("2026-10-25T03:40:00Z"));
         assert_eq!(w[1].pct, 15.0);
+    }
+
+    /// Extra usage as Claude Code 2.1.310 cached it, turned off by the user and in use.
+    #[test]
+    fn extra_usage_states() {
+        let off = json!({"extra_usage": {"is_enabled": false, "monthly_limit": null,
+            "used_credits": null, "utilization": null, "currency": null, "decimal_places": null,
+            "disabled_reason": null, "user_disabled": true, "spend_limit_reached": false}});
+        let off = extra_usage(&off).unwrap();
+        assert!(!off.enabled);
+        assert_eq!(
+            (off.monthly_limit, off.used, off.currency),
+            (None, None, None)
+        );
+
+        let on = json!({"extra_usage": {"is_enabled": true, "monthly_limit": 5000,
+            "used_credits": 1240.0, "utilization": 24.8, "currency": "usd"}});
+        let on = extra_usage(&on).unwrap();
+        assert_eq!((on.monthly_limit, on.used), (Some(5000), Some(1240)));
+        assert_eq!(on.currency.as_deref(), Some("USD"));
+
+        assert!(extra_usage(&json!({"extra_usage": null})).is_none());
+        assert!(extra_usage(&json!({})).is_none());
     }
 
     #[test]

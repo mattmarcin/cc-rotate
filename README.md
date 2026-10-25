@@ -212,10 +212,25 @@ The app sends a notification once when they would all be at a limit within the h
 - For an account with a weekly limit: the highest usage of each weekly window that ended in the period, and the average.
 - For an account without one: how many 5-hour windows it used each calendar week (Monday to Monday), and how many of them reached the limit.
 
+It also shows each account's **API value**: what its use would have cost at API prices, as Claude Code itself estimates it (the cost `/cost` shows).
+Compare it with what you pay for the subscription.
+cc-rotate counts it from the status line of every session in the cc-rotate profile, and of your other profiles it tracks, for the account each request went to.
+
 It only reports what cc-rotate recorded, and usage history is kept for `sample_retention_days` (90 days by default).
 A week with no readings shows no numbers.
 A week with few readings is marked, since the account may have used more than cc-rotate saw.
-The app shows the same numbers for the last 4 weeks as **Recent weeks** in the account's **More** dialog.
+The app shows the same numbers for the last 4 weeks as **Recent weeks** and **API value** in the account's **More** dialog.
+
+### Extra usage
+
+An account with extra usage turned on on claude.ai keeps working past its plan's limits, and bills the card on file.
+cc-rotate swaps before a limit, so that only happens once every account is at a limit.
+Each account's **More** dialog shows whether extra usage is on and how much it spent this month, from the account's latest usage report, and `cc-rotate-ctl status` lists the accounts that have it on.
+
+- When sessions start running on paid extra usage, the app sends a notification ("Sessions are using paid extra usage").
+- To have them wait for the next reset instead, turn on **When every account is at a limit, wait instead of paying for extra usage** in **Settings** (`avoid_extra_usage`).
+  cc-rotate then moves the profile to an account whose extra usage is off, the one that frees up first, and its sessions continue once an account has room.
+  An account whose extra usage cc-rotate hasn't seen yet isn't taken for one without it.
 
 ### Unattended runs
 
@@ -252,7 +267,7 @@ When its input or output isn't a terminal, it prints the status once and exits.
 | `cc-rotate [claude arguments]` | Start Claude Code on the pool. |
 | `cc-rotate-ctl status` | Every account with its plan, usage and reset times, and the next pick. |
 | `cc-rotate-ctl watch` | `status` and the latest events, redrawn every 2 seconds until you press q. `--interval <seconds>` changes the pace. |
-| `cc-rotate-ctl report` | How much of its limits each account used, week by week, over the last 4 weeks. `--weeks <n>` looks further back, `--json` prints the numbers. |
+| `cc-rotate-ctl report` | How much of its limits each account used, week by week, over the last 4 weeks, and what that use would have cost at API prices. `--weeks <n>` looks further back, `--json` prints the numbers. |
 | `cc-rotate-ctl next` | The account the next swap would pick, and why. `--explain` lists every account in order with a reason. |
 | `cc-rotate-ctl swap` | Swap now to the next pick. `--to <label>` picks one. |
 | `cc-rotate-ctl check [<label>...]` | Read the usage of accounts not in use now with Claude Code's `/usage`, all of them when none are listed. |
@@ -292,6 +307,7 @@ When its input or output isn't a terminal, it prints the status once and exits.
 | `usage_check_interval_s` | 3600 | How often the app checks each account that is not in use (at least 300). |
 | `usage_check_max_age_s` | 900 | A swap checks the account it picked first when its usage data is older than this. 0 always checks first. |
 | `login_warning_days` | 5 | Warn this many days before an account's sign-in ends. 0 turns the warning off. |
+| `avoid_extra_usage` | false | When every account is at a limit and the one in use has extra usage on, move to one without, so sessions wait for a reset instead of paying. |
 
 ### Tracking your other profiles too
 

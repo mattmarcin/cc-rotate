@@ -73,6 +73,9 @@ pub struct CalendarWeek {
     pub windows_at_limit: Option<usize>,
     /// Few readings, or older than the history kept: the counts may be low.
     pub thin: bool,
+    /// What the account's use this week would have cost at API prices, as Claude Code estimates
+    /// it in the status line; `None` when cc-rotate counted none.
+    pub api_value_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -94,6 +97,15 @@ pub struct AccountHistory {
 }
 
 impl AccountHistory {
+    /// What the account's use over the weeks reported would have cost at API prices, when
+    /// cc-rotate counted any.
+    pub fn api_value_usd(&self) -> Option<f64> {
+        self.weeks
+            .iter()
+            .filter_map(|w| w.api_value_usd)
+            .reduce(|a, b| a + b)
+    }
+
     /// The average peak of the weekly windows, when there is one.
     pub fn average_weekly_peak(&self) -> Option<f64> {
         if self.weekly.is_empty() {
@@ -178,6 +190,7 @@ pub fn calendar_weeks(
                 windows_at_limit: known
                     .then(|| windows.iter().filter(|p| p.peak_pct >= threshold).count()),
                 thin: samples < THIN_SAMPLES || starts_at < kept_from_s,
+                api_value_usd: None,
             }
         })
         .collect()
@@ -245,7 +258,7 @@ fn history(
             store.sample_count(account.id, (start * 1000).max(kept_from_ms), end * 1000)
         })
         .collect::<Result<Vec<_>>>()?;
-    let weeks = calendar_weeks(
+    let mut weeks = calendar_weeks(
         &five_hour,
         bounds,
         &samples,
@@ -253,6 +266,10 @@ fn history(
         kept_from_s,
         now_s,
     );
+    for week in &mut weeks {
+        week.api_value_usd =
+            store.account_cost_between(account.id, week.starts_at, week.ends_at)?;
+    }
 
     let detected = swap::detect_weekly_limit(store, account.id, now_s)?;
     let weekly_limit = scheduler::weekly_limit(account.weekly_limit, detected);
