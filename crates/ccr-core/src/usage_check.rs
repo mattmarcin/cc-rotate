@@ -435,6 +435,10 @@ fn check_with(
         .as_ref()
         .and_then(usage_report::from_config)
         .filter(|r| r.fetched_at_ms >= started - 1000);
+    // Kept with the reading when the check reads the account's usage.
+    let extra_usage = report
+        .as_ref()
+        .and_then(|r| Some((r.extra_usage.clone()?, r.fetched_at_ms)));
     let debug_log = std::fs::read_to_string(scratch.dir.join(DEBUG_FILE)).unwrap_or_default();
     let credman = cfg!(windows) && credstore::windows_credman_enabled(&scratch.dir, None);
     let timed_out = ran.as_ref().is_ok_and(|r| r.timed_out);
@@ -548,6 +552,9 @@ fn check_with(
                     model: None,
                     windows: profile_usage::with_carried(windows.clone(), last.as_ref(), now / 1000),
                 })?;
+                if let Some((extra, read_at)) = &extra_usage {
+                    s.set_extra_usage(account_id, extra, *read_at)?;
+                }
                 st.last_read_at = Some(now);
                 st.not_before = None;
                 st.problem = None;
@@ -858,6 +865,9 @@ fn confirm_with(
         });
     }
     let now = time::now_ms();
+    if let Some(extra) = &report.extra_usage {
+        store.set_extra_usage(active.id, extra, report.fetched_at_ms)?;
+    }
     let last = store.last_sample(active.id)?;
     let windows = profile_usage::with_carried(report.windows, last.as_ref(), now / 1000);
     store.record_sample(&Sample {

@@ -7,6 +7,7 @@ pub mod budget;
 pub mod credfile;
 pub mod credstore;
 pub mod doctor;
+pub mod extra_usage;
 pub mod forecast;
 pub mod health;
 pub mod herdr;

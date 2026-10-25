@@ -83,6 +83,9 @@ enum Command {
         /// Only swap if this account id is still in use (used by the status line).
         #[arg(long, hide = true)]
         from_id: Option<i64>,
+        /// Swap to this account id (used by the status line).
+        #[arg(long, hide = true, conflicts_with = "to")]
+        to_id: Option<i64>,
         #[arg(long, hide = true, default_value = "manual")]
         reason: String,
         /// Skip instead of waiting when another swap is running.
@@ -363,16 +366,20 @@ fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> 
         Command::Swap {
             to,
             from_id,
+            to_id,
             reason,
             no_wait,
             quiet,
         } => {
             let reason =
                 Reason::parse(&reason).with_context(|| format!("unknown reason {reason:?}"))?;
-            let to = to
-                .map(|r| store.find_account(&r))
-                .transpose()?
-                .map(|a| a.id);
+            let to = match to_id {
+                Some(id) => Some(id),
+                None => to
+                    .map(|r| store.find_account(&r))
+                    .transpose()?
+                    .map(|a| a.id),
+            };
             let outcome = swap::run(
                 store,
                 paths,

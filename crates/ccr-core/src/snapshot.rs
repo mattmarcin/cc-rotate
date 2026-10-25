@@ -35,6 +35,8 @@ pub struct AccountView {
     pub refresh_expires_at: Option<i64>,
     /// The sign-in ends within `login_warning_days`.
     pub sign_in_ends_soon: bool,
+    /// The account's extra usage, as its latest usage report gave it.
+    pub extra_usage: Option<ExtraUsageView>,
     /// Parked and below every threshold that applies: the scheduler may pick it.
     pub eligible: bool,
     /// When this account is usable again, if a window keeps it from being used now.
@@ -45,6 +47,14 @@ pub struct AccountView {
     pub reason: String,
     /// Its weekly budget would reset unused unless it is used now (`budget::expiring`).
     pub expiring: Option<crate::budget::Expiring>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ExtraUsageView {
+    #[serde(flatten)]
+    pub usage: crate::store::ExtraUsage,
+    /// When the report was read (epoch ms).
+    pub read_at: i64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -160,6 +170,9 @@ pub fn snapshot_at(store: &Store, paths: &Paths, now_ms: i64) -> Result<Snapshot
                         crate::health::sign_in_ends_soon(t, settings.login_warning_days, now_ms)
                     }),
             login_updated_at: meta.as_ref().map(|m| m.updated_at),
+            extra_usage: store
+                .extra_usage(c.account.id)?
+                .map(|(usage, read_at)| ExtraUsageView { usage, read_at }),
             eligible: c.eligible(),
             available_at: c.blocked_until(),
             rank: ranked.and_then(|r| r.rank),

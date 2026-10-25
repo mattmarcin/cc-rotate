@@ -24,7 +24,9 @@ use crate::{credfile, time};
 /// 4: the per-account weekly cap (`weekly_cap`).
 /// 5: whether an account's weekly budget is used before it resets (`use_expiring`).
 /// 6: sessions stopped at a usage limit (`waiting_sessions`).
-const SCHEMA_VERSION: i64 = 6;
+/// 7: what each account's use would cost at API prices (`session_costs`, `account_costs`) and
+///    its extra usage (`extra_usage`).
+const SCHEMA_VERSION: i64 = 7;
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE accounts (
@@ -156,6 +158,33 @@ CREATE TABLE waiting_sessions (
     woken_account_id INTEGER REFERENCES accounts (id) ON DELETE SET NULL,
     woken_accounts   TEXT NOT NULL DEFAULT '[]',
     updated_at       INTEGER NOT NULL
+);
+"#;
+
+/// Schema 7. `session_costs` holds each session's last `cost.total_cost_usd` from the status
+/// line, so only what it adds is counted; `account_costs` sums that per account and hour (epoch
+/// hours); `extra_usage` is each account's latest extra-usage state from a usage report.
+const SCHEMA_V7: &str = r#"
+CREATE TABLE session_costs (
+    session_id TEXT PRIMARY KEY,
+    total_usd  REAL NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE TABLE account_costs (
+    account_id INTEGER NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
+    hour       INTEGER NOT NULL,
+    usd        REAL NOT NULL,
+    PRIMARY KEY (account_id, hour)
+) WITHOUT ROWID;
+CREATE TABLE extra_usage (
+    account_id      INTEGER PRIMARY KEY REFERENCES accounts (id) ON DELETE CASCADE,
+    enabled         INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+    monthly_limit   INTEGER,
+    used            INTEGER,
+    utilization     REAL,
+    currency        TEXT,
+    disabled_reason TEXT,
+    read_at         INTEGER NOT NULL
 );
 "#;
 
@@ -382,6 +411,20 @@ fn sample_from_row(row: &Row) -> rusqlite::Result<(i64, Sample)> {
     ))
 }
 
+/// An account's extra usage (overage) for the billing period, as a usage report gives it.
+/// Amounts are in minor units of `currency` (cents for USD).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExtraUsage {
+    /// False while extra usage cannot cover requests: turned off, or its limit reached.
+    pub enabled: bool,
+    pub monthly_limit: Option<i64>,
+    pub used: Option<i64>,
+    /// Percent of the monthly limit used.
+    pub utilization: Option<f64>,
+    pub currency: Option<String>,
+    pub disabled_reason: Option<String>,
+}
+
 /// Where a session stopped at a usage limit stands (`waiting`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -507,6 +550,9 @@ pub mod kind {
     /// The rotation profile's sessions run a Claude Code version not seen before;
     /// `detail` has `version`, `previous` and `tested`.
     pub const CLAUDE_VERSION: &str = "claude_version";
+    /// Every account is at a limit and the one in use runs on paid extra usage
+    /// (`extra_usage::scan`); `detail` has its spend so far.
+    pub const PAID_USAGE: &str = "paid_usage";
 }
 
 /// Typed view of the `settings` table with defaults applied.
@@ -540,6 +586,9 @@ pub struct Settings {
     pub login_warning_days: i64,
     /// Go by the user's order alone (`scheduler::Policy::strict_order`).
     pub strict_order: bool,
+    /// When every account is at a limit and the one in use has extra usage on, move to one
+    /// without, so sessions wait for a reset instead of paying (`extra_usage`).
+    pub avoid_extra_usage: bool,
 }
 
 pub const SETTING_KEYS: &[&str] = &[
@@ -559,6 +608,7 @@ pub const SETTING_KEYS: &[&str] = &[
     "use_expiring_weekly",
     "login_warning_days",
     "strict_order",
+    "avoid_extra_usage",
 ];
 
 pub struct Store {
@@ -709,6 +759,10 @@ impl Store {
                 s.conn.execute_batch(SCHEMA_V6)?;
                 s.conn.pragma_update(None, "user_version", 6)?;
             }
+            if version < 7 {
+                s.conn.execute_batch(SCHEMA_V7)?;
+                s.conn.pragma_update(None, "user_version", 7)?;
+            }
             Ok(())
         })
     }
@@ -852,6 +906,9 @@ impl Store {
                 .unwrap_or(true),
             login_warning_days: int("login_warning_days", 5)?,
             strict_order: get("strict_order")?
+                .and_then(|v| parse_bool(&v))
+                .unwrap_or(false),
+            avoid_extra_usage: get("avoid_extra_usage")?
                 .and_then(|v| parse_bool(&v))
                 .unwrap_or(false),
         })
@@ -1458,7 +1515,129 @@ impl Store {
             "DELETE FROM waiting_sessions WHERE updated_at < ?1",
             [now_ms - WAITING_RETENTION_MS],
         )?;
+        self.conn
+            .execute("DELETE FROM session_costs WHERE updated_at < ?1", [cutoff])?;
+        self.conn.execute(
+            "DELETE FROM account_costs WHERE hour < ?1",
+            [cutoff.div_euclid(3_600_000)],
+        )?;
         self.set_meta("last_prune_at", now_ms)
+    }
+
+    // ---- what use would cost at API prices ---------------------------------------------------
+
+    /// A session's `cost.total_cost_usd` from the status line. What it added since the last one
+    /// counts for `account_id`, in the hour of `now_ms`; returns that. A total below the last
+    /// one is a new count (the session's cost was reset), and counts whole. The first total of a
+    /// session counts whole too: Claude Code restores a resumed session's total under its id,
+    /// which this table still holds.
+    pub fn note_session_cost(
+        &self,
+        session_id: &str,
+        total_usd: f64,
+        account_id: i64,
+        now_ms: i64,
+    ) -> Result<f64> {
+        if !total_usd.is_finite() || total_usd < 0.0 {
+            return Ok(0.0);
+        }
+        self.immediate(|s| {
+            let last: Option<f64> = s
+                .conn
+                .query_row(
+                    "SELECT total_usd FROM session_costs WHERE session_id = ?1",
+                    [session_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let added = match last {
+                Some(last) if total_usd >= last => total_usd - last,
+                _ => total_usd,
+            };
+            s.conn.execute(
+                "INSERT INTO session_costs (session_id, total_usd, updated_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (session_id) DO UPDATE SET total_usd = excluded.total_usd,
+                                                        updated_at = excluded.updated_at",
+                params![session_id, total_usd, now_ms],
+            )?;
+            if added > 0.0 {
+                s.conn.execute(
+                    "INSERT INTO account_costs (account_id, hour, usd) VALUES (?1, ?2, ?3)
+                     ON CONFLICT (account_id, hour) DO UPDATE SET usd = usd + excluded.usd",
+                    params![account_id, now_ms.div_euclid(3_600_000), added],
+                )?;
+            }
+            Ok(added)
+        })
+    }
+
+    /// What an account's use from `from_s` to `to_s` (epoch seconds, by whole hours) would have
+    /// cost at API prices, or `None` when nothing was counted then.
+    pub fn account_cost_between(
+        &self,
+        account_id: i64,
+        from_s: i64,
+        to_s: i64,
+    ) -> Result<Option<f64>> {
+        Ok(self.conn.query_row(
+            "SELECT SUM(usd) FROM account_costs WHERE account_id = ?1 AND hour >= ?2 AND hour < ?3",
+            params![account_id, from_s.div_euclid(3600), to_s.div_euclid(3600)],
+            |r| r.get(0),
+        )?)
+    }
+
+    // ---- extra usage ---------------------------------------------------------------------------
+
+    /// Record an account's extra usage as a report read at `read_at` (epoch ms) gave it, unless a
+    /// newer one is already recorded.
+    pub fn set_extra_usage(&self, account_id: i64, extra: &ExtraUsage, read_at: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO extra_usage (account_id, enabled, monthly_limit, used, utilization,
+                                      currency, disabled_reason, read_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT (account_id) DO UPDATE SET
+                enabled = excluded.enabled, monthly_limit = excluded.monthly_limit,
+                used = excluded.used, utilization = excluded.utilization,
+                currency = excluded.currency, disabled_reason = excluded.disabled_reason,
+                read_at = excluded.read_at
+             WHERE excluded.read_at >= extra_usage.read_at",
+            params![
+                account_id,
+                extra.enabled,
+                extra.monthly_limit,
+                extra.used,
+                extra.utilization,
+                extra.currency,
+                extra.disabled_reason,
+                read_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// An account's latest extra usage, with when it was read (epoch ms).
+    pub fn extra_usage(&self, account_id: i64) -> Result<Option<(ExtraUsage, i64)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT enabled, monthly_limit, used, utilization, currency, disabled_reason, read_at
+                 FROM extra_usage WHERE account_id = ?1",
+                [account_id],
+                |r| {
+                    Ok((
+                        ExtraUsage {
+                            enabled: r.get(0)?,
+                            monthly_limit: r.get(1)?,
+                            used: r.get(2)?,
+                            utilization: r.get(3)?,
+                            currency: r.get(4)?,
+                            disabled_reason: r.get(5)?,
+                        },
+                        r.get(6)?,
+                    ))
+                },
+            )
+            .optional()?)
     }
 
     // ---- sessions stopped at a usage limit ------------------------------------------------
@@ -1713,7 +1892,11 @@ fn validate_setting(key: &str, value: &str) -> Result<Option<String>> {
                 bail!("Use a whole number of days from 0 to 30.");
             }
         }
-        "prefer_no_weekly_limit" | "usage_checks" | "use_expiring_weekly" | "strict_order" => {
+        "prefer_no_weekly_limit"
+        | "usage_checks"
+        | "use_expiring_weekly"
+        | "strict_order"
+        | "avoid_extra_usage" => {
             let v = parse_bool(value).context("expected true or false")?;
             return Ok(Some(v.to_string()));
         }

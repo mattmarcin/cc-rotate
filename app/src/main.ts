@@ -9,6 +9,7 @@ import {
   type AccountView,
   type CheckOutcome,
   type EventRow,
+  type ExtraUsage,
   type LoginProgress,
   type Snapshot,
   type WeeklyLimitSetting,
@@ -199,6 +200,40 @@ function checkText(a: AccountView): string {
 }
 
 const WEEKLY_TEXT = { none: "none found", unknown: "not known yet", has: "has one" } as const;
+
+/** An amount in minor units of `currency` (cents for USD), as ccr-core's `extra_usage::money` writes it. */
+function money(minor: number, currency: string | null): string {
+  const code = (currency ?? "USD").toUpperCase();
+  const whole = ["JPY", "KRW", "CLP", "ISK", "VND"].includes(code);
+  const amount = whole ? String(Math.round(minor)) : (minor / 100).toFixed(2);
+  return code === "USD" ? `$${amount}` : `${amount} ${code}`;
+}
+
+/** "$12.40", or "$123" from $100 up. */
+function dollars(usd: number): string {
+  return usd >= 100 ? `$${Math.round(usd)}` : `$${usd.toFixed(2)}`;
+}
+
+/** The account's extra usage, as ccr-core's `extra_usage::describe` writes it. */
+function extraText(e: ExtraUsage): string {
+  if (!e.enabled) {
+    return e.used !== null && e.monthly_limit !== null && e.monthly_limit > 0 && e.used >= e.monthly_limit
+      ? `off, its ${money(e.monthly_limit, e.currency)} monthly limit is used up`
+      : "off";
+  }
+  if (e.used !== null && e.monthly_limit !== null) return `on, ${money(e.used, e.currency)} of ${money(e.monthly_limit, e.currency)} used this month`;
+  if (e.used !== null) return `on, ${money(e.used, e.currency)} used this month`;
+  return "on";
+}
+
+/** "API value" in the account dialog: what the last weeks' use would have cost at API prices. */
+function valueText(hist: AccountHistory): string {
+  const counted = hist.weeks.filter((w) => w.api_value_usd !== null);
+  if (counted.length === 0) return "nothing counted yet";
+  const total = counted.reduce((sum, w) => sum + (w.api_value_usd ?? 0), 0);
+  const weeks = hist.weeks.length;
+  return `${dollars(total)} in the last ${weeks === 1 ? "week" : `${weeks} weeks`}`;
+}
 
 /** Weeks "Recent weeks" shows in the account dialog. */
 const RECENT_WEEKS = 4;
@@ -850,6 +885,7 @@ const REASONS: Record<string, string> = {
   threshold_other: "at a usage limit",
   preferred_available: "now that it's ready again",
   stop_failure: "after Claude Code hit a limit",
+  avoid_extra_usage: "so sessions wait instead of paying for extra usage",
   dead_login: "because the login stopped working",
   manual: "by hand",
   login: "after its first sign-in",
@@ -910,6 +946,8 @@ function describe(e: EventRow): { parts: Child[]; tone?: "warn" | "danger" } {
           ? { parts: ["A session stopped at a limit continued on ", to] }
           : { parts: ["A woken session continued on ", to] };
       return { parts: ["A session ", e.reason ?? "changed"] };
+    case "paid_usage":
+      return { parts: ["Every account is at a limit, and ", from, " is running on paid extra usage"], tone: "warn" };
     case "session_stuck":
       return { parts: ["A session woken on ", to, " hasn't continued"], tone: "warn" };
     case "claude_version": {
@@ -1225,10 +1263,17 @@ function openManage(a: AccountView) {
   });
   // Filled in once the history is read, which takes a moment.
   const history = h("dd", { class: "recent-weeks" }, h("span", { class: "muted" }, "Loading…"));
+  const value = h("dd", { title: "What this use would have cost at API prices, as Claude Code estimates it" }, h("span", { class: "muted" }, "Loading…"));
   api
     .usageHistory(a.id)
-    .then((hist) => replace(history, recentWeeks(hist)))
-    .catch(() => replace(history, h("span", { class: "muted" }, "couldn't be read")));
+    .then((hist) => {
+      replace(history, recentWeeks(hist));
+      replace(value, valueText(hist));
+    })
+    .catch(() => {
+      replace(history, h("span", { class: "muted" }, "couldn't be read"));
+      replace(value, h("span", { class: "muted" }, "couldn't be read"));
+    });
   const useExpiring = h("input", { type: "checkbox", checked: a.use_expiring });
   const details = h(
     "dl",
@@ -1241,6 +1286,15 @@ function openManage(a: AccountView) {
     a.plan && h("dd", null, a.plan),
     h("dt", null, "Recent weeks"),
     history,
+    h("dt", null, "API value"),
+    value,
+    a.extra_usage && h("dt", null, "Extra usage"),
+    a.extra_usage &&
+      h(
+        "dd",
+        { class: a.extra_usage.enabled ? "warn" : null, title: `As of ${new Date(a.extra_usage.read_at).toLocaleString()}` },
+        extraText(a.extra_usage),
+      ),
     h("dt", null, "Pick order"),
     h("dd", null, a.rank ? `${ordinal(a.rank)} - ${a.reason}` : `not available${a.reason ? ` - ${a.reason}` : ""}`),
     h("dt", null, "Login updated"),
@@ -1369,6 +1423,15 @@ async function openSettings() {
         .then(() => (say(strictBox.checked ? "Accounts higher in your order are used again as soon as they're ready" : "The account in use is kept until a limit"), refresh()))
         .catch((e) => say(String(e), "error")),
     );
+    const avoidPaid = h("input", { type: "checkbox", id: "avoid-extra-usage", checked: snap.settings.avoid_extra_usage });
+    avoidPaid.addEventListener("change", () =>
+      api
+        .setSetting("avoid_extra_usage", String(avoidPaid.checked))
+        .then(() =>
+          (say(avoidPaid.checked ? "Sessions will wait instead of using paid extra usage" : "Accounts with extra usage keep working when every account is at a limit"), refresh()),
+        )
+        .catch((e) => say(String(e), "error")),
+    );
     expiringBox.addEventListener("change", () =>
       api
         .setSetting("use_expiring_weekly", String(expiringBox.checked))
@@ -1397,6 +1460,12 @@ async function openSettings() {
       h("label", { class: "check", for: "prefer-no-weekly" }, prefer, "Use accounts without a weekly limit first"),
       h("label", { class: "check", for: "strict-order" }, strictBox, "Always go back to accounts higher in my order"),
       h("label", { class: "check", for: "use-expiring" }, expiringBox, "Use weekly budget before it resets"),
+      h(
+        "label",
+        { class: "check", for: "avoid-extra-usage" },
+        avoidPaid,
+        "When every account is at a limit, wait instead of paying for extra usage",
+      ),
       h("label", { class: "check", for: "usage-checks" }, checks, "Check usage of accounts not in use"),
       field(
         "usage_check_interval_s",

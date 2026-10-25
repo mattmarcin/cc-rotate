@@ -1024,7 +1024,13 @@ dialog.drawer {
 
 .fields label.check {
   display: inline-flex;
+  /* A label that wraps keeps its box beside the first line. */
+  align-items: flex-start;
   font-weight: 400;
+}
+
+.fields label.check input {
+  margin-top: 2px;
 }
 
 input[type="text"],

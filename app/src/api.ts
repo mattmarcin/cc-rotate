@@ -95,6 +95,8 @@ export interface AccountView extends Account {
   refresh_expires_at: number | null;
   /** The sign-in ends within the warning period in Settings. */
   sign_in_ends_soon: boolean;
+  /** As the account's latest usage report gave it. */
+  extra_usage: ExtraUsage | null;
   eligible: boolean;
   available_at: number | null;
   /** Place in the pick order among the accounts usable now. */
@@ -124,6 +126,20 @@ export interface CalendarWeek {
   windows_used: number | null;
   windows_at_limit: number | null;
   thin: boolean;
+  /** What the week's use would have cost at API prices, as Claude Code estimates it; null when none was counted. */
+  api_value_usd: number | null;
+}
+
+/** An account's extra usage (overage), amounts in minor units of `currency` (cents for USD). */
+export interface ExtraUsage {
+  /** False while extra usage can't cover requests: turned off, or its limit reached. */
+  enabled: boolean;
+  monthly_limit: number | null;
+  used: number | null;
+  utilization: number | null;
+  currency: string | null;
+  disabled_reason: string | null;
+  read_at: number;
 }
 
 /** An account's usage over the last weeks (ccr-core's `history`). */
@@ -159,6 +175,8 @@ export interface Settings {
   strict_order: boolean;
   /** Warn this many days before an account's sign-in ends; 0 turns the warning off. */
   login_warning_days: number;
+  /** When every account is at a limit, move off an account that would bill extra usage. */
+  avoid_extra_usage: boolean;
   switch_back_dwell_s: number;
   lock_timeout_ms: number;
   sample_retention_days: number;

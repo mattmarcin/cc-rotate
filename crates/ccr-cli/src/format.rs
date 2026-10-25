@@ -119,6 +119,15 @@ pub fn status(snap: &Snapshot) -> String {
             week_reset,
             a.account.email.as_deref().unwrap_or("-"),
         );
+        if let Some(extra) = a.extra_usage.as_ref().filter(|e| e.usage.enabled) {
+            let _ = writeln!(
+                out,
+                "{:>2}  {:<width$}  {DIM}extra usage {}{RESET}",
+                "",
+                "",
+                ccr_core::extra_usage::describe(&extra.usage),
+            );
+        }
         for w in other_windows(a) {
             let _ = writeln!(
                 out,
@@ -422,6 +431,35 @@ pub fn report_summary(h: &AccountHistory, weeks: usize) -> String {
 }
 
 /// `report`: a table per account, then a one-line summary per account.
+/// "$12.40", or "$123" from $100 up.
+pub fn dollars(usd: f64) -> String {
+    if usd >= 100.0 {
+        format!("${usd:.0}")
+    } else {
+        format!("${usd:.2}")
+    }
+}
+
+/// "API value: $12.40 this week so far, $85 over the last 4 weeks", when cc-rotate counted any.
+fn value_line(h: &AccountHistory, weeks: usize) -> Option<String> {
+    let total = h.api_value_usd()?;
+    let this_week = h
+        .weeks
+        .first()
+        .filter(|w| w.in_progress)
+        .map(|w| w.api_value_usd.unwrap_or(0.0));
+    Some(match this_week {
+        Some(now) if weeks > 1 => format!(
+            "API value: {} this week so far, {} over {}",
+            dollars(now),
+            dollars(total),
+            last_weeks(weeks)
+        ),
+        Some(now) => format!("API value: {} this week so far", dollars(now)),
+        None => format!("API value: {} over {}", dollars(total), last_weeks(weeks)),
+    })
+}
+
 pub fn report(histories: &[AccountHistory], weeks: usize) -> String {
     let mut out = String::new();
     if histories.is_empty() {
@@ -495,6 +533,9 @@ pub fn report(histories: &[AccountHistory], weeks: usize) -> String {
                     );
                 }
             }
+        }
+        if let Some(line) = value_line(h, weeks) {
+            let _ = writeln!(out, "  {line}");
         }
         let _ = writeln!(out);
     }
@@ -582,6 +623,7 @@ mod tests {
             windows_used: used,
             windows_at_limit: at_limit,
             thin,
+            api_value_usd: None,
         }
     }
 
@@ -663,6 +705,21 @@ mod tests {
             report_summary(&h, 1),
             "account3: didn't use a single 5-hour window in the last week."
         );
+    }
+
+    #[test]
+    fn api_value_lines() {
+        let mut h = history("main", HistoryKind::FiveHour);
+        assert_eq!(value_line(&h, 4), None);
+        h.weeks = vec![week(Some(3), Some(1), false), week(Some(2), Some(0), false)];
+        h.weeks[0].in_progress = true;
+        h.weeks[0].api_value_usd = Some(12.4);
+        h.weeks[1].api_value_usd = Some(140.0);
+        assert_eq!(
+            value_line(&h, 4).unwrap(),
+            "API value: $12.40 this week so far, $152 over the last 4 weeks"
+        );
+        assert_eq!(dollars(0.0), "$0.00");
     }
 
     #[test]

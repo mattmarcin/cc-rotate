@@ -33,6 +33,9 @@ pub fn spawn_swap(req: &SwapRequest, profile: Option<&Path>) -> Result<()> {
             if let Some(from) = req.from {
                 cmd.args(["--from-id", &from.to_string()]);
             }
+            if let Some(to) = req.to {
+                cmd.args(["--to-id", &to.to_string()]);
+            }
         },
         "starting the background swap",
     )

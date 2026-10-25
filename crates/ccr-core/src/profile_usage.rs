@@ -160,6 +160,11 @@ fn reading(store: &Store, dir: &Path, view: &ConfigView, now_ms: i64) -> Result<
     // Written on this machine, so a time ahead of now is clock trouble; never let it hide the
     // live readings that follow.
     let ts = report.fetched_at_ms.min(now_ms);
+    if let Some(extra) = &report.extra_usage {
+        // Kept apart from the windows: a newer extra-usage state counts even when the reading
+        // itself is not new.
+        store.set_extra_usage(account.id, extra, ts)?;
+    }
     let last = store.last_sample(account.id)?;
     if last.as_ref().is_some_and(|l| l.ts >= ts) {
         return Ok(Found::Nothing);
@@ -242,9 +247,13 @@ mod tests {
                 "cachedUsageUtilization": {
                     "fetchedAtMs": fetched_at,
                     "accountUuid": stamped,
-                    "utilization": {"limits": [
-                        {"kind": "session", "percent": pct, "resets_at": "2026-10-25T03:40:00Z"}
-                    ]}
+                    "utilization": {
+                        "limits": [
+                            {"kind": "session", "percent": pct, "resets_at": "2026-10-25T03:40:00Z"}
+                        ],
+                        "extra_usage": {"is_enabled": true, "monthly_limit": 5000,
+                                        "used_credits": 1240, "currency": "USD"}
+                    }
                 }
             });
             std::fs::write(dir.join(".claude.json"), config.to_string()).unwrap();
@@ -270,6 +279,10 @@ mod tests {
         assert_eq!(sample.profile, ".claude-raid2");
         assert_eq!(sample.windows[0].name, "five_hour");
         assert_eq!(sample.windows[0].pct, 100.0);
+        let (extra, read_at) = h.store.extra_usage(raid2).unwrap().unwrap();
+        assert!(extra.enabled);
+        assert_eq!((extra.used, extra.monthly_limit), (Some(1240), Some(5000)));
+        assert_eq!(read_at, NOW - 360_000);
 
         assert_eq!(
             import(&h.store, &h.paths, NOW).unwrap(),
