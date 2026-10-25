@@ -99,6 +99,43 @@ export interface AccountView extends Account {
   expiring: { left: number; hours_needed: number; hours_available: number; resets_at: number } | null;
 }
 
+/** A weekly window that has closed, with the highest usage recorded for it. */
+export interface PastWeeklyWindow {
+  resets_at: number;
+  peak_pct: number;
+  samples: number;
+  last_sample_at: number;
+  /** Few readings, or none in the days before the reset: it may have gone higher. */
+  thin: boolean;
+}
+
+/** One calendar week (Monday to Monday, local time) of an account's 5-hour windows. */
+export interface CalendarWeek {
+  starts_at: number;
+  ends_at: number;
+  in_progress: boolean;
+  samples: number;
+  /** Null without a single reading that week. */
+  windows_used: number | null;
+  windows_at_limit: number | null;
+  thin: boolean;
+}
+
+/** An account's usage over the last weeks (ccr-core's `history`). */
+export interface AccountHistory {
+  account_id: number;
+  label: string;
+  plan: string | null;
+  weekly_limit: WeeklyLimit;
+  /** Which history describes the account: its weekly windows, or its 5-hour windows per week. */
+  kind: "weekly" | "five_hour";
+  /** Newest first. */
+  weekly: PastWeeklyWindow[];
+  /** Newest first; the first is the current week. */
+  weeks: CalendarWeek[];
+  threshold_5h: number;
+}
+
 export interface Ranked {
   account_id: number;
   label: string;
@@ -207,6 +244,7 @@ export const api = {
   snapshot: () => invoke<Snapshot>("snapshot"),
   series: (sinceMs: number) => invoke<Sample[]>("series", { sinceMs }),
   events: (limit: number) => invoke<EventRow[]>("events", { limit }),
+  usageHistory: (id: number) => invoke<AccountHistory>("usage_history", { id }),
   swapNow: (to: number | null) => invoke<SwapOutcome>("swap_now", { to }),
   checkUsage: (id: number) => invoke<CheckOutcome>("check_usage", { id }),
   setPaused: (id: number, paused: boolean) => invoke<void>("set_paused", { id, paused }),

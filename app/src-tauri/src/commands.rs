@@ -2,6 +2,7 @@
 //! anything that can wait on locks runs on the blocking pool.
 
 use ccr_core::doctor::{self, Check};
+use ccr_core::history::{self, AccountHistory};
 use ccr_core::profiles::{self, FoundProfile};
 use ccr_core::scheduler::Reason;
 use ccr_core::snapshot::{self, Snapshot};
@@ -46,6 +47,20 @@ pub async fn series(since_ms: i64) -> CmdResult<Vec<Sample>> {
 #[tauri::command]
 pub async fn events(limit: usize) -> CmdResult<Vec<Event>> {
     blocking(move |s, _| snapshot::recent_events(s, limit)).await
+}
+
+/// Weeks of history "Recent weeks" in the account dialog shows, besides the current one.
+const RECENT_WEEKS: usize = 4;
+
+/// An account's usage over the last weeks, for "Recent weeks" in its dialog. Read-only.
+#[tauri::command]
+pub async fn usage_history(id: i64) -> CmdResult<AccountHistory> {
+    blocking(move |s, _| {
+        let now = ccr_core::time::now_ms();
+        let weeks = history::local_weeks(now / 1000, RECENT_WEEKS + 1);
+        history::account_report(s, id, now, &weeks)
+    })
+    .await
 }
 
 #[tauri::command]

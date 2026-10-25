@@ -1150,6 +1150,12 @@ input[type="checkbox"] {
   font-weight: 450;
 }
 
+/* "Recent weeks": the numbers, then what they are on a line of their own. */
+.recent-weeks small {
+  display: block;
+  font-size: 12px;
+}
+
 .path {
   word-break: break-all;
   font-size: 12.5px;

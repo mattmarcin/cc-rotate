@@ -5,6 +5,7 @@ import {
   api,
   onLoginProgress,
   onStoreChanged,
+  type AccountHistory,
   type AccountView,
   type CheckOutcome,
   type EventRow,
@@ -198,6 +199,49 @@ function checkText(a: AccountView): string {
 }
 
 const WEEKLY_TEXT = { none: "none found", unknown: "not known yet", has: "has one" } as const;
+
+/** Weeks "Recent weeks" shows in the account dialog. */
+const RECENT_WEEKS = 4;
+
+/**
+ * "Recent weeks" in the account dialog, newest first: the highest usage of each weekly window
+ * that closed, or for an account without a weekly limit, how many of each week's 5-hour windows
+ * reached the limit. A week cc-rotate saw little of is dimmed, and its tooltip says why.
+ */
+function recentWeeks(hist: AccountHistory): Child[] {
+  const day = (s: number) => new Date(s * 1000).toLocaleDateString([], { month: "short", day: "numeric" });
+  const few = "Few readings, so it may have been higher.";
+  const list = (items: { text: string; title: string; dim: boolean }[], note: string): Child[] => [
+    items.map((it, i) => [i > 0 && ", ", h("span", { class: it.dim ? "muted" : null, title: it.title }, it.text)]),
+    h("small", { class: "muted" }, note),
+  ];
+  if (hist.kind === "weekly") {
+    const windows = hist.weekly.slice(0, RECENT_WEEKS);
+    if (windows.length === 0) return ["no data yet"];
+    return list(
+      windows.map((w) => ({
+        text: pct(w.peak_pct),
+        dim: w.thin,
+        title: `Week to ${day(w.resets_at)}${w.thin ? `. ${few}` : ""}`,
+      })),
+      "Highest weekly usage, newest first",
+    );
+  }
+  const weeks = hist.weeks.filter((w) => !w.in_progress).slice(0, RECENT_WEEKS);
+  if (weeks.every((w) => w.windows_used === null)) return ["no data yet"];
+  return list(
+    weeks.map((w) =>
+      w.windows_used === null
+        ? { text: "-", dim: true, title: `Week of ${day(w.starts_at)}: no data` }
+        : {
+            text: `${w.windows_at_limit ?? 0} of ${w.windows_used}`,
+            dim: w.thin,
+            title: `Week of ${day(w.starts_at)}: ${w.windows_at_limit ?? 0} of ${plural(w.windows_used, "5-hour window")} reached the limit${w.thin ? `. ${few}` : ""}`,
+          },
+    ),
+    "5-hour windows at the limit, newest first",
+  );
+}
 
 function level(used: number, threshold: number): "ok" | "warn" | "over" {
   if (used >= threshold) return "over";
@@ -1116,6 +1160,12 @@ function openManage(a: AccountView) {
     value: a.weekly_cap === null ? "" : String(a.weekly_cap),
     placeholder: String(weeklyThreshold),
   });
+  // Filled in once the history is read, which takes a moment.
+  const history = h("dd", { class: "recent-weeks" }, h("span", { class: "muted" }, "Loading…"));
+  api
+    .usageHistory(a.id)
+    .then((hist) => replace(history, recentWeeks(hist)))
+    .catch(() => replace(history, h("span", { class: "muted" }, "couldn't be read")));
   const details = h(
     "dl",
     { class: "facts info" },
@@ -1125,6 +1175,8 @@ function openManage(a: AccountView) {
     a.org_name && h("dd", null, a.org_name),
     a.plan && h("dt", null, "Plan"),
     a.plan && h("dd", null, a.plan),
+    h("dt", null, "Recent weeks"),
+    history,
     h("dt", null, "Pick order"),
     h("dd", null, a.rank ? `${ordinal(a.rank)} - ${a.reason}` : `not available${a.reason ? ` - ${a.reason}` : ""}`),
     h("dt", null, "Login updated"),
