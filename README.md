@@ -164,6 +164,26 @@ To keep your own status line, add it with `--then`, for example `cc-rotate-ctl s
 Observe mode only records usage for accounts that are also in the pool.
 It never touches that profile's login and never swaps anything.
 
+## Using cc-rotate with herdr
+
+[herdr](https://github.com/herdrdev/herdr) brings your panes back when it restarts and resumes the Claude Code sessions in them.
+On its own it resumes them with `claude --resume <id>`, which starts them on your default profile instead of the pool.
+
+cc-rotate fixes that with a `SessionStart` hook in the rotation profile.
+When a session starts in a herdr pane, the hook tells herdr to resume it with `cc-rotate --resume <id>` instead.
+When herdr restarts, the restored pane types that command into a fresh shell, so the session comes back on the pool.
+When you quit Claude Code in a pane, herdr forgets the command, just as it forgets its own.
+
+- It needs herdr 0.9.2 or newer, and `cc-rotate` on your `PATH`, since herdr types the bare command name.
+- `cc-rotate-ctl setup` adds the hook.
+  For a rotation profile set up before cc-rotate supported herdr, run `cc-rotate-ctl setup --force` once to add it.
+- A pane is covered once its session starts, resumes, compacts or is cleared with `/clear` after the hook is in place.
+- Sessions that were already running before you upgraded are not covered: herdr still resumes them with plain `claude`.
+  Quit them and resume them once with `cc-rotate --resume <id>` to cover them.
+- Subagents never report anything, and outside herdr the hook does nothing.
+- `cc-rotate-ctl doctor` shows whether herdr is detected and whether the hook is installed.
+  If herdr refuses a report, the reason goes to the log (see **Troubleshooting**).
+
 ## What it does not cover
 
 - **The Claude desktop app.** Its Code tab passes its own login to Claude Code directly, so swapping the profile's login cannot reach it.
