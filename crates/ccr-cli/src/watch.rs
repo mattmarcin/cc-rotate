@@ -10,7 +10,8 @@
 //! moves the cursor home and overwrites the previous one line by line, clearing only what's
 //! left over, so nothing flickers. The terminal is put back however it ends: q, Esc, Ctrl-C, an
 //! error, a panic (before the panic message is printed, so it stays readable), and on Unix
-//! SIGTERM, SIGHUP and SIGQUIT, after which the process ends as the signal would have ended it.
+//! SIGTERM, SIGHUP, SIGQUIT and a SIGINT sent by another process, after which the process ends
+//! as the signal would have ended it.
 
 use std::io::{ErrorKind, IsTerminal, Write};
 use std::panic::PanicHookInfo;
@@ -251,8 +252,8 @@ impl Stop {
         let signal = Arc::new(AtomicUsize::new(0));
         #[cfg(unix)]
         let ids = {
-            use signal_hook::consts::{SIGHUP, SIGQUIT, SIGTERM};
-            [SIGTERM, SIGHUP, SIGQUIT]
+            use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
+            [SIGTERM, SIGHUP, SIGQUIT, SIGINT]
                 .into_iter()
                 .map(|sig| {
                     signal_hook::flag::register_usize(sig, Arc::clone(&signal), sig as usize)
