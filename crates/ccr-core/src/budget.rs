@@ -189,9 +189,12 @@ pub fn promoted(store: &Store, pool: &[Candidate]) -> Result<HashMap<i64, i64>> 
 /// Learn the rates from each account's readings, oldest first.
 ///
 /// Readings report whole or half points and repeat between changes, so rates are measured
-/// over stretches from one change of the 5-hour window to the next: the 5-hour points, the
-/// weekly points and the time between two changes. A stretch longer than `MAX_STRETCH_MS`, a
-/// gap between readings longer than `MAX_GAP_MS`, a new window or a drop starts afresh.
+/// over stretches from one rise of the 5-hour window to the next: the 5-hour points, the
+/// weekly points and the time between two rises. Several sessions report the same account, and
+/// an idle one keeps repeating its last values, so a reading below the highest one of its
+/// window, or of an older window, is a stale session's and is passed over. A stretch longer
+/// than `MAX_STRETCH_MS`, a gap between readings longer than `MAX_GAP_MS` or a newer window
+/// starts afresh.
 pub fn learn(by_account: &[(i64, Vec<Sample>)], now_ms: i64) -> Rates {
     let mut rates = Rates {
         computed_at: now_ms,
@@ -211,9 +214,15 @@ pub fn learn(by_account: &[(i64, Vec<Sample>)], now_ms: i64) -> Rates {
             let restart = match (anchor, prev) {
                 (Some(a), Some(p)) => {
                     let then = window(a, "five_hour").expect("an anchor has a 5-hour window");
-                    s.ts - p.ts > MAX_GAP_MS
-                        || !same_reset(then.resets_at, now_five.resets_at)
-                        || now_five.pct < then.pct
+                    if older(now_five.resets_at, then.resets_at)
+                        || (same_reset(then.resets_at, now_five.resets_at)
+                            && now_five.pct < then.pct)
+                    {
+                        // A stale session's reading: it shows nothing new.
+                        prev = Some(s);
+                        continue;
+                    }
+                    s.ts - p.ts > MAX_GAP_MS || !same_reset(then.resets_at, now_five.resets_at)
                 }
                 _ => true,
             };
@@ -271,6 +280,15 @@ pub fn learn(by_account: &[(i64, Vec<Sample>)], now_ms: i64) -> Rates {
 
 fn window<'a>(s: &'a Sample, name: &str) -> Option<&'a crate::store::SampleWindow> {
     s.windows.iter().find(|w| w.name == name)
+}
+
+/// Whether window reset `a` is of a window before `b` (an older 5-hour window).
+fn older(a: Option<i64>, b: Option<i64>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => a < b - SAME_RESET_S,
+        (None, Some(_)) => true,
+        _ => false,
+    }
 }
 
 fn same_reset(a: Option<i64>, b: Option<i64>) -> bool {
@@ -617,6 +635,31 @@ mod tests {
         assert!((r.five_per_hour - 80.0 / 6.0).abs() < 0.01, "{r:?}");
         // 6 weekly points for 60 five-hour points: 0.1, which is also the guess.
         assert!((r.weekly_per_5h - 0.1).abs() < 0.005, "{r:?}");
+    }
+
+    /// Two sessions on one account, each ticking every 30 seconds: one working (30% to 33% over
+    /// 40 minutes, 4.5 points an hour) and one idle, repeating 30%. The idle session's readings
+    /// must not count its drops and the working one's rebounds as use.
+    #[test]
+    fn an_idle_session_repeating_old_values_is_no_use() {
+        let mut samples = Vec::new();
+        let reset = NOW + 4 * 3600;
+        for half_minute in 0..=80i64 {
+            let ts_min = half_minute / 2;
+            let working = 30.0 + (3 * half_minute / 80) as f64;
+            let mut fresh = reading(ts_min, working, reset, Some((10.0, NOW + 86_400)));
+            fresh.ts += (half_minute % 2) * 30_000;
+            let mut stale = reading(ts_min, 30.0, reset, Some((10.0, NOW + 86_400)));
+            stale.ts = fresh.ts + 1_000;
+            samples.push(fresh);
+            samples.push(stale);
+        }
+        let r = learn(&[(1, samples)], (NOW + 41 * 60) * 1000).account(1);
+        // 3 points in 40 minutes, with the 2 guessed hours at 10: (3 + 20) / (2/3 + 2).
+        assert!(
+            (r.five_per_hour - 23.0 / (2.0 / 3.0 + 2.0)).abs() < 0.5,
+            "{r:?}"
+        );
     }
 
     #[test]
