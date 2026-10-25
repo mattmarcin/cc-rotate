@@ -59,6 +59,7 @@ fn main() -> Result<()> {
         let ident = AccountIdentity {
             email: Some(format!("{name}@example.com")),
             account_uuid: Some(format!("demo-{i}")),
+            org_uuid: Some(format!("demo-org-{i}")),
             subscription_type: Some(sub.to_string()),
             rate_limit_tier: Some(tier.to_string()),
             ..Default::default()
@@ -171,12 +172,20 @@ fn main() -> Result<()> {
             continue;
         }
         let paused = i == PAUSED;
+        let ts = if paused {
+            now - 2 * 24 * hour
+        } else {
+            now - (12 + 7 * i as i64) * 60_000
+        };
+        if !paused {
+            // The check's own record, as the More dialog shows it.
+            store.set_meta(
+                &format!("usage_check:{}", s.id),
+                json!({ "last_attempt_at": ts, "last_read_at": ts }).to_string(),
+            )?;
+        }
         store.record_sample(&Sample {
-            ts: if paused {
-                now - 2 * 24 * hour
-            } else {
-                now - (12 + 7 * i as i64) * 60_000
-            },
+            ts,
             account_id: s.id,
             profile: if paused { "rotate" } else { "check" }.into(),
             session_id: None,
