@@ -15,6 +15,16 @@ use crate::swap::{self, SwapRequest};
 
 /// The account in use when the last `paid_usage` warning went out, until the episode ends.
 const META_WARNED: &str = "paid_usage_warned";
+/// When the current episode of paid extra usage began (epoch ms).
+const META_PAYING_SINCE: &str = "paid_usage_since";
+/// When a fresh reading of the paying account was last asked for (epoch ms).
+const META_REFRESH_AT: &str = "paid_usage_refresh_at";
+
+/// How long a swap away from paid extra usage has before the user is told anyway: it may never
+/// land (a dead login, an interrupted swap, a busy target).
+const AVOID_GRACE_MS: i64 = 2 * 60_000;
+/// A paying account's extra usage is read again at most this often.
+const REFRESH_EVERY_MS: i64 = 10 * 60_000;
 
 /// A window this full is used up: requests beyond it bill extra usage. cc-rotate's thresholds
 /// (98% by default, lower with a weekly cap) stop rotating onto an account before that.
@@ -40,18 +50,28 @@ fn paying(
 
 /// Log `paid_usage` once when sessions start running on paid extra usage, which the app shows as
 /// a notification. Another warning needs the episode to end first (an account free again, or the
-/// one in use without extra usage).
+/// one in use without extra usage). With `avoid_extra_usage` on and an account to move to, the
+/// swap gets `AVOID_GRACE_MS` to end the episode first.
 pub fn scan(store: &Store, now_ms: i64) -> Result<()> {
     let Some(active) = store.active_account()? else {
         return Ok(());
     };
     let (pool, policy) = swap::load_pool(store, now_ms / 1000)?;
-    // With the setting on and an account to move to, the swap ends the episode: no warning.
-    let paying = match paying(store, &pool, policy, &active, now_ms / 1000)? {
-        Some(p) if avoid_swap(store, &pool, policy, &active, now_ms / 1000)?.is_none() => Some(p),
-        _ => None,
+    let paying = paying(store, &pool, policy, &active, now_ms / 1000)?;
+    let since = match &paying {
+        Some(_) => store.immediate(|s| match s.meta_i64(META_PAYING_SINCE)? {
+            Some(t) => Ok(t),
+            None => {
+                s.set_meta(META_PAYING_SINCE, now_ms)?;
+                Ok(now_ms)
+            }
+        })?,
+        None => now_ms,
     };
+    let can_move =
+        paying.is_some() && avoid_swap(store, &pool, policy, &active, now_ms / 1000)?.is_some();
     match paying {
+        Some(_) if can_move && now_ms - since < AVOID_GRACE_MS => Ok(()),
         Some((extra, read_at)) => store.immediate(|s| {
             if s.meta_i64(META_WARNED)? == Some(active.id) {
                 return Ok(());
@@ -69,19 +89,55 @@ pub fn scan(store: &Store, now_ms: i64) -> Result<()> {
                     "currency": extra.currency,
                     // The account in use is rarely read: say how old the figures are.
                     "read_at": read_at,
-                    // With the setting on, it still pays: no account without extra usage to go to.
+                    // With the setting on, it still pays: no account without extra usage to go
+                    // to, or the swap to one did not land.
                     "avoiding": s.settings()?.avoid_extra_usage,
+                    "could_move": can_move,
                 })),
             )?;
             Ok(())
         }),
         None => {
-            if store.meta(META_WARNED)?.is_some() {
-                store.delete_meta(META_WARNED)?;
+            for key in [META_WARNED, META_PAYING_SINCE] {
+                if store.meta(key)?.is_some() {
+                    store.delete_meta(key)?;
+                }
             }
             Ok(())
         }
     }
+}
+
+/// Whether to read the account in use's usage again (`usage_check::confirm_active`): it runs on
+/// paid extra usage by a report older than `usage_check_max_age_s`, and none was asked for in the
+/// last `REFRESH_EVERY_MS`. The account in use is rarely read, and a new billing month or a
+/// change on claude.ai may have turned its extra usage on or off since.
+pub fn needs_fresh_reading(
+    store: &Store,
+    pool: &[Candidate],
+    policy: Policy,
+    active: &Account,
+    now_ms: i64,
+) -> Result<bool> {
+    let settings = store.settings()?;
+    if !settings.usage_checks {
+        return Ok(false);
+    }
+    let Some((_, read_at)) = paying(store, pool, policy, active, now_ms / 1000)? else {
+        return Ok(false);
+    };
+    if now_ms - read_at < settings.usage_check_max_age_s * 1000 {
+        return Ok(false);
+    }
+    store.immediate(|s| {
+        let due = s
+            .meta_i64(META_REFRESH_AT)?
+            .is_none_or(|t| !(0..REFRESH_EVERY_MS).contains(&(now_ms - t)));
+        if due {
+            s.set_meta(META_REFRESH_AT, now_ms)?;
+        }
+        Ok(due)
+    })
 }
 
 /// With `avoid_extra_usage` on, a swap from an account running on paid extra usage to one whose

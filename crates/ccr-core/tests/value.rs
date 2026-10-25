@@ -108,47 +108,38 @@ fn a_session_counts_only_what_it_adds() {
     let e = env();
     let hour = 1_000_000 * 3_600_000;
     let s = &e.store;
-    // A new session counts from its first total.
+    // The status line runs as a session starts, at $0: counting starts there.
+    assert_eq!(s.note_session_cost("s1", 0.0, e.a, hour).unwrap(), 0.0);
     assert_eq!(
-        s.note_session_cost("s1", 0.50, true, e.a, hour).unwrap(),
+        s.note_session_cost("s1", 0.50, e.a, hour + 30_000).unwrap(),
         0.50
     );
     assert_eq!(
-        s.note_session_cost("s1", 0.75, false, e.a, hour + 60_000)
-            .unwrap(),
+        s.note_session_cost("s1", 0.75, e.a, hour + 60_000).unwrap(),
         0.25
     );
     assert_eq!(
-        s.note_session_cost("s1", 0.75, false, e.a, hour + 120_000)
+        s.note_session_cost("s1", 0.75, e.a, hour + 120_000)
             .unwrap(),
         0.0
     );
-    // A drop (two processes on one session) is only where counting goes on from.
+    // A drop (a /login resets the total) is only where counting goes on from.
     assert_eq!(
-        s.note_session_cost("s1", 0.60, false, e.a, hour + 180_000)
+        s.note_session_cost("s1", 0.60, e.a, hour + 180_000)
             .unwrap(),
         0.0
     );
     let added = s
-        .note_session_cost("s1", 0.70, false, e.b, hour + 3_600_000)
+        .note_session_cost("s1", 0.70, e.b, hour + 3_600_000)
         .unwrap();
     assert!((added - 0.10).abs() < 1e-9, "{added}");
+    assert_eq!(s.note_session_cost("s1", f64::NAN, e.a, hour).unwrap(), 0.0);
+    assert_eq!(s.note_session_cost("s1", -1.0, e.a, hour).unwrap(), 0.0);
+    // A session first seen with a total (resumed, forked, or running before cc-rotate counted)
+    // carries what it spent before: only a starting point.
+    assert_eq!(s.note_session_cost("old", 80.0, e.a, hour).unwrap(), 0.0);
     assert_eq!(
-        s.note_session_cost("s1", f64::NAN, true, e.a, hour)
-            .unwrap(),
-        0.0
-    );
-    assert_eq!(
-        s.note_session_cost("s1", -1.0, true, e.a, hour).unwrap(),
-        0.0
-    );
-    // A session first seen after it ran a while carries what it spent before: only a baseline.
-    assert_eq!(
-        s.note_session_cost("old", 80.0, false, e.a, hour).unwrap(),
-        0.0
-    );
-    assert_eq!(
-        s.note_session_cost("old", 80.5, false, e.a, hour + 60_000)
+        s.note_session_cost("old", 80.5, e.a, hour + 60_000)
             .unwrap(),
         0.5
     );
@@ -170,11 +161,11 @@ fn a_session_counts_only_what_it_adds() {
     assert!((b - 0.10).abs() < 1e-9, "{b}");
 }
 
-fn tick_input(session: &str, cost: f64, pct: f64, resets_at: i64) -> StatusInput {
+fn tick_input(session: &str, cost: f64, ran_ms: i64, pct: f64, resets_at: i64) -> StatusInput {
     StatusInput::parse(
         &json!({
             "session_id": session,
-            "cost": {"total_cost_usd": cost, "total_duration_ms": 60_000},
+            "cost": {"total_cost_usd": cost, "total_duration_ms": ran_ms},
             "rate_limits": {"five_hour": {"used_percentage": pct, "resets_at": resets_at}}
         })
         .to_string(),
@@ -184,15 +175,19 @@ fn tick_input(session: &str, cost: f64, pct: f64, resets_at: i64) -> StatusInput
 #[test]
 fn the_status_line_counts_cost_for_the_account_that_served_it() {
     let e = env();
-    let now = time::now_ms();
-    let a_resets = now / 1000 + 3_600;
-    statusline::tick(
-        &e.store,
-        &e.paths,
-        &tick_input("s1", 1.00, 20.0, a_resets),
-        now,
-    )
-    .unwrap();
+    let start = time::now_ms();
+    let a_resets = start / 1000 + 3_600;
+    let tick = |cost: f64, at: i64, pct: f64, resets: i64| {
+        statusline::tick(
+            &e.store,
+            &e.paths,
+            &tick_input("s1", cost, at - start, pct, resets),
+            at,
+        )
+        .unwrap();
+    };
+    tick(0.0, start, 20.0, a_resets);
+    tick(1.00, start + 20_000, 20.0, a_resets);
     swap::run(
         &e.store,
         &e.paths,
@@ -206,25 +201,12 @@ fn the_status_line_counts_cost_for_the_account_that_served_it() {
     .unwrap();
     // Its request started on a's login before the swap: the reading is still a's.
     let later = time::now_ms() + 1_000;
-    statusline::tick(
-        &e.store,
-        &e.paths,
-        &tick_input("s1", 1.40, 22.0, a_resets),
-        later,
-    )
-    .unwrap();
+    tick(1.40, later, 22.0, a_resets);
     // Then it works on b.
-    let b_resets = now / 1000 + 9_000;
-    statusline::tick(
-        &e.store,
-        &e.paths,
-        &tick_input("s1", 2.00, 5.0, b_resets),
-        later + 30_000,
-    )
-    .unwrap();
+    tick(2.00, later + 30_000, 5.0, start / 1000 + 9_000);
 
-    let from = now / 1000 - 3_600;
-    let to = now / 1000 + 7_200;
+    let from = start / 1000 - 3_600;
+    let to = start / 1000 + 7_200;
     let a = e
         .store
         .account_cost_between(e.a, from, to)
@@ -237,6 +219,31 @@ fn the_status_line_counts_cost_for_the_account_that_served_it() {
         .unwrap();
     assert!((a - 1.40).abs() < 1e-9, "a {a}");
     assert!((b - 0.60).abs() < 1e-9, "b {b}");
+}
+
+#[test]
+fn two_processes_on_one_session_each_keep_their_own_count() {
+    let e = env();
+    let now = time::now_ms();
+    let resets = now / 1000 + 3_600;
+    // Resumed twice: both start from the $5 the session had, two minutes apart.
+    let first = |cost: f64, at: i64| tick_input("s1", cost, at - (now - 600_000), 20.0, resets);
+    let second = |cost: f64, at: i64| tick_input("s1", cost, at - (now - 480_000), 20.0, resets);
+    for (input, at) in [
+        (first(5.0, now), now),
+        (second(5.0, now + 1_000), now + 1_000),
+        (first(5.5, now + 30_000), now + 30_000),
+        (second(5.2, now + 31_000), now + 31_000),
+        (first(5.6, now + 60_000), now + 60_000),
+    ] {
+        statusline::tick(&e.store, &e.paths, &input, at).unwrap();
+    }
+    let a = e
+        .store
+        .account_cost_between(e.a, now / 1000 - 3_600, now / 1000 + 3_600)
+        .unwrap()
+        .unwrap();
+    assert!((a - 0.80).abs() < 1e-9, "{a}");
 }
 
 #[test]
@@ -396,4 +403,58 @@ fn no_warning_while_a_swap_away_from_paying_is_due() {
         .detail
         .unwrap();
     assert_eq!(detail["avoiding"], true);
+}
+
+#[test]
+fn a_swap_away_from_paying_that_does_not_land_is_reported() {
+    let e = env();
+    let now = time::now_ms();
+    e.store.set_extra_usage(e.a, &extra(true, 10), now).unwrap();
+    e.store.set_extra_usage(e.b, &extra(false, 0), now).unwrap();
+    five_hour(&e.store, e.a, 100.0, 3_600);
+    five_hour(&e.store, e.b, 100.0, 1_800);
+    five_hour(&e.store, e.c, 100.0, 900);
+    e.store
+        .set_setting("avoid_extra_usage", Some("true"))
+        .unwrap();
+    extra_usage::scan(&e.store, now).unwrap();
+    extra_usage::scan(&e.store, now + 60_000).unwrap();
+    assert_eq!(paid_events(&e.store), 0);
+    // Still paying two minutes on: the swap did not land.
+    extra_usage::scan(&e.store, now + 130_000).unwrap();
+    assert_eq!(paid_events(&e.store), 1);
+    let detail = e
+        .store
+        .last_event_of(kind::PAID_USAGE)
+        .unwrap()
+        .unwrap()
+        .detail
+        .unwrap();
+    assert_eq!(detail["could_move"], true);
+}
+
+#[test]
+fn an_old_report_of_paid_usage_asks_for_a_fresh_reading_now_and_then() {
+    let e = env();
+    let now = time::now_ms();
+    e.store
+        .set_extra_usage(e.a, &extra(true, 10), now - 3_600_000)
+        .unwrap();
+    five_hour(&e.store, e.a, 100.0, 3_600);
+    five_hour(&e.store, e.b, 100.0, 1_800);
+    five_hour(&e.store, e.c, 100.0, 900);
+    let active = e.store.active_account().unwrap().unwrap();
+    let (pool, policy) = swap::load_pool(&e.store, now / 1000).unwrap();
+    // Usage checks are off in these tests, and the reading runs as one.
+    assert!(!extra_usage::needs_fresh_reading(&e.store, &pool, policy, &active, now).unwrap());
+    e.store.set_setting("usage_checks", Some("true")).unwrap();
+    assert!(extra_usage::needs_fresh_reading(&e.store, &pool, policy, &active, now).unwrap());
+    assert!(
+        !extra_usage::needs_fresh_reading(&e.store, &pool, policy, &active, now + 60_000).unwrap()
+    );
+    // A recent report needs none.
+    e.store.set_extra_usage(e.a, &extra(true, 20), now).unwrap();
+    assert!(
+        !extra_usage::needs_fresh_reading(&e.store, &pool, policy, &active, now + 700_000).unwrap()
+    );
 }

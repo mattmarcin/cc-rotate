@@ -51,13 +51,14 @@ pub struct StatusInput {
 #[derive(Debug, Default, Deserialize)]
 pub struct CostInfo {
     pub total_cost_usd: Option<f64>,
-    /// How long the session has run, restored with its cost on `--resume`.
+    /// How long the session's process has run (wall time), restored with its cost on `--resume`:
+    /// `now - total_duration_ms` is the same for every tick of one process.
     pub total_duration_ms: Option<f64>,
 }
 
-/// A session whose status line reports having run for at most this long started moments ago: its
-/// whole cost counts (`Store::note_session_cost`).
-const NEW_SESSION_MS: f64 = 10.0 * 60_000.0;
+/// The process a cost total belongs to is told by when it started, to this precision: one
+/// process's ticks agree on it to within their delivery time.
+const PROCESS_START_PRECISION_MS: i64 = 10_000;
 
 #[derive(Debug, Default, Deserialize)]
 pub struct ModelInfo {
@@ -199,12 +200,13 @@ pub fn tick(store: &Store, paths: &Paths, input: &StatusInput, now_ms: i64) -> R
         crate::health::note_claude_version(store, version)?;
     }
     // What the session added to its cost since its last reading was spent on the account in
-    // use, unless its reading is the account a swap just left: then the request was still on that
-    // one's login.
+    // use, unless its reading is another account's: then the request still carried that one's
+    // login.
     let mut cost_account = active.id;
     if let Some(sample) = input.sample_for(active.id, "rotate", now_ms) {
         if is_stale_reading(store, &sample, now_ms)? {
-            cost_account = reading_account(store, &sample, active.id)?.unwrap_or(active.id);
+            // It carries the reset times of the account the last swap left.
+            cost_account = left_account(store)?.unwrap_or(active.id);
         } else {
             match swap::attribute(store, &sample, active.id, now_ms / 1000)? {
                 swap::Attribution::Own => {
@@ -258,6 +260,13 @@ pub fn tick(store: &Store, paths: &Paths, input: &StatusInput, now_ms: i64) -> R
     {
         result.pool_exhausted =
             scheduler::pick(&pool, policy, Some(active.id), now_ms / 1000).is_none();
+    }
+
+    // Paid extra usage judged by an old report: read the account in use again first.
+    if !result.confirm
+        && crate::extra_usage::needs_fresh_reading(store, &pool, policy, &active, now_ms)?
+    {
+        result.confirm = true;
     }
 
     store.prune(now_ms)?;
@@ -447,20 +456,33 @@ fn note_cost(store: &Store, input: &StatusInput, account_id: i64, now_ms: i64) -
     let Some(cost) = input.cost.as_ref() else {
         return Ok(());
     };
-    let new = cost.total_duration_ms.is_some_and(|d| d <= NEW_SESSION_MS);
-    match (input.session_id.as_deref(), cost.total_cost_usd) {
-        (Some(session), Some(total)) if !session.is_empty() => {
-            store.note_session_cost(session, total, new, account_id, now_ms)?;
-            Ok(())
-        }
-        _ => Ok(()),
+    let (Some(session), Some(total)) = (input.session_id.as_deref(), cost.total_cost_usd) else {
+        return Ok(());
+    };
+    if session.is_empty() {
+        return Ok(());
     }
+    // Two processes can run one session (resumed twice, each restoring the same total): each
+    // keeps its own count, told apart by when it started.
+    let key = match cost.total_duration_ms {
+        Some(d) if d.is_finite() && d >= 0.0 => {
+            let started = now_ms - d as i64;
+            format!(
+                "{session}@{}",
+                started.div_euclid(PROCESS_START_PRECISION_MS)
+            )
+        }
+        _ => session.to_string(),
+    };
+    store.note_session_cost(&key, total, account_id, now_ms)?;
+    Ok(())
 }
 
-/// The account other than `active_id` whose latest reading shares a reset time with `sample`:
-/// the one a reading that is not the active account's belongs to. Else the account the last swap
-/// left.
+/// The account a reading that is not the account in use's belongs to: one whose latest reading
+/// it repeats exactly, else the one whose latest reading shares the most windows' reset times
+/// with it, else the account the last swap left.
 fn reading_account(store: &Store, sample: &Sample, active_id: i64) -> Result<Option<i64>> {
+    let mut best: Option<(usize, i64)> = None;
     for account in store.accounts()? {
         if account.id == active_id {
             continue;
@@ -468,17 +490,32 @@ fn reading_account(store: &Store, sample: &Sample, active_id: i64) -> Result<Opt
         let Some(latest) = store.last_sample(account.id)? else {
             continue;
         };
-        let shares = sample.windows.iter().any(|w| {
-            w.resets_at.is_some_and(|r| {
-                latest.windows.iter().any(|o| {
-                    o.name == w.name && o.resets_at.is_some_and(|or| swap::same_reset(or, r))
-                })
-            })
-        });
-        if shares {
+        if crate::store::same_windows(&sample.windows, &latest.windows) {
             return Ok(Some(account.id));
         }
+        let shared = sample
+            .windows
+            .iter()
+            .filter(|w| {
+                w.resets_at.is_some_and(|r| {
+                    latest.windows.iter().any(|o| {
+                        o.name == w.name && o.resets_at.is_some_and(|or| swap::same_reset(or, r))
+                    })
+                })
+            })
+            .count();
+        if shared > 0 && best.is_none_or(|(n, _)| shared > n) {
+            best = Some((shared, account.id));
+        }
     }
+    match best {
+        Some((_, id)) => Ok(Some(id)),
+        None => left_account(store),
+    }
+}
+
+/// The account the last swap left, while it is in the pool.
+fn left_account(store: &Store) -> Result<Option<i64>> {
     Ok(store
         .last_event_of(kind::SWAP)?
         .and_then(|e| e.account_from)

@@ -331,7 +331,13 @@ fn describe(store: &Store, event: &Event) -> Option<(String, String)> {
                 .and_then(|d| d.get("avoiding"))
                 .and_then(|v| v.as_bool())
                 == Some(true);
-            let next = if avoiding {
+            let could_move = detail
+                .and_then(|d| d.get("could_move"))
+                .and_then(|v| v.as_bool())
+                == Some(true);
+            let next = if avoiding && could_move {
+                " cc-rotate couldn't move to an account without extra usage. Activity says why."
+            } else if avoiding {
                 " No account without extra usage is ready to move to."
             } else {
                 " To wait for a reset instead, turn that on in Settings."

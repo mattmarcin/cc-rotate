@@ -161,8 +161,9 @@ CREATE TABLE waiting_sessions (
 );
 "#;
 
-/// Schema 7. `session_costs` holds each session's last `cost.total_cost_usd` from the status
-/// line, so only what it adds is counted; `account_costs` sums that per account and hour (epoch
+/// Schema 7. `session_costs` holds the last `cost.total_cost_usd` from the status line of each
+/// session's process (`session_id` is the session and when its process started), so only what it
+/// adds is counted; `account_costs` sums that per account and hour (epoch
 /// hours); `extra_usage` is each account's latest extra-usage state from a usage report.
 const SCHEMA_V7: &str = r#"
 CREATE TABLE session_costs (
@@ -1526,19 +1527,18 @@ impl Store {
 
     // ---- what use would cost at API prices ---------------------------------------------------
 
-    /// A session's `cost.total_cost_usd` from the status line. What it added since the last one
-    /// counts for `account_id`, in the hour of `now_ms`; returns that.
+    /// A session's `cost.total_cost_usd` from the status line, under `key` (the session and its
+    /// process). What it added since the last one counts for `account_id`, in the hour of
+    /// `now_ms`; returns that.
     ///
-    /// The first total of a session only counts when the session is `new` (it started moments
-    /// ago): a session first seen later carries what it spent before (one running before cc-rotate
-    /// counted, or a resumed one whose earlier total was pruned), and its total is only where
-    /// counting starts. A total below the last one (two processes resumed on one session, each
-    /// with its own total) is also only where counting goes on from.
+    /// A first total is only where counting starts: the status line runs as a session starts,
+    /// at $0, and a session first seen later carries what it spent before (a resumed or forked
+    /// one, which Claude Code gives the total it had, or one running before cc-rotate counted). A
+    /// total below the last one (a `/login` resets it) is also only where counting goes on from.
     pub fn note_session_cost(
         &self,
-        session_id: &str,
+        key: &str,
         total_usd: f64,
-        new: bool,
         account_id: i64,
         now_ms: i64,
     ) -> Result<f64> {
@@ -1550,21 +1550,19 @@ impl Store {
                 .conn
                 .query_row(
                     "SELECT total_usd FROM session_costs WHERE session_id = ?1",
-                    [session_id],
+                    [key],
                     |r| r.get(0),
                 )
                 .optional()?;
             let added = match last {
                 Some(last) if total_usd >= last => total_usd - last,
-                Some(_) => 0.0,
-                None if new => total_usd,
-                None => 0.0,
+                _ => 0.0,
             };
             s.conn.execute(
                 "INSERT INTO session_costs (session_id, total_usd, updated_at) VALUES (?1, ?2, ?3)
                  ON CONFLICT (session_id) DO UPDATE SET total_usd = excluded.total_usd,
                                                         updated_at = excluded.updated_at",
-                params![session_id, total_usd, now_ms],
+                params![key, total_usd, now_ms],
             )?;
             if added > 0.0 {
                 s.conn.execute(
