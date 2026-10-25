@@ -222,7 +222,7 @@ function recentWeeks(hist: AccountHistory): Child[] {
       windows.map((w) => ({
         text: pct(w.peak_pct),
         dim: w.thin,
-        title: `Week to ${day(w.resets_at)}${w.thin ? `. ${few}` : ""}`,
+        title: `Week to ${day(w.resets_at)}. Highest weekly usage: ${pct(w.peak_pct)}.${w.thin ? ` ${few}` : ""}`,
       })),
       "Highest weekly usage, newest first",
     );
@@ -232,11 +232,11 @@ function recentWeeks(hist: AccountHistory): Child[] {
   return list(
     weeks.map((w) =>
       w.windows_used === null
-        ? { text: "-", dim: true, title: `Week of ${day(w.starts_at)}: no data` }
+        ? { text: "-", dim: true, title: `Week of ${day(w.starts_at)}. No data.` }
         : {
             text: `${w.windows_at_limit ?? 0} of ${w.windows_used}`,
             dim: w.thin,
-            title: `Week of ${day(w.starts_at)}: ${w.windows_at_limit ?? 0} of ${plural(w.windows_used, "5-hour window")} reached the limit${w.thin ? `. ${few}` : ""}`,
+            title: `Week of ${day(w.starts_at)}. 5-hour windows at the limit: ${w.windows_at_limit ?? 0} of ${w.windows_used}.${w.thin ? ` ${few}` : ""}`,
           },
     ),
     "5-hour windows at the limit, newest first",

@@ -317,9 +317,7 @@ pub fn report_summary(h: &AccountHistory, weeks: usize) -> String {
         HistoryKind::Weekly => {
             let n = h.weekly.len();
             let Some(avg) = h.average_weekly_peak() else {
-                return format!(
-                    "{label}: its weekly limit hasn't reset in {period}, so there's nothing to report yet."
-                );
+                return format!("{label}: no readings of a weekly window that ended in {period}.");
             };
             let thin = h.weekly.iter().filter(|w| w.thin).count();
             let used = if n == 1 && weeks == 1 {
@@ -350,6 +348,8 @@ pub fn report_summary(h: &AccountHistory, weeks: usize) -> String {
             let at_limit: usize = known.iter().filter_map(|w| w.windows_at_limit).sum();
             let main = match (used, at_limit) {
                 (0, _) => format!("didn't use a single 5-hour window in {period}."),
+                (1, 0) => format!("its only 5-hour window in {period} didn't reach the limit."),
+                (1, _) => format!("its only 5-hour window in {period} reached the limit."),
                 (u, 0) => {
                     format!("none of its 5-hour windows reached the limit in {period} ({u} used).")
                 }
@@ -396,7 +396,7 @@ pub fn report(histories: &[AccountHistory], weeks: usize) -> String {
             HistoryKind::Weekly if h.weekly.is_empty() => {
                 let _ = writeln!(
                     out,
-                    "  {DIM}No weekly limit has reset in {}.{RESET}",
+                    "  {DIM}No readings of a weekly window that ended in {}.{RESET}",
                     last_weeks(weeks)
                 );
             }
@@ -541,7 +541,7 @@ mod tests {
         let mut h = history("main", HistoryKind::Weekly);
         assert_eq!(
             report_summary(&h, 4),
-            "main: its weekly limit hasn't reset in the last 4 weeks, so there's nothing to report yet."
+            "main: no readings of a weekly window that ended in the last 4 weeks."
         );
         h.weekly = vec![
             window(10.0, false),
@@ -598,6 +598,16 @@ mod tests {
         assert_eq!(
             report_summary(&h, 3),
             "account3: none of its 5-hour windows reached the limit in the last 3 weeks (4 used). No data for 1 of those weeks. 1 week had few readings, so the real numbers may be higher."
+        );
+        h.weeks = vec![week(Some(1), Some(1), false), week(None, None, true)];
+        assert_eq!(
+            report_summary(&h, 2),
+            "account3: its only 5-hour window in the last 2 weeks reached the limit. No data for 1 of those weeks."
+        );
+        h.weeks = vec![week(Some(1), Some(0), false)];
+        assert_eq!(
+            report_summary(&h, 1),
+            "account3: its only 5-hour window in the last week didn't reach the limit."
         );
         h.weeks = vec![week(Some(0), Some(0), false)];
         assert_eq!(
