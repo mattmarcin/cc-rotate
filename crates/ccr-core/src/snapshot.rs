@@ -184,7 +184,7 @@ pub fn snapshot_at(store: &Store, paths: &Paths, now_ms: i64) -> Result<Snapshot
 
     let forecast = match active_id {
         Some(_) => {
-            let rates = crate::budget::rates(store, now_ms)?;
+            let rates = crate::budget::cached_rates(store)?;
             crate::forecast::pace(store, &rates, now_ms)?
                 .map(|pace| crate::forecast::forecast(&pool, policy, &rates, pace, now_s))
         }
