@@ -899,7 +899,10 @@ function describe(e: EventRow): { parts: Child[]; tone?: "warn" | "danger" } {
     case "session":
       if (e.reason === "waiting") return { parts: e.account_from ? ["A session stopped at ", from, "'s usage limit"] : ["A session stopped at a usage limit"] };
       if (e.reason === "woken") return { parts: ["Woke a session that was stopped at a limit, now on ", to] };
-      if (e.reason === "resumed") return { parts: ["A woken session continued on ", to] };
+      if (e.reason === "resumed")
+        return e.detail?.woken === false
+          ? { parts: ["A session stopped at a limit continued on ", to] }
+          : { parts: ["A woken session continued on ", to] };
       return { parts: ["A session ", e.reason ?? "changed"] };
     case "session_stuck":
       return { parts: ["A session woken on ", to, " hasn't continued"], tone: "warn" };

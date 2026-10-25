@@ -587,11 +587,11 @@ fn profile_settings_check(paths: &Paths) -> Check {
 }
 
 /// Variables that make Claude Code ignore the profile's login, so a swap reaches no session.
-const LOGIN_OVERRIDES: &[&str] = &[
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "CLAUDE_CODE_OAUTH_TOKEN",
-];
+const LOGIN_OVERRIDES: &[&str] = &["ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"];
+
+/// Claude Code asks once before it uses this key in an interactive session, and remembers the
+/// answer, so it only overrides the login when someone said yes (or in `claude -p`).
+const API_KEY: &str = "ANTHROPIC_API_KEY";
 
 /// With it, a request at a usage limit waits inside Claude Code holding the login it was built
 /// with, so it never moves to the account cc-rotate swapped to (spec section 21).
@@ -638,6 +638,11 @@ fn environment_check(paths: &Paths, var: impl Fn(&str) -> Option<String>) -> Che
         );
     }
     let overrides = !problems.is_empty();
+    if let Some((_, place)) = lookup(API_KEY) {
+        problems.push(format!(
+            "{API_KEY} is set in {place}. If you told Claude Code to use it, it does instead of the account cc-rotate swaps in, and so does `claude -p`."
+        ));
+    }
     if let Some((_, place)) = lookup(RETRY_WATCHDOG)
         .filter(|(v, _)| v.trim() != "0" && !v.trim().eq_ignore_ascii_case("false"))
     {
@@ -721,6 +726,10 @@ mod tests {
         std::fs::create_dir_all(&paths.profile_dir).unwrap();
         let none = |_: &str| None;
         assert_eq!(environment_check(&paths, none).status, Status::Ok);
+
+        // Claude Code asks before it uses an API key: a warning, not a failure.
+        let key = |k: &str| (k == "ANTHROPIC_API_KEY").then(|| "sk-x".to_string());
+        assert_eq!(environment_check(&paths, key).status, Status::Warn);
 
         let token = |k: &str| (k == "CLAUDE_CODE_OAUTH_TOKEN").then(|| "x".to_string());
         let c = environment_check(&paths, token);

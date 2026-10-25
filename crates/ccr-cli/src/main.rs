@@ -487,15 +487,22 @@ fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> 
             if (remove_alias || keep_existing) && !force && paths.settings_file().exists() {
                 if keep_existing {
                     // An upgrade: cc-rotate's own hooks follow the new release, the rest stays.
-                    let updated = setup::update_hooks(&paths.profile_dir, &dunce_exe()?)?;
-                    println!(
-                        "The cc-rotate profile at {} is already set up. {}",
-                        paths.profile_dir.display(),
-                        if updated {
+                    // A settings.json it cannot update must not fail the upgrade: doctor says
+                    // the hook is outdated until it is fixed.
+                    let note = match setup::update_hooks(&paths.profile_dir, &dunce_exe()?) {
+                        Ok(true) => {
                             "Updated cc-rotate's hooks in it and left everything else as it is."
-                        } else {
-                            "Leaving it as it is."
+                                .to_string()
                         }
+                        Ok(false) => "Leaving it as it is.".to_string(),
+                        Err(e) => {
+                            eprintln!("warning: couldn't update cc-rotate's hooks in it: {e:#}");
+                            "Leaving it as it is.".to_string()
+                        }
+                    };
+                    println!(
+                        "The cc-rotate profile at {} is already set up. {note}",
+                        paths.profile_dir.display(),
                     );
                     println!(
                         "To rebuild it from your template profile, run: cc-rotate-ctl setup --force"

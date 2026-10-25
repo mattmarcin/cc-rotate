@@ -215,14 +215,14 @@ cc-rotate takes care of that:
 - A `StopFailure` hook in the cc-rotate profile notes the session, asks for a swap, and waits in the background.
   As soon as the profile holds an account with room, it wakes the session, which continues the task on that account.
   When every account is at a limit, it waits until one frees up.
-- A session is woken at most once per account, so a wrong reading can't make it loop, and the hook stops waiting when you close the session.
+- While a session keeps stopping, it's woken at most once per account, so a wrong reading can't make it loop. The hook stops waiting when the session continues by itself or you close it.
 - If a woken session hasn't continued 3 minutes later, the app sends a notification ("A session didn't continue"), and Activity shows it.
 - Claude Code also continues a task on its own when the old account's limit resets.
   It tells the session not to repeat finished work, so that later message is harmless.
 - Each sign-in lasts about a month, however much the account is used.
   The app warns 5 days before one ends (`login_warning_days`), and **Sign in again** renews it.
   An account whose sign-in ended is marked **Signed out**, so rotation never swaps to it.
-- `cc-rotate-ctl doctor` warns when something would keep a swap from reaching your sessions: an `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` or `CLAUDE_CODE_OAUTH_TOKEN`, an `apiKeyHelper`, or `CLAUDE_CODE_RETRY_WATCHDOG` (a request waiting under it keeps its old login).
+- `cc-rotate-ctl doctor` warns when something would keep a swap from reaching your sessions: an `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` you told Claude Code to use, an `apiKeyHelper`, or `CLAUDE_CODE_RETRY_WATCHDOG` (a request waiting under it keeps its old login).
 
 The hook comes with `cc-rotate-ctl setup`, and the installer updates it in an existing profile on every upgrade.
 

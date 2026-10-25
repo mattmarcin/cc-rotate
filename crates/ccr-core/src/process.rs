@@ -84,6 +84,18 @@ pub fn start_time(pid: u32) -> Option<String> {
 /// The parent of the process `pid`, while both run.
 #[cfg(windows)]
 pub fn parent(pid: u32) -> Option<u32> {
+    process_entry(pid).map(|(parent, _)| parent)
+}
+
+/// The executable name of the process `pid` (`bash.exe`), while it runs.
+#[cfg(windows)]
+pub fn name(pid: u32) -> Option<String> {
+    process_entry(pid).map(|(_, name)| name)
+}
+
+/// The parent and executable name of the process `pid`, from a process snapshot.
+#[cfg(windows)]
+fn process_entry(pid: u32) -> Option<(u32, String)> {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
@@ -101,7 +113,13 @@ pub fn parent(pid: u32) -> Option<u32> {
         let mut more = Process32FirstW(snapshot, &mut entry);
         while more != 0 {
             if entry.th32ProcessID == pid {
-                found = Some(entry.th32ParentProcessID);
+                let len = entry
+                    .szExeFile
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
+                found = Some((entry.th32ParentProcessID, name));
                 break;
             }
             more = Process32NextW(snapshot, &mut entry);
@@ -133,6 +151,39 @@ pub fn parent(pid: u32) -> Option<u32> {
     String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
+/// The command name of the process `pid` (`bash`): from `/proc` on Linux, else what `ps`
+/// reports.
+#[cfg(unix)]
+pub fn name(pid: u32) -> Option<String> {
+    if let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) {
+        return Some(comm.trim().to_string()).filter(|c| !c.is_empty());
+    }
+    let out = Command::new("ps")
+        .args(["-o", "comm=", "-p", &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    // macOS prints the path, and a login shell's name starts with "-".
+    let base = text
+        .rsplit('/')
+        .next()
+        .unwrap_or(&text)
+        .trim_start_matches('-');
+    Some(base.to_string()).filter(|b| !b.is_empty())
+}
+
+/// Whether a process name is a shell, as Claude Code runs a hook command through one.
+pub fn is_shell(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    let name = name.strip_suffix(".exe").unwrap_or(&name);
+    matches!(
+        name,
+        "sh" | "bash" | "dash" | "zsh" | "ksh" | "fish" | "ash" | "cmd" | "pwsh" | "powershell"
+    )
+}
+
 /// This process's nearest ancestors as they were when it started, to tell when the program that
 /// started it is gone: a hook outlives a Claude Code session that was killed, since the shell
 /// between them waits for it.
@@ -140,7 +191,17 @@ pub fn parent(pid: u32) -> Option<u32> {
 pub struct Ancestors(Vec<(u32, Option<String>)>);
 
 impl Ancestors {
-    /// Up to `depth` ancestors: for a hook, the shell Claude Code runs it in and Claude Code.
+    /// For a hook: the shell Claude Code runs it in and Claude Code, or Claude Code alone when it
+    /// started the hook directly (a shell that runs a single command often replaces itself with
+    /// it), so whatever started Claude Code is never watched.
+    pub fn of_hook() -> Ancestors {
+        let shell_parent = parent(std::process::id())
+            .and_then(name)
+            .is_some_and(|n| is_shell(&n));
+        Ancestors::of_this_process(if shell_parent { 2 } else { 1 })
+    }
+
+    /// Up to `depth` ancestors.
     pub fn of_this_process(depth: usize) -> Ancestors {
         let mut chain = Vec::new();
         let mut pid = std::process::id();
@@ -170,6 +231,40 @@ impl Ancestors {
 
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod ancestry_tests {
+    use super::*;
+
+    #[test]
+    fn finds_this_process_parent_and_its_name() {
+        let me = std::process::id();
+        let parent = parent(me).expect("a parent");
+        assert!(alive(parent));
+        assert!(name(me).is_some_and(|n| !n.is_empty()));
+        let ancestors = Ancestors::of_this_process(2);
+        assert!(!ancestors.is_empty());
+        assert!(ancestors.all_alive());
+    }
+
+    #[test]
+    fn knows_shells() {
+        for shell in [
+            "bash",
+            "bash.exe",
+            "sh",
+            "zsh",
+            "pwsh.exe",
+            "PowerShell.exe",
+            "cmd.exe",
+        ] {
+            assert!(is_shell(shell), "{shell}");
+        }
+        for other in ["claude", "claude.exe", "node", "cc-rotate.exe"] {
+            assert!(!is_shell(other), "{other}");
+        }
     }
 }
 

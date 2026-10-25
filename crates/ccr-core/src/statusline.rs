@@ -191,12 +191,12 @@ pub fn tick(store: &Store, paths: &Paths, input: &StatusInput, now_ms: i64) -> R
                 swap::Attribution::Own => {
                     store.record_sample(&sample)?;
                     swap::note_known_resets(store, active.id, &sample.windows, now_ms / 1000)?;
-                    note_session_working(store, input, active.id, now_ms)?;
+                    note_session_working(store, input, active.id, &sample, now_ms)?;
                 }
                 // Recorded, but it does not vouch for the account's reset times.
                 swap::Attribution::Ambiguous => {
                     store.record_sample(&sample)?;
-                    note_session_working(store, input, active.id, now_ms)?;
+                    note_session_working(store, input, active.id, &sample, now_ms)?;
                 }
                 swap::Attribution::Elsewhere => {
                     result.confirm = confirm_due(store, &sample, active.id, now_ms)?;
@@ -232,17 +232,18 @@ pub fn tick(store: &Store, paths: &Paths, input: &StatusInput, now_ms: i64) -> R
     Ok(result)
 }
 
-/// A fresh reading of the account in use from a session cc-rotate woke after a usage limit
+/// A fresh reading of the account in use from a session stopped at a usage limit, with room,
 /// means it is working again (`waiting::note_reading`).
 fn note_session_working(
     store: &Store,
     input: &StatusInput,
     account_id: i64,
+    sample: &Sample,
     now_ms: i64,
 ) -> Result<()> {
     match input.session_id.as_deref() {
         Some(session) if !session.is_empty() => {
-            crate::waiting::note_reading(store, session, account_id, now_ms)
+            crate::waiting::note_reading(store, session, account_id, sample, now_ms)
         }
         _ => Ok(()),
     }

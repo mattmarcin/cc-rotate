@@ -10,8 +10,8 @@ use ccr_core::store::{AccountIdentity, AccountState, Sample, SampleWindow, Store
 use ccr_core::time;
 use serde_json::json;
 
-/// A store with `a` (active, at its 5-hour limit) and `b` (parked, with room), and a's login
-/// in the profile. Usage checks are off and find no Claude Code anyway.
+/// A store with `a` (active, at its 5-hour limit), `b` and `c` (parked, with room), and a's
+/// login in the profile. Usage checks are off and find no Claude Code anyway.
 fn fixture(root: &Path) -> Store {
     let profile = root.join("profile");
     std::fs::create_dir_all(&profile).unwrap();
@@ -24,6 +24,7 @@ fn fixture(root: &Path) -> Store {
     for (label, state, five) in [
         ("a", AccountState::Active, 100.0),
         ("b", AccountState::Parked, 10.0),
+        ("c", AccountState::Parked, 10.0),
     ] {
         let id = store
             .insert_account(
@@ -147,4 +148,35 @@ fn other_errors_and_sessions_without_an_id_are_not_waited_on() {
         assert!(start.elapsed() < Duration::from_secs(30), "no swap");
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// A second session whose request still carried a's login stops just after the first one's
+/// swap landed on b: it is woken on b at once, and the profile is not moved on to c.
+#[test]
+fn a_stop_just_after_a_swap_wakes_at_once_without_another_swap() {
+    let root = tempfile::tempdir().unwrap();
+    let store = fixture(root.path());
+    let first = hook(
+        root.path(),
+        r#"{"hook_event_name":"StopFailure","session_id":"s-1","error":"rate_limit"}"#,
+    );
+    assert_eq!(first.status.code(), Some(2), "{first:?}");
+    let start = Instant::now();
+    let second = hook(
+        root.path(),
+        r#"{"hook_event_name":"StopFailure","session_id":"s-2","error":"rate_limit"}"#,
+    );
+    assert_eq!(second.status.code(), Some(2), "{second:?}");
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        start.elapsed()
+    );
+    assert!(String::from_utf8_lossy(&second.stderr).contains("the account b"));
+    // Give a wrongly requested background swap the time to land, then check none did.
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(
+        store.active_account().unwrap().map(|a| a.label),
+        Some("b".to_string())
+    );
 }

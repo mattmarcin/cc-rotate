@@ -442,13 +442,15 @@ pub struct WaitingSession {
     pub woken_at: Option<i64>,
     pub woken_account_id: Option<i64>,
     /// Every account the session was woken on since it first stopped. Kept across a new stop
-    /// soon after a wake (`WAKE_MEMORY_MS`), so a session is never woken twice on one account,
-    /// even while readings wrongly show room on several.
+    /// within `WAKE_MEMORY_MS` of the last wake, unless the session was seen working since, so
+    /// a session that keeps stopping is never woken twice on one account, even while readings
+    /// wrongly show room on several.
     pub woken_accounts: Vec<i64>,
     pub updated_at: i64,
 }
 
-/// A new stop of a session woken this recently remembers the account it was woken on.
+/// A new stop of a session woken this recently, and not seen working since, remembers the
+/// accounts it was woken on.
 pub const WAKE_MEMORY_MS: i64 = 30 * 60_000;
 
 /// Waiting-session rows are dropped this long after their last change.
@@ -1276,6 +1278,37 @@ impl Store {
         Ok(Some(sample))
     }
 
+    /// The latest reading one session reported for an account at or after `since_ms`.
+    pub fn session_sample_since(
+        &self,
+        session_id: &str,
+        account_id: i64,
+        since_ms: i64,
+    ) -> Result<Option<Sample>> {
+        let row = self
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT {SAMPLE_COLS} FROM samples
+                     WHERE account_id = ?1 AND ts >= ?2 AND session_id = ?3
+                     ORDER BY ts DESC, id DESC LIMIT 1"
+                ),
+                params![account_id, since_ms, session_id],
+                sample_from_row,
+            )
+            .optional()?;
+        let Some((id, mut sample)) = row else {
+            return Ok(None);
+        };
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT name, pct, resets_at FROM sample_windows WHERE sample_id = ?1 ORDER BY name",
+        )?;
+        sample.windows = stmt
+            .query_map([id], window_from_row)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(Some(sample))
+    }
+
     pub fn samples_since(&self, since_ms: i64) -> Result<Vec<Sample>> {
         self.samples_matching(None, since_ms)
     }
@@ -1412,7 +1445,8 @@ impl Store {
     // ---- sessions stopped at a usage limit ------------------------------------------------
 
     /// Record that `session_id` stopped at a usage limit at `since_ms`, replacing an earlier
-    /// stop of the same session. The last wake is kept when it was recent (`WAKE_MEMORY_MS`).
+    /// stop of the same session. Its wakes are kept when the last was recent (`WAKE_MEMORY_MS`)
+    /// and the session was not seen working since. The expressions read the row as it was.
     pub fn start_waiting(
         &self,
         session_id: &str,
@@ -1431,9 +1465,11 @@ impl Store {
                 hook_pid = excluded.hook_pid,
                 hook_started = excluded.hook_started,
                 state = 'waiting',
-                woken_at = CASE WHEN woken_at >= ?6 THEN woken_at END,
-                woken_account_id = CASE WHEN woken_at >= ?6 THEN woken_account_id END,
-                woken_accounts = CASE WHEN woken_at >= ?6 THEN woken_accounts ELSE '[]' END,
+                woken_at = CASE WHEN woken_at >= ?6 AND state <> 'resumed' THEN woken_at END,
+                woken_account_id = CASE WHEN woken_at >= ?6 AND state <> 'resumed'
+                                        THEN woken_account_id END,
+                woken_accounts = CASE WHEN woken_at >= ?6 AND state <> 'resumed'
+                                      THEN woken_accounts ELSE '[]' END,
                 updated_at = excluded.updated_at",
             params![
                 session_id,
@@ -1469,25 +1505,31 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Move the stop recorded at `since_ms` to `state` (and record a wake), unless a later stop
-    /// replaced it. Returns whether it did.
+    /// Move the stop recorded at `since_ms` from one of the `from` states to `state` (and record
+    /// a wake), unless a later stop replaced it or another process moved it first. Returns
+    /// whether it did.
     pub fn set_waiting_state(
         &self,
         session_id: &str,
         since_ms: i64,
+        from: &[WaitingState],
         state: WaitingState,
         woken: Option<(i64, i64)>,
         now_ms: i64,
     ) -> Result<bool> {
         let (woken_at, woken_account) = woken.unzip();
+        let from: Vec<String> = from.iter().map(|s| format!("'{}'", s.as_str())).collect();
         let n = self.conn.execute(
-            "UPDATE waiting_sessions SET state = ?3,
+            &format!(
+                "UPDATE waiting_sessions SET state = ?3,
                 woken_at = COALESCE(?4, woken_at),
                 woken_account_id = COALESCE(?5, woken_account_id),
                 woken_accounts = CASE WHEN ?5 IS NULL THEN woken_accounts
                                       ELSE json_insert(woken_accounts, '$[#]', ?5) END,
                 updated_at = ?6
-             WHERE session_id = ?1 AND since_ms = ?2",
+             WHERE session_id = ?1 AND since_ms = ?2 AND state IN ({})",
+                from.join(", ")
+            ),
             params![
                 session_id,
                 since_ms,

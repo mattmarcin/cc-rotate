@@ -5,7 +5,7 @@ use ccr_core::scheduler::Reason;
 use ccr_core::statusline::{self, StatusInput};
 use ccr_core::store::{AccountIdentity, AccountState, Sample, SampleWindow, WaitingState, kind};
 use ccr_core::swap::{self, SwapRequest};
-use ccr_core::waiting::{self, Decision, GiveUp};
+use ccr_core::waiting::{self, Decision, WakeReason};
 use ccr_core::{Paths, Store, time};
 use serde_json::json;
 
@@ -67,20 +67,25 @@ fn env() -> Env {
     }
 }
 
+fn five_hour(account: i64, session: Option<&str>, five: f64, ts: i64, resets_at: i64) -> Sample {
+    Sample {
+        ts,
+        account_id: account,
+        profile: "rotate".into(),
+        session_id: session.map(str::to_string),
+        model: None,
+        windows: vec![SampleWindow {
+            name: "five_hour".into(),
+            pct: five,
+            resets_at: Some(resets_at),
+        }],
+    }
+}
+
+/// A reading of the account from any session, with its 5-hour window resetting in an hour.
 fn reading(store: &Store, account: i64, five: f64, ts: i64) {
     store
-        .record_sample(&Sample {
-            ts,
-            account_id: account,
-            profile: "rotate".into(),
-            session_id: None,
-            model: None,
-            windows: vec![SampleWindow {
-                name: "five_hour".into(),
-                pct: five,
-                resets_at: Some(ts / 1000 + 3600),
-            }],
-        })
+        .record_sample(&five_hour(account, None, five, ts, ts / 1000 + 3600))
         .unwrap();
 }
 
@@ -105,118 +110,119 @@ fn swap_to_b(e: &Env) {
     assert!(matches!(out, swap::SwapOutcome::Swapped { .. }), "{out:?}");
 }
 
+fn woken(decision: Decision) -> (i64, WakeReason) {
+    match decision {
+        Decision::Wake(account, reason) => (account.id, reason),
+        other => panic!("expected a wake, got {other:?}"),
+    }
+}
+
+fn waits(decision: Decision) {
+    assert!(matches!(decision, Decision::Wait), "{decision:?}");
+}
+
 #[test]
 fn waits_on_the_account_it_stopped_on_and_wakes_after_a_swap() {
     let e = env();
     let now = time::now_ms();
     reading(&e.store, e.a, 100.0, now - 1_000);
     reading(&e.store, e.b, 10.0, now - 60_000);
-    // Long after the last swap: nothing has moved yet.
-    e.store
-        .set_meta(swap::META_ACTIVE_SINCE, now - 3_600_000)
-        .unwrap();
     let ws = stop(&e, "s1", now);
-    assert!(matches!(
-        waiting::decide(&e.store, &e.paths, &ws, now).unwrap(),
-        Decision::Wait
-    ));
+    waits(waiting::decide(&e.store, &e.paths, &ws, now).unwrap());
 
     swap_to_b(&e);
-    match waiting::decide(&e.store, &e.paths, &ws, time::now_ms()).unwrap() {
-        Decision::Wake(account) => assert_eq!(account.id, e.b),
-        other => panic!("{other:?}"),
-    }
+    let (account, reason) =
+        woken(waiting::decide(&e.store, &e.paths, &ws, time::now_ms()).unwrap());
+    assert_eq!((account, reason), (e.b, WakeReason::Switched));
+    let b = e.store.account(e.b).unwrap().unwrap();
     assert!(
-        waiting::wake_message(&e.store.account(e.b).unwrap().unwrap())
-            .contains("the account b, which has usage left")
+        waiting::wake_message(&b, WakeReason::Switched)
+            .contains("switched this Claude Code profile to the account b, which has usage left")
     );
 }
 
 #[test]
-fn a_reading_from_before_the_stop_does_not_count_as_room() {
+fn other_sessions_readings_never_count_as_room_on_the_account_it_stopped_on() {
     let e = env();
     let now = time::now_ms();
-    // At 97% just before the turn jumped to its limit: the reading of the jump comes later.
     reading(&e.store, e.a, 97.0, now - 5_000);
-    e.store
-        .set_meta(swap::META_ACTIVE_SINCE, now - 3_600_000)
-        .unwrap();
     let ws = stop(&e, "s1", now);
-    assert!(matches!(
-        waiting::decide(&e.store, &e.paths, &ws, now).unwrap(),
-        Decision::Wait
-    ));
-
-    // A reading taken since, with room: its limit has reset, and Claude Code continues the
-    // session itself.
-    reading(&e.store, e.a, 2.0, now + 1_000);
-    assert!(matches!(
-        waiting::decide(&e.store, &e.paths, &ws, now + 2_000).unwrap(),
-        Decision::GiveUp(GiveUp::LimitReset)
-    ));
-
-    // Unless the user turned that off: then cc-rotate wakes it.
+    // An idle session repeats its pre-limit numbers with a fresh time: that is no reset.
+    reading(&e.store, e.a, 85.0, now + 1_000);
+    waits(waiting::decide(&e.store, &e.paths, &ws, now + 2_000).unwrap());
     std::fs::write(
         e.paths.settings_file(),
         r#"{"autoContinueAtUsageLimit": false}"#,
     )
     .unwrap();
-    assert!(matches!(
-        waiting::decide(&e.store, &e.paths, &ws, now + 2_000).unwrap(),
-        Decision::Wake(_)
-    ));
+    waits(waiting::decide(&e.store, &e.paths, &ws, now + 2_000).unwrap());
 }
 
 #[test]
-fn a_swap_that_landed_just_before_the_stop_wakes_once_the_account_shows_room() {
+fn wakes_on_the_same_account_after_its_reset_only_with_claude_codes_continue_off() {
+    let e = env();
+    let now = time::now_ms();
+    let ws = stop(&e, "s1", now);
+    // The stop's own reading: at the limit until it resets 10 minutes later.
+    let resets = now / 1000 + 600;
+    e.store
+        .record_sample(&five_hour(e.a, Some("s1"), 100.0, now + 500, resets))
+        .unwrap();
+    let after_reset = (resets + 60) * 1000;
+    // With Claude Code's own continue on, it continues the session itself.
+    waits(waiting::decide(&e.store, &e.paths, &ws, after_reset).unwrap());
+
+    std::fs::write(
+        e.paths.settings_file(),
+        r#"{"autoContinueAtUsageLimit": false}"#,
+    )
+    .unwrap();
+    waits(waiting::decide(&e.store, &e.paths, &ws, now + 60_000).unwrap());
+    let (account, reason) = woken(waiting::decide(&e.store, &e.paths, &ws, after_reset).unwrap());
+    assert_eq!((account, reason), (e.a, WakeReason::LimitReset));
+    let a = e.store.account(e.a).unwrap().unwrap();
+    assert!(
+        waiting::wake_message(&a, WakeReason::LimitReset)
+            .contains("usage limit of the account a has reset")
+    );
+}
+
+#[test]
+fn a_swap_that_landed_just_before_the_stop_wakes_at_once() {
     let e = env();
     let now = time::now_ms();
     reading(&e.store, e.a, 100.0, now - 120_000);
     reading(&e.store, e.b, 10.0, now - 120_000);
     swap_to_b(&e);
-    // The turn's request still carried a's login: it stops a moment after the swap, with b in
+    // The turn's request still carried a's login: it stops moments after the swap, with b in
     // the profile.
-    let since = time::now_ms() + 30_000;
+    let since = time::now_ms() + 5_000;
     let ws = e.store.start_waiting("s1", since, Some(e.b), None).unwrap();
-    // Until a reading since shows room on b, the stop may as well be b's own limit.
-    assert!(matches!(
-        waiting::decide(&e.store, &e.paths, &ws, since).unwrap(),
-        Decision::Wait
-    ));
-    reading(&e.store, e.b, 11.0, since + 1_000);
-    match waiting::decide(&e.store, &e.paths, &ws, since + 2_000).unwrap() {
-        Decision::Wake(account) => assert_eq!(account.id, e.b),
-        other => panic!("{other:?}"),
-    }
+    assert_eq!(
+        woken(waiting::decide(&e.store, &e.paths, &ws, since).unwrap()).0,
+        e.b
+    );
 
-    // A first activation just before the stop, and the account at its limit by a reading since:
-    // the stop is its own.
-    let at_limit = e
-        .store
-        .start_waiting("s2", since + 3_000, Some(e.b), None)
-        .unwrap();
-    reading(&e.store, e.b, 100.0, since + 4_000);
-    assert!(matches!(
-        waiting::decide(&e.store, &e.paths, &at_limit, since + 5_000).unwrap(),
-        Decision::Wait
-    ));
-
-    // Long after the swap, room on b by a reading since means its limit reset: Claude Code
-    // continues the session itself.
-    let later_since = time::now_ms() + 600_000;
-    let later = e
-        .store
-        .start_waiting("s3", later_since, Some(e.b), None)
-        .unwrap();
-    reading(&e.store, e.b, 3.0, later_since + 1_000);
-    assert!(matches!(
-        waiting::decide(&e.store, &e.paths, &later, later_since + 2_000).unwrap(),
-        Decision::GiveUp(GiveUp::LimitReset)
-    ));
+    // Long after the swap, a stop on b is b's own limit.
+    let later = time::now_ms() + 600_000;
+    let ws = e.store.start_waiting("s2", later, Some(e.b), None).unwrap();
+    waits(waiting::decide(&e.store, &e.paths, &ws, later).unwrap());
 }
 
 #[test]
-fn never_wakes_a_session_twice_on_one_account() {
+fn a_first_activation_just_before_the_stop_is_no_reason_to_wake() {
+    let e = env();
+    let now = time::now_ms();
+    reading(&e.store, e.a, 50.0, now - 1_000);
+    e.store
+        .log_event(kind::SWAP, None, Some(e.a), Some("manual"), None)
+        .unwrap();
+    let ws = stop(&e, "s1", time::now_ms() + 1_000);
+    waits(waiting::decide(&e.store, &e.paths, &ws, ws.since_ms).unwrap());
+}
+
+#[test]
+fn never_wakes_a_session_twice_on_one_account_while_it_keeps_stopping() {
     let e = env();
     let now = time::now_ms();
     reading(&e.store, e.a, 100.0, now - 1_000);
@@ -226,27 +232,74 @@ fn never_wakes_a_session_twice_on_one_account() {
     let b = e.store.account(e.b).unwrap().unwrap();
     assert!(waiting::note_woken(&e.store, &ws, &b, now + 1_000).unwrap());
 
-    // Woken on b, it stops again: b may really be at its limit, so no second wake there.
+    // Woken on b, it stops again: b may really be at its limit, so no second wake there, even
+    // though the swap to b landed just before.
     let again = e
         .store
         .start_waiting("s1", now + 5_000, Some(e.b), None)
         .unwrap();
-    assert_eq!(again.woken_account_id, Some(e.b));
-    assert!(matches!(
-        waiting::decide(&e.store, &e.paths, &again, now + 6_000).unwrap(),
-        Decision::Wait
-    ));
+    assert_eq!(again.woken_accounts, vec![e.b]);
+    waits(waiting::decide(&e.store, &e.paths, &again, now + 6_000).unwrap());
 
     // The hook of the replaced stop can no longer record a wake.
     assert!(!waiting::note_woken(&e.store, &ws, &b, now + 7_000).unwrap());
 
-    // Long after, a new stop forgets that wake.
+    // Long after the last wake, a new stop forgets the episode.
     let much_later = now + ccr_core::store::WAKE_MEMORY_MS + 60_000;
     let fresh = e
         .store
         .start_waiting("s1", much_later, Some(e.b), None)
         .unwrap();
     assert_eq!(fresh.woken_account_id, None);
+    assert!(fresh.woken_accounts.is_empty());
+}
+
+#[test]
+fn a_session_that_worked_again_starts_a_new_episode() {
+    let e = env();
+    let now = time::now_ms();
+    reading(&e.store, e.b, 10.0, now - 60_000);
+    let ws = stop(&e, "s1", now);
+    swap_to_b(&e);
+    let b = e.store.account(e.b).unwrap().unwrap();
+    assert!(waiting::note_woken(&e.store, &ws, &b, now + 1_000).unwrap());
+    let working = five_hour(e.b, Some("s1"), 20.0, now + 30_000, now / 1000 + 7_200);
+    waiting::note_reading(&e.store, "s1", e.b, &working, now + 30_000).unwrap();
+    assert_eq!(
+        e.store.waiting_session("s1").unwrap().unwrap().state,
+        WaitingState::Resumed
+    );
+    let next = e
+        .store
+        .start_waiting("s1", now + 600_000, Some(e.b), None)
+        .unwrap();
+    assert!(next.woken_accounts.is_empty());
+}
+
+#[test]
+fn a_refused_request_is_no_sign_of_work_but_room_is_even_unwoken() {
+    let e = env();
+    let now = time::now_ms();
+    let b = e.store.account(e.b).unwrap().unwrap();
+    let ws = stop(&e, "woken", now);
+    assert!(waiting::note_woken(&e.store, &ws, &b, now + 1_000).unwrap());
+    // The woken turn was refused: its reading is at the limit.
+    let refused = five_hour(e.b, Some("woken"), 100.0, now + 2_000, now / 1000 + 3_600);
+    waiting::note_reading(&e.store, "woken", e.b, &refused, now + 2_000).unwrap();
+    assert_eq!(
+        e.store.waiting_session("woken").unwrap().unwrap().state,
+        WaitingState::Woken
+    );
+
+    // A session that continued by itself (Claude Code's own continue, or the user) with room is
+    // working again too, so its hook stops waiting.
+    stop(&e, "itself", now);
+    let fine = five_hour(e.a, Some("itself"), 3.0, now + 5_000, now / 1000 + 18_000);
+    waiting::note_reading(&e.store, "itself", e.a, &fine, now + 5_000).unwrap();
+    assert_eq!(
+        e.store.waiting_session("itself").unwrap().unwrap().state,
+        WaitingState::Resumed
+    );
 }
 
 #[test]
@@ -256,7 +309,7 @@ fn gives_up_after_the_longest_wait() {
     let ws = stop(&e, "s1", now);
     assert!(matches!(
         waiting::decide(&e.store, &e.paths, &ws, now + waiting::MAX_WAIT_MS).unwrap(),
-        Decision::GiveUp(GiveUp::TimedOut)
+        Decision::TimedOut
     ));
 }
 
@@ -265,7 +318,6 @@ fn input(session: &str, pct: f64, resets_at: i64) -> StatusInput {
         &json!({
             "session_id": session,
             "version": ccr_core::doctor::TESTED_CLAUDE_VERSIONS[0],
-            "cost": {"total_api_duration_ms": time::now_ms()},
             "rate_limits": {"five_hour": {"used_percentage": pct, "resets_at": resets_at}}
         })
         .to_string(),
@@ -302,7 +354,8 @@ fn a_woken_session_reporting_usage_is_resumed_and_a_silent_one_is_stuck() {
     let busy = e.store.waiting_session("busy").unwrap().unwrap();
     assert_eq!(busy.state, WaitingState::Resumed);
 
-    // Minutes later, the quiet one has said nothing: the user is told, once.
+    // Minutes later, the quiet one has said nothing: the user is told, once, however many
+    // scans run.
     let later = woken_at + waiting::STUCK_AFTER_MS + 1_000;
     waiting::scan(&e.store, later).unwrap();
     waiting::scan(&e.store, later + 60_000).unwrap();
@@ -331,6 +384,47 @@ fn a_woken_session_reporting_usage_is_resumed_and_a_silent_one_is_stuck() {
         .collect();
     assert!(reasons.contains(&"woken".to_string()));
     assert!(reasons.contains(&"resumed".to_string()));
+}
+
+#[test]
+fn state_changes_only_apply_from_the_state_read() {
+    let e = env();
+    let now = time::now_ms();
+    let ws = stop(&e, "s1", now);
+    let b = e.store.account(e.b).unwrap().unwrap();
+    assert!(waiting::note_woken(&e.store, &ws, &b, now + 1_000).unwrap());
+    // A scan that read the stop as waiting, before the wake, cannot end it now.
+    assert!(
+        !e.store
+            .set_waiting_state(
+                "s1",
+                ws.since_ms,
+                &[WaitingState::Waiting],
+                WaitingState::Ended,
+                None,
+                now + 2_000,
+            )
+            .unwrap()
+    );
+    // Nor can one that read it as woken mark it stuck once the status line saw it working.
+    let working = five_hour(e.b, Some("s1"), 20.0, now + 3_000, now / 1000 + 7_200);
+    waiting::note_reading(&e.store, "s1", e.b, &working, now + 3_000).unwrap();
+    assert!(
+        !e.store
+            .set_waiting_state(
+                "s1",
+                ws.since_ms,
+                &[WaitingState::Woken],
+                WaitingState::Stuck,
+                None,
+                now + 4_000,
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        e.store.waiting_session("s1").unwrap().unwrap().state,
+        WaitingState::Resumed
+    );
 }
 
 #[test]
