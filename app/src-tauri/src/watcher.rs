@@ -30,6 +30,8 @@ struct Watch {
     last_event_id: Option<i64>,
     /// Whether the pool was exhausted at the last status check.
     exhausted: Option<bool>,
+    /// The "running out" notification went out, and the pool has not had room since.
+    warned_running_out: bool,
     /// A background usage check is running.
     checking: Arc<AtomicBool>,
     /// A swap the background sync asked for is running.
@@ -184,7 +186,36 @@ fn status(app: &AppHandle, store: &Store, paths: &Paths, watch: &mut Watch) {
         }
     }
     watch.exhausted = Some(exhausted && !snap.accounts.is_empty());
+
+    // Once, when at the current pace every account would be at a limit within the hour.
+    let now_s = snap.now_ms / 1000;
+    let soon = snap.forecast.and_then(|f| {
+        f.runs_out_at
+            .filter(|&t| t - now_s <= RUNNING_OUT_WARNING_S)
+            .map(|t| (t, f.free_again_at))
+    });
+    match soon {
+        Some((out_at, free)) if !watch.warned_running_out && !exhausted => {
+            let mut body = format!(
+                "At this pace, every account is at a limit in {}.",
+                ccr_core::time::span(out_at - now_s)
+            );
+            if let Some(free) = free {
+                body.push_str(&format!(
+                    " The first frees up {} after that.",
+                    ccr_core::time::span(free - out_at)
+                ));
+            }
+            notify(app, "Running out of accounts", &body);
+            watch.warned_running_out = true;
+        }
+        None => watch.warned_running_out = false,
+        _ => {}
+    }
 }
+
+/// How far ahead the "running out" notification warns.
+const RUNNING_OUT_WARNING_S: i64 = 3600;
 
 fn tooltip(snap: &Snapshot) -> String {
     let Some(a) = snap

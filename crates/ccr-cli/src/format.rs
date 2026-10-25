@@ -156,6 +156,29 @@ pub fn status(snap: &Snapshot) -> String {
     if let Some(next) = &snap.next {
         let _ = writeln!(out, "Next: {} - {}", next.label, next.reason);
     }
+    if let Some(f) = &snap.forecast {
+        let now_s = snap.now_ms / 1000;
+        match (f.runs_out_at, f.free_again_at) {
+            (Some(out_at), free) => {
+                let _ = write!(
+                    out,
+                    "{YELLOW}At this pace, every account is at a limit in {}",
+                    time::span(out_at - now_s)
+                );
+                if let Some(free) = free {
+                    let _ = write!(
+                        out,
+                        ", and one frees up {} later",
+                        time::span(free - out_at)
+                    );
+                }
+                let _ = writeln!(out, ".{RESET}");
+            }
+            (None, _) => {
+                let _ = writeln!(out, "At this pace, there's room for the next 24 hours.");
+            }
+        }
+    }
     if p.exhausted {
         let next = p
             .next_available_at

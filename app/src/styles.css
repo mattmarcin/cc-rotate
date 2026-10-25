@@ -251,6 +251,11 @@ button {
   margin-left: auto;
 }
 
+/* "At this pace" when the pool would run out. */
+.facts dd.warn {
+  color: var(--amber);
+}
+
 /* ---- overview: the bank ---- */
 
 .overview {

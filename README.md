@@ -186,6 +186,11 @@ Turn it off with `cc-rotate-ctl config use_expiring_weekly false`, or in **Setti
 To keep part of an account's week for yourself, set where rotation stops using it, in its **More** dialog or with `cc-rotate-ctl weekly-cap <label> 70` (`off` goes back to the setting).
 cc-rotate then treats 70% as that account's weekly limit, and only plans to use its budget up to there.
 
+### How long your accounts last
+
+While you work, the dashboard shows how long your accounts last at your current pace ("all at a limit by 3:10 PM, one frees up at 4:30 PM"), and `cc-rotate-ctl status` shows the same.
+The app sends a notification once when they would all be at a limit within the hour.
+
 ### Commands
 
 | Command | What it does |

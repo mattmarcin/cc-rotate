@@ -381,6 +381,20 @@ function renderOverview() {
       h("dd", null, active ? active.label : "None", active && swapEvent ? h("span", { class: "muted" }, ` since ${clock(swapEvent.ts)}`) : null),
       h("dt", null, "Next"),
       h("dd", null, snap.next ? [snap.next.label, h("span", { class: "muted" }, ` - ${snap.next.reason}`)] : "None ready"),
+      snap.forecast && h("dt", null, "At this pace"),
+      snap.forecast &&
+        h(
+          "dd",
+          { class: snap.forecast.runs_out_at ? "warn" : null },
+          snap.forecast.runs_out_at
+            ? [
+                `all at a limit by ${clock(snap.forecast.runs_out_at * 1000)}`,
+                snap.forecast.free_again_at
+                  ? h("span", { class: "muted" }, `, one frees up at ${clock(snap.forecast.free_again_at * 1000)}`)
+                  : null,
+              ]
+            : "room for the next 24 hours",
+        ),
       p.weekly_limited > 0 && p.no_weekly_limit > 0 && h("dt", null, "No weekly limit"),
       p.weekly_limited > 0 && p.no_weekly_limit > 0 && h("dd", null, plural(p.no_weekly_limit, "account")),
       unavailable > 0 && h("dt", null, "Unavailable"),
