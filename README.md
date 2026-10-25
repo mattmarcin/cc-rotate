@@ -299,6 +299,15 @@ When you quit Claude Code in a pane, herdr forgets the command, just as it forge
 
 - **The Claude desktop app.** Its Code tab passes its own login to Claude Code directly, so swapping the profile's login cannot reach it.
 - **Claude Code's Windows Credential Manager storage.** Claude Code can be switched to keep its login in the Windows Credential Manager; swaps would then stop reaching running sessions. `cc-rotate-ctl doctor` fails loudly if that is on.
+- **Cloud sessions.** Cloud agents (`isolation: "remote"`), `/ultrareview`, routines and Claude Code on the web run on Anthropic's servers under the account that started them, and use that account's limits.
+  A swap cannot move them to another account.
+  A session in the pool reaches its cloud agents with whatever login the profile holds now, so after a swap it stops hearing from them until that account is in use again.
+  The cloud agent itself keeps running, and its results are on claude.ai/code under the account that started it.
+  Resuming a session while another account is in use can make Claude Code forget a cloud agent it was waiting for.
+  Starting a cloud agent after a swap may fail, because Claude Code can still name the organization of the account it signed in with earlier.
+  Prefer local background agents in the pool: they move with every swap.
+- **Remote Control.** Claude Code ends a Remote Control session and archives it as soon as the profile's login belongs to another account, so the next swap ends it.
+  Run `/remote-control` again to start one for the account now in use.
 - **Claude Code updates.** cc-rotate relies on how Claude Code reloads its login and locks login renewal, which is not a documented interface.
   `cc-rotate-ctl doctor` and the app warn when your Claude Code version has not been tested.
 
