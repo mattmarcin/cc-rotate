@@ -208,12 +208,32 @@ pub fn finish_dead_swap(store: &Store, paths: &Paths, settler: Settler) -> Resul
                         }
                     }
                 }
+                let label = |id: i64| -> Result<Option<String>> {
+                    Ok(s.account(id)?.map(|a| a.label))
+                };
+                let to = label(pending.to)?.unwrap_or_else(|| "The other account".into());
+                let from = match pending.from {
+                    Some(id) => label(id)?,
+                    None => None,
+                };
+                let what = "A swap was interrupted and the profile's login stopped working.";
+                let message = match (restored, from) {
+                    (true, Some(from)) => format!(
+                        "{what} cc-rotate put {from}'s login back. {to} is on hold until a usage check confirms its login."
+                    ),
+                    (false, Some(from)) => format!(
+                        "{what} {from} and {to} are on hold until usage checks confirm their logins."
+                    ),
+                    (_, None) => format!(
+                        "{what} {to} is on hold until a usage check confirms its login."
+                    ),
+                };
                 s.log_event(
                     kind::ERROR,
                     pending.from,
                     Some(pending.to),
                     Some("swap"),
-                    Some(json!({ "message": "A swap stopped half way and the login in the profile was then rejected; cc-rotate put the previous account's login back and checks the other one before using it." })),
+                    Some(json!({ "message": message })),
                 )?;
             }
             Verdict::Foreign => {

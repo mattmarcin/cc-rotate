@@ -228,15 +228,15 @@ fn describe(store: &Store, event: &Event) -> Option<(String, String)> {
     match event.kind.as_str() {
         kind::POOL_EXHAUSTED => Some((
             "No account left to swap to".into(),
-            format!("{} is near its limit and every other account is paused, needs a login, or is used up.", label(event.account_from)),
+            "Every other account is near a limit, paused or signed out.".into(),
         )),
         kind::DEAD_LOGIN => Some((
             format!("{} needs a new login", label(event.account_from)),
             "Its login stopped working. Open cc-rotate and choose Log in again.".into(),
         )),
         kind::FOREIGN_LOGIN => Some((
-            "The rotation profile is signed in to an unknown account".into(),
-            "Someone ran /login in the cc-rotate profile with an account outside the pool. Add it in cc-rotate or swap back.".into(),
+            "cc-rotate profile signed in to another account".into(),
+            "A /login in the cc-rotate profile signed in to an account that isn't in cc-rotate. Add that account, or use Swap now to go back to one of yours.".into(),
         )),
         kind::ERROR => Some((
             "cc-rotate hit an error".into(),

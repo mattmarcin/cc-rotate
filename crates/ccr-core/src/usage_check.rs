@@ -206,7 +206,7 @@ pub fn identifies_logins(store: &Store, paths: &Paths) -> Result<bool> {
 /// Whether nothing at all keeps automatic checks from running.
 fn checks_possible(store: &Store, paths: &Paths) -> Result<Option<String>> {
     if let Some(reason) = blocked(store)? {
-        return Ok(Some(format!("usage checks are stopped: {reason}")));
+        return Ok(Some(format!("usage checks are stopped because {reason}")));
     }
     if cfg!(windows)
         && credstore::windows_credman_enabled(
@@ -592,7 +592,7 @@ fn block(store: &Store, reason: &str) -> Result<()> {
         None,
         None,
         Some("usage_check"),
-        Some(json!({ "message": format!("Usage checks are stopped: {reason}. Turn them on again with `cc-rotate-ctl config usage_checks true` once Claude Code is updated.") })),
+        Some(json!({ "message": format!("Usage checks stopped because {reason}. After updating Claude Code, turn usage checks off and on again in Settings, or run `cc-rotate-ctl config usage_checks true`.") })),
     )?;
     Ok(())
 }
