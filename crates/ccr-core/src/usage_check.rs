@@ -7,7 +7,7 @@
 //! account's quota; Claude Code's JSON result says so (`num_turns` 0, `local_command` `usage`),
 //! and a result saying otherwise stops all checks. cc-rotate itself sends nothing.
 //!
-//! A warm-up (spec section 22, `warm_up`) is the one exception, for accounts the user opted in
+//! A warm-up (spec section 23, `warm_up`) is the one exception, for accounts the user opted in
 //! (`Account::keep_running`): in the same scratch profile and under the same lock, before its
 //! `/usage`, Claude Code sends one short prompt to the smallest model with no tools, which
 //! starts the account's next 5-hour window. A result showing another model, more than one turn
@@ -403,7 +403,7 @@ pub fn window_end_ms(at_ms: i64) -> i64 {
     at_ms - at_ms.rem_euclid(WINDOW_START_STEP_MS) + FIVE_HOURS_MS
 }
 
-/// The account whose 5-hour window the background should start now (spec section 22): a parked
+/// The account whose 5-hour window the background should start now (spec section 23): a parked
 /// account the user opted in (`Account::keep_running`), not held back, kept out of use by no
 /// other limit, with no 5-hour window running by its latest reading nor started by a warm-up,
 /// and no warm-up tried in the last `WARM_RETRY_MS`. Warm-ups run while usage checks do.
@@ -463,7 +463,7 @@ pub fn warm_ups_paused(store: &Store, paths: &Paths) -> Result<Option<String>> {
     checks_possible(store, paths)
 }
 
-/// Start the account's next 5-hour window (spec section 22): Claude Code sends a short prompt to
+/// Start the account's next 5-hour window (spec section 23): Claude Code sends a short prompt to
 /// the smallest model with the account's login, then reads its usage like a check, so the new
 /// window shows. Everything a check guarantees about the login holds for both runs.
 pub fn warm_up(

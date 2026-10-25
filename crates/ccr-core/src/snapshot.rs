@@ -117,7 +117,7 @@ pub struct Snapshot {
     /// How long the pool lasts at the account in use's current pace, while it is being used.
     pub forecast: Option<crate::forecast::Forecast>,
     /// Why warm-ups stopped until the user turns keeping a window running on again (spec
-    /// section 22), if they did.
+    /// section 23), if they did.
     pub warm_ups_blocked: Option<String>,
 }
 

@@ -160,7 +160,7 @@ pub fn forecast(
     while t < now_s + HORIZON_S {
         for c in &mut pool {
             // An account the user keeps running gets its next window as soon as one ends, while
-            // it is not in use (section 22).
+            // it is not in use (section 23).
             let kept =
                 c.account.keep_running && c.account.state == AccountState::Parked && !c.held_back;
             for w in &mut c.windows {

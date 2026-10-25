@@ -432,7 +432,7 @@ fn usage_checks_check(store: &Store, accounts: &[Account]) -> Check {
 }
 
 /// Whether warm-ups keep the 5-hour windows running of the accounts the user chose (section
-/// 22); nothing when no account has it on.
+/// 23); nothing when no account has it on.
 fn warm_ups_check(store: &Store, paths: &Paths, accounts: &[Account]) -> Option<Check> {
     let name = "Keeping 5-hour windows running";
     let kept: Vec<&Account> = accounts.iter().filter(|a| a.keep_running).collect();
