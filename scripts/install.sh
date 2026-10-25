@@ -83,6 +83,14 @@ case ":$PATH:" in
   *) echo "warning: $bin_dir is not on your PATH. Add it so the cc-rotate and cc-rotate-ctl commands work." >&2 ;;
 esac
 
+# A running app keeps the build it started with. It is not restarted from here: this may be an SSH
+# session, which cannot open windows on the desktop.
+if [ "$skip_app" -eq 0 ] && pgrep -x cc-rotate-app >/dev/null 2>&1; then
+  echo ""
+  echo "The cc-rotate app is still running the previous version."
+  echo "Quit it from its tray menu (Quit cc-rotate) and start it again to use the new one."
+fi
+
 echo ""
 echo "Next steps:"
 echo "  1. Add each account: cc-rotate-ctl login   (or use Add account in the app: cc-rotate-ctl dashboard)"
