@@ -1,7 +1,7 @@
 # cc-rotate
 
 Run one Claude Code profile on a pool of your own Claude accounts.
-When the account in use gets close to its 5-hour or weekly limit, cc-rotate switches the profile to another account in place.
+When the account in use gets close to one of its usage limits, cc-rotate switches the profile to another account in place.
 Running sessions keep going on their next request, with no restart and no proxy.
 
 Because every session lives in one profile, sessions can see and message each other, and their history lives in one place.
@@ -19,7 +19,7 @@ Because every session lives in one profile, sessions can see and message each ot
 - A dedicated profile (`~/.claude-rotate`) holds the account in use.
   cc-rotate copies your existing settings, hooks, skills and plugins into it.
 - Every Claude Code session in that profile runs `cc-rotate-ctl statusline` after every reply and every 30 seconds.
-  It records the account's usage, copies renewed logins back into the store, and starts a swap at 98% of either limit.
+  It records every usage limit Claude Code reports for the account, copies renewed logins back into the store, and starts a swap at 98% of any limit.
 - A swap takes the same lock Claude Code uses when it renews a login, saves the outgoing account's latest login, and writes the next account's login into the profile.
   Claude Code notices the change and uses the new account on its next request.
 - If a request already hit the limit, Claude Code waits and retries on its own, and the retry goes out on the new account.
@@ -115,21 +115,51 @@ Start it in a project folder, not your home folder.
 Claude Code does not run status lines in the home folder (trust there lasts for one run and is never saved), so cc-rotate cannot see usage or swap accounts for a session started there.
 The `cc-rotate` command warns you, and `cc-rotate-ctl doctor` lists any such session.
 
-The desktop app shows every account, how much of each limit is used, when each resets, usage over the last day or week with swaps marked, and an activity log.
-It lives in the tray, starts when you sign in to your computer (you can turn that off in **Health**), and sends a notification when an account needs a new login or no account is left to swap to.
+The desktop app shows every account with its plan, how much of each limit is used, when each resets, which account is used next and why, usage over the last day or week with swaps marked, and an activity log.
+It lives in the tray, starts when you sign in to your computer (you can turn that off in **Health**), and sends a notification when an account needs a new login, when no account is left to swap to, and when an account is ready again after that.
+
+### Which account is used next
+
+Every account has a place in your order.
+Drag the handles in the app's **Accounts** table to change it, or use the arrow keys on a focused handle, or `cc-rotate-ctl order` and `cc-rotate-ctl move`.
+New accounts go to the end.
+After an upgrade from an older cc-rotate, accounts that had the same priority share a place until you reorder them.
+
+When the account in use reaches a limit, cc-rotate picks the next account that is below all of its limits:
+
+1. Accounts without a weekly limit first, then accounts whose weekly limit is not known yet, then accounts with one.
+   Turn this off with `cc-rotate-ctl config prefer_no_weekly_limit false`, and only your order counts.
+2. Then your order.
+3. Then, between accounts in the same place, the one with the most room left.
+
+cc-rotate finds out whether an account has a weekly limit from the usage Claude Code reports: an account that reported a weekly limit has one, and an account that went through two separate 5-hour windows in the last 8 days without ever reporting one has none.
+Until then it is not known yet.
+If that guess is wrong, set it yourself in the account's **More** dialog or with `cc-rotate-ctl weekly-limit <label> yes|no` (`auto` goes back to detecting it).
+
+cc-rotate also switches back by itself: when an account that ranks above the one in use is ready again (for example once its 5-hour window has reset), it swaps to it, as long as the account in use has been in use for at least `switch_back_dwell_s` (10 minutes by default).
+That includes an account you picked by hand, so pause an account if you want it left alone.
+Accounts in the same place never swap just to even out usage.
+
+`cc-rotate-ctl next --explain` lists every account in the order it would be used, with the reason for each.
+
+Some limits only apply to one model, such as a weekly limit for one model family.
+When Claude Code reports one, cc-rotate records it too and only counts it while your sessions use that model.
 
 ### Commands
 
 | Command | What it does |
 |---|---|
 | `cc-rotate [claude arguments]` | Start Claude Code on the pool. |
-| `cc-rotate-ctl status` | Every account with its usage and reset times. |
-| `cc-rotate-ctl swap` | Swap now to the account with the most room. `--to <label>` picks one. |
+| `cc-rotate-ctl status` | Every account with its plan, usage and reset times, and the next pick. |
+| `cc-rotate-ctl next` | The account the next swap would pick, and why. `--explain` lists every account in order with a reason. |
+| `cc-rotate-ctl swap` | Swap now to the next pick. `--to <label>` picks one. |
 | `cc-rotate-ctl login` | Add an account. `--relogin <label>` signs an existing account in again. `--from-profile <name>` adds the account another profile uses. |
 | `cc-rotate-ctl profiles` | List your other Claude Code profiles and the account each belongs to. |
 | `cc-rotate-ctl pause <label>` / `resume <label>` | Keep an account out of rotation, or bring it back. |
 | `cc-rotate-ctl rename <label> <new>` / `remove <label> --yes` | Rename or delete an account. |
-| `cc-rotate-ctl priority <label> <n>` | Break ties between equally used accounts (lower is preferred). |
+| `cc-rotate-ctl order [<label>...]` | Show the order accounts are used in, or put the listed accounts first, in that order. |
+| `cc-rotate-ctl move <label> --to <n>` | Move an account to place `n` in the order (1 is used first). |
+| `cc-rotate-ctl weekly-limit <label> [auto\|yes\|no]` | Show or set whether an account has a weekly limit (`auto` detects it). |
 | `cc-rotate-ctl events` | Recent swaps, logins and problems. |
 | `cc-rotate-ctl doctor` | Check the profile, the store and Claude Code. |
 | `cc-rotate-ctl backup <file>` | Print a daily backup of the profile's login file, decrypted. It contains tokens, so keep the output private. |
@@ -141,9 +171,11 @@ It lives in the tray, starts when you sign in to your computer (you can turn tha
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `swap_threshold_5h` | 98 | Swap when the 5-hour limit reaches this percentage. |
-| `swap_threshold_7d` | 98 | Swap when the weekly limit reaches this percentage. |
+| `swap_threshold_5h` | 98 | Swap when a 5-hour limit reaches this percentage. |
+| `swap_threshold_7d` | 98 | Swap when a weekly limit, for all models or for one, reaches this percentage. Limits of a kind cc-rotate does not know use the lower of the two thresholds. |
 | `swap_cooldown_s` | 120 | Minimum seconds between swaps caused by usage readings. |
+| `prefer_no_weekly_limit` | true | Use accounts without a weekly limit before the ones with one. |
+| `switch_back_dwell_s` | 600 | How long an account stays in use before cc-rotate switches back to a better ranked account that is ready again. |
 | `lock_timeout_ms` | 30000 | How long a swap waits for Claude Code to finish renewing a login. |
 | `sample_retention_days` | 90 | How long usage history is kept. |
 | `statusline_downstream` | your old status line | The status line command shown after cc-rotate's label. |
