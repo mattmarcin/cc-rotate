@@ -101,9 +101,9 @@ pub fn start_login(
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("Could not start `claude auth login`: {e}"))?;
+    let mut child = cmd.spawn().map_err(|e| {
+        format!("Couldn't start Claude Code's sign-in: {e}. Check that Claude Code is installed.")
+    })?;
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let stdin = child.stdin.take();
@@ -194,10 +194,8 @@ fn wait_and_import(
             Ok(None) if started.elapsed() > TIMEOUT => {
                 let _ = child.lock().unwrap().kill();
                 let mut p = Progress::new(id, Stage::Failed);
-                p.message = Some(
-                    "The sign-in timed out after 10 minutes. Start it again when you are ready."
-                        .into(),
-                );
+                p.message =
+                    Some("Sign-in timed out after 10 minutes. Try again when you're ready.".into());
                 return p;
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(200)),
@@ -218,10 +216,10 @@ fn wait_and_import(
             let mut p = Progress::new(id, Stage::Failed);
             p.message = Some(match other {
                 Some(s) if !last.is_empty() => {
-                    format!("Claude Code stopped the sign-in ({s}): {last}")
+                    format!("Claude Code ended the sign-in ({s}): {last}")
                 }
-                Some(s) => format!("Claude Code stopped the sign-in ({s})."),
-                None => "Lost track of the sign-in process.".into(),
+                Some(s) => format!("Claude Code ended the sign-in ({s})."),
+                None => "Lost track of the sign-in. Try again.".into(),
             });
             return p;
         }
@@ -252,7 +250,7 @@ pub fn submit_login_code(logins: State<'_, Logins>, id: String, code: String) ->
     let stdin = running
         .stdin
         .as_mut()
-        .ok_or("That sign-in is not accepting a code.")?;
+        .ok_or("This sign-in isn't waiting for a code.")?;
     writeln!(stdin, "{}", code.trim()).map_err(|e| e.to_string())?;
     stdin.flush().map_err(|e| e.to_string())
 }

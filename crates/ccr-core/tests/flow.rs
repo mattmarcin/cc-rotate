@@ -283,7 +283,7 @@ fn stale_from_and_cooldown_skip() {
     assert_eq!(
         out,
         SwapOutcome::Skipped {
-            why: "within the swap cooldown".into()
+            why: "too soon after the last swap".into()
         },
         "R5"
     );
@@ -583,7 +583,7 @@ fn first_login_becomes_active_and_relogin_checks_identity() {
     )
     .unwrap_err();
     assert!(
-        err.to_string().contains("signed in as sam@x.test"),
+        err.to_string().contains("Signed in as sam@x.test"),
         "R10: {err}"
     );
     assert_eq!(
@@ -609,10 +609,7 @@ fn first_login_becomes_active_and_relogin_checks_identity() {
         },
     )
     .unwrap_err();
-    assert!(
-        err.to_string().contains("this sign-in was for work@x.test"),
-        "{err}"
-    );
+    assert!(err.to_string().contains("not work@x.test"), "{err}");
     assert!(store.account_by_label("work").unwrap().is_none());
 
     let again = env.paths.data_dir.join("st4");
@@ -789,7 +786,7 @@ fn stale_switch_back_requests_are_skipped() {
     assert_eq!(
         swap::run(&store, &env.paths, &req).unwrap(),
         SwapOutcome::Skipped {
-            why: "no better ranked account is ready".into()
+            why: "no account higher in your order is ready".into()
         }
     );
     store
@@ -902,7 +899,7 @@ fn an_account_found_used_up_after_a_swap_is_left_at_once() {
     assert_eq!(
         swap::run(&store, &env.paths, &threshold(c)).unwrap(),
         SwapOutcome::Skipped {
-            why: "within the swap cooldown".into()
+            why: "too soon after the last swap".into()
         }
     );
 }

@@ -453,7 +453,7 @@ impl Store {
             // A new key cannot open what an earlier one sealed. Say so, instead of creating
             // one that leaves every stored login unreadable without an explanation.
             None if self.has_sealed_credentials()? => bail!(
-                "{} is missing, so the stored logins cannot be decrypted; restore that file, or remove the accounts and sign them in again",
+                "{} is missing, so saved logins can't be decrypted. Restore the file, or remove the accounts and sign in to them again.",
                 path.display()
             ),
             None => secret::load_or_create_key(path)?,
@@ -529,7 +529,7 @@ impl Store {
                         None,
                         Some("store_upgrade"),
                         Some(serde_json::json!({
-                            "message": format!("could not convert this account's stored login ({e:#}); sign it in again"),
+                            "message": format!("Couldn't upgrade this account's saved login ({e:#}). Sign in to it again."),
                         })),
                     )?;
                 }
@@ -976,13 +976,13 @@ impl Store {
         };
         if !secret::is_sealed(&blob) {
             bail!(
-                "the stored login for account {account_id} was saved by an older cc-rotate and could not be converted; sign it in again with `cc-rotate-ctl login --relogin`"
+                "The saved login for account {account_id} is from an older cc-rotate and couldn't be upgraded. Sign in to it again."
             );
         }
         let plain = self
             .key()?
             .open(&blob, &secret::credential_aad(account_id))
-            .with_context(|| format!("decrypting the stored login for account {account_id}"))?;
+            .with_context(|| format!("decrypting the saved login for account {account_id}"))?;
         Ok(Some(StoredCredential {
             oauth: serde_json::from_slice(&plain)?,
             refresh_fp,
@@ -1270,29 +1270,31 @@ pub const MIN_CHECK_INTERVAL_S: i64 = 300;
 fn validate_setting(key: &str, value: &str) -> Result<Option<String>> {
     match key {
         "swap_threshold_5h" | "swap_threshold_7d" => {
-            let v: f64 = value.parse().context("expected a number")?;
+            let v: f64 = value
+                .parse()
+                .map_err(|_| anyhow!("Use a number from 1 to 100."))?;
             if !(1.0..=100.0).contains(&v) {
-                bail!("{key} must be between 1 and 100");
+                bail!("Use a number from 1 to 100.");
             }
         }
         "swap_cooldown_s" | "switch_back_dwell_s" | "lock_timeout_ms" | "sample_retention_days" => {
-            let v: i64 = value.parse().context("expected an integer")?;
+            let v: i64 = value.parse().map_err(|_| anyhow!("Use a whole number."))?;
             if v < 0 {
-                bail!("{key} must not be negative");
+                bail!("Use 0 or more.");
             }
         }
         "usage_check_interval_s" => {
-            let v: i64 = value.parse().context("expected an integer")?;
+            let v: i64 = value.parse().map_err(|_| anyhow!("Use a whole number."))?;
             if v < MIN_CHECK_INTERVAL_S {
                 bail!(
-                    "{key} must be at least {MIN_CHECK_INTERVAL_S}: Anthropic refuses usage readings asked for more often"
+                    "Use {MIN_CHECK_INTERVAL_S} or more. Anthropic refuses more frequent usage checks."
                 );
             }
         }
         "usage_check_max_age_s" => {
-            let v: i64 = value.parse().context("expected an integer")?;
+            let v: i64 = value.parse().map_err(|_| anyhow!("Use a whole number."))?;
             if v < 0 {
-                bail!("{key} must not be negative");
+                bail!("Use 0 or more.");
             }
         }
         "prefer_no_weekly_limit" | "usage_checks" => {
@@ -1306,16 +1308,16 @@ fn validate_setting(key: &str, value: &str) -> Result<Option<String>> {
 
 pub fn validate_label(label: &str) -> Result<()> {
     if label.is_empty() || label.len() > 40 {
-        bail!("labels must be 1 to 40 characters");
+        bail!("Labels can be 1 to 40 characters.");
     }
     if !label
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
     {
-        bail!("labels may only contain letters, digits, '-', '_' and '.'");
+        bail!("Labels can only use letters, digits, - _ and .");
     }
     if label.parse::<i64>().is_ok() {
-        bail!("labels cannot be plain numbers");
+        bail!("A label can't be just a number.");
     }
     Ok(())
 }
@@ -1536,7 +1538,10 @@ mod tests {
         assert!(blob_of(&s, 1).starts_with(secret::MAGIC));
         assert_eq!(s.credential(1).unwrap().unwrap().oauth, oauth);
         let err = s.credential(2).unwrap_err();
-        assert!(format!("{err:#}").contains("sign it in again"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("Sign in to it again"),
+            "{err:#}"
+        );
         let logged = s.last_event_of(kind::ERROR).unwrap().unwrap();
         assert_eq!(logged.account_from, Some(2));
 

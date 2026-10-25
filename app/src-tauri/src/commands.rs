@@ -76,7 +76,7 @@ pub async fn set_paused(id: i64, paused: bool) -> CmdResult<()> {
     blocking(move |s, _| {
         let account = s
             .account(id)?
-            .ok_or_else(|| anyhow::anyhow!("that account no longer exists"))?;
+            .ok_or_else(|| anyhow::anyhow!("That account no longer exists."))?;
         let next = match (account.state, paused) {
             (AccountState::Active, true) => {
                 anyhow::bail!("Swap to another account before pausing {}.", account.label)
@@ -99,7 +99,7 @@ pub async fn remove_account(id: i64) -> CmdResult<()> {
     blocking(move |s, p| {
         let account = s
             .account(id)?
-            .ok_or_else(|| anyhow::anyhow!("that account no longer exists"))?;
+            .ok_or_else(|| anyhow::anyhow!("That account no longer exists."))?;
         if account.state == AccountState::Active {
             anyhow::bail!("Swap to another account before removing {}.", account.label);
         }
@@ -120,7 +120,7 @@ pub async fn remove_account(id: i64) -> CmdResult<()> {
 pub async fn rename_account(id: i64, label: String) -> CmdResult<()> {
     blocking(move |s, _| {
         if s.account_by_label(&label)?.is_some_and(|a| a.id != id) {
-            anyhow::bail!("Another account is already called {label}.");
+            anyhow::bail!("Another account is already named {label}.");
         }
         s.rename_account(id, &label)
     })
@@ -152,7 +152,7 @@ pub async fn set_weekly_limit(id: i64, value: String) -> CmdResult<()> {
         let setting: WeeklyLimitSetting = value.parse()?;
         let account = s
             .account(id)?
-            .ok_or_else(|| anyhow::anyhow!("that account no longer exists"))?;
+            .ok_or_else(|| anyhow::anyhow!("That account no longer exists."))?;
         s.set_weekly_limit(id, setting)?;
         s.log_event(
             kind::STATE,

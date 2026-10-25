@@ -217,7 +217,7 @@ fn checks_possible(store: &Store, paths: &Paths) -> Result<Option<String>> {
         )
     {
         return Ok(Some(
-            "Claude Code keeps logins in the Windows Credential Manager on this computer, which usage checks do not support".into(),
+            "usage checks don't support Windows Credential Manager, where Claude Code keeps logins on this computer".into(),
         ));
     }
     Ok(None)
@@ -323,7 +323,7 @@ fn check_with(
     let mut st = state(store, account_id)?;
     let now = time::now_ms();
     if trigger != Trigger::Manual && st.not_before.is_some_and(|t| t > now) {
-        return skipped("waiting until the usage endpoint answers again");
+        return skipped("Anthropic asked to wait before the next check");
     }
     // A skip below is about this account: count it as an attempt, so the background moves on
     // to the next account instead of picking this one every minute.
@@ -357,17 +357,19 @@ fn check_with(
         return skipped("the account no longer exists");
     };
     match account.state {
-        AccountState::Active => return skipped("it is in use; its status line reports its usage"),
-        AccountState::NeedsLogin => return skipped("it needs a new login"),
-        AccountState::Paused if trigger != Trigger::Manual => return skipped("it is paused"),
+        AccountState::Active => {
+            return skipped("it's in use, so its usage comes from the status line");
+        }
+        AccountState::NeedsLogin => return skipped("it's signed out"),
+        AccountState::Paused if trigger != Trigger::Manual => return skipped("it's paused"),
         _ => {}
     }
     st = state(store, account_id)?;
     let stored = match store.credential(account_id) {
         Ok(Some(c)) => c,
-        Ok(None) => return skipped("it has no stored login"),
+        Ok(None) => return skipped("it has no saved login"),
         Err(e) => {
-            let why = format!("its stored login cannot be read: {e:#}");
+            let why = format!("its saved login can't be read: {e:#}");
             st.last_attempt_at = Some(time::now_ms());
             st.problem = Some(why.clone());
             save_state(store, account_id, &st)?;
@@ -378,7 +380,7 @@ fn check_with(
     // Not while a swap is pending (running, or stopped half way): which account the profile's
     // login is, and so which stored logins are current, is not settled.
     if swap::pending_swap(store)?.is_some() {
-        return attempted(store, "a swap is being settled");
+        return attempted(store, "a swap isn't finished yet");
     }
     // Never with the login the profile's sessions are using (a swap that stopped half way can
     // leave a parked account's login there): whichever renewed it first would sign the other out.
@@ -390,7 +392,7 @@ fn check_with(
         .as_ref()
         .and_then(credfile::oauth_fingerprint);
     if in_profile.as_deref() == Some(stored.refresh_fp.as_str()) {
-        return attempted(store, "its login is the one the rotation profile is using");
+        return attempted(store, "the cc-rotate profile is using its login");
     }
 
     let started = time::now_ms();
@@ -418,7 +420,7 @@ fn check_with(
             // Claude Code may have renewed the login and the only copy is in there: keep it for
             // `recover`, and keep the account out of swaps until then.
             let why = format!(
-                "the login Claude Code left after the check cannot be read ({e:#}); the account is not used until a check settles it"
+                "can't read the login Claude Code left after the check ({e:#}). On hold until a check succeeds."
             );
             st.held_back = true;
             st.problem = Some(why.clone());
@@ -456,13 +458,12 @@ fn check_with(
             (Some(expected), Some(got)) if expected != got => {
                 wrong_account = Some(got.clone());
                 CheckOutcome::Failed {
-                    why: format!(
-                        "the stored login belongs to another account ({got}); sign this account in again"
-                    ),
+                    why: "the saved login belongs to a different account. Sign in to this account again."
+                        .into(),
                 }
             }
             (Some(_), None) => CheckOutcome::Failed {
-                why: "Claude Code did not say which account the usage belongs to".into(),
+                why: "Claude Code didn't say which account the usage is for".into(),
             },
             _ => CheckOutcome::Read {
                 windows: report.windows,
@@ -517,14 +518,14 @@ fn check_with(
                 None,
             )?;
         }
-        if let Some(got) = &wrong_account {
+        if wrong_account.is_some() {
             s.set_state(account_id, AccountState::NeedsLogin)?;
             s.log_event(
                 kind::ERROR,
                 Some(account_id),
                 None,
                 Some("usage_check"),
-                Some(json!({ "message": format!("{}'s stored login belongs to another account ({got}); it needs a new login", account.label) })),
+                Some(json!({ "message": format!("{label}'s saved login belongs to a different account. Sign in to {label} again.", label = account.label) })),
             )?;
         }
         if let Some(why) = &prompted {
@@ -533,7 +534,7 @@ fn check_with(
         if credman {
             block(
                 s,
-                "Claude Code started keeping logins in the Windows Credential Manager, which usage checks do not support",
+                "Claude Code started keeping logins in Windows Credential Manager, which usage checks don't support",
             )?;
         }
         match &outcome {
@@ -564,15 +565,15 @@ fn check_with(
                 st.problem = Some(why.clone());
             }
             CheckOutcome::LoginRejected => {
-                st.problem = Some("Anthropic rejected the stored login".into());
+                st.problem = Some("Anthropic rejected the saved login".into());
             }
             CheckOutcome::Skipped { .. } => {}
         }
         if st.held_back && st.problem.is_none() {
             st.problem = Some(if timed_out {
-                "a check was interrupted while Claude Code may have been renewing the login; the account is not used until a check settles it".into()
+                "a check was interrupted, possibly while Claude Code was renewing the login. On hold until a check confirms it.".into()
             } else {
-                "the account is not used until a check settles whether its login still works".into()
+                "on hold until a check confirms its login still works".into()
             });
         }
         save_state(s, account_id, &st)
@@ -612,7 +613,7 @@ fn ran_as_prompt(stdout: &str) -> Option<String> {
         .and_then(Value::as_i64)
         .unwrap_or(0);
     (turns > 0 || cost > 0.0 || output > 0).then(|| {
-        "Claude Code ran /usage as a prompt instead of its own command, which uses the account's limits".to_string()
+        "Claude Code sent /usage to the model as a prompt instead of running its command, which uses the account's limits".to_string()
     })
 }
 
@@ -687,7 +688,7 @@ pub fn recover(store: &Store, paths: &Paths, account_id: i64) -> Result<Recovery
                 hold_back(store, account_id)?;
                 if time::now_ms() - started_at(&dir).unwrap_or(0) < LEFTOVER_KEPT_MS {
                     return Ok(Recovery::Busy(
-                        "the login an earlier usage check left cannot be read yet".into(),
+                        "the login an earlier usage check left can't be read yet".into(),
                     ));
                 }
             }
@@ -776,7 +777,7 @@ pub fn remove_account(store: &Store, paths: &Paths, account_id: i64) -> Result<(
         .context("waiting for a usage check of the account to finish")?;
     let dirs = scratch_dirs(paths, &format!("{SCRATCH_PREFIX}{account_id}-"));
     if dirs.iter().any(|d| running(d)) {
-        bail!("a usage check of this account is still running; try again in a minute");
+        bail!("A usage check of this account is running. Try again in a minute.");
     }
     for dir in dirs {
         remove_scratch(&dir);
@@ -823,7 +824,7 @@ fn confirm_with(
     };
     let expires = oauth.get("expiresAt").and_then(Value::as_i64).unwrap_or(0);
     if expires < time::now_ms() + 120_000 {
-        return skipped("its access token is about to be renewed");
+        return skipped("its login is about to be renewed");
     }
     oauth["refreshToken"] = json!("");
     let started = time::now_ms();
@@ -853,7 +854,7 @@ fn confirm_with(
     };
     if active.account_uuid.is_none() || report.account_uuid != active.account_uuid {
         return Ok(CheckOutcome::Failed {
-            why: "the profile's login did not report the usage of the account in use".into(),
+            why: "the profile's login didn't report the usage of the account in use".into(),
         });
     }
     let now = time::now_ms();
@@ -1112,7 +1113,7 @@ fn failure(ran: &Result<Run>, debug_log: &str) -> String {
         Err(e) => return format!("{e:#}"),
     };
     if run.timed_out {
-        return "Claude Code did not finish in time".into();
+        return "Claude Code didn't finish in time".into();
     }
     let logged = debug_log
         .lines()
@@ -1120,11 +1121,11 @@ fn failure(ran: &Result<Run>, debug_log: &str) -> String {
         .find(|l| l.contains("Failed to load usage data"))
         .and_then(|l| l.split("Failed to load usage data: ").nth(1));
     if let Some(why) = logged {
-        return format!("Claude Code could not read the usage: {}", why.trim());
+        return format!("Claude Code couldn't read the usage: {}", why.trim());
     }
     let last = run.stderr.lines().rev().find(|l| !l.trim().is_empty());
     match (run.exit_code, last) {
-        (Some(0), _) => "Claude Code did not report any usage".into(),
+        (Some(0), _) => "Claude Code didn't report any usage".into(),
         (code, Some(line)) => format!(
             "Claude Code exited with {}: {}",
             code.map_or("a signal".into(), |c| c.to_string()),
@@ -1137,7 +1138,7 @@ fn failure(ran: &Result<Run>, debug_log: &str) -> String {
     }
 }
 
-/// The outcome in a few words for people: "5-hour 100%", "Anthropic asked to wait 24m ...".
+/// The outcome in a few words for people: "5-hour 100%", "too soon, Anthropic asked to wait 24m".
 pub fn describe(outcome: &CheckOutcome) -> String {
     match outcome {
         CheckOutcome::Read { windows } if windows.is_empty() => "no limits reported".into(),
@@ -1148,10 +1149,10 @@ pub fn describe(outcome: &CheckOutcome) -> String {
             .join(", "),
         CheckOutcome::Skipped { why } => format!("skipped: {why}"),
         CheckOutcome::RateLimited { until } => format!(
-            "Anthropic asked to wait {} before the next reading",
+            "too soon, Anthropic asked to wait {}",
             time::span((until - time::now_ms()) / 1000)
         ),
-        CheckOutcome::LoginRejected => "its login was rejected; sign it in again".into(),
+        CheckOutcome::LoginRejected => "login rejected. Sign in again.".into(),
         CheckOutcome::Failed { why } => format!("failed: {why}"),
     }
 }
@@ -1457,7 +1458,7 @@ mod tests {
         // Still unreadable: recovery keeps it and the account stays out.
         assert_eq!(
             recover(&e.store, &e.paths, a).unwrap(),
-            Recovery::Busy("the login an earlier usage check left cannot be read yet".into())
+            Recovery::Busy("the login an earlier usage check left can't be read yet".into())
         );
 
         // Readable again (a renewal), recovered, and the account usable once more.
@@ -1864,7 +1865,7 @@ mod tests {
                 }),
                 "[ERROR] Failed to load usage data: Request failed with status code 500\n"
             ),
-            "Claude Code could not read the usage: Request failed with status code 500"
+            "Claude Code couldn't read the usage: Request failed with status code 500"
         );
         assert_eq!(rate_limited("all good"), None);
         assert_eq!(

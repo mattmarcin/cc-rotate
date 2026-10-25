@@ -190,7 +190,7 @@ pub fn finish_dead_swap(store: &Store, paths: &Paths, settler: Settler) -> Resul
                         pending.from,
                         Some(pending.to),
                         Some("completed"),
-                        Some(json!({ "why": "a swap that stopped after writing the login was completed" })),
+                        Some(json!({ "why": "finished a swap that was interrupted after writing the login" })),
                     )?;
                 }
             }
@@ -243,7 +243,7 @@ pub fn finish_dead_swap(store: &Store, paths: &Paths, settler: Settler) -> Resul
                     pending.from,
                     None,
                     Some("login_in_profile"),
-                    Some(json!({ "why": "after a swap stopped half way, the profile holds a login of an account outside the pool" })),
+                    Some(json!({ "why": "after an interrupted swap, the profile holds the login of an account that isn't in cc-rotate" })),
                 )?;
             }
         }
@@ -265,7 +265,7 @@ fn unsure(store: &Store, pending: &PendingSwap, raw: &str) -> Result<Settle> {
             pending.from,
             Some(pending.to),
             Some("swap"),
-            Some(json!({ "message": "A swap stopped half way and cc-rotate cannot tell yet which account the profile is signed in to, so it stores nothing from the profile and does not swap. It asks Claude Code once a minute, which needs the `claude` command to run and the network; your sessions keep working meanwhile." })),
+            Some(json!({ "message": "A swap was interrupted and cc-rotate can't tell yet which account the profile is signed in to. Until it can, swaps are on hold and nothing is saved from the profile. It retries every minute, which needs the `claude` command and a network connection. Your sessions keep working." })),
         )?;
     }
     Ok(Settle::Unsure)
@@ -454,7 +454,7 @@ fn unidentified_for_long(store: &Store, changed: &ChangedLogin) -> Result<bool> 
         Some(changed.active.id),
         None,
         Some("login"),
-        Some(json!({ "message": format!("The login in the profile changed and Claude Code could not say for 10 minutes which account it belongs to, so cc-rotate stored it as {}'s, as it did before it could tell. Claude Code is asked with the `claude` command, which needs to run and reach the network.", changed.active.label) })),
+        Some(json!({ "message": format!("The profile's login changed and Claude Code couldn't confirm its account for 10 minutes, so cc-rotate saved it as {}'s. Confirming needs the `claude` command and a network connection.", changed.active.label) })),
     )?;
     Ok(true)
 }
@@ -892,7 +892,7 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
     });
     let _swap_lock = match DirLock::acquire(&paths.swap_lock(), swap_lock_opts) {
         Ok(lock) => lock,
-        Err(LockError::Busy(_)) => return skip(store, req, "another swap is in progress"),
+        Err(LockError::Busy(_)) => return skip(store, req, "another swap is running"),
         Err(e) => return Err(e.into()),
     };
     // An earlier swap that stopped half way. While the profile's login is unidentified, no swap
@@ -901,7 +901,7 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
         return skip(
             store,
             req,
-            "an earlier swap stopped half way, and the login in the profile cannot be identified yet",
+            "an earlier swap was interrupted and the profile's login isn't identified yet",
         );
     }
     // A login that changed in the profile is identified first, so the swap below never stores
@@ -910,7 +910,7 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
         return skip(
             store,
             req,
-            "the login in the profile changed, and Claude Code cannot say yet which account it belongs to",
+            "the profile's login changed and isn't identified yet",
         );
     }
 
@@ -920,7 +920,7 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
 
     if let Some(from) = req.from {
         if active_id != Some(from) {
-            return skip(store, req, "the active account already changed");
+            return skip(store, req, "the account in use already changed");
         }
     }
     let mut arrived_full = false;
@@ -934,7 +934,7 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
                         None => false,
                     };
                 if !arrived_full {
-                    return skip(store, req, "within the swap cooldown");
+                    return skip(store, req, "too soon after the last swap");
                 }
             }
         }
@@ -942,11 +942,7 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
     if req.reason == Reason::PreferredAvailable
         && now - active_since(store)? < settings.switch_back_dwell_s * 1000
     {
-        return skip(
-            store,
-            req,
-            "the active account has not been in use long enough to switch back",
-        );
+        return skip(store, req, "too soon to swap back");
     }
 
     // What the user's other profiles read since, so an account an agent used up there is not
@@ -978,7 +974,7 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
                         return skip(
                             store,
                             req,
-                            "the account in use is below its limits by its own usage reading",
+                            "a fresh check shows the account in use is below its limits",
                         );
                     }
                 }
@@ -1004,7 +1000,11 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
         if req.to.is_none() && some_ready && scheduler::pick(&pool, policy, active_id).is_none() {
             // The accounts that could take over are only busy (a check of them running): not an
             // exhausted pool, so no such event or notification.
-            return skip(store, req, "the accounts that could take over are busy");
+            return skip(
+                store,
+                req,
+                "the accounts that could take over are being checked",
+            );
         }
         let target = match choose(store, req, &pool, policy, active.as_ref())? {
             Choice::Target(account) => account,
@@ -1039,7 +1039,7 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
                     store,
                     req,
                     &target,
-                    format!("could not take the lock of {}'s login: {e}", target.label),
+                    format!("couldn't lock {}'s login: {e}", target.label),
                 ));
             }
         };
@@ -1052,7 +1052,7 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
                 store,
                 req,
                 &target,
-                format!("{} cannot be used now: {why}", target.label),
+                format!("{} can't be used now: {why}", target.label),
             ));
         }
         // Under the lock: a check that finished while it was awaited may have found the target
@@ -1063,7 +1063,7 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
             Choice::Target(settled) if settled.id == target.id => {
                 if req.to.is_some() && usage_check::state(store, target.id)?.held_back {
                     return Err(anyhow!(
-                        "{} is waiting for a usage check to confirm its login; check it first",
+                        "{} is on hold until a usage check confirms its login. Check its usage first.",
                         target.label
                     ));
                 }
@@ -1105,7 +1105,7 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
 
     let target_login = store
         .credential(target.id)?
-        .ok_or_else(|| anyhow!("{} has no stored login", target.label))?;
+        .ok_or_else(|| anyhow!("{} has no saved login", target.label))?;
 
     let claude_lock_opts = LockOptions::claude(lock_timeout);
     let refresh_lock = DirLock::acquire(&paths.refresh_lock(), claude_lock_opts).map_err(|e| {
@@ -1113,7 +1113,7 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
             store,
             req,
             &target,
-            format!("could not take Claude Code's refresh lock: {e}"),
+            format!("couldn't take Claude Code's refresh lock: {e}"),
         )
     })?;
     let legacy_lock =
@@ -1122,7 +1122,7 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
                 store,
                 req,
                 &target,
-                format!("could not take Claude Code's legacy refresh lock: {e}"),
+                format!("couldn't take Claude Code's legacy refresh lock: {e}"),
             )
         })?;
     let storage_lock = DirLock::acquire(
@@ -1134,7 +1134,7 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
             store,
             req,
             &target,
-            format!("could not take Claude Code's credentials write lock: {e}"),
+            format!("couldn't take Claude Code's credentials write lock: {e}"),
         )
     })?;
 
@@ -1159,7 +1159,7 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
             return skip(
                 store,
                 req,
-                "the login in the profile changed during the swap, and is identified first",
+                "the profile's login changed during the swap and needs identifying first",
             );
         }
     }
@@ -1269,13 +1269,18 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
     if let Err(e) = committed {
         // Put the outgoing login back so the profile and the store agree again; keep the mark
         // unless that is verified, so `finish_dead_swap` settles it.
-        if restore_outgoing(&creds, previous.as_ref(), &target_login.refresh_fp) {
+        let restored = restore_outgoing(&creds, previous.as_ref(), &target_login.refresh_fp);
+        if restored {
             let _ = store.delete_meta(META_SWAP_PENDING);
         }
         drop(storage_lock);
         drop(legacy_lock);
         drop(refresh_lock);
-        return Err(e.context("recording the swap failed; the previous login was restored"));
+        return Err(e.context(if restored {
+            "couldn't record the swap, so the previous login was put back"
+        } else {
+            "couldn't record the swap"
+        }));
     }
 
     drop(storage_lock);
@@ -1348,12 +1353,12 @@ fn choose(
                     return Ok(Choice::Done(skip(
                         store,
                         req,
-                        "that account is already active",
+                        "that account is already in use",
                     )?));
                 }
                 AccountState::NeedsLogin => {
                     return Err(anyhow!(
-                        "{} needs a new login before it can be used",
+                        "{} is signed out. Sign in to it again first.",
                         account.label
                     ));
                 }
@@ -1367,7 +1372,7 @@ fn choose(
                     return Ok(Choice::Done(skip(
                         store,
                         req,
-                        "no better ranked account is ready",
+                        "no account higher in your order is ready",
                     )?));
                 }
             }

@@ -30,26 +30,32 @@ pub struct Check {
     pub detail: String,
 }
 
+/// A detail is written as it is shown: it may start with an account label, which keeps its case.
 fn check(name: &str, status: Status, detail: impl Into<String>) -> Check {
-    let detail: String = detail.into();
-    let mut chars = detail.chars();
-    let detail = match chars.next() {
-        Some(first) => first.to_uppercase().chain(chars).collect(),
-        None => detail,
-    };
     Check {
         name: name.to_string(),
         status,
-        detail,
+        detail: detail.into(),
     }
 }
 
+/// `text` with its first letter in upper case, for a detail that starts with a message from
+/// elsewhere.
+fn capitalized(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// "45s ago", "12m ago", "3h ago", "2d ago", as the dashboard writes it.
 fn age(ms: i64) -> String {
     match ms / 1000 {
-        s if s < 90 => format!("{s} seconds ago"),
-        s if s < 5400 => format!("{} minutes ago", s / 60),
-        s if s < 172_800 => format!("{} hours ago", s / 3600),
-        s => format!("{} days ago", s / 86_400),
+        s if s < 60 => format!("{}s ago", s.max(0)),
+        s if s < 3600 => format!("{}m ago", s / 60),
+        s if s < 86_400 => format!("{}h ago", s / 3600),
+        s => format!("{}d ago", s / 86_400),
     }
 }
 
@@ -70,14 +76,25 @@ pub fn run(store: &Store, paths: &Paths) -> Vec<Check> {
 
     match claude_version(store) {
         Some(v) if TESTED_CLAUDE_VERSIONS.contains(&v.as_str()) => {
-            checks.push(check("Claude Code version", Status::Ok, format!("{v} (tested)")));
+            checks.push(check(
+                "Claude Code version",
+                Status::Ok,
+                format!("{v} (tested)"),
+            ));
         }
         Some(v) => checks.push(check(
             "Claude Code version",
             Status::Warn,
-            format!("{v} is not on the tested list ({}); rotation still runs, but re-verify after updates", TESTED_CLAUDE_VERSIONS.join(", ")),
+            format!(
+                "{v}, not yet tested with cc-rotate (tested: {})",
+                TESTED_CLAUDE_VERSIONS.join(", ")
+            ),
         )),
-        None => checks.push(check("Claude Code version", Status::Fail, "could not run `claude --version`")),
+        None => checks.push(check(
+            "Claude Code version",
+            Status::Fail,
+            "Couldn't run `claude --version`. Install Claude Code or check your PATH.",
+        )),
     }
 
     checks.push(profile_settings_check(paths));
@@ -90,7 +107,7 @@ pub fn run(store: &Store, paths: &Paths) -> Vec<Check> {
             "cc-rotate command",
             Status::Warn,
             format!(
-                "{} still defines the old cc-rotate PowerShell function, which hides the cc-rotate command; run `cc-rotate-ctl setup --remove-alias` and open a new terminal",
+                "{} still defines the old cc-rotate PowerShell function, which hides the cc-rotate command. Run `cc-rotate-ctl setup --remove-alias`, then open a new terminal.",
                 files.join(" and ")
             ),
         ));
@@ -109,14 +126,19 @@ pub fn run(store: &Store, paths: &Paths) -> Vec<Check> {
         (0, _) => check(
             "Accounts",
             Status::Warn,
-            "no accounts yet; add one with `cc-rotate-ctl login`",
+            "No accounts yet. Add one with Add account or `cc-rotate-ctl login`.",
         ),
         (_, 1) => check(
             "Accounts",
             Status::Ok,
             format!(
-                "{} accounts, {} usable, active: {}",
+                "{} {}, {} usable, {} in use",
                 accounts.len(),
+                if accounts.len() == 1 {
+                    "account"
+                } else {
+                    "accounts"
+                },
                 usable,
                 active[0].label
             ),
@@ -124,17 +146,17 @@ pub fn run(store: &Store, paths: &Paths) -> Vec<Check> {
         (_, 0) if usable == 0 => check(
             "Accounts",
             Status::Warn,
-            "no account is active; every account is paused or needs a login",
+            "No account in use: every account is paused or signed out.",
         ),
         (_, 0) => check(
             "Accounts",
             Status::Fail,
-            "accounts are parked but none is active; run `cc-rotate-ctl swap`",
+            "No account in use, though some are ready. Use Swap now or run `cc-rotate-ctl swap`.",
         ),
         _ => check(
             "Accounts",
             Status::Fail,
-            "more than one account is marked active",
+            "More than one account is marked in use.",
         ),
     });
 
@@ -150,7 +172,7 @@ pub fn run(store: &Store, paths: &Paths) -> Vec<Check> {
             "Organizations",
             Status::Warn,
             format!(
-                "{} {} no organization on record, so usage your other profiles see is not counted for {}; sign in again with `cc-rotate-ctl login --relogin <label>`",
+                "{} {} no organization on record, so usage seen in your other profiles isn't counted for {}. Sign in again from the app, or with `cc-rotate-ctl login --relogin <label>`.",
                 no_org.join(", "),
                 if no_org.len() == 1 { "has" } else { "have" },
                 if no_org.len() == 1 { "it" } else { "them" },
@@ -166,15 +188,26 @@ pub fn run(store: &Store, paths: &Paths) -> Vec<Check> {
     }
     checks.push(if undecryptable.is_empty() {
         check(
-            "Stored logins",
+            "Saved logins",
             Status::Ok,
-            format!("{} logins decrypt", accounts.len()),
+            match accounts.len() {
+                1 => "The one saved login can be decrypted".to_string(),
+                n => format!("All {n} can be decrypted"),
+            },
         )
     } else {
         check(
-            "Stored logins",
+            "Saved logins",
             Status::Fail,
-            format!("missing or unreadable: {}", undecryptable.join(", ")),
+            format!(
+                "Missing or unreadable: {}. Sign in to {} again.",
+                undecryptable.join(", "),
+                if undecryptable.len() == 1 {
+                    "it"
+                } else {
+                    "them"
+                }
+            ),
         )
     });
     checks.push(encryption_check(store));
@@ -208,36 +241,40 @@ pub fn run(store: &Store, paths: &Paths) -> Vec<Check> {
             .and_then(|v| serde_json::from_str::<swap::Unidentified>(&v).ok())
             .map(|u| time::now_ms() - u.at);
         checks.push(match (file_fp, stored_fp) {
-            (Some(f), Some(s)) if f == s => check("Profile login", Status::Ok, format!("matches {}", account.label)),
+            (Some(f), Some(s)) if f == s => check("Profile login", Status::Ok, format!("Matches {}", account.label)),
             (Some(_), Some(_)) if foreign => check(
                 "Profile login",
                 Status::Warn,
-                "the profile is signed in to an account outside the pool (a /login in it); cc-rotate stores nothing from it until the next swap or a re-login",
+                "The profile is signed in to an account that isn't in cc-rotate (from a /login). Nothing is saved from it until the next swap or sign-in.",
             ),
             (Some(_), Some(_)) if !identifies => check(
                 "Profile login",
                 Status::Warn,
-                "the profile holds a newer login than the store; the next statusline tick will sync it",
+                "The profile has a newer login than cc-rotate saved. It's saved on the next status line update.",
             ),
             (Some(_), Some(_)) => match unidentified_ms.filter(|ms| *ms >= 2 * 60_000) {
                 None => check(
                     "Profile login",
                     Status::Ok,
-                    format!("a newer login than the store; stored once Claude Code confirms it is {}'s", account.label),
+                    format!("The profile has a newer login. It's saved once Claude Code confirms it belongs to {}.", account.label),
                 ),
                 Some(ms) => check(
                     "Profile login",
                     Status::Warn,
                     format!(
-                        "Claude Code has not said for {} min which account the profile's login belongs to, so cc-rotate does not swap; after {} min it stores the login as {}'s",
+                        "Claude Code hasn't confirmed for {} min which account the profile's login belongs to. Swaps wait until it does. After {} min, the login is saved as {}'s.",
                         ms / 60_000,
                         swap::UNIDENTIFIED_FOR_AT_MOST_MS / 60_000,
                         account.label
                     ),
                 ),
             },
-            (None, _) => check("Profile login", Status::Fail, "the profile has no usable login"),
-            (_, None) => check("Profile login", Status::Fail, "the active account has no stored login"),
+            (None, _) => check("Profile login", Status::Fail, "The profile has no usable login."),
+            (_, None) => check(
+                "Profile login",
+                Status::Fail,
+                format!("{} is in use but has no saved login. Sign in to it again.", account.label),
+            ),
         });
     }
 
@@ -259,7 +296,7 @@ pub fn run(store: &Store, paths: &Paths) -> Vec<Check> {
                     "Locks",
                     Status::Warn,
                     format!(
-                        "{} is {age}s old and will be treated as stale",
+                        "{} is {age}s old and will be ignored as stale.",
                         lock.display()
                     ),
                 ));
@@ -281,7 +318,8 @@ pub fn run(store: &Store, paths: &Paths) -> Vec<Check> {
             "Sessions",
             Status::Warn,
             format!(
-                "{in_home} cc-rotate session(s) running in your home folder; Claude Code does not run status lines there, so cc-rotate cannot see their usage or swap them. Start cc-rotate in a project folder"
+                "{in_home} cc-rotate {} running in your home folder, where Claude Code doesn't run status lines. cc-rotate can't see their usage or swap them. Start cc-rotate in a project folder.",
+                if in_home == 1 { "session is" } else { "sessions are" }
             ),
         ));
     }
@@ -293,20 +331,20 @@ pub fn run(store: &Store, paths: &Paths) -> Vec<Check> {
         .flatten();
     checks.push(match (last_tick, had_usage.as_deref()) {
         (None, _) => check(
-            "Statusline",
+            "Status line",
             Status::Warn,
-            "has not run yet; start a cc-rotate session and send a message",
+            "Hasn't run yet. Start a cc-rotate session and send a message.",
         ),
         (Some(ts), Some("1")) => check(
-            "Statusline",
+            "Status line",
             Status::Ok,
-            format!("last ran {}, with usage data", age(time::now_ms() - ts)),
+            format!("Last ran {}, with usage", age(time::now_ms() - ts)),
         ),
         (Some(ts), _) => check(
-            "Statusline",
+            "Status line",
             Status::Warn,
             format!(
-                "last ran {}, but Claude Code sent no usage data (it does after the first reply on a subscription login)",
+                "Last ran {} without usage data. Claude Code sends it after the first reply on a subscription login.",
                 age(time::now_ms() - ts)
             ),
         ),
@@ -319,14 +357,14 @@ pub fn run(store: &Store, paths: &Paths) -> Vec<Check> {
         .max();
     checks.push(match last_sample {
         Some(ts) => check(
-            "Usage samples",
+            "Usage data",
             Status::Ok,
-            format!("last sample {}", age(time::now_ms() - ts)),
+            format!("Last update {}", age(time::now_ms() - ts)),
         ),
         None => check(
-            "Usage samples",
+            "Usage data",
             Status::Warn,
-            "none yet; they arrive once a session runs in the profile",
+            "None yet. It arrives once a session runs in the cc-rotate profile.",
         ),
     });
     checks.push(usage_checks_check(store, &accounts));
@@ -336,7 +374,7 @@ pub fn run(store: &Store, paths: &Paths) -> Vec<Check> {
         checks.push(check(
             "Swap",
             Status::Warn,
-            "a swap stopped half way, and cc-rotate has not yet told which account the profile is signed in to; until it does, it stores nothing from the profile and does not swap (your sessions keep working). It asks Claude Code once a minute, which needs the `claude` command to run and the network",
+            "A swap was interrupted and cc-rotate can't tell yet which account the profile is signed in to. Until it can, swaps are on hold and nothing is saved from the profile. Your sessions keep working. It retries every minute, which needs the `claude` command and a network connection.",
         ));
     }
 
@@ -379,13 +417,13 @@ fn usage_checks_check(store: &Store, accounts: &[Account]) -> Check {
         }
     }
     match (failing.is_empty(), last_read) {
-        (false, _) => check(name, Status::Warn, failing.join("; ")),
+        (false, _) => check(name, Status::Warn, failing.join(". ")),
         (true, Some(ts)) => check(
             name,
             Status::Ok,
-            format!("on; last reading {}", age(time::now_ms() - ts)),
+            format!("On. Last check {}.", age(time::now_ms() - ts)),
         ),
-        (true, None) => check(name, Status::Ok, "on; no account has been checked yet"),
+        (true, None) => check(name, Status::Ok, "On. No account checked yet."),
     }
 }
 
@@ -423,7 +461,7 @@ fn credential_storage_check(paths: &Paths) -> Check {
         return check(
             name,
             Status::Fail,
-            "Claude Code is set to keep this profile's login in the Windows Credential Manager (tengu_windows_credman or CLAUDE_CODE_FORCE_WINDOWS_CREDMAN), which cc-rotate does not support yet; swaps will not reach running sessions",
+            "Claude Code keeps this profile's login in Windows Credential Manager, which cc-rotate doesn't support yet. Swaps won't reach running sessions. Set by tengu_windows_credman or CLAUDE_CODE_FORCE_WINDOWS_CREDMAN.",
         );
     }
     let creds = paths.credentials();
@@ -433,7 +471,7 @@ fn credential_storage_check(paths: &Paths) -> Check {
             Status::Ok,
             format!(
                 "{}. Swaps reach running sessions within about 30 seconds.",
-                creds.describe(Location::Keychain)
+                capitalized(&creds.describe(Location::Keychain))
             ),
         ),
         Ok(Some(Location::File)) => check(name, Status::Ok, creds.describe(Location::File)),
@@ -441,25 +479,25 @@ fn credential_storage_check(paths: &Paths) -> Check {
             name,
             Status::Ok,
             format!(
-                "nothing yet; the first login goes to {}",
+                "Nothing yet. The first login is saved to {}.",
                 creds.describe(Location::File)
             ),
         ),
-        Err(e) => check(name, Status::Fail, format!("{e:#}")),
+        Err(e) => check(name, Status::Fail, capitalized(&format!("{e:#}"))),
     }
 }
 
 /// Where the key that encrypts the stored logins lives, and whether only its owner can read it.
 fn encryption_check(store: &Store) -> Check {
     let Some(path) = store.key_path() else {
-        return check("Encryption", Status::Ok, "in-memory store");
+        return check("Encryption", Status::Ok, "In-memory store");
     };
     if !path.is_file() {
         return check(
             "Encryption",
             Status::Ok,
             format!(
-                "XChaCha20-Poly1305; the key file {} is created with the first login",
+                "Key file {} is created with the first login",
                 path.display()
             ),
         );
@@ -469,7 +507,8 @@ fn encryption_check(store: &Store) -> Check {
             "Encryption",
             Status::Warn,
             format!(
-                "{} is readable by other users; run `chmod 600` on it",
+                "{} is readable by other users. Run `chmod 600 {}`.",
+                path.display(),
                 path.display()
             ),
         ),
@@ -477,7 +516,7 @@ fn encryption_check(store: &Store) -> Check {
             "Encryption",
             Status::Ok,
             format!(
-                "XChaCha20-Poly1305 with the key file {} ({})",
+                "Key file {}, {}",
                 path.display(),
                 if cfg!(windows) {
                     "protected by your user profile's permissions"
@@ -495,7 +534,7 @@ fn profile_settings_check(paths: &Paths) -> Check {
         return check(
             "Profile",
             Status::Fail,
-            format!("{} is missing; run `cc-rotate-ctl setup`", path.display()),
+            format!("{} is missing. Run `cc-rotate-ctl setup`.", path.display()),
         );
     };
     let Ok(settings) = serde_json::from_str::<Value>(&text) else {
@@ -518,7 +557,7 @@ fn profile_settings_check(paths: &Paths) -> Check {
         return check(
             "Profile",
             Status::Fail,
-            "the statusline command starts with a quoted path, which fails when Claude Code runs it through PowerShell; run `cc-rotate-ctl setup --force`",
+            "The status line command starts with a quoted path, which fails under PowerShell. Run `cc-rotate-ctl setup --force`.",
         );
     }
     match (status_ok, hook_ok) {
@@ -530,12 +569,12 @@ fn profile_settings_check(paths: &Paths) -> Check {
         (false, _) => check(
             "Profile",
             Status::Fail,
-            "statusLine does not run `cc-rotate-ctl statusline`",
+            "The profile's status line doesn't run cc-rotate. Run `cc-rotate-ctl setup --force`.",
         ),
         (_, false) => check(
             "Profile",
             Status::Warn,
-            "the StopFailure hook is not installed",
+            "The StopFailure hook isn't installed. Run `cc-rotate-ctl setup --force`.",
         ),
     }
 }
@@ -553,18 +592,18 @@ fn herdr_check(paths: &Paths, detected: Option<herdr::Detected>) -> Check {
             name,
             Status::Ok,
             if hook {
-                "not detected (optional); the SessionStart hook is installed for when you use it"
+                "Not installed (optional). The profile is ready for it."
             } else {
-                "not detected (optional); if you start using it, run `cc-rotate-ctl setup --force` so it resumes sessions with cc-rotate"
+                "Not installed (optional). If you start using it, run `cc-rotate-ctl setup --force` so it resumes sessions with cc-rotate."
             },
         );
     };
     // The check's name is "herdr", so the detail starts with what was found.
     let version = herdr::version(detected.bin());
     let found = match (&version, &detected) {
-        (Some(v), _) => format!("version {v}"),
-        (None, herdr::Detected::InPane(_)) => "running in a herdr pane".to_string(),
-        (None, herdr::Detected::OnPath(p)) => format!("found at {}", p.display()),
+        (Some(v), _) => format!("Version {v}"),
+        (None, herdr::Detected::InPane(_)) => "Running in a herdr pane".to_string(),
+        (None, herdr::Detected::OnPath(p)) => format!("Found at {}", p.display()),
     };
     let (major, minor, patch) = herdr::MIN_VERSION;
     if let Some(v) = version.as_deref().and_then(herdr::parse_version) {
@@ -573,7 +612,7 @@ fn herdr_check(paths: &Paths, detected: Option<herdr::Detected>) -> Check {
                 name,
                 Status::Warn,
                 format!(
-                    "{found} cannot be told how to resume cc-rotate sessions, so it resumes them with plain `claude` on your default profile; update herdr to {major}.{minor}.{patch} or newer"
+                    "{found} resumes cc-rotate sessions with plain `claude` on your default profile. Update herdr to {major}.{minor}.{patch} or newer."
                 ),
             );
         }
@@ -583,16 +622,14 @@ fn herdr_check(paths: &Paths, detected: Option<herdr::Detected>) -> Check {
             name,
             Status::Warn,
             format!(
-                "{found}, but the profile has no SessionStart hook for it, so herdr resumes cc-rotate sessions with plain `claude` on your default profile; run `cc-rotate-ctl setup --force`"
+                "{found}, but the profile has no SessionStart hook for it, so herdr resumes cc-rotate sessions with plain `claude`. Run `cc-rotate-ctl setup --force`."
             ),
         );
     }
     check(
         name,
         Status::Ok,
-        format!(
-            "{found}; panes it restores resume with `cc-rotate --resume`, on the rotation profile"
-        ),
+        format!("{found}. Restored panes resume with `cc-rotate --resume`."),
     )
 }
 

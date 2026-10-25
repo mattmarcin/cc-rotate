@@ -42,7 +42,7 @@ fn warn_if_home() {
     if let (Some(home), Some(cwd)) = (home, cwd) {
         if canonical(&home).is_some() && canonical(&home) == canonical(&cwd) {
             eprintln!(
-                "warning: cc-rotate cannot track usage or swap accounts in your home folder: Claude Code does not run status lines there. Start it in a project folder."
+                "warning: cc-rotate can't track usage or swap accounts in your home folder, because Claude Code doesn't run status lines there. Start it in a project folder."
             );
         }
     }

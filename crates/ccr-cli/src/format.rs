@@ -37,10 +37,10 @@ fn ago(ts_ms: i64) -> String {
 
 fn state_label(a: &AccountView) -> &'static str {
     match a.account.state {
-        AccountState::Active => "active",
+        AccountState::Active => "in use",
         AccountState::Parked if a.eligible => "ready",
         AccountState::Parked => "resting",
-        AccountState::NeedsLogin => "needs login",
+        AccountState::NeedsLogin => "signed out",
         AccountState::Paused => "paused",
     }
 }
@@ -143,14 +143,14 @@ pub fn status(snap: &Snapshot) -> String {
     if p.weekly_limited > 0 {
         let _ = write!(
             out,
-            "Pool: {:.1} of {} accounts' weekly budget left",
+            "Weekly usage left: {:.1} of {} accounts",
             p.weekly_accounts_left, p.weekly_limited
         );
         if p.no_weekly_limit > 0 {
             let _ = write!(out, ", plus {} without a weekly limit", p.no_weekly_limit);
         }
     } else {
-        let _ = write!(out, "Pool: {} accounts, none with a weekly limit", p.usable);
+        let _ = write!(out, "{} accounts, none with a weekly limit", p.usable);
     }
     let _ = writeln!(out, ", {} ready, {} swaps in 24h.", p.eligible, p.swaps_24h);
     if let Some(next) = &snap.next {
@@ -163,13 +163,13 @@ pub fn status(snap: &Snapshot) -> String {
             .unwrap_or_else(|| "unknown".into());
         let _ = writeln!(
             out,
-            "{YELLOW}No other account is available. Next one frees up in {next}.{RESET}"
+            "{YELLOW}No other account is ready. The next one frees up in {next}.{RESET}"
         );
     }
     if !p.needs_login.is_empty() {
         let _ = writeln!(
             out,
-            "{YELLOW}Needs a new login: {} (cc-rotate-ctl login --relogin <label>){RESET}",
+            "{YELLOW}Signed out: {}. Sign in again with `cc-rotate-ctl login --relogin <label>`.{RESET}",
             p.needs_login.join(", ")
         );
     }
@@ -191,7 +191,7 @@ pub fn next(snap: &Snapshot, explain: bool) -> String {
         None => {
             let _ = writeln!(
                 out,
-                "None: every other account is paused, needs a login, or is over a threshold"
+                "None: every other account is near a limit, paused or signed out"
             );
         }
     }
