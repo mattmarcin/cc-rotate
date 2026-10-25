@@ -8,9 +8,14 @@
 //! Drawing uses crossterm, which handles raw mode, keys, the terminal size and the alternate
 //! screen the same way on Windows consoles and Unix terminals (including over SSH). Each frame
 //! moves the cursor home and overwrites the previous one line by line, clearing only what's
-//! left over, so nothing flickers.
+//! left over, so nothing flickers. The terminal is put back however it ends: q, Esc, Ctrl-C, an
+//! error, a panic (before the panic message is printed, so it stays readable), and on Unix
+//! SIGTERM, SIGHUP and SIGQUIT, after which the process ends as the signal would have ended it.
 
-use std::io::{IsTerminal, Write};
+use std::io::{ErrorKind, IsTerminal, Write};
+use std::panic::PanicHookInfo;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -19,6 +24,7 @@ use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{Command, execute};
+use unicode_width::UnicodeWidthChar;
 
 use crate::format;
 
@@ -28,6 +34,9 @@ const RESET: &str = "\x1b[0m";
 /// The most events shown below the accounts.
 const MAX_EVENTS: usize = 8;
 
+/// How often the wait between frames checks for a termination signal.
+const STOP_CHECK: Duration = Duration::from_millis(100);
+
 pub fn run(store: &Store, paths: &Paths, interval: Duration) -> Result<()> {
     let mut out = std::io::stdout();
     if !out.is_terminal() {
@@ -35,7 +44,18 @@ pub fn run(store: &Store, paths: &Paths, interval: Duration) -> Result<()> {
         out.write_all(frame(store, paths, interval, false, None)?.as_bytes())?;
         return Ok(());
     }
+    let stop = Stop::register()?;
+    let outcome = live(store, paths, interval, &stop);
+    // The terminal is restored by now: end the way a termination signal asked to, if one did.
+    stop.finish();
+    outcome
+}
+
+/// Redraw until q, Esc, Ctrl-C or a termination signal. The terminal is restored when it
+/// returns, whichever way.
+fn live(store: &Store, paths: &Paths, interval: Duration, stop: &Stop) -> Result<()> {
     let _terminal = TerminalGuard::enter()?;
+    let mut out = std::io::stdout();
     loop {
         // Some terminals (a serial console, an SSH client that sends no size) report 0 x 0.
         let (cols, rows) = match terminal::size() {
@@ -50,7 +70,7 @@ pub fn run(store: &Store, paths: &Paths, interval: Duration) -> Result<()> {
             )
         });
         draw(&mut out, &text, cols, rows)?;
-        if wait(interval)? == Wake::Quit {
+        if wait(interval, stop)? == Wake::Quit {
             return Ok(());
         }
     }
@@ -69,13 +89,18 @@ fn header(interval: Duration, live: bool) -> String {
     }
 }
 
-/// "2s", "1m 30s".
+/// "2s", "1m 30s", "1h".
 fn every(interval: Duration) -> String {
     let s = interval.as_secs();
-    match (s / 60, s % 60) {
-        (0, s) => format!("{s}s"),
-        (m, 0) => format!("{m}m"),
-        (m, s) => format!("{m}m {s}s"),
+    let parts: Vec<String> = [(s / 3600, "h"), (s % 3600 / 60, "m"), (s % 60, "s")]
+        .into_iter()
+        .filter(|&(n, _)| n > 0)
+        .map(|(n, unit)| format!("{n}{unit}"))
+        .collect();
+    if parts.is_empty() {
+        "0s".into()
+    } else {
+        parts.join(" ")
     }
 }
 
@@ -132,8 +157,9 @@ fn render(text: &str, cols: u16, rows: u16) -> Result<String> {
     Ok(buf)
 }
 
-/// Cut `line` to `width` visible characters, keeping its color codes whole; a cut line ends by
-/// resetting its colors.
+/// Cut `line` to `width` terminal columns, keeping its color codes whole; a cut line ends by
+/// resetting its colors. Wide characters (CJK, most emoji) take two columns, and one that would
+/// cross the edge is left out with the rest, so a line never wraps.
 pub fn fit(line: &str, width: usize) -> String {
     let mut out = String::with_capacity(line.len());
     let mut visible = 0;
@@ -155,14 +181,15 @@ pub fn fit(line: &str, width: usize) -> String {
             styled = true;
             continue;
         }
-        if visible == width {
+        let columns = c.width().unwrap_or(0);
+        if visible + columns > width {
             if styled {
                 out.push_str(RESET);
             }
             return out;
         }
         out.push(c);
-        visible += 1;
+        visible += columns;
     }
     out
 }
@@ -173,14 +200,24 @@ enum Wake {
     Quit,
 }
 
-/// Wait for the next frame: `interval`, or less when the window is resized; `Quit` on q, Esc
-/// or Ctrl-C (raw mode delivers Ctrl-C as a key, on Windows too).
-fn wait(interval: Duration) -> Result<Wake> {
+/// Wait for the next frame: `interval`, or less when the window is resized; `Quit` on q, Esc,
+/// Ctrl-C (raw mode delivers Ctrl-C as a key, on Windows too) or a termination signal.
+fn wait(interval: Duration, stop: &Stop) -> Result<Wake> {
     let deadline = Instant::now() + interval;
     loop {
+        if stop.requested().is_some() {
+            return Ok(Wake::Quit);
+        }
         let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() || !event::poll(left)? {
+        if left.is_zero() {
             return Ok(Wake::Redraw);
+        }
+        match event::poll(left.min(STOP_CHECK)) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            // A signal arrived while waiting: the check above handles it.
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
         }
         match event::read()? {
             Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
@@ -196,18 +233,126 @@ fn wait(interval: Duration) -> Result<Wake> {
     }
 }
 
-/// Raw mode, the alternate screen and a hidden cursor while it lives; all three are restored
-/// when it drops, on q, Ctrl-C, an error, or a panic.
-struct TerminalGuard;
+/// The termination signals that should end `watch` with the terminal restored: SIGTERM, SIGHUP
+/// and SIGQUIT on Unix (Ctrl-C arrives as a key in raw mode). Their default action would end the
+/// process at once, leaving the terminal in raw mode on the alternate screen; while this is
+/// registered they only set a flag that `wait` checks.
+struct Stop {
+    /// The number of the signal that arrived, 0 for none.
+    signal: Arc<AtomicUsize>,
+    #[cfg(unix)]
+    ids: Vec<signal_hook::SigId>,
+}
+
+impl Stop {
+    fn register() -> Result<Self> {
+        let signal = Arc::new(AtomicUsize::new(0));
+        #[cfg(unix)]
+        let ids = {
+            use signal_hook::consts::{SIGHUP, SIGQUIT, SIGTERM};
+            [SIGTERM, SIGHUP, SIGQUIT]
+                .into_iter()
+                .map(|sig| {
+                    signal_hook::flag::register_usize(sig, Arc::clone(&signal), sig as usize)
+                })
+                .collect::<std::io::Result<Vec<_>>>()?
+        };
+        Ok(Self {
+            signal,
+            #[cfg(unix)]
+            ids,
+        })
+    }
+
+    /// The termination signal that arrived, if one did.
+    fn requested(&self) -> Option<i32> {
+        match self.signal.load(Ordering::SeqCst) {
+            0 => None,
+            sig => Some(sig as i32),
+        }
+    }
+
+    /// Once the terminal is restored: stop catching the signals, and end the process the way
+    /// the one that arrived would have (so `timeout` and shells see the signal, not a normal exit).
+    fn finish(self) {
+        let requested = self.requested();
+        drop(self);
+        #[cfg(unix)]
+        if let Some(sig) = requested {
+            let _ = signal_hook::low_level::emulate_default_handler(sig);
+        }
+        #[cfg(not(unix))]
+        let _ = requested;
+    }
+}
+
+impl Drop for Stop {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        for id in self.ids.drain(..) {
+            signal_hook::low_level::unregister(id);
+        }
+    }
+}
+
+/// Whether the terminal is in watch's state (raw mode, alternate screen, cursor hidden), so it is
+/// restored exactly once, by the panic hook or the guard, whichever comes first.
+static TERMINAL_CHANGED: AtomicBool = AtomicBool::new(false);
+
+fn restore_terminal() {
+    if TERMINAL_CHANGED.swap(false, Ordering::SeqCst) {
+        let _ = execute!(std::io::stdout(), Show, LeaveAlternateScreen);
+        let _ = terminal::disable_raw_mode();
+    }
+}
+
+type PanicHook = Box<dyn Fn(&PanicHookInfo<'_>) + Sync + Send + 'static>;
+
+/// Put a panic hook in front of the current one that restores the terminal first, so the panic
+/// message is printed on the normal screen instead of being wiped with the alternate one.
+/// Returns the hook it wraps, for `restore_panic_hook`.
+fn install_panic_hook() -> Arc<PanicHook> {
+    let previous: Arc<PanicHook> = Arc::new(std::panic::take_hook());
+    let chained = Arc::clone(&previous);
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        chained(info);
+    }));
+    previous
+}
+
+/// Put back the hook `install_panic_hook` wrapped. Not while panicking, when the hook can't be
+/// changed (the process is ending with the hook it has anyway).
+fn restore_panic_hook(previous: Arc<PanicHook>) {
+    if std::thread::panicking() {
+        return;
+    }
+    // Dropping ours drops its share of `previous`, so the original comes back as it was.
+    drop(std::panic::take_hook());
+    match Arc::try_unwrap(previous) {
+        Ok(original) => std::panic::set_hook(original),
+        Err(shared) => std::panic::set_hook(Box::new(move |info| shared(info))),
+    }
+}
+
+/// Raw mode, the alternate screen and a hidden cursor while it lives. All three are restored
+/// when it drops (q, Ctrl-C, a signal, an error), or by the panic hook it installs, before the
+/// panic message is printed.
+struct TerminalGuard {
+    previous_hook: Option<Arc<PanicHook>>,
+}
 
 impl TerminalGuard {
     fn enter() -> Result<Self> {
         // Turns on a Windows console's ANSI support (Windows 10 and later), which the frames use.
         #[cfg(windows)]
         crossterm::ansi_support::supports_ansi();
-        terminal::enable_raw_mode()?;
         // From here on, dropping the guard restores whatever was changed.
-        let guard = TerminalGuard;
+        let guard = TerminalGuard {
+            previous_hook: Some(install_panic_hook()),
+        };
+        TERMINAL_CHANGED.store(true, Ordering::SeqCst);
+        terminal::enable_raw_mode()?;
         execute!(std::io::stdout(), EnterAlternateScreen, Hide)?;
         Ok(guard)
     }
@@ -215,8 +360,10 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = execute!(std::io::stdout(), Show, LeaveAlternateScreen);
-        let _ = terminal::disable_raw_mode();
+        restore_terminal();
+        if let Some(previous) = self.previous_hook.take() {
+            restore_panic_hook(previous);
+        }
     }
 }
 
@@ -235,10 +382,60 @@ mod tests {
     }
 
     #[test]
+    fn fit_counts_wide_characters_as_two_columns() {
+        assert_eq!(fit("日本語", 6), "日本語");
+        assert_eq!(fit("日本語", 5), "日本", "the third would cross the edge");
+        assert_eq!(fit("ab😀c", 3), "ab");
+        assert_eq!(fit("ab😀c", 4), "ab😀");
+        assert_eq!(fit("\x1b[2m日本\x1b[0m", 3), "\x1b[2m日\x1b[0m");
+        // Combining marks take no column.
+        assert_eq!(fit("e\u{301}x", 1), "e\u{301}");
+    }
+
+    #[test]
     fn intervals_read_like_durations() {
         assert_eq!(every(Duration::from_secs(2)), "2s");
         assert_eq!(every(Duration::from_secs(60)), "1m");
         assert_eq!(every(Duration::from_secs(90)), "1m 30s");
+        assert_eq!(every(Duration::from_secs(3600)), "1h");
+        assert_eq!(every(Duration::from_secs(3661)), "1h 1m 1s");
+    }
+
+    /// The panic hook restores the terminal and then runs the hook it wraps, and dropping the
+    /// guard puts that hook back.
+    #[test]
+    fn the_panic_hook_runs_the_previous_one_and_is_put_back() {
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        let original = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+        }));
+        let wrapped = install_panic_hook();
+        assert!(std::panic::catch_unwind(|| panic!("in watch")).is_err());
+        assert_eq!(
+            CALLS.load(Ordering::SeqCst),
+            1,
+            "the previous hook still runs"
+        );
+        restore_panic_hook(wrapped);
+        assert!(std::panic::catch_unwind(|| panic!("after watch")).is_err());
+        assert_eq!(CALLS.load(Ordering::SeqCst), 2);
+        std::panic::set_hook(original);
+    }
+
+    /// A termination signal makes the wait end with `Quit`, so the guard drops and restores the
+    /// terminal, instead of the signal ending the process on the spot.
+    #[cfg(unix)]
+    #[test]
+    fn a_termination_signal_quits() {
+        use signal_hook::consts::SIGTERM;
+        let stop = Stop::register().unwrap();
+        assert_eq!(stop.requested(), None);
+        signal_hook::low_level::raise(SIGTERM).unwrap();
+        assert_eq!(stop.requested(), Some(SIGTERM), "caught, not fatal");
+        assert_eq!(wait(Duration::from_secs(30), &stop).unwrap(), Wake::Quit);
+        // Dropping it (rather than `finish`) unregisters without ending the test process.
+        drop(stop);
     }
 
     #[test]
