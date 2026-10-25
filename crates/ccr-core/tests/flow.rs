@@ -1320,3 +1320,55 @@ fn with_nothing_known_of_the_new_account_an_ambiguous_reading_counts() {
         "an ambiguous reading does not vouch for b's reset times"
     );
 }
+
+/// The old and the new account's windows reset at the same moment, and the new account's reset
+/// time is known to be its own. A session still showing the old account repeats that account's
+/// latest reading exactly, so it is told apart by its values; the new account's own readings
+/// count.
+#[test]
+fn with_aligned_reset_times_a_copy_of_the_old_accounts_reading_is_not_counted() {
+    let env = Env::new();
+    let (store, a, b, _) = pool(&env);
+    let now = time::now_ms();
+    let shared = time::now_s() + 2 * 3600;
+    store
+        .record_sample(&five_only(b, 40.0, shared, now - 60_000))
+        .unwrap();
+    known_as_own(&store, b);
+    statusline::tick(
+        &store,
+        &env.paths,
+        &session_input("idle", 5000, 99.0, shared),
+        now,
+    )
+    .unwrap();
+    swap::run(
+        &store,
+        &env.paths,
+        &SwapRequest {
+            from: Some(a),
+            to: None,
+            reason: Reason::FiveHour,
+            wait: false,
+        },
+    )
+    .unwrap();
+    let tick = statusline::tick(
+        &store,
+        &env.paths,
+        &session_input("idle", 5000, 99.0, shared),
+        now + 150_000,
+    )
+    .unwrap();
+    assert!(tick.swap.is_none(), "{:?}", tick.swap);
+    assert_eq!(store.last_sample(b).unwrap().unwrap().windows[0].pct, 40.0);
+
+    statusline::tick(
+        &store,
+        &env.paths,
+        &session_input("busy", 9000, 41.0, shared),
+        now + 160_000,
+    )
+    .unwrap();
+    assert_eq!(store.last_sample(b).unwrap().unwrap().windows[0].pct, 41.0);
+}

@@ -300,7 +300,7 @@ impl Sample {
 }
 
 /// Two readings with the same windows and reset times, and percentages within half a point.
-fn same_windows(a: &[SampleWindow], b: &[SampleWindow]) -> bool {
+pub fn same_windows(a: &[SampleWindow], b: &[SampleWindow]) -> bool {
     a.len() == b.len()
         && a.iter().all(|w| {
             b.iter().any(|o| {
