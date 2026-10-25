@@ -141,6 +141,10 @@ enum Command {
         /// --force, this is all setup does.
         #[arg(long)]
         remove_alias: bool,
+        /// Leave an existing rotation profile as it is instead of failing (the installer runs
+        /// setup on every upgrade).
+        #[arg(long, conflicts_with = "force")]
+        keep_existing: bool,
     },
     /// Check the store, the profile and Claude Code.
     Doctor {
@@ -426,10 +430,22 @@ fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> 
             from,
             force,
             remove_alias,
+            keep_existing,
         } => {
-            if remove_alias && !force && paths.settings_file().exists() {
-                for file in setup::remove_powershell_alias()? {
-                    println!("Removed the old cc-rotate function from {}", file.display());
+            if (remove_alias || keep_existing) && !force && paths.settings_file().exists() {
+                if keep_existing {
+                    println!(
+                        "The rotation profile at {} is already set up; leaving it as it is.",
+                        paths.profile_dir.display()
+                    );
+                    println!(
+                        "To rebuild it from your template profile, run: cc-rotate-ctl setup --force"
+                    );
+                }
+                if remove_alias {
+                    for file in setup::remove_powershell_alias()? {
+                        println!("Removed the old cc-rotate function from {}", file.display());
+                    }
                 }
                 return Ok(ExitCode::SUCCESS);
             }
