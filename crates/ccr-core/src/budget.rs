@@ -53,9 +53,9 @@ pub const MIN_LEFT: f64 = 5.0;
 /// An account moves ahead once spending its budget, and that of every account resetting
 /// before it, would take this share of the working hours left before its reset.
 pub const ENTER: f64 = 0.75;
-/// An account that moved ahead this week stays ahead while the share is at least this, so it
-/// is not given up as its own spending lowers the share, and is taken back after its 5-hour
-/// limit.
+/// An account that moved ahead this week (`promoted`) stays ahead while the share is at least
+/// this, so it is not given up as its own spending lowers the share, and is taken back after
+/// its 5-hour limit.
 pub const STAY: f64 = 0.3;
 const HOURS_PER_WEEK: usize = 168;
 
@@ -155,6 +155,24 @@ pub fn refresh_rates(store: &Store, now_ms: i64) -> Result<Rates> {
 /// The meta key recording that a swap took the account for its expiring weekly budget.
 pub fn promoted_key(account_id: i64) -> String {
     format!("{META_PROMOTED_PREFIX}{account_id}")
+}
+
+/// Mark the account in use as moved ahead for this weekly window once its budget would reset
+/// unused (it got there while in use, not by a swap that marked it). Called on status line
+/// ticks and the app's syncs, which write anyway.
+pub fn note_in_use(store: &Store, pool: &[Candidate]) -> Result<()> {
+    for c in pool {
+        if c.account.state != AccountState::Active {
+            continue;
+        }
+        if let Some(e) = &c.expiring {
+            let key = promoted_key(c.account.id);
+            if store.meta_i64(&key)? != Some(e.resets_at) {
+                store.set_meta(&key, e.resets_at)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The weekly reset of the window in which each account was taken for its expiring budget.
@@ -282,8 +300,10 @@ pub struct Expiring {
 /// Only one account is in use at a time, so the accounts are taken in the order their weekly
 /// windows reset: an account must be used now when its hours, together with the hours of
 /// every account resetting before it, take `ENTER` of the working hours it has left before its
-/// reset. `STAY` applies instead to the account in use and to one a swap took for its budget in
-/// this weekly window (`promoted`, weekly resets by account id). An account blocked by another
+/// reset. `STAY` applies instead to an account already moved ahead in this weekly window
+/// (`promoted`, weekly resets by account id): taken by a swap for its budget, or found expiring
+/// while in use (`note_in_use`). An account in use for other reasons (every seat was at a
+/// limit) is not kept: its budget stays in reserve. An account blocked by another
 /// window has only the working hours after that window resets; one blocked until its weekly
 /// reset, or on hold, cannot spend anything and does not count.
 pub fn expiring(
@@ -332,11 +352,7 @@ pub fn expiring(
         let taken = promoted
             .get(&c.account.id)
             .is_some_and(|&r| same_reset(Some(r), Some(resets_at)));
-        let bar = if c.account.state == AccountState::Active || taken {
-            STAY
-        } else {
-            ENTER
-        };
+        let bar = if taken { STAY } else { ENTER };
         if share >= bar {
             out.insert(
                 c.account.id,
@@ -469,12 +485,16 @@ mod tests {
     }
 
     #[test]
-    fn the_account_in_use_stays_ahead_while_it_spends() {
+    fn only_an_account_moved_ahead_stays_ahead_while_it_spends() {
         // 40 of 100 hours: below the bar to move ahead, above the bar to stay.
         let parked = [weekly(1, AccountState::Parked, 58.0, 100)];
         let active = [weekly(1, AccountState::Active, 58.0, 100)];
         assert!(expiring(&parked, &always_working(), &none(), 98.0, NOW).is_empty());
-        assert!(expiring(&active, &always_working(), &none(), 98.0, NOW).contains_key(&1));
+        // In use because the seats were at a limit: its budget fits, so the seats take over
+        // again when they can.
+        assert!(expiring(&active, &always_working(), &none(), 98.0, NOW).is_empty());
+        let taken = HashMap::from([(1, NOW + 100 * 3600)]);
+        assert!(expiring(&active, &always_working(), &taken, 98.0, NOW).contains_key(&1));
     }
 
     #[test]

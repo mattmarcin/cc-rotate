@@ -199,6 +199,7 @@ pub fn tick(store: &Store, paths: &Paths, input: &StatusInput, now_ms: i64) -> R
     }
 
     let (pool, policy) = swap::load_pool(store, now_ms / 1000)?;
+    crate::budget::note_in_use(store, &pool)?;
     let timing = timing(store, active.id, now_ms)?;
     if let Some(reason) = scheduler::decide(&pool, policy, timing, dead_login, true) {
         if reason != Reason::PreferredAvailable {
@@ -395,6 +396,7 @@ pub fn sync_at(store: &Store, paths: &Paths, now_ms: i64) -> Result<Option<SwapR
         return Ok(None);
     };
     let (pool, policy) = swap::load_pool(store, now_ms / 1000)?;
+    crate::budget::note_in_use(store, &pool)?;
     let timing = timing(store, active.id, now_ms)?;
     let Some(reason) = scheduler::decide(&pool, policy, timing, dead_login, false) else {
         return Ok(None);

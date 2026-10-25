@@ -1098,7 +1098,7 @@ function openManage(a: AccountView) {
     type: "number",
     min: 1,
     max: 100,
-    step: 1,
+    step: "any",
     value: a.weekly_cap === null ? "" : String(a.weekly_cap),
     placeholder: String(weeklyThreshold),
   });
@@ -1143,8 +1143,11 @@ function openManage(a: AccountView) {
   close.addEventListener("click", () => d.close());
   save.addEventListener("click", async () => {
     try {
-      if (cap.validity.badInput || !cap.checkValidity()) throw new Error("Use a number from 1 to 100, or leave it empty.");
+      // Only a change is checked and saved: a cap set from the CLI can be any number from 1 to 100.
       const capValue = cap.value.trim() === "" ? null : Number(cap.value);
+      if (cap.validity.badInput || (capValue !== null && !(Number.isFinite(capValue) && capValue >= 1 && capValue <= 100))) {
+        throw new Error("Use a number from 1 to 100, or leave it empty.");
+      }
       if (capValue !== a.weekly_cap) await api.setWeeklyCap(a.id, capValue);
       if (label.value.trim() !== a.label) await api.renameAccount(a.id, label.value.trim());
       d.close();
