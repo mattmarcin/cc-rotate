@@ -77,6 +77,13 @@ pub fn import(store: &Store, paths: &Paths, now_ms: i64) -> Result<usize> {
                 if store.record_sample(&sample)? {
                     recorded += 1;
                 }
+                // Stamped by Claude Code with the account: its own reset times.
+                crate::swap::note_known_resets(
+                    store,
+                    sample.account_id,
+                    &sample.windows,
+                    now_ms / 1000,
+                )?;
                 mtime.to_string()
             }
             Found::Nothing => mtime.to_string(),

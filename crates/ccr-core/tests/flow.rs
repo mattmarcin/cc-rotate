@@ -1041,6 +1041,12 @@ fn observe_mode_works_in_the_default_profile() {
     assert_eq!(store.last_sample(b).unwrap().unwrap().windows[0].pct, 55.0);
 }
 
+/// Record an account's latest reading as known to be its own, as a usage check does.
+fn known_as_own(store: &Store, account: i64) {
+    let last = store.last_sample(account).unwrap().unwrap();
+    swap::note_known_resets(store, account, &last.windows, time::now_s()).unwrap();
+}
+
 /// A status line reading from session `session`, whose API time so far is `api_ms`.
 fn session_input(session: &str, api_ms: u64, pct: f64, resets_at: i64) -> StatusInput {
     StatusInput::parse(&format!(
@@ -1063,6 +1069,8 @@ fn a_session_idle_since_before_a_swap_is_ignored_however_long_it_idles() {
     store
         .record_sample(&five_only(b, 10.0, b_resets, now - 60_000))
         .unwrap();
+    // What a usage check of b before the swap establishes: b's own reset times.
+    known_as_own(&store, b);
     // The idle session's last reading on a, before the swap.
     statusline::tick(
         &store,
@@ -1177,6 +1185,8 @@ fn a_request_that_finishes_after_a_swap_still_counts_for_the_old_account() {
     store
         .record_sample(&five_only(b, 10.0, time::now_s() + 4 * 3600, now - 60_000))
         .unwrap();
+    // What a usage check of b before the swap establishes: b's own reset times.
+    known_as_own(&store, b);
     statusline::tick(
         &store,
         &env.paths,
@@ -1232,6 +1242,8 @@ fn a_reading_sharing_the_new_accounts_own_reset_time_counts() {
     store
         .record_sample(&five_only(b, 20.0, shared, now - 60_000))
         .unwrap();
+    // What a usage check of b before the swap establishes: b's own reset times.
+    known_as_own(&store, b);
     statusline::tick(
         &store,
         &env.paths,
