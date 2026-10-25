@@ -14,9 +14,7 @@ use serde_json::{Value, json};
 use crate::paths::Paths;
 use crate::profile_account;
 use crate::scheduler::{self, Reason, Timing};
-use crate::store::{
-    Account, AccountState, META_SESSION_PREFIX, Sample, SampleWindow, Store, kind, same_windows,
-};
+use crate::store::{Account, AccountState, META_SESSION_PREFIX, Sample, SampleWindow, Store, kind};
 use crate::swap::{
     self, META_ACTIVE_SINCE, META_CRED_SEEN, META_LAST_SWAP_AT, META_PROFILE_FOREIGN,
     META_PROFILE_MODEL, STALE_SAMPLE_GUARD_MS, SwapRequest,
@@ -41,20 +39,15 @@ pub struct StatusInput {
     /// is only present while the API reports it and its reset has not passed.
     #[serde(default, deserialize_with = "lenient_windows")]
     pub rate_limits: Option<BTreeMap<String, Window>>,
-    /// The session's totals; its API time only grows when the session made a request.
-    pub cost: Option<CostInfo>,
 }
 
-#[derive(Debug, Default, Deserialize)]
-pub struct CostInfo {
-    pub total_api_duration_ms: Option<f64>,
-}
-
-/// What a session last reported (`store::META_SESSION_PREFIX`).
+/// What a session last reported (`store::META_SESSION_PREFIX`), and the account it was counted
+/// for (`None` when that is not known).
 #[derive(Debug, Serialize, Deserialize)]
 struct SessionReading {
     at: i64,
-    api_ms: Option<f64>,
+    #[serde(default)]
+    account: Option<i64>,
     windows: Vec<SampleWindow>,
 }
 
@@ -107,10 +100,6 @@ fn epoch_seconds<'de, D: Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Erro
 impl StatusInput {
     pub fn parse(text: &str) -> Self {
         serde_json::from_str(text).unwrap_or_default()
-    }
-
-    fn api_duration_ms(&self) -> Option<f64> {
-        self.cost.as_ref().and_then(|c| c.total_api_duration_ms)
     }
 
     pub fn model_id(&self) -> Option<&str> {
@@ -182,9 +171,7 @@ pub fn tick(store: &Store, paths: &Paths, input: &StatusInput, now_ms: i64) -> R
         }
     }
     if let Some(sample) = input.sample_for(active.id, "rotate", now_ms) {
-        if !frozen_reading(store, input, &sample, now_ms)?
-            && !is_stale_reading(store, &sample, now_ms)?
-        {
+        if !stale_for_session(store, input, &sample, active.id, now_ms)? {
             store.record_sample(&sample)?;
         }
     }
@@ -270,44 +257,72 @@ pub fn observe(
     Ok(Some(account))
 }
 
-/// A session only notices a new login when it next makes a request (F1), so a session idle since
-/// before the active account became active keeps reporting the usage of the account it used
-/// then, for as long as it stays idle. Such a reading is exactly the session's last one from
-/// before, and the session's API time has not grown since; drop it. A genuine reading of the new
-/// account differs (another account's percentages and reset times), and follows a request.
-/// Readings without a session id are left to `is_stale_reading`.
-fn frozen_reading(
+/// Whether a reading is the active account's, judged by the session that sent it, and the
+/// session's record updated.
+///
+/// A session only notices a new login when it next starts a request (F1). Until then it keeps
+/// showing the account it used before: while it idles, and also when a request it started
+/// before the swap finishes afterwards, which brings that account's latest usage. Both readings
+/// carry the old account's reset times, so a reading from a session whose last reading belonged
+/// to another account is stale when it has the same reset times as that reading, and they are
+/// not the active account's own (its latest reading). When the two accounts' windows reset at
+/// the same moment the reading cannot be told apart and counts, since hiding a genuine reading
+/// of a used-up account would leave its sessions waiting at the limit.
+///
+/// Readings without a session id, and sessions seen for the first time, are judged by the reset
+/// guard after a swap (`is_stale_reading`) alone.
+fn stale_for_session(
     store: &Store,
     input: &StatusInput,
     sample: &Sample,
+    active_id: i64,
     now_ms: i64,
 ) -> Result<bool> {
+    let guarded = is_stale_reading(store, sample, now_ms)?;
     let Some(session) = input.session_id.as_deref().filter(|s| !s.is_empty()) else {
-        return Ok(false);
+        return Ok(guarded);
     };
     let key = format!("{META_SESSION_PREFIX}{session}");
-    let api_ms = input.api_duration_ms();
     let previous: Option<SessionReading> = store
         .meta(&key)?
         .and_then(|v| serde_json::from_str(&v).ok());
-    if let Some(prev) = previous {
-        let before = prev.at < swap::active_since(store)?;
-        let no_request = match (api_ms, prev.api_ms) {
-            (Some(now), Some(then)) => now <= then,
-            _ => true,
-        };
-        if before && no_request && same_windows(&prev.windows, &sample.windows) {
-            // Keep the record from before, so the session stays recognized until it moves.
-            return Ok(true);
+    let from_other = previous
+        .as_ref()
+        .and_then(|p| p.account)
+        .filter(|&a| a != active_id);
+    let still_other = match (&previous, from_other) {
+        (Some(prev), Some(_)) if same_resets(&prev.windows, &sample.windows) => {
+            let own: Vec<i64> = store
+                .last_sample(active_id)?
+                .iter()
+                .flat_map(|s| &s.windows)
+                .filter_map(|w| w.resets_at)
+                .collect();
+            !sample
+                .windows
+                .iter()
+                .any(|w| w.resets_at.is_some_and(|r| own.contains(&r)))
         }
-    }
-    let reading = SessionReading {
+        _ => false,
+    };
+    let stale = guarded || still_other;
+    let record = SessionReading {
         at: now_ms,
-        api_ms,
+        // A dropped reading belongs to the account the session reported before, if known.
+        account: if stale { from_other } else { Some(active_id) },
         windows: sample.windows.clone(),
     };
-    store.set_meta(&key, serde_json::to_string(&reading)?)?;
-    Ok(false)
+    store.set_meta(&key, serde_json::to_string(&record)?)?;
+    Ok(stale)
+}
+
+/// The same windows, with the same reset times.
+fn same_resets(a: &[SampleWindow], b: &[SampleWindow]) -> bool {
+    a.len() == b.len()
+        && a.iter().all(|w| {
+            b.iter()
+                .any(|o| o.name == w.name && o.resets_at == w.resets_at)
+        })
 }
 
 /// Shortly after a swap, a session that has not made a request yet still reports the old

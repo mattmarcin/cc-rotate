@@ -138,6 +138,26 @@ pub fn run(store: &Store, paths: &Paths) -> Vec<Check> {
         ),
     });
 
+    // Readings from other profiles and observe mode only count within the account's own
+    // organization (section 9.1), so an account without one on record gets none of them.
+    let no_org: Vec<&str> = accounts
+        .iter()
+        .filter(|a| a.org_uuid.is_none())
+        .map(|a| a.label.as_str())
+        .collect();
+    if !no_org.is_empty() {
+        checks.push(check(
+            "Organizations",
+            Status::Warn,
+            format!(
+                "{} {} no organization on record, so usage your other profiles see is not counted for {}; sign in again with `cc-rotate-ctl login --relogin <label>`",
+                no_org.join(", "),
+                if no_org.len() == 1 { "has" } else { "have" },
+                if no_org.len() == 1 { "it" } else { "them" },
+            ),
+        ));
+    }
+
     let mut undecryptable = Vec::new();
     for account in &accounts {
         if store.credential(account.id).ok().flatten().is_none() {
