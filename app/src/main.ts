@@ -250,7 +250,18 @@ function renderTop() {
   );
 
   const needs = snap?.accounts.filter((a) => a.state === "needs_login") ?? [];
-  if (needs.length > 0) {
+  if (snap?.pool.swap_unsettled) {
+    banner.hidden = false;
+    banner.className = "banner warn";
+    replace(
+      banner,
+      h(
+        "span",
+        null,
+        "A swap stopped half way. cc-rotate is finding out which account the profile is signed in to, and does not swap until it knows. Your sessions keep working meanwhile.",
+      ),
+    );
+  } else if (needs.length > 0) {
     banner.hidden = false;
     banner.className = "banner danger";
     replace(

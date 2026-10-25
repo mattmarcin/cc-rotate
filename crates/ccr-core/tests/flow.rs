@@ -12,7 +12,7 @@ use ccr_core::store::{
     AccountIdentity, AccountState, Sample, SampleWindow, WeeklyLimitSetting, kind,
 };
 use ccr_core::swap::{self, SwapOutcome, SwapRequest};
-use ccr_core::{Paths, Store, credfile, login, time};
+use ccr_core::{Paths, Store, credfile, login, time, usage_check};
 use serde_json::{Value, json};
 
 struct Env {
@@ -1392,9 +1392,10 @@ fn a_tick_during_a_swap_does_not_store_the_targets_login_as_the_outgoing_one() {
     let env = Env::new();
     let (store, a, b, _) = pool(&env);
     let target = store.credential(b).unwrap().unwrap();
-    store
-        .set_meta(swap::META_SWAP_PENDING_FP, &target.refresh_fp)
-        .unwrap();
+    // The swap is running: it holds the swap lock.
+    let swapping =
+        DirLock::acquire(&env.paths.swap_lock(), LockOptions::claude(Duration::ZERO)).unwrap();
+    mark_pending(&store, &target.refresh_fp, Some(a), b);
     credfile::write_oauth(&env.cred_file(), &target.oauth).unwrap();
 
     statusline::sync(&store, &env.paths).unwrap();
@@ -1410,9 +1411,10 @@ fn a_tick_during_a_swap_does_not_store_the_targets_login_as_the_outgoing_one() {
         .immediate(|s| {
             s.set_state(a, AccountState::Parked)?;
             s.set_state(b, AccountState::Active)?;
-            s.delete_meta(swap::META_SWAP_PENDING_FP)
+            s.delete_meta(swap::META_SWAP_PENDING)
         })
         .unwrap();
+    drop(swapping);
     statusline::sync(&store, &env.paths).unwrap();
     assert_eq!(
         store.credential(a).unwrap().unwrap().oauth["refreshToken"],
@@ -1421,5 +1423,242 @@ fn a_tick_during_a_swap_does_not_store_the_targets_login_as_the_outgoing_one() {
     assert_eq!(
         store.credential(b).unwrap().unwrap().oauth["refreshToken"],
         "refresh-b1"
+    );
+}
+
+fn mark_pending(store: &Store, fp: &str, from: Option<i64>, to: i64) {
+    let pending = swap::PendingSwap {
+        fp: fp.to_string(),
+        from,
+        to,
+        at: time::now_ms(),
+    };
+    store
+        .set_meta(
+            swap::META_SWAP_PENDING,
+            serde_json::to_string(&pending).unwrap(),
+        )
+        .unwrap();
+}
+
+/// A swap that died after writing the target's login and before committing (a crash): nobody
+/// holds the swap lock any more, the profile has exactly b's login, the store still says a. The
+/// next write-back completes the swap instead of storing b's login as a's.
+#[test]
+fn a_swap_that_died_after_writing_is_completed() {
+    let env = Env::new();
+    let (store, a, b, _) = pool(&env);
+    let target = store.credential(b).unwrap().unwrap();
+    mark_pending(&store, &target.refresh_fp, Some(a), b);
+    credfile::write_oauth(&env.cred_file(), &target.oauth).unwrap();
+
+    statusline::sync(&store, &env.paths).unwrap();
+    assert_eq!(store.active_account().unwrap().unwrap().id, b);
+    assert_eq!(
+        store.credential(a).unwrap().unwrap().oauth["refreshToken"],
+        "refresh-a1",
+        "a's login is untouched"
+    );
+    assert!(swap::pending_swap(&store).unwrap().is_none());
+    assert_eq!(
+        store
+            .last_event_of(kind::SWAP)
+            .unwrap()
+            .unwrap()
+            .reason
+            .as_deref(),
+        Some("completed")
+    );
+}
+
+/// The profile's login changed since the swap died (Claude Code renewed whichever login it
+/// had), so its fingerprint is neither account's. Until Claude Code says whose it is, nothing is
+/// stored from the profile, and no swap runs.
+#[test]
+fn an_unidentified_login_after_a_dead_swap_stops_everything_until_settled() {
+    let env = Env::new();
+    let (store, a, b, _) = pool(&env);
+    let target = store.credential(b).unwrap().unwrap();
+    mark_pending(&store, &target.refresh_fp, Some(a), b);
+    credfile::write_oauth(&env.cred_file(), &oauth("someone-renewed")).unwrap();
+
+    let tick = |at: i64| {
+        statusline::tick(
+            &store,
+            &env.paths,
+            &five_hour_input(10.0, time::now_s() + 3600),
+            at,
+        )
+        .unwrap()
+    };
+    let now = time::now_ms();
+    assert!(
+        tick(now).finish_swap,
+        "settling is started in the background"
+    );
+    assert!(!tick(now + 5_000).finish_swap, "at most once a minute");
+    assert!(tick(now + 61_000).finish_swap);
+    statusline::sync(&store, &env.paths).unwrap();
+    assert_eq!(
+        store.credential(a).unwrap().unwrap().oauth["refreshToken"],
+        "refresh-a1"
+    );
+    assert_eq!(
+        store.credential(b).unwrap().unwrap().oauth["refreshToken"],
+        "refresh-b1"
+    );
+    assert_eq!(store.active_account().unwrap().unwrap().id, a);
+    assert!(swap::pending_swap(&store).unwrap().is_some());
+    assert!(matches!(
+        swap::run(&store, &env.paths, &manual(None)).unwrap(),
+        SwapOutcome::Skipped { .. }
+    ));
+}
+
+/// A swap that died before writing: the profile still has a's login. Only the mark goes.
+#[test]
+fn a_swap_that_died_before_writing_is_forgotten() {
+    let env = Env::new();
+    let (store, a, b, _) = pool(&env);
+    let target = store.credential(b).unwrap().unwrap();
+    mark_pending(&store, &target.refresh_fp, Some(a), b);
+    statusline::sync(&store, &env.paths).unwrap();
+    assert_eq!(store.active_account().unwrap().unwrap().id, a);
+    assert!(swap::pending_swap(&store).unwrap().is_none());
+}
+
+/// The only accounts that could take over are busy (their logins locked by a usage check): the
+/// swap is skipped, and the pool is not reported as exhausted.
+#[test]
+fn busy_accounts_are_not_an_exhausted_pool() {
+    let env = Env::new();
+    let (store, a, b, c) = pool(&env);
+    store.set_setting("lock_timeout_ms", Some("200")).unwrap();
+    let _b = DirLock::acquire(
+        &env.paths.account_lock(b),
+        LockOptions::claude(Duration::ZERO),
+    )
+    .unwrap();
+    let _c = DirLock::acquire(
+        &env.paths.account_lock(c),
+        LockOptions::claude(Duration::ZERO),
+    )
+    .unwrap();
+    let out = swap::run(
+        &store,
+        &env.paths,
+        &SwapRequest {
+            from: Some(a),
+            to: None,
+            reason: Reason::Manual,
+            wait: true,
+        },
+    )
+    .unwrap();
+    assert!(matches!(out, SwapOutcome::Skipped { .. }), "{out:?}");
+    assert!(store.last_event_of(kind::POOL_EXHAUSTED).unwrap().is_none());
+    assert_eq!(store.active_account().unwrap().unwrap().id, a);
+}
+
+/// Both accounts at their limit with the same reset time: the new account's genuine reading is
+/// an exact copy of the old one's and is dropped, so only its own reading can tell. The first
+/// such reading asks for a usage check of the account in use at once; a session idle since the
+/// swap repeating the same reading does not keep asking.
+#[test]
+fn a_dropped_reading_at_a_limit_asks_for_a_confirmation_once_per_account_in_use() {
+    let env = Env::new();
+    let (store, a, b, _) = pool(&env);
+    store.set_setting("usage_checks", Some("true")).unwrap();
+    let now = time::now_ms();
+    let shared = time::now_s() + 2 * 3600;
+    store
+        .record_sample(&five_only(b, 40.0, shared, now - 60_000))
+        .unwrap();
+    known_as_own(&store, b);
+    store
+        .record_sample(&five_only(a, 100.0, shared, now))
+        .unwrap();
+    swap::run(&store, &env.paths, &manual(Some(b))).unwrap();
+
+    let tick = |at: i64| {
+        statusline::tick(
+            &store,
+            &env.paths,
+            &session_input("s", 9000, 100.0, shared),
+            at,
+        )
+        .unwrap()
+    };
+    let first = tick(now + 130_000);
+    assert!(first.confirm, "the first one asks at once");
+    for later in [160_000, 600_000, 3_600_000] {
+        assert!(!tick(now + later).confirm, "an exact copy asks only once");
+    }
+}
+
+/// A swap from a to b stopped half way, and then the profile's login was rejected (blanked):
+/// whichever login it was, a's (stored before the write) goes back into the profile, and b is
+/// held back until a check shows whether its login still works.
+#[test]
+fn a_dead_swap_whose_login_was_then_rejected_puts_the_outgoing_login_back() {
+    let env = Env::new();
+    let (store, a, b, _) = pool(&env);
+    let target = store.credential(b).unwrap().unwrap();
+    mark_pending(&store, &target.refresh_fp, Some(a), b);
+    let mut dead = oauth("b1");
+    dead["refreshToken"] = json!("");
+    dead["accessToken"] = json!("");
+    credfile::write_oauth(&env.cred_file(), &dead).unwrap();
+
+    assert_eq!(
+        swap::finish_dead_swap(&store, &env.paths, swap::Settler::Locked).unwrap(),
+        swap::DeadSwap::Settled
+    );
+    assert_eq!(refresh_of(&env.file_doc()), "refresh-a1");
+    assert_eq!(store.active_account().unwrap().unwrap().id, a);
+    assert!(usage_check::state(&store, b).unwrap().held_back);
+    assert!(swap::pending_swap(&store).unwrap().is_none());
+}
+
+/// While the profile's login is unidentified after a stopped swap, no swap runs, not even one
+/// asked for by hand: it would overwrite the only copy of a login nobody can identify.
+#[test]
+fn no_swap_runs_while_the_profiles_login_is_unidentified() {
+    let env = Env::new();
+    let (store, a, b, c) = pool(&env);
+    let target = store.credential(b).unwrap().unwrap();
+    mark_pending(&store, &target.refresh_fp, Some(a), b);
+    credfile::write_oauth(&env.cred_file(), &oauth("whose")).unwrap();
+
+    assert!(matches!(
+        swap::run(&store, &env.paths, &manual(Some(c))).unwrap(),
+        SwapOutcome::Skipped { .. }
+    ));
+    assert_eq!(refresh_of(&env.file_doc()), "refresh-whose", "left alone");
+    assert_eq!(
+        store.credential(a).unwrap().unwrap().oauth["refreshToken"],
+        "refresh-a1"
+    );
+    assert!(swap::pending_swap(&store).unwrap().is_some());
+}
+
+/// A `/login` in the profile with an account outside the pool: the next swap must not store that
+/// login as the outgoing account's.
+#[test]
+fn a_foreign_login_in_the_profile_is_never_stored_as_the_active_accounts() {
+    let env = Env::new();
+    let (store, a, b, _) = pool(&env);
+    store.set_meta(swap::META_PROFILE_FOREIGN, "1").unwrap();
+    credfile::write_oauth(&env.cred_file(), &oauth("stranger")).unwrap();
+    assert_eq!(
+        swap::run(&store, &env.paths, &manual(Some(b))).unwrap(),
+        SwapOutcome::Swapped {
+            from: Some(a),
+            to: b
+        }
+    );
+    assert_eq!(
+        store.credential(a).unwrap().unwrap().oauth["refreshToken"],
+        "refresh-a1"
     );
 }

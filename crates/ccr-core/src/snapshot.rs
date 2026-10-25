@@ -74,6 +74,8 @@ pub struct PoolSummary {
     pub next_available_at: Option<i64>,
     pub swaps_24h: usize,
     pub needs_login: Vec<String>,
+    /// A swap stopped half way and is not settled yet (`swap::finish_dead_swap`).
+    pub swap_unsettled: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -188,6 +190,8 @@ pub fn snapshot_at(store: &Store, paths: &Paths, now_ms: i64) -> Result<Snapshot
                 .filter(|c| c.account.state == AccountState::NeedsLogin)
                 .map(|c| c.account.label.clone())
                 .collect(),
+            swap_unsettled: swap::pending_swap(store)?.is_some()
+                && !crate::lock::is_held(&paths.swap_lock(), crate::lock::CLAUDE_STALE),
         },
         accounts,
         ranking,

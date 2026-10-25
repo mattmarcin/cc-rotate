@@ -38,6 +38,20 @@ pub fn spawn_swap(req: &SwapRequest, profile: Option<&Path>) -> Result<()> {
     )
 }
 
+/// Start `cc-rotate-ctl finish-swap` in the background: identifying the profile's login after a
+/// swap stopped half way runs Claude Code, which takes seconds the statusline does not have.
+pub fn spawn_finish_swap(profile: Option<&Path>) -> Result<()> {
+    spawn_ctl(
+        |cmd| {
+            if let Some(p) = profile {
+                cmd.arg("--profile").arg(p);
+            }
+            cmd.arg("finish-swap");
+        },
+        "starting the background settling of a swap",
+    )
+}
+
 /// Start `cc-rotate-ctl confirm-active` in the background: a usage check of the account in use,
 /// which takes a few seconds the statusline does not have.
 pub fn spawn_confirm(profile: Option<&Path>) -> Result<()> {

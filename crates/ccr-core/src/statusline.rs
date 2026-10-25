@@ -138,6 +138,9 @@ pub struct TickResult {
     /// background: readings at its limit keep coming that look like another account's, while
     /// none of its own arrived for a while.
     pub confirm: bool,
+    /// Start `cc-rotate-ctl finish-swap` in the background: a swap stopped half way and the
+    /// profile's login has to be identified (`swap::finish_dead_swap`).
+    pub finish_swap: bool,
 }
 
 /// One statusline tick in the rotation profile.
@@ -156,7 +159,12 @@ pub fn tick(store: &Store, paths: &Paths, input: &StatusInput, now_ms: i64) -> R
         },
     )?;
 
-    sync_profile_login(store, paths, &mut dead_login)?;
+    if !sync_profile_login(store, paths, &mut dead_login)? {
+        // Nothing can be trusted about the profile's login until the swap is settled.
+        result.finish_swap = settle_due(store, now_ms)?;
+        result.active = store.active_account()?;
+        return Ok(result);
+    }
 
     let Some(active) = store.active_account()? else {
         return Ok(result);
@@ -210,6 +218,34 @@ pub fn tick(store: &Store, paths: &Paths, input: &StatusInput, now_ms: i64) -> R
     Ok(result)
 }
 
+/// When a swap stopped half way, settling it runs Claude Code: ask at most once a minute (one of
+/// the processes noticing it at once does).
+const SETTLE_EVERY_MS: i64 = 60_000;
+const META_SETTLE_AT: &str = "dead_swap_settle_at";
+
+fn settle_due(store: &Store, now_ms: i64) -> Result<bool> {
+    store.immediate(|s| {
+        let due = s
+            .meta_i64(META_SETTLE_AT)?
+            .is_none_or(|t| now_ms - t >= SETTLE_EVERY_MS);
+        if due {
+            s.set_meta(META_SETTLE_AT, now_ms)?;
+        }
+        Ok(due)
+    })
+}
+
+/// Whether a swap stopped half way and it is time to try settling it again
+/// (`swap::finish_dead_swap` with the swap lock, which callers run off the hot path).
+pub fn needs_settling(store: &Store, paths: &Paths, now_ms: i64) -> Result<bool> {
+    if swap::pending_swap(store)?.is_none()
+        || crate::lock::is_held(&paths.swap_lock(), crate::lock::CLAUDE_STALE)
+    {
+        return Ok(false);
+    }
+    settle_due(store, now_ms)
+}
+
 /// Readings dropped as another account's may be the active account's after all, if the reset
 /// times known to be its own are wrong. When such a reading is at a limit and no reading of the
 /// active account itself came for `CONFIRM_QUIET_MS`, ask for a usage check of it (at most that
@@ -228,17 +264,31 @@ fn confirm_due(store: &Store, sample: &Sample, active_id: i64, now_ms: i64) -> R
     )
     .iter()
     .any(scheduler::WindowUsage::blocking);
+    if !blocking {
+        return Ok(false);
+    }
+    // The first such reading since the account became active asks at once, whatever it is: at a
+    // limit, a genuine reading can repeat another account's exactly (both at 100% with the same
+    // reset time), and only the account's own reading tells. After that, only a reading that is
+    // not a copy of another account's latest asks, after a quiet spell: a session idle since an
+    // earlier swap repeats that account's reading for as long as it idles, and asking again
+    // would not change anything.
+    let since = swap::active_since(store)?;
+    let frozen = swap::copies_another(sample, &swap::others_latest(store, active_id)?);
     let quiet = store
         .last_sample(active_id)?
         .is_none_or(|s| now_ms - s.ts > CONFIRM_QUIET_MS);
-    let asked = store
-        .meta_i64(META_CONFIRM_REQUESTED_AT)?
-        .is_some_and(|t| now_ms - t < CONFIRM_QUIET_MS);
-    if blocking && quiet && !asked {
-        store.set_meta(META_CONFIRM_REQUESTED_AT, now_ms)?;
-        return Ok(true);
-    }
-    Ok(false)
+    // One of the sessions ticking at once asks.
+    store.immediate(|s| {
+        let last = s.meta_i64(META_CONFIRM_REQUESTED_AT)?;
+        let first = last.is_none_or(|t| t < since);
+        let again = !frozen && quiet && last.is_none_or(|t| now_ms - t >= CONFIRM_QUIET_MS);
+        let ask = first || again;
+        if ask {
+            s.set_meta(META_CONFIRM_REQUESTED_AT, now_ms)?;
+        }
+        Ok(ask)
+    })
 }
 
 /// The throttling state a decision needs: the last swap, the last request, how long the active
@@ -325,7 +375,10 @@ pub fn sync(store: &Store, paths: &Paths) -> Result<Option<SwapRequest>> {
 
 pub fn sync_at(store: &Store, paths: &Paths, now_ms: i64) -> Result<Option<SwapRequest>> {
     let mut dead_login = false;
-    sync_profile_login(store, paths, &mut dead_login)?;
+    if !sync_profile_login(store, paths, &mut dead_login)? {
+        // Settled where it can take its time (`needs_settling`).
+        return Ok(None);
+    }
     // Best effort, like before a swap: an unreadable profile must not stop the write-back.
     let _ = crate::profile_usage::import(store, paths, now_ms);
     let Some(active) = store.active_account()? else {
@@ -347,34 +400,38 @@ pub fn sync_at(store: &Store, paths: &Paths, now_ms: i64) -> Result<Option<SwapR
 
 /// Keep the store's copy of the active login current, and notice when the login in the
 /// profile changed for reasons other than our own swaps.
-fn sync_profile_login(store: &Store, paths: &Paths, dead_login: &mut bool) -> Result<()> {
+/// Returns false when nothing could be synced because a swap stopped half way and the profile's
+/// login is not identified yet.
+fn sync_profile_login(store: &Store, paths: &Paths, dead_login: &mut bool) -> Result<bool> {
+    if swap::finish_dead_swap(store, paths, swap::Settler::Tick)? == swap::DeadSwap::Unsure {
+        return Ok(false);
+    }
     if adopt_manual_login(store, paths)? {
-        return Ok(());
+        return Ok(true);
     }
 
     let creds = paths.credentials();
     let Some(marker) = creds.change_marker()? else {
-        return Ok(());
+        return Ok(true);
     };
     if store.meta(META_CRED_SEEN)?.as_deref() == Some(marker.as_str()) {
-        return Ok(());
+        return Ok(true);
     }
     let Some(oauth) = creds.read_oauth()? else {
         store.set_meta(META_CRED_SEEN, &marker)?;
-        return Ok(());
+        return Ok(true);
     };
     // A swap writes the target's login before it commits; until then the store still names the
     // outgoing account as active, and the login in the file is not the outgoing account's. The
     // file is read first and the pending swap second: once the pending mark is gone, the commit
     // is done and the active account read next is the target. Leave the change unseen.
-    if credfile::oauth_fingerprint(&oauth).is_some()
-        && store.meta(swap::META_SWAP_PENDING_FP)? == credfile::oauth_fingerprint(&oauth)
-    {
-        return Ok(());
+    let file_fp = credfile::oauth_fingerprint(&oauth);
+    if file_fp.is_some() && swap::pending_swap(store)?.map(|p| p.fp) == file_fp {
+        return Ok(true);
     }
     let Some(active) = store.active_account()? else {
         store.set_meta(META_CRED_SEEN, &marker)?;
-        return Ok(());
+        return Ok(true);
     };
 
     if credfile::is_dead(&oauth) {
@@ -390,17 +447,21 @@ fn sync_profile_login(store: &Store, paths: &Paths, dead_login: &mut bool) -> Re
             store.set_meta(META_DEAD_LOGIN_SEEN, &marker)?;
         }
         // Leave the change unseen so every tick keeps requesting a swap until one lands.
-        return Ok(());
+        return Ok(true);
     }
 
+    // A swap may have written another login since the file was read (and committed, so the
+    // active account read above is already the new one): then this login is not that account's.
+    if creds.change_marker()?.as_deref() != Some(marker.as_str()) {
+        return Ok(true);
+    }
     let stored_fp = store.credential_meta(active.id)?.map(|m| m.refresh_fp);
-    let file_fp = credfile::oauth_fingerprint(&oauth);
     if file_fp.is_some() && file_fp != stored_fp {
         store.save_credential(active.id, &oauth, "sync")?;
         store.log_event(kind::SYNC, Some(active.id), None, Some("refreshed"), None)?;
     }
     store.set_meta(META_CRED_SEEN, &marker)?;
-    Ok(())
+    Ok(true)
 }
 
 /// If someone ran `/login` inside the rotation profile, `.claude.json` names a different

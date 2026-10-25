@@ -53,6 +53,19 @@ const DEFAULT_RETRY_AFTER_MS: i64 = 5 * 60_000;
 const MAX_RETRY_AFTER_MS: i64 = 3_600_000;
 /// A held-back account is checked again at most this often.
 const HELD_BACK_RETRY_MS: i64 = 5 * 60_000;
+/// How long an unreadable leftover is kept in case it becomes readable (20.3).
+const LEFTOVER_KEPT_MS: i64 = 3_600_000;
+/// `CLAUDE_CODE_*` variables kept for the check: how Claude Code reaches the network and finds
+/// Git Bash on Windows, which it needs to start.
+const KEPT_ENV: &[&str] = &[
+    "CLAUDE_CODE_GIT_BASH_PATH",
+    "CLAUDE_CODE_CERT_STORE",
+    "CLAUDE_CODE_CLIENT_CERT",
+    "CLAUDE_CODE_CLIENT_KEY",
+    "CLAUDE_CODE_CLIENT_KEY_PASSPHRASE",
+    "CLAUDE_CODE_HTTP_PROXY",
+    "CLAUDE_CODE_HTTPS_PROXY",
+];
 /// Names of scratch profiles: `check-<account id>-<start ms>-<uuid>`.
 const SCRATCH_PREFIX: &str = "check-";
 /// Scratch profiles of `confirm_active`: `confirm-<uuid>`. They hold a login that cannot be
@@ -147,6 +160,7 @@ impl CheckOutcome {
 #[derive(Debug, Default)]
 struct Run {
     exit_code: Option<i32>,
+    /// Killed before it finished: at the time limit, or because waiting for it failed.
     timed_out: bool,
     stdout: String,
     stderr: String,
@@ -236,7 +250,9 @@ pub fn next_due(store: &Store, paths: &Paths, now_ms: i64) -> Result<Option<i64>
     };
     for c in parked() {
         let st = state(store, c.account.id)?;
+        let waiting = st.not_before.is_some_and(|t| t > now_ms);
         if st.held_back
+            && !waiting
             && st
                 .last_attempt_at
                 .is_none_or(|t| now_ms - t > HELD_BACK_RETRY_MS)
@@ -295,7 +311,7 @@ fn check_with(
     }
     let mut st = state(store, account_id)?;
     let now = time::now_ms();
-    if trigger != Trigger::Manual && !st.held_back && st.not_before.is_some_and(|t| t > now) {
+    if trigger != Trigger::Manual && st.not_before.is_some_and(|t| t > now) {
         return skipped("waiting until the usage endpoint answers again");
     }
     // A skip below is about this account: count it as an attempt, so the background moves on
@@ -348,6 +364,24 @@ fn check_with(
         }
     };
 
+    // Not while a swap is pending (running, or stopped half way): which account the profile's
+    // login is, and so which stored logins are current, is not settled.
+    if swap::pending_swap(store)?.is_some() {
+        return attempted(store, "a swap is being settled");
+    }
+    // Never with the login the profile's sessions are using (a swap that stopped half way can
+    // leave a parked account's login there): whichever renewed it first would sign the other out.
+    let in_profile = paths
+        .credentials()
+        .read_oauth()
+        .ok()
+        .flatten()
+        .as_ref()
+        .and_then(credfile::oauth_fingerprint);
+    if in_profile.as_deref() == Some(stored.refresh_fp.as_str()) {
+        return attempted(store, "its login is the one the rotation profile is using");
+    }
+
     let started = time::now_ms();
     st.last_attempt_at = Some(started);
     save_state(store, account_id, &st)?;
@@ -358,8 +392,9 @@ fn check_with(
         // Settle whether the stored login still works: make Claude Code renew it.
         oauth["expiresAt"] = json!(0);
     }
-    credfile::write_oauth(&scratch.dir.join(".credentials.json"), &oauth)?;
+    // First, so a scratch profile without it is known never to have held the login (20.3).
     std::fs::write(scratch.dir.join(START_FP_FILE), &stored.refresh_fp)?;
+    credfile::write_oauth(&scratch.dir.join(".credentials.json"), &oauth)?;
 
     // From here on Claude Code may renew the login: keep the scratch profile until the outcome
     // is stored.
@@ -392,6 +427,9 @@ fn check_with(
     let timed_out = ran.as_ref().is_ok_and(|r| r.timed_out);
     let prompted = ran.as_ref().ok().and_then(|r| ran_as_prompt(&r.stdout));
 
+    // No login left at all: Claude Code removed the one it was given, so where a renewal went
+    // is unknown.
+    let vanished = left.is_none();
     let dead = left.as_ref().is_some_and(credfile::is_dead);
     let renewal = left
         .filter(|o| !credfile::is_dead(o))
@@ -434,12 +472,26 @@ fn check_with(
     if st.held_back && settled {
         st.held_back = false;
     }
-    if (timed_out || credman) && !settled {
+    if (timed_out || credman || vanished) && !settled {
         st.held_back = true;
     }
 
     let now = time::now_ms();
     store.immediate(|s| {
+        // `adopt_manual_login` changes an account without its lock (a `/login` in the profile):
+        // when its login or state changed meanwhile, this check's verdict on the old login is
+        // moot. Its reading of the account's usage still counts.
+        let unchanged = s
+            .credential_meta(account_id)?
+            .is_some_and(|m| m.refresh_fp == stored.refresh_fp)
+            && s.account(account_id)?.is_some_and(|a| {
+                matches!(a.state, AccountState::Parked | AccountState::Paused)
+            });
+        let (renewal, dead, wrong_account) = if unchanged {
+            (renewal.clone(), dead, wrong_account.clone())
+        } else {
+            (None, false, None)
+        };
         if let Some(oauth) = &renewal {
             s.save_credential(account_id, oauth, SOURCE)?;
             s.log_event(kind::SYNC, Some(account_id), None, Some("usage_check"), None)?;
@@ -491,7 +543,13 @@ fn check_with(
             // Routine: the endpoint allows a reading now and then, not a problem to report.
             CheckOutcome::RateLimited { until } => st.not_before = Some(*until),
             CheckOutcome::Failed { why } => {
-                st.not_before = Some(now + s.settings()?.usage_check_interval_s * 1000);
+                // A held-back account is tried again soon: it is out of use until settled.
+                let back_off = if st.held_back {
+                    HELD_BACK_RETRY_MS
+                } else {
+                    s.settings()?.usage_check_interval_s * 1000
+                };
+                st.not_before = Some(now + back_off);
                 st.problem = Some(why.clone());
             }
             CheckOutcome::LoginRejected => {
@@ -528,13 +586,21 @@ fn block(store: &Store, reason: &str) -> Result<()> {
     Ok(())
 }
 
-/// Why a result is not that of the `/usage` command: Claude Code ran the text as a prompt (a
-/// model request, using the account's quota), which no check may ever do again.
+/// Why a result shows that Claude Code ran the text as a prompt (a model request, using the
+/// account's quota) instead of its `/usage` command, which no check may ever do again. Only a
+/// turn or a cost counts as evidence; an error result or a field Claude Code renamed does not.
 fn ran_as_prompt(stdout: &str) -> Option<String> {
     let result: Value = serde_json::from_str(stdout.trim()).ok()?;
     let turns = result.get("num_turns").and_then(Value::as_i64).unwrap_or(0);
-    let command = result.get("local_command").and_then(Value::as_str);
-    (turns > 0 || command != Some("usage")).then(|| {
+    let cost = result
+        .get("total_cost_usd")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let output = result
+        .pointer("/usage/output_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    (turns > 0 || cost > 0.0 || output > 0).then(|| {
         "Claude Code ran /usage as a prompt instead of its own command, which uses the account's limits".to_string()
     })
 }
@@ -548,10 +614,17 @@ pub enum Recovery {
     Busy(String),
 }
 
-/// Settle what earlier checks of this account that died left in their scratch profiles: a
-/// renewed login is stored and a rejected one marks the account, as long as the stored login is
-/// still the one the check started from (`start.fp`); otherwise (a re-login since) the leftover
-/// is stale and discarded. Call with the account's lock held.
+/// Settle what earlier checks of this account that did not finish left in their scratch
+/// profiles. Call with the account's lock held.
+///
+/// A leftover means the check never stored its outcome, so Claude Code may have renewed the
+/// login, retiring the stored one, without that being recorded. One from a check that started
+/// from a login stored before the one stored now (a re-login since) is stale and discarded
+/// unread. Otherwise a renewal in it is stored, a rejected login marks the account, and anything
+/// else (the login unchanged, none at all) leaves the doubt: the account is held back, and its
+/// next check makes Claude Code renew to settle it. A leftover whose login cannot be read is kept
+/// (the account counts as busy) for `LEFTOVER_KEPT_MS`, in case it becomes readable, then given
+/// up on the same way.
 pub fn recover(store: &Store, paths: &Paths, account_id: i64) -> Result<Recovery> {
     let prefix = format!("{SCRATCH_PREFIX}{account_id}-");
     for dir in scratch_dirs(paths, &prefix) {
@@ -560,56 +633,82 @@ pub fn recover(store: &Store, paths: &Paths, account_id: i64) -> Result<Recovery
                 "a usage check of this account is still running".into(),
             ));
         }
-        let left = match Credentials::for_profile(&dir).read_oauth() {
-            Ok(left) => left,
-            Err(_) => {
-                hold_back(store, account_id)?;
-                return Ok(Recovery::Busy(
-                    "the login an earlier usage check left cannot be read yet".into(),
-                ));
-            }
+        let Some(stored) = store.credential_meta(account_id)? else {
+            remove_scratch(&dir);
+            continue;
         };
+        // Written before the login itself: without it, Claude Code never got the login.
         let start = std::fs::read_to_string(dir.join(START_FP_FILE))
             .ok()
             .map(|s| s.trim().to_string());
-        let stored = store.credential_meta(account_id)?;
-        match (left, start, stored) {
-            (Some(oauth), Some(start), Some(stored)) if stored.refresh_fp == start => {
-                if credfile::is_dead(&oauth) {
-                    store.immediate(|s| {
-                        s.set_state(account_id, AccountState::NeedsLogin)?;
-                        s.log_event(
-                            kind::DEAD_LOGIN,
-                            Some(account_id),
-                            None,
-                            Some("usage_check"),
-                            None,
-                        )
-                        .map(drop)
-                    })?;
-                } else if credfile::oauth_fingerprint(&oauth).as_deref() != Some(start.as_str()) {
-                    store.immediate(|s| {
-                        s.save_credential(account_id, &oauth, SOURCE)?;
-                        s.log_event(kind::SYNC, Some(account_id), None, Some("recovered"), None)?;
-                        let mut st = state(s, account_id)?;
-                        st.held_back = false;
-                        save_state(s, account_id, &st)
-                    })?;
+        if start.as_deref() != Some(stored.refresh_fp.as_str()) {
+            remove_scratch(&dir);
+            continue;
+        }
+        match Credentials::for_profile(&dir).read_oauth() {
+            Ok(Some(oauth)) if credfile::is_dead(&oauth) => {
+                store.immediate(|s| {
+                    s.set_state(account_id, AccountState::NeedsLogin)?;
+                    s.log_event(
+                        kind::DEAD_LOGIN,
+                        Some(account_id),
+                        None,
+                        Some("usage_check"),
+                        None,
+                    )
+                    .map(drop)
+                })?;
+            }
+            Ok(Some(oauth))
+                if credfile::oauth_fingerprint(&oauth).as_deref()
+                    != Some(stored.refresh_fp.as_str()) =>
+            {
+                store.immediate(|s| {
+                    s.save_credential(account_id, &oauth, SOURCE)?;
+                    s.log_event(kind::SYNC, Some(account_id), None, Some("recovered"), None)?;
+                    let mut st = state(s, account_id)?;
+                    st.held_back = false;
+                    save_state(s, account_id, &st)
+                })?;
+            }
+            Ok(_) => hold_back(store, account_id)?,
+            Err(_) => {
+                hold_back(store, account_id)?;
+                if time::now_ms() - started_at(&dir).unwrap_or(0) < LEFTOVER_KEPT_MS {
+                    return Ok(Recovery::Busy(
+                        "the login an earlier usage check left cannot be read yet".into(),
+                    ));
                 }
             }
-            // A re-login stored a newer login since the check began: what it left is stale.
-            (_, Some(_), Some(_)) => {}
-            // Nothing to judge by (no login left, or no record of the start): the stored login
-            // may be retired, so settle it with the next check.
-            (_, _, Some(_)) => hold_back(store, account_id)?,
-            (_, _, None) => {}
         }
         remove_scratch(&dir);
     }
     Ok(Recovery::Clean)
 }
 
-fn hold_back(store: &Store, account_id: i64) -> Result<()> {
+/// When a check's scratch profile was created (from its name).
+fn started_at(dir: &Path) -> Option<i64> {
+    dir.file_name()?
+        .to_str()?
+        .strip_prefix(SCRATCH_PREFIX)?
+        .split('-')
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+/// Delete what earlier checks of this account left (after a fresh login supersedes the login
+/// they ran with). Call with the account's lock held.
+pub fn discard_leftovers(paths: &Paths, account_id: i64) {
+    for dir in scratch_dirs(paths, &format!("{SCRATCH_PREFIX}{account_id}-")) {
+        if !running(&dir) {
+            remove_scratch(&dir);
+        }
+    }
+}
+
+/// Keep an account out of use until a check settles whether its login still works.
+pub(crate) fn hold_back(store: &Store, account_id: i64) -> Result<()> {
     let mut st = state(store, account_id)?;
     if !st.held_back {
         st.held_back = true;
@@ -762,12 +861,89 @@ fn confirm_with(
     Ok(CheckOutcome::Read { windows })
 }
 
-/// Whether the Claude Code a scratch profile records as started is still running.
-fn running(dir: &Path) -> bool {
-    std::fs::read_to_string(dir.join(PID_FILE))
+/// The account a login belongs to, as Claude Code reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Who {
+    pub uuid: Option<String>,
+    pub email: Option<String>,
+    pub org_uuid: Option<String>,
+}
+
+/// Which account the rotation profile's login belongs to, as Claude Code reports it: run with a
+/// copy of it whose refresh token is removed (so Claude Code cannot renew it), and read the
+/// identity Claude Code fetched for it. `None` when that cannot be told now (no login, an access
+/// token about to expire, Claude Code failing).
+pub fn identify_profile_login(store: &Store, paths: &Paths) -> Result<Option<Who>> {
+    identify_with(store, paths, &|scratch| {
+        run_claude(
+            &login::claude_executable(store)?,
+            scratch,
+            BEFORE_SWAP_TIMEOUT,
+        )
+    })
+}
+
+fn identify_with(
+    store: &Store,
+    paths: &Paths,
+    run: &dyn Fn(&Path) -> Result<Run>,
+) -> Result<Option<Who>> {
+    if blocked(store)?.is_some() {
+        return Ok(None);
+    }
+    let Some(mut oauth) = paths.credentials().read_oauth()? else {
+        return Ok(None);
+    };
+    let expires = oauth.get("expiresAt").and_then(Value::as_i64).unwrap_or(0);
+    if credfile::is_dead(&oauth) || expires < time::now_ms() + 120_000 {
+        return Ok(None);
+    }
+    oauth["refreshToken"] = json!("");
+    let scratch = Scratch::create(paths, CONFIRM_PREFIX, None)?;
+    credfile::write_oauth(&scratch.dir.join(".credentials.json"), &oauth)?;
+    let ran = run(&scratch.dir);
+    if let Some(why) = ran.as_ref().ok().and_then(|r| ran_as_prompt(&r.stdout)) {
+        block(store, &why)?;
+        return Ok(None);
+    }
+    Ok(credfile::read_document(&scratch.dir.join(".claude.json"))
         .ok()
-        .and_then(|p| p.trim().parse::<u32>().ok())
-        .is_some_and(process::alive)
+        .flatten()
+        .and_then(|doc| {
+            let account = doc.get("oauthAccount")?;
+            let text = |k: &str| {
+                account
+                    .get(k)
+                    .and_then(Value::as_str)
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_string)
+            };
+            let who = Who {
+                uuid: text("accountUuid"),
+                email: text("emailAddress"),
+                org_uuid: text("organizationUuid"),
+            };
+            (who.uuid.is_some() || who.email.is_some()).then_some(who)
+        }))
+}
+
+/// Whether the Claude Code a scratch profile records as started is still running: a process
+/// with that id and the same start time (ids are reused).
+fn running(dir: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(dir.join(PID_FILE)) else {
+        return false;
+    };
+    let mut parts = text.trim().splitn(2, ' ');
+    let Some(pid) = parts.next().and_then(|p| p.parse::<u32>().ok()) else {
+        return false;
+    };
+    let started = parts.next().unwrap_or_default();
+    if process::alive(pid) {
+        // Without a recorded start time (it could not be read), being alive has to do.
+        return started.is_empty() || process::start_time(pid).as_deref() == Some(started);
+    }
+    // The first process is gone, but on Unix what it started runs on in its process group.
+    cfg!(unix) && process::group_alive(pid)
 }
 
 fn scratch_dirs(paths: &Paths, prefix: &str) -> Vec<PathBuf> {
@@ -833,7 +1009,7 @@ fn run_claude(claude: &Path, scratch: &Path, timeout: Duration) -> Result<Run> {
         .stderr(Stdio::from(err));
     for (key, _) in std::env::vars_os() {
         let name = key.to_string_lossy();
-        if SCRUBBED_PREFIXES.iter().any(|p| name.starts_with(p)) {
+        if SCRUBBED_PREFIXES.iter().any(|p| name.starts_with(p)) && !KEPT_ENV.contains(&&*name) {
             cmd.env_remove(&key);
         }
     }
@@ -848,20 +1024,27 @@ fn run_claude(claude: &Path, scratch: &Path, timeout: Duration) -> Result<Run> {
     }
     let mut tree =
         Tree::spawn(&mut cmd).with_context(|| format!("running {}", claude.display()))?;
-    std::fs::write(scratch.join(PID_FILE), tree.id().to_string())?;
+    // From here on no error returns early: Claude Code may be renewing the login, and an error
+    // that stops it counts as an interruption (`timed_out`), which holds the account back.
+    let started = process::start_time(tree.id()).unwrap_or_default();
+    let _ = std::fs::write(scratch.join(PID_FILE), format!("{} {started}", tree.id()));
     let deadline = Instant::now() + timeout;
     let mut run = Run::default();
     loop {
-        if let Some(status) = tree.try_wait()? {
-            run.exit_code = status.code();
-            break;
+        match tree.try_wait() {
+            Ok(Some(status)) => {
+                run.exit_code = status.code();
+                break;
+            }
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            _ => {
+                tree.kill();
+                run.timed_out = true;
+                break;
+            }
         }
-        if Instant::now() >= deadline {
-            tree.kill();
-            run.timed_out = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
     }
     // Whatever it started and left running goes with it.
     drop(tree);
@@ -1286,7 +1469,8 @@ mod tests {
                 ..Default::default()
             })(dir)
         };
-        let out = check_with(&e.store, &e.paths, a, Trigger::Background, &settle).unwrap();
+        // (The user asking now; the background would wait for the retry after a failure.)
+        let out = check_with(&e.store, &e.paths, a, Trigger::Manual, &settle).unwrap();
         assert!(matches!(out, CheckOutcome::Read { .. }), "{out:?}");
         assert_eq!(expiry.into_inner().unwrap(), Some(0));
         assert!(!state(&e.store, a).unwrap().held_back);
@@ -1326,44 +1510,153 @@ mod tests {
         ));
     }
 
+    /// A check's leftover: its start fingerprint, then (optionally) the login it left.
+    fn leave(
+        e: &Env,
+        a: i64,
+        tag: &str,
+        started: i64,
+        start_fp: &str,
+        login: Option<&str>,
+    ) -> PathBuf {
+        let dir = e
+            .paths
+            .staging_root()
+            .join(format!("{SCRATCH_PREFIX}{a}-{started}-{tag}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(START_FP_FILE), start_fp).unwrap();
+        if let Some(text) = login {
+            std::fs::write(dir.join(".credentials.json"), text).unwrap();
+        }
+        dir
+    }
+
+    fn login_text(tag: &str) -> String {
+        json!({ "claudeAiOauth": oauth(tag) }).to_string()
+    }
+
     #[test]
-    fn recovery_follows_the_login_the_check_started_from() {
+    fn recovery_stores_a_renewal_the_check_left() {
         let e = env();
         let a = account(&e, "a", "ua", AccountState::Parked);
         let start = e.store.credential_meta(a).unwrap().unwrap().refresh_fp;
-        let leave = |tag: &str, start_fp: &str, oauth: &Value| {
-            let dir = e
-                .paths
-                .staging_root()
-                .join(format!("{SCRATCH_PREFIX}{a}-1-{tag}"));
-            credfile::write_oauth(&dir.join(".credentials.json"), oauth).unwrap();
-            std::fs::write(dir.join(START_FP_FILE), start_fp).unwrap();
-            dir
-        };
-        // Started from the stored login and renewed it: recovered.
-        let renewed = leave("x", &start, &oauth("a-renewed"));
-        recover(&e.store, &e.paths, a).unwrap();
+        let dir = leave(&e, a, "x", 1, &start, Some(&login_text("a-renewed")));
+        assert_eq!(recover(&e.store, &e.paths, a).unwrap(), Recovery::Clean);
         assert_eq!(
             e.store.credential(a).unwrap().unwrap().oauth["refreshToken"],
             "refresh-a-renewed"
         );
-        assert!(!renewed.exists());
-        // Started from a login stored before a re-login: stale, discarded.
-        let stale = leave("y", &start, &oauth("a-older"));
+        assert!(!dir.exists() && !state(&e.store, a).unwrap().held_back);
+    }
+
+    #[test]
+    fn a_leftover_that_settles_nothing_holds_the_account_back() {
+        let e = env();
+        let a = account(&e, "a", "ua", AccountState::Parked);
+        let start = e.store.credential_meta(a).unwrap().unwrap().refresh_fp;
+        // The login unchanged: the check never committed, so a renewal may have been lost.
+        let unchanged = leave(&e, a, "x", 1, &start, Some(&login_text("a")));
+        assert_eq!(recover(&e.store, &e.paths, a).unwrap(), Recovery::Clean);
+        assert!(!unchanged.exists());
+        assert!(state(&e.store, a).unwrap().held_back);
+
+        // No login left at all.
+        forget(&e.store, a).unwrap();
+        leave(&e, a, "y", 1, &start, None);
         recover(&e.store, &e.paths, a).unwrap();
-        assert_eq!(
-            e.store.credential(a).unwrap().unwrap().oauth["refreshToken"],
-            "refresh-a-renewed"
+        assert!(state(&e.store, a).unwrap().held_back);
+    }
+
+    #[test]
+    fn a_leftover_from_before_a_relogin_is_discarded_unread() {
+        let e = env();
+        let a = account(&e, "a", "ua", AccountState::Parked);
+        let dir = leave(&e, a, "x", 1, "an-older-login", Some("{\"claudeAi"));
+        assert_eq!(recover(&e.store, &e.paths, a).unwrap(), Recovery::Clean);
+        assert!(!dir.exists());
+        assert!(!state(&e.store, a).unwrap().held_back);
+        // Without a start fingerprint, Claude Code never got the login either.
+        let no_start = e
+            .paths
+            .staging_root()
+            .join(format!("{SCRATCH_PREFIX}{a}-1-z"));
+        std::fs::create_dir_all(&no_start).unwrap();
+        recover(&e.store, &e.paths, a).unwrap();
+        assert!(!no_start.exists() && !state(&e.store, a).unwrap().held_back);
+    }
+
+    #[test]
+    fn an_unreadable_leftover_is_kept_a_while_then_given_up() {
+        let e = env();
+        let a = account(&e, "a", "ua", AccountState::Parked);
+        let start = e.store.credential_meta(a).unwrap().unwrap().refresh_fp;
+        let recent = leave(&e, a, "x", time::now_ms(), &start, Some("{\"claudeAi"));
+        assert!(matches!(
+            recover(&e.store, &e.paths, a).unwrap(),
+            Recovery::Busy(_)
+        ));
+        assert!(recent.exists() && state(&e.store, a).unwrap().held_back);
+        std::fs::remove_dir_all(&recent).unwrap();
+
+        let old = leave(
+            &e,
+            a,
+            "y",
+            time::now_ms() - LEFTOVER_KEPT_MS - 1,
+            &start,
+            Some("{\"claudeAi"),
         );
-        assert!(!stale.exists());
-        // Its Claude Code still runs: left alone, and the account is busy.
-        let live = leave("z", "whatever", &oauth("a-live"));
-        std::fs::write(live.join(PID_FILE), std::process::id().to_string()).unwrap();
+        assert_eq!(recover(&e.store, &e.paths, a).unwrap(), Recovery::Clean);
+        assert!(!old.exists());
+        assert!(
+            state(&e.store, a).unwrap().held_back,
+            "the next check settles it by renewing"
+        );
+    }
+
+    #[test]
+    fn a_still_running_check_is_left_alone_but_a_reused_process_id_is_not() {
+        let e = env();
+        let a = account(&e, "a", "ua", AccountState::Parked);
+        let start = e.store.credential_meta(a).unwrap().unwrap().refresh_fp;
+        let me = std::process::id();
+        let live = leave(&e, a, "x", 1, &start, Some(&login_text("a")));
+        let started = process::start_time(me).unwrap();
+        std::fs::write(live.join(PID_FILE), format!("{me} {started}")).unwrap();
         assert!(matches!(
             recover(&e.store, &e.paths, a).unwrap(),
             Recovery::Busy(_)
         ));
         assert!(live.exists());
+
+        // The same id, but another process (it started at another time).
+        std::fs::write(live.join(PID_FILE), format!("{me} 12345")).unwrap();
+        assert_eq!(recover(&e.store, &e.paths, a).unwrap(), Recovery::Clean);
+        assert!(!live.exists());
+    }
+
+    /// A `/login` in the profile changed the account while its check ran: the check's verdict on
+    /// the old login is not stored over the fresh one.
+    #[test]
+    fn a_check_does_not_overwrite_a_login_that_changed_meanwhile() {
+        let e = env();
+        let a = account(&e, "a", "ua", AccountState::Parked);
+        let run = |dir: &Path| {
+            e.store
+                .save_credential(a, &oauth("a-fresh"), "sync")
+                .unwrap();
+            fake(Fake {
+                stamp: Some("ua".into()),
+                renew: Some(Some(oauth("a-renewed-old"))),
+                ..Default::default()
+            })(dir)
+        };
+        let out = check_with(&e.store, &e.paths, a, Trigger::Manual, &run).unwrap();
+        assert!(matches!(out, CheckOutcome::Read { .. }), "{out:?}");
+        assert_eq!(
+            e.store.credential(a).unwrap().unwrap().oauth["refreshToken"],
+            "refresh-a-fresh"
+        );
     }
 
     #[test]
@@ -1551,7 +1844,15 @@ mod tests {
         );
         assert_eq!(ran_as_prompt(USAGE_RESULT), None);
         assert!(ran_as_prompt(r#"{"num_turns":2}"#).is_some());
+        assert!(ran_as_prompt(r#"{"num_turns":0,"total_cost_usd":0.04}"#).is_some());
         assert_eq!(ran_as_prompt(""), None, "no result to judge");
+        assert_eq!(
+            ran_as_prompt(
+                r#"{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":0}"#
+            ),
+            None,
+            "an error is not a prompt"
+        );
         assert_eq!(
             describe(&CheckOutcome::Read {
                 windows: vec![SampleWindow {

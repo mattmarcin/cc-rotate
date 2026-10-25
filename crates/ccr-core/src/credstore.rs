@@ -122,6 +122,16 @@ impl Credentials {
         Ok(credfile::mtime_ms(&self.file).map(|m| m.to_string()))
     }
 
+    /// Whether what `read_raw` returns is all there is: false on macOS while the Keychain cannot
+    /// be used (locked, or no GUI session), when the file fallback may be stale or missing while
+    /// Claude Code keeps the live login in the Keychain.
+    pub fn complete(&self) -> Result<bool> {
+        match &self.keychain {
+            Some(keychain) => keychain.usable(),
+            None => Ok(true),
+        }
+    }
+
     /// Delete the Keychain item, if any (for staging profiles, which are thrown away).
     pub fn delete_keychain_item(&self) -> Result<()> {
         match &self.keychain {
@@ -240,6 +250,22 @@ impl Keychain {
             );
         }
         Ok(())
+    }
+
+    /// Whether the Keychain can be read now (an item or not); false while it is locked or there
+    /// is no GUI session.
+    pub fn usable(&self) -> Result<bool> {
+        let (code, _) = self.security(
+            &[
+                "find-generic-password",
+                "-a",
+                &self.account,
+                "-s",
+                &self.service,
+            ],
+            None,
+        )?;
+        Ok(code != INTERACTION_NOT_ALLOWED)
     }
 
     pub fn delete(&self) -> Result<()> {
