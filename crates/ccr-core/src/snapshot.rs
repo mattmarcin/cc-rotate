@@ -231,3 +231,61 @@ pub fn recent_events(store: &Store, limit: usize) -> Result<Vec<Event>> {
 pub fn series(store: &Store, since_ms: i64) -> Result<Vec<Sample>> {
     store.samples_since(since_ms)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{AccountIdentity, SampleWindow};
+
+    /// `cc-rotate-ctl watch` redraws from snapshots every few seconds, so building one must never
+    /// write to the store or touch the profile.
+    #[test]
+    fn a_snapshot_never_writes() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path().join("data"), root.path().join("profile"));
+        let store = Store::open(&paths.data_dir.join("store.db")).unwrap();
+        let now = time::now_ms();
+        for (i, state) in [
+            AccountState::Active,
+            AccountState::Parked,
+            AccountState::Paused,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = store
+                .insert_account(
+                    &format!("a{i}"),
+                    &AccountIdentity {
+                        account_uuid: Some(format!("u{i}")),
+                        ..Default::default()
+                    },
+                    state,
+                )
+                .unwrap();
+            store
+                .record_sample(&Sample {
+                    ts: now - 60_000,
+                    account_id: id,
+                    profile: "rotate".into(),
+                    session_id: None,
+                    model: None,
+                    windows: vec![SampleWindow {
+                        name: "five_hour".into(),
+                        pct: 99.0,
+                        resets_at: Some(now / 1000 + 3600),
+                    }],
+                })
+                .unwrap();
+            store
+                .log_event(kind::SWAP, None, Some(id), Some("manual"), None)
+                .unwrap();
+        }
+        let before = store.conn().total_changes();
+        let snap = snapshot(&store, &paths).unwrap();
+        recent_events(&store, 10).unwrap();
+        assert_eq!(snap.accounts.len(), 3);
+        assert_eq!(store.conn().total_changes(), before, "no row written");
+        assert!(!paths.profile_dir.exists(), "the profile is left alone");
+    }
+}
