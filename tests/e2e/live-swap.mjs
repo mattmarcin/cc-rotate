@@ -6,22 +6,37 @@
 // account, so the test can tell which account served each turn without trusting cc-rotate.
 //
 // Usage (needs at least two accounts in the pool; uses a few tiny requests per account):
-//   node tests/e2e/live-swap.mjs <labelA> <labelB> [--force-refresh]
+//   node tests/e2e/live-swap.mjs <labelA> <labelB> [--force-refresh] [--settle <seconds>]
 //
 // --force-refresh marks the first account's access token as expired just before swapping away,
 // so swapping back makes Claude Code renew a parked login from the stored refresh token (E3).
+// It edits `.credentials.json`, so it is not available on macOS, where the login lives in the
+// Keychain. Never use it with a login that another machine or profile also holds: the renewal
+// retires the other copies.
+//
+// --settle waits after each swap before the next turn. Claude Code caches the macOS Keychain for
+// 30 s, so it defaults to 35 on macOS and 0 elsewhere.
 
 import { spawn, execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
-const [labelA, labelB] = process.argv.slice(2).filter((a) => !a.startsWith("--"));
-const forceRefresh = process.argv.includes("--force-refresh");
-if (!labelA || !labelB) {
-  console.error("usage: node tests/e2e/live-swap.mjs <labelA> <labelB> [--force-refresh]");
+const argv = process.argv.slice(2);
+const settleAt = argv.indexOf("--settle");
+const settleSeconds = settleAt >= 0 ? Number(argv[settleAt + 1]) : process.platform === "darwin" ? 35 : 0;
+const positional = argv.filter((a, i) => !a.startsWith("--") && !(settleAt >= 0 && i === settleAt + 1));
+const [labelA, labelB] = positional;
+const forceRefresh = argv.includes("--force-refresh");
+if (!labelA || !labelB || !Number.isFinite(settleSeconds)) {
+  console.error("usage: node tests/e2e/live-swap.mjs <labelA> <labelB> [--force-refresh] [--settle <seconds>]");
   process.exit(2);
 }
+if (forceRefresh && process.platform === "darwin") {
+  console.error("--force-refresh edits .credentials.json and is not available on macOS");
+  process.exit(2);
+}
+const settle = () => new Promise((resolve) => setTimeout(resolve, settleSeconds * 1000));
 
 const ctl = (...args) => execFileSync("cc-rotate-ctl", args, { encoding: "utf8" }).trim();
 const profile = ctl("config", "profile_dir") || join(homedir(), ".claude-rotate");
@@ -71,15 +86,18 @@ function startClaude() {
   };
 }
 
+/// The reset times of every window the serving account reported, e.g. "five_hour@1793...".
+/// Accounts start their windows at different moments, so these identify the account. Not every
+/// plan has every window (some have no weekly limit), so all reported windows are compared.
 function fingerprint(limits) {
   const info = limits.findLast((l) => l?.unifiedWindows) ?? limits.at(-1);
   if (!info) return null;
-  const w = info.unifiedWindows ?? {};
-  return {
-    weekReset: w.seven_day?.resetsAt ?? null,
-    fiveReset: w.five_hour?.resetsAt ?? null,
-    weekUsed: w.seven_day?.utilization ?? null,
-  };
+  const windows = Object.entries(info.unifiedWindows ?? {})
+    .filter(([, w]) => w && Number.isFinite(w.resetsAt))
+    .map(([name, w]) => `${name}@${w.resetsAt}`)
+    .sort();
+  if (windows.length === 0 && Number.isFinite(info.resetsAt)) windows.push(`${info.rateLimitType ?? "limit"}@${info.resetsAt}`);
+  return windows.length ? windows.join(" ") : null;
 }
 
 function expireActiveLogin() {
@@ -100,26 +118,28 @@ try {
   const t1 = await claude.turn("Reply with the single word: one");
   const fpA = fingerprint(t1.limits);
   check("turn 1 succeeded on " + labelA, !t1.result.is_error, t1.result.subtype);
-  check("turn 1 reported its limits", !!fpA?.weekReset, JSON.stringify(fpA));
+  check("turn 1 reported its limits", !!fpA, `${fpA}`);
 
   if (forceRefresh) expireActiveLogin();
   const swapOut = ctl("swap", "--to", labelB);
   check(`swapped to ${labelB}`, swapOut.includes(labelB), swapOut);
+  await settle();
 
   const t2 = await claude.turn("Reply with the single word: two");
   const fpB = fingerprint(t2.limits);
   check("turn 2 succeeded in the same process", !t2.result.is_error, t2.result.subtype);
   check(
     "turn 2 was served by a different account (same process, no restart)",
-    !!fpB?.weekReset && fpB.weekReset !== fpA?.weekReset,
-    `A week reset ${fpA?.weekReset}, B week reset ${fpB?.weekReset}`,
+    !!fpB && fpB !== fpA,
+    `A ${fpA}, B ${fpB}`,
   );
 
   ctl("swap", "--to", labelA);
+  await settle();
   const t3 = await claude.turn("Reply with the single word: three");
   const fpA2 = fingerprint(t3.limits);
   check("turn 3 succeeded after swapping back", !t3.result.is_error, t3.result.subtype);
-  check("turn 3 was served by the first account again", fpA2?.weekReset === fpA?.weekReset, `week reset ${fpA2?.weekReset}`);
+  check("turn 3 was served by the first account again", !!fpA2 && fpA2 === fpA, `${fpA2}`);
 } finally {
   claude.close();
 }
