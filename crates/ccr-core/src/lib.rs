@@ -10,6 +10,7 @@ pub mod herdr;
 pub mod lock;
 pub mod login;
 pub mod paths;
+pub mod plan;
 pub mod profile_account;
 pub mod profiles;
 pub mod scheduler;

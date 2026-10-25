@@ -39,6 +39,8 @@ fn main() {
             commands::set_paused,
             commands::remove_account,
             commands::rename_account,
+            commands::set_order,
+            commands::set_weekly_limit,
             commands::doctor,
             commands::other_profiles,
             commands::set_setting,

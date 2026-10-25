@@ -18,13 +18,19 @@ use serde_json::json;
 
 use crate::lock::{DirLock, LockError, LockOptions};
 use crate::paths::Paths;
-use crate::scheduler::{self, Candidate, Reason, Thresholds, Usage};
+use crate::scheduler::{self, Candidate, Policy, Reason, WeeklyEvidence, WeeklyLimit, WindowKind};
 use crate::store::{Account, AccountState, Store, kind};
 use crate::{credfile, secret, time};
 
 pub const META_LAST_SWAP_AT: &str = "last_swap_at";
-pub const META_LAST_SWAP_FROM_FIVE_RESETS: &str = "last_swap_from_five_resets";
-pub const META_LAST_SWAP_FROM_WEEK_RESETS: &str = "last_swap_from_week_resets";
+/// The reset times (comma-separated epoch seconds) of every window in the outgoing account's
+/// last reading, for the stale-reading guard after a swap.
+pub const META_LAST_SWAP_FROM_RESETS: &str = "last_swap_from_resets";
+/// When the active account became active: a swap, or a login adopted from the profile.
+pub const META_ACTIVE_SINCE: &str = "active_since";
+/// The model id the rotation profile's sessions last reported, which decides whether a window
+/// scoped to one model family applies.
+pub const META_PROFILE_MODEL: &str = "profile_model_seen";
 /// The credentials change marker (`Credentials::change_marker`) last seen. Named for the file
 /// mtime it held before the marker could also be a Keychain fingerprint.
 pub const META_CRED_SEEN: &str = "cred_mtime_seen";
@@ -55,30 +61,69 @@ pub enum SwapOutcome {
     PoolExhausted,
 }
 
-/// Every account with its effective usage at `now_s`.
-pub fn usage_by_account(store: &Store, now_s: i64) -> Result<Vec<(Account, Usage)>> {
-    store
-        .accounts()?
-        .into_iter()
-        .map(|a| {
-            let usage = Usage::from_sample(store.last_sample(a.id)?.as_ref(), now_s);
-            Ok((a, usage))
-        })
-        .collect()
+/// Every account as the scheduler sees it at `now_s`, in the user's order, with the policy
+/// from the settings.
+pub fn load_pool(store: &Store, now_s: i64) -> Result<(Vec<Candidate>, Policy)> {
+    let policy = Policy::from(&store.settings()?);
+    let model = store.meta(META_PROFILE_MODEL)?;
+    let accounts = store.accounts()?;
+    // Places in the order; accounts at the same position (stores upgraded from `priority`,
+    // which was usually 0 for all) share a place.
+    let mut positions: Vec<i64> = accounts.iter().map(|a| a.position).collect();
+    positions.dedup();
+    let mut pool = Vec::new();
+    for account in accounts {
+        let order = positions
+            .iter()
+            .position(|&p| p == account.position)
+            .unwrap_or_default();
+        let sample = store.last_sample(account.id)?;
+        let windows =
+            scheduler::window_usage(sample.as_ref(), now_s, policy.thresholds, model.as_deref());
+        let detected = detect_weekly_limit(store, account.id, now_s)?;
+        pool.push(Candidate {
+            weekly_limit: scheduler::weekly_limit(account.weekly_limit, detected),
+            weekly_detected: detected,
+            windows,
+            order,
+            account,
+        });
+    }
+    Ok((pool, policy))
+}
+
+/// What the account's recorded usage says about its weekly limit (`scheduler::WeeklyEvidence`).
+pub fn detect_weekly_limit(store: &Store, account_id: i64, now_s: i64) -> Result<WeeklyLimit> {
+    let names = store.window_names(account_id)?;
+    let mut session_resets = Vec::new();
+    for name in &names {
+        let spec = scheduler::classify(name);
+        if spec.kind == WindowKind::Session && spec.all_models() {
+            session_resets.extend(store.window_resets_since(
+                account_id,
+                name,
+                now_s - scheduler::NO_LIMIT_LOOKBACK_S,
+            )?);
+        }
+    }
+    Ok(scheduler::detect_weekly_limit(
+        WeeklyEvidence::from_history(&names, &session_resets),
+    ))
 }
 
 /// The account the scheduler would pick right now, excluding `exclude`.
 pub fn next_target(store: &Store, exclude: Option<i64>) -> Result<Option<Account>> {
-    let thresholds = Thresholds::from(&store.settings()?);
-    let pool = usage_by_account(store, time::now_s())?;
-    let cands: Vec<Candidate> = pool
-        .iter()
-        .map(|(a, u)| Candidate {
-            account: a,
-            usage: *u,
-        })
-        .collect();
-    Ok(scheduler::pick(&cands, thresholds, exclude).cloned())
+    let (pool, policy) = load_pool(store, time::now_s())?;
+    Ok(scheduler::pick(&pool, policy, exclude).map(|c| c.account.clone()))
+}
+
+/// When the active account became active (epoch ms), falling back to the last swap for stores
+/// written before this was recorded.
+pub fn active_since(store: &Store) -> Result<i64> {
+    Ok(store
+        .meta_i64(META_ACTIVE_SINCE)?
+        .or(store.meta_i64(META_LAST_SWAP_AT)?)
+        .unwrap_or(0))
 }
 
 pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcome> {
@@ -113,7 +158,18 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
             }
         }
     }
+    if req.reason == Reason::PreferredAvailable
+        && now - active_since(store)? < settings.switch_back_dwell_s * 1000
+    {
+        return skip(
+            store,
+            req,
+            "the active account has not been in use long enough to switch back",
+        );
+    }
 
+    let now_s = now / 1000;
+    let (pool, policy) = load_pool(store, now_s)?;
     let target = match req.to {
         Some(id) => {
             let account = store
@@ -130,11 +186,37 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
                 AccountState::Parked | AccountState::Paused => account,
             }
         }
-        None => match next_target(store, active_id)? {
-            Some(account) => account,
+        None if req.reason == Reason::PreferredAvailable => {
+            match scheduler::switch_back_target(&pool, policy) {
+                Some(c) => c.account.clone(),
+                None => return skip(store, req, "no better ranked account is ready"),
+            }
+        }
+        None => match scheduler::pick(&pool, policy, active_id) {
+            Some(c) => c.account.clone(),
             None => return pool_exhausted(store, req, active.as_ref(), now),
         },
     };
+    let ranking = scheduler::ranking(&pool, policy, now_s);
+    let reason_for = |id: i64| {
+        ranking
+            .iter()
+            .find(|r| r.account_id == id)
+            .map(|r| r.reason.clone())
+    };
+    let outgoing = pool.iter().find(|c| Some(c.account.id) == active_id);
+    let why = match (req.reason, outgoing) {
+        (Reason::PreferredAvailable, Some(from)) => Some(format!(
+            "{} ranks above {}: {}",
+            target.label,
+            from.account.label,
+            reason_for(target.id).unwrap_or_default()
+        )),
+        _ => None,
+    };
+    let trigger_window = outgoing
+        .and_then(Candidate::blocking)
+        .map(|w| w.name.clone());
 
     let target_login = store
         .credential(target.id)?
@@ -202,31 +284,41 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
         s.set_state(target.id, AccountState::Active)?;
         s.set_meta(META_LAST_SWAP_AT, now)?;
         s.set_meta(META_PROFILE_FOREIGN, "0")?;
-        let five = from_sample
-            .as_ref()
-            .and_then(|x| x.five_resets_at)
-            .unwrap_or(0);
-        let week = from_sample
-            .as_ref()
-            .and_then(|x| x.week_resets_at)
-            .unwrap_or(0);
-        s.set_meta(META_LAST_SWAP_FROM_FIVE_RESETS, five)?;
-        s.set_meta(META_LAST_SWAP_FROM_WEEK_RESETS, week)?;
+        s.set_meta(META_ACTIVE_SINCE, now)?;
+        let resets: Vec<String> = from_sample
+            .iter()
+            .flat_map(|x| &x.windows)
+            .filter_map(|w| w.resets_at)
+            .map(|r| r.to_string())
+            .collect();
+        s.set_meta(META_LAST_SWAP_FROM_RESETS, resets.join(","))?;
         if let Some(marker) = &marker {
             s.set_meta(META_CRED_SEEN, marker)?;
+        }
+        let from_windows: serde_json::Map<String, serde_json::Value> = from_sample
+            .iter()
+            .flat_map(|x| &x.windows)
+            .map(|w| (w.name.clone(), json!(w.pct)))
+            .collect();
+        let mut detail = json!({
+            "from_label": active.as_ref().map(|a| a.label.clone()),
+            "to_label": target.label,
+            "from_state": outgoing_state.as_str(),
+            "from_windows": from_windows,
+            "pick": reason_for(target.id),
+        });
+        if let Some(window) = &trigger_window {
+            detail["window"] = json!(window);
+        }
+        if let Some(why) = &why {
+            detail["why"] = json!(why);
         }
         s.log_event(
             kind::SWAP,
             active_id,
             Some(target.id),
             Some(req.reason.as_str()),
-            Some(json!({
-                "from_label": active.as_ref().map(|a| a.label.clone()),
-                "to_label": target.label,
-                "from_state": outgoing_state.as_str(),
-                "from_five_pct": from_sample.as_ref().and_then(|x| x.five_pct),
-                "from_week_pct": from_sample.as_ref().and_then(|x| x.week_pct),
-            })),
+            Some(detail),
         )?;
         Ok(())
     });

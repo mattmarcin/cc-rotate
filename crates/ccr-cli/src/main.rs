@@ -1,6 +1,7 @@
 mod format;
 mod herdr;
 mod process;
+mod ranking;
 
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
@@ -54,6 +55,14 @@ enum Command {
     },
     /// List your other Claude Code profiles and the account each belongs to.
     Profiles,
+    /// Show the account the next swap would pick, and why.
+    Next {
+        /// List every account in the order they would be used, with a reason for each.
+        #[arg(long)]
+        explain: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Swap the profile to another account now.
     Swap {
         /// Swap to this account instead of the scheduler's pick.
@@ -82,8 +91,20 @@ enum Command {
     },
     /// Change an account's label.
     Rename { account: String, label: String },
-    /// Set an account's priority (lower is preferred on ties).
-    Priority { account: String, priority: i64 },
+    /// Show the order accounts are used in, or put the listed accounts first, in that order.
+    Order { accounts: Vec<String> },
+    /// Move an account to a place in the order (1 is used first).
+    Move {
+        account: String,
+        #[arg(long, value_name = "N")]
+        to: usize,
+    },
+    /// Show or set whether an account has a weekly limit: auto (detect it), yes, or no.
+    WeeklyLimit {
+        account: String,
+        #[arg(value_parser = ["auto", "yes", "no"])]
+        value: Option<String>,
+    },
     /// Show recent swaps, logins and errors.
     Events {
         #[arg(long, default_value_t = 30)]
@@ -340,10 +361,11 @@ fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> 
             store.rename_account(a.id, &label)?;
             println!("Renamed {} to {label}", a.label);
         }
-        Command::Priority { account, priority } => {
-            let a = store.find_account(&account)?;
-            store.set_priority(a.id, priority)?;
-            println!("{} priority set to {priority}", a.label);
+        Command::Next { explain, json } => ranking::next(store, paths, explain, json)?,
+        Command::Order { accounts } => ranking::order(store, &accounts)?,
+        Command::Move { account, to } => ranking::move_to(store, &account, to)?,
+        Command::WeeklyLimit { account, value } => {
+            ranking::weekly_limit(store, &account, value.as_deref())?
         }
         Command::Events { limit, json } => {
             let events = store.events(limit)?;

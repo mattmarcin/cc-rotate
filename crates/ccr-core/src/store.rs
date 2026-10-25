@@ -19,7 +19,9 @@ use crate::{credfile, time};
 
 /// 1: initial schema, logins sealed with Windows DPAPI.
 /// 2: logins sealed with the platform-independent format in `secret`.
-const SCHEMA_VERSION: i64 = 2;
+/// 3: usage windows as rows (`sample_windows`), the account order (`position`, formerly
+///    `priority`) and the per-account weekly limit override.
+const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE accounts (
@@ -79,6 +81,49 @@ CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 "#;
 
+/// Schema 3. Samples used to hold exactly two windows in fixed columns; now every window a data
+/// source reports is a row in `sample_windows`, so a new limit system needs no schema change.
+/// The two fixed columns become `five_hour` and `seven_day` rows. `priority` keeps its values
+/// as the account order (`position`, lower is used first).
+const SCHEMA_V3: &str = r#"
+ALTER TABLE accounts RENAME COLUMN priority TO position;
+ALTER TABLE accounts ADD COLUMN weekly_limit TEXT NOT NULL DEFAULT 'auto'
+    CHECK (weekly_limit IN ('auto', 'yes', 'no'));
+
+DROP INDEX samples_account_ts;
+DROP INDEX samples_ts;
+ALTER TABLE samples RENAME TO samples_v2;
+CREATE TABLE samples (
+    id         INTEGER PRIMARY KEY,
+    ts         INTEGER NOT NULL,
+    account_id INTEGER NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
+    profile    TEXT NOT NULL,
+    session_id TEXT,
+    model      TEXT
+);
+CREATE INDEX samples_account_ts ON samples (account_id, ts);
+CREATE INDEX samples_ts ON samples (ts);
+CREATE TABLE sample_windows (
+    sample_id  INTEGER NOT NULL REFERENCES samples (id) ON DELETE CASCADE,
+    account_id INTEGER NOT NULL,
+    name       TEXT NOT NULL,
+    pct        REAL NOT NULL,
+    resets_at  INTEGER,
+    PRIMARY KEY (sample_id, name)
+) WITHOUT ROWID;
+CREATE INDEX sample_windows_account ON sample_windows (account_id, name, resets_at);
+
+INSERT INTO samples (id, ts, account_id, profile, session_id)
+    SELECT id, ts, account_id, profile, session_id FROM samples_v2;
+INSERT INTO sample_windows (sample_id, account_id, name, pct, resets_at)
+    SELECT id, account_id, 'five_hour', five_pct, five_resets_at FROM samples_v2
+    WHERE five_pct IS NOT NULL;
+INSERT INTO sample_windows (sample_id, account_id, name, pct, resets_at)
+    SELECT id, account_id, 'seven_day', week_pct, week_resets_at FROM samples_v2
+    WHERE week_pct IS NOT NULL;
+DROP TABLE samples_v2;
+"#;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountState {
@@ -112,6 +157,38 @@ impl FromStr for AccountState {
     }
 }
 
+/// Whether an account has a weekly limit on all models: detected from its usage (`auto`), or
+/// set by the user when detection does not know yet or gets it wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WeeklyLimitSetting {
+    Auto,
+    Yes,
+    No,
+}
+
+impl WeeklyLimitSetting {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Yes => "yes",
+            Self::No => "no",
+        }
+    }
+}
+
+impl FromStr for WeeklyLimitSetting {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        Ok(match s.to_ascii_lowercase().as_str() {
+            "auto" | "detect" => Self::Auto,
+            "yes" | "has" | "true" | "on" => Self::Yes,
+            "no" | "none" | "false" | "off" => Self::No,
+            other => bail!("expected auto, yes or no, not {other:?}"),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Account {
     pub id: i64,
@@ -123,16 +200,25 @@ pub struct Account {
     pub subscription_type: Option<String>,
     pub rate_limit_tier: Option<String>,
     pub state: AccountState,
-    pub priority: i64,
+    /// Place in the user's order: lower is used first. Ties are possible in stores upgraded
+    /// from the old `priority`; reordering numbers every account from 1.
+    pub position: i64,
+    pub weekly_limit: WeeklyLimitSetting,
     pub added_at: i64,
     pub last_login_at: Option<i64>,
 }
 
 const ACCOUNT_COLS: &str = "id, label, email, account_uuid, org_uuid, org_name, subscription_type, \
-    rate_limit_tier, state, priority, added_at, last_login_at";
+    rate_limit_tier, state, position, added_at, last_login_at, weekly_limit";
+
+fn parse_col<T: FromStr<Err = anyhow::Error>>(row: &Row, i: usize) -> rusqlite::Result<T> {
+    let text: String = row.get(i)?;
+    text.parse().map_err(|e: anyhow::Error| {
+        rusqlite::Error::FromSqlConversionFailure(i, rusqlite::types::Type::Text, e.into())
+    })
+}
 
 fn account_from_row(row: &Row) -> rusqlite::Result<Account> {
-    let state: String = row.get(8)?;
     Ok(Account {
         id: row.get(0)?,
         label: row.get(1)?,
@@ -142,12 +228,11 @@ fn account_from_row(row: &Row) -> rusqlite::Result<Account> {
         org_name: row.get(5)?,
         subscription_type: row.get(6)?,
         rate_limit_tier: row.get(7)?,
-        state: state.parse().map_err(|e: anyhow::Error| {
-            rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, e.into())
-        })?,
-        priority: row.get(9)?,
+        state: parse_col(row, 8)?,
+        position: row.get(9)?,
         added_at: row.get(10)?,
         last_login_at: row.get(11)?,
+        weekly_limit: parse_col(row, 12)?,
     })
 }
 
@@ -181,33 +266,59 @@ pub struct CredentialMeta {
     pub updated_at: i64,
 }
 
+/// One reading of an account's usage: every window the data source reported at that moment.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Sample {
     pub ts: i64,
     pub account_id: i64,
     pub profile: String,
     pub session_id: Option<String>,
-    pub five_pct: Option<f64>,
-    pub five_resets_at: Option<i64>,
-    pub week_pct: Option<f64>,
-    pub week_resets_at: Option<i64>,
+    /// The model the session that sent this reading was using, when it said.
+    pub model: Option<String>,
+    pub windows: Vec<SampleWindow>,
 }
 
-fn sample_from_row(row: &Row) -> rusqlite::Result<Sample> {
-    Ok(Sample {
-        ts: row.get(0)?,
-        account_id: row.get(1)?,
-        profile: row.get(2)?,
-        session_id: row.get(3)?,
-        five_pct: row.get(4)?,
-        five_resets_at: row.get(5)?,
-        week_pct: row.get(6)?,
-        week_resets_at: row.get(7)?,
-    })
+/// One usage window in a sample, named as Claude Code names it (`five_hour`, `seven_day`, ...).
+/// `scheduler::classify` says what kind of limit a name is.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SampleWindow {
+    pub name: String,
+    pub pct: f64,
+    /// Epoch seconds.
+    pub resets_at: Option<i64>,
 }
 
-const SAMPLE_COLS: &str =
-    "ts, account_id, profile, session_id, five_pct, five_resets_at, week_pct, week_resets_at";
+impl Sample {
+    pub fn window(&self, name: &str) -> Option<&SampleWindow> {
+        self.windows.iter().find(|w| w.name == name)
+    }
+
+    /// Same windows and reset times, and percentages within half a point.
+    fn same_reading(&self, other: &Sample) -> bool {
+        self.windows.len() == other.windows.len()
+            && self.windows.iter().all(|w| {
+                other
+                    .window(&w.name)
+                    .is_some_and(|o| o.resets_at == w.resets_at && (o.pct - w.pct).abs() < 0.5)
+            })
+    }
+}
+
+const SAMPLE_COLS: &str = "id, ts, account_id, profile, session_id, model";
+
+fn sample_from_row(row: &Row) -> rusqlite::Result<(i64, Sample)> {
+    Ok((
+        row.get(0)?,
+        Sample {
+            ts: row.get(1)?,
+            account_id: row.get(2)?,
+            profile: row.get(3)?,
+            session_id: row.get(4)?,
+            model: row.get(5)?,
+            windows: Vec::new(),
+        },
+    ))
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Event {
@@ -237,9 +348,16 @@ pub mod kind {
 /// Typed view of the `settings` table with defaults applied.
 #[derive(Debug, Clone, Serialize)]
 pub struct Settings {
+    /// Applies to 5-hour (session) windows.
     pub swap_threshold_5h: f64,
+    /// Applies to every weekly window, on all models or on one.
     pub swap_threshold_7d: f64,
     pub swap_cooldown_s: i64,
+    /// Rank accounts without a weekly limit before the ones with one.
+    pub prefer_no_weekly_limit: bool,
+    /// How long the active account stays in use before cc-rotate switches back to a better
+    /// ranked account that became usable again.
+    pub switch_back_dwell_s: i64,
     pub lock_timeout_ms: u64,
     pub sample_retention_days: i64,
     pub statusline_downstream: Option<String>,
@@ -251,6 +369,8 @@ pub const SETTING_KEYS: &[&str] = &[
     "swap_threshold_5h",
     "swap_threshold_7d",
     "swap_cooldown_s",
+    "prefer_no_weekly_limit",
+    "switch_back_dwell_s",
     "lock_timeout_ms",
     "sample_retention_days",
     "statusline_downstream",
@@ -362,6 +482,10 @@ impl Store {
                 s.convert_legacy_credentials()?;
                 s.conn.pragma_update(None, "user_version", 2)?;
             }
+            if version < 3 {
+                s.conn.execute_batch(SCHEMA_V3)?;
+                s.conn.pragma_update(None, "user_version", 3)?;
+            }
             Ok(())
         })
     }
@@ -453,7 +577,8 @@ impl Store {
         }
         match value {
             Some(v) => {
-                validate_setting(key, v)?;
+                let normalized = validate_setting(key, v)?;
+                let v = normalized.as_deref().unwrap_or(v);
                 self.conn.execute(
                     "INSERT INTO settings (key, value) VALUES (?1, ?2)
                      ON CONFLICT (key) DO UPDATE SET value = excluded.value",
@@ -481,6 +606,10 @@ impl Store {
             swap_threshold_5h: num("swap_threshold_5h", 98.0)?,
             swap_threshold_7d: num("swap_threshold_7d", 98.0)?,
             swap_cooldown_s: int("swap_cooldown_s", 120)?,
+            prefer_no_weekly_limit: get("prefer_no_weekly_limit")?
+                .and_then(|v| parse_bool(&v))
+                .unwrap_or(true),
+            switch_back_dwell_s: int("switch_back_dwell_s", 600)?,
             lock_timeout_ms: int("lock_timeout_ms", 30_000)? as u64,
             sample_retention_days: int("sample_retention_days", 90)?,
             statusline_downstream: text("statusline_downstream")?,
@@ -513,7 +642,7 @@ impl Store {
 
     pub fn accounts(&self) -> Result<Vec<Account>> {
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {ACCOUNT_COLS} FROM accounts ORDER BY priority, label"
+            "SELECT {ACCOUNT_COLS} FROM accounts ORDER BY position, label COLLATE NOCASE, id"
         ))?;
         let rows = stmt.query_map([], account_from_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -597,10 +726,13 @@ impl Store {
         state: AccountState,
     ) -> Result<i64> {
         let now = time::now_ms();
+        // A new account goes to the end of the order.
         self.conn.execute(
             "INSERT INTO accounts (label, email, account_uuid, org_uuid, org_name, subscription_type,
-                                   rate_limit_tier, profile_account, state, added_at, last_login_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
+                                   rate_limit_tier, profile_account, state, added_at, last_login_at,
+                                   position)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10,
+                     (SELECT COALESCE(MAX(position), 0) + 1 FROM accounts))",
             params![
                 label,
                 ident.email,
@@ -669,11 +801,56 @@ impl Store {
         Ok(())
     }
 
-    pub fn set_priority(&self, id: i64, priority: i64) -> Result<()> {
-        self.conn.execute(
-            "UPDATE accounts SET priority = ?2 WHERE id = ?1",
-            params![id, priority],
+    /// Put `ids` first, in that order, and every other account after them in its current
+    /// order; then number the whole order from 1.
+    pub fn set_order(&self, ids: &[i64]) -> Result<()> {
+        let current: Vec<i64> = self.accounts()?.iter().map(|a| a.id).collect();
+        if let Some(id) = ids.iter().find(|id| !current.contains(id)) {
+            bail!("account {id} does not exist");
+        }
+        let mut order: Vec<i64> = Vec::with_capacity(current.len());
+        for id in ids.iter().chain(&current) {
+            if !order.contains(id) {
+                order.push(*id);
+            }
+        }
+        self.write_order(&order)
+    }
+
+    /// Move one account to place `to` in the order (1 is used first), shifting the others.
+    pub fn move_account(&self, id: i64, to: usize) -> Result<()> {
+        let mut order: Vec<i64> = self.accounts()?.iter().map(|a| a.id).collect();
+        let from = order
+            .iter()
+            .position(|&x| x == id)
+            .ok_or_else(|| anyhow!("account {id} does not exist"))?;
+        order.remove(from);
+        order.insert(to.saturating_sub(1).min(order.len()), id);
+        self.write_order(&order)
+    }
+
+    fn write_order(&self, order: &[i64]) -> Result<()> {
+        self.conn.execute_batch("SAVEPOINT write_order")?;
+        let written = order.iter().enumerate().try_for_each(|(i, id)| {
+            self.conn
+                .execute(
+                    "UPDATE accounts SET position = ?2 WHERE id = ?1",
+                    params![id, i as i64 + 1],
+                )
+                .map(drop)
+                .map_err(anyhow::Error::from)
+        });
+        finish_savepoint(&self.conn, "write_order", written)
+    }
+
+    pub fn set_weekly_limit(&self, id: i64, setting: WeeklyLimitSetting) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE accounts SET weekly_limit = ?2 WHERE id = ?1",
+            params![id, setting.as_str()],
         )?;
+        if n == 0 {
+            bail!("account {id} does not exist");
+        }
         Ok(())
     }
 
@@ -726,6 +903,21 @@ impl Store {
                 expires_at = excluded.expires_at, refresh_expires_at = excluded.refresh_expires_at,
                 updated_at = excluded.updated_at, source = excluded.source",
             params![account_id, sealed, fp, expires, refresh_expires, time::now_ms(), source],
+        )?;
+        // A login names the account's plan, and every renewal repeats it, so storing a login is
+        // also what keeps the plan shown for the account current.
+        let text = |k: &str| {
+            oauth
+                .get(k)
+                .and_then(Value::as_str)
+                .filter(|v| !v.is_empty())
+        };
+        self.conn.execute(
+            "UPDATE accounts SET
+                subscription_type = COALESCE(?2, subscription_type),
+                rate_limit_tier   = COALESCE(?3, rate_limit_tier)
+             WHERE id = ?1",
+            params![account_id, text("subscriptionType"), text("rateLimitTier")],
         )?;
         Ok(())
     }
@@ -797,53 +989,112 @@ impl Store {
     /// Returns whether a row was written.
     pub fn record_sample(&self, s: &Sample) -> Result<bool> {
         if let Some(last) = self.last_sample(s.account_id)? {
-            let close = |a: Option<f64>, b: Option<f64>| match (a, b) {
-                (Some(a), Some(b)) => (a - b).abs() < 0.5,
-                (None, None) => true,
-                _ => false,
-            };
-            let same = close(last.five_pct, s.five_pct)
-                && close(last.week_pct, s.week_pct)
-                && last.five_resets_at == s.five_resets_at
-                && last.week_resets_at == s.week_resets_at;
-            if same && s.ts - last.ts < 60_000 {
+            if s.ts - last.ts < 60_000 && last.same_reading(s) {
                 return Ok(false);
             }
         }
-        self.conn.execute(
-            &format!("INSERT INTO samples ({SAMPLE_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"),
-            params![
-                s.ts,
-                s.account_id,
-                s.profile,
-                s.session_id,
-                s.five_pct,
-                s.five_resets_at,
-                s.week_pct,
-                s.week_resets_at
-            ],
-        )?;
+        self.conn.execute_batch("SAVEPOINT record_sample")?;
+        let written = (|| -> Result<()> {
+            self.conn.execute(
+                "INSERT INTO samples (ts, account_id, profile, session_id, model)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![s.ts, s.account_id, s.profile, s.session_id, s.model],
+            )?;
+            let id = self.conn.last_insert_rowid();
+            for w in &s.windows {
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO sample_windows (sample_id, account_id, name, pct, resets_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![id, s.account_id, w.name, w.pct, w.resets_at],
+                )?;
+            }
+            Ok(())
+        })();
+        finish_savepoint(&self.conn, "record_sample", written)?;
         Ok(true)
     }
 
     pub fn last_sample(&self, account_id: i64) -> Result<Option<Sample>> {
-        Ok(self
+        let row = self
             .conn
             .query_row(
                 &format!(
-                    "SELECT {SAMPLE_COLS} FROM samples WHERE account_id = ?1 ORDER BY ts DESC LIMIT 1"
+                    "SELECT {SAMPLE_COLS} FROM samples WHERE account_id = ?1
+                     ORDER BY ts DESC, id DESC LIMIT 1"
                 ),
                 [account_id],
                 sample_from_row,
             )
-            .optional()?)
+            .optional()?;
+        let Some((id, mut sample)) = row else {
+            return Ok(None);
+        };
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT name, pct, resets_at FROM sample_windows WHERE sample_id = ?1 ORDER BY name",
+        )?;
+        sample.windows = stmt
+            .query_map([id], window_from_row)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(Some(sample))
     }
 
     pub fn samples_since(&self, since_ms: i64) -> Result<Vec<Sample>> {
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {SAMPLE_COLS} FROM samples WHERE ts >= ?1 ORDER BY ts"
+            "SELECT {SAMPLE_COLS} FROM samples WHERE ts >= ?1 ORDER BY ts, id"
         ))?;
-        let rows = stmt.query_map([since_ms], sample_from_row)?;
+        let mut samples: Vec<(i64, Sample)> = stmt
+            .query_map([since_ms], sample_from_row)?
+            .collect::<rusqlite::Result<_>>()?;
+        let index: std::collections::HashMap<i64, usize> = samples
+            .iter()
+            .enumerate()
+            .map(|(i, (id, _))| (*id, i))
+            .collect();
+        let mut stmt = self.conn.prepare(
+            "SELECT w.sample_id, w.name, w.pct, w.resets_at FROM sample_windows w
+             JOIN samples s ON s.id = w.sample_id WHERE s.ts >= ?1 ORDER BY w.name",
+        )?;
+        let rows = stmt.query_map([since_ms], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                SampleWindow {
+                    name: r.get(1)?,
+                    pct: r.get(2)?,
+                    resets_at: r.get(3)?,
+                },
+            ))
+        })?;
+        for row in rows {
+            let (id, window) = row?;
+            if let Some(&i) = index.get(&id) {
+                samples[i].1.windows.push(window);
+            }
+        }
+        Ok(samples.into_iter().map(|(_, s)| s).collect())
+    }
+
+    /// Every window name recorded for an account within the retention period.
+    pub fn window_names(&self, account_id: i64) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT DISTINCT name FROM sample_windows WHERE account_id = ?1 ORDER BY name",
+        )?;
+        let rows = stmt.query_map([account_id], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The distinct reset times recorded for one of an account's windows that are at or after
+    /// `since_s`, in ascending order.
+    pub fn window_resets_since(
+        &self,
+        account_id: i64,
+        name: &str,
+        since_s: i64,
+    ) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT DISTINCT resets_at FROM sample_windows
+             WHERE account_id = ?1 AND name = ?2 AND resets_at >= ?3 ORDER BY resets_at",
+        )?;
+        let rows = stmt.query_map(params![account_id, name, since_s], |r| r.get(0))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -942,7 +1193,38 @@ fn legacy_unseal(_blob: &[u8]) -> Result<Vec<u8>> {
     bail!("it was sealed with Windows DPAPI, which only Windows can open")
 }
 
-fn validate_setting(key: &str, value: &str) -> Result<()> {
+fn window_from_row(r: &Row) -> rusqlite::Result<SampleWindow> {
+    Ok(SampleWindow {
+        name: r.get(0)?,
+        pct: r.get(1)?,
+        resets_at: r.get(2)?,
+    })
+}
+
+/// Release a savepoint after `result`, first rolling its changes back if it failed.
+fn finish_savepoint(conn: &Connection, name: &str, result: Result<()>) -> Result<()> {
+    match result {
+        Ok(()) => {
+            conn.execute_batch(&format!("RELEASE {name}"))?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = conn.execute_batch(&format!("ROLLBACK TO {name}; RELEASE {name}"));
+            Err(e)
+        }
+    }
+}
+
+pub fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// Check a setting's value. Returns the value to store instead, when it is spelled differently.
+fn validate_setting(key: &str, value: &str) -> Result<Option<String>> {
     match key {
         "swap_threshold_5h" | "swap_threshold_7d" => {
             let v: f64 = value.parse().context("expected a number")?;
@@ -950,15 +1232,19 @@ fn validate_setting(key: &str, value: &str) -> Result<()> {
                 bail!("{key} must be between 1 and 100");
             }
         }
-        "swap_cooldown_s" | "lock_timeout_ms" | "sample_retention_days" => {
+        "swap_cooldown_s" | "switch_back_dwell_s" | "lock_timeout_ms" | "sample_retention_days" => {
             let v: i64 = value.parse().context("expected an integer")?;
             if v < 0 {
                 bail!("{key} must not be negative");
             }
         }
+        "prefer_no_weekly_limit" => {
+            let v = parse_bool(value).context("expected true or false")?;
+            return Ok(Some(v.to_string()));
+        }
         _ => {}
     }
-    Ok(())
+    Ok(None)
 }
 
 pub fn validate_label(label: &str) -> Result<()> {
@@ -1236,16 +1522,224 @@ mod tests {
             account_id: a,
             profile: "rotate".into(),
             session_id: None,
-            five_pct: Some(pct),
-            five_resets_at: Some(100),
-            week_pct: Some(10.0),
-            week_resets_at: Some(200),
+            model: Some("claude-opus-4-1".into()),
+            windows: vec![
+                SampleWindow {
+                    name: "five_hour".into(),
+                    pct,
+                    resets_at: Some(100),
+                },
+                SampleWindow {
+                    name: "seven_day".into(),
+                    pct: 10.0,
+                    resets_at: Some(200),
+                },
+            ],
         };
         assert!(s.record_sample(&mk(1_000, 20.0)).unwrap());
         assert!(!s.record_sample(&mk(6_000, 20.2)).unwrap());
         assert!(s.record_sample(&mk(7_000, 21.0)).unwrap());
         assert!(s.record_sample(&mk(70_000, 21.0)).unwrap());
-        assert_eq!(s.samples_since(0).unwrap().len(), 3);
+        let mut fewer = mk(71_000, 21.0);
+        fewer.windows.pop();
+        assert!(
+            s.record_sample(&fewer).unwrap(),
+            "a window that stopped being reported is a new reading"
+        );
+        let all = s.samples_since(0).unwrap();
+        assert_eq!(all.len(), 4);
+        assert_eq!(all[0], mk(1_000, 20.0), "windows round-trip");
+        assert_eq!(s.last_sample(a).unwrap().unwrap(), fewer);
+        assert_eq!(
+            s.window_names(a).unwrap(),
+            vec!["five_hour".to_string(), "seven_day".to_string()]
+        );
+        assert_eq!(s.window_resets_since(a, "five_hour", 0).unwrap(), vec![100]);
+        assert!(
+            s.window_resets_since(a, "five_hour", 101)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn order_and_weekly_limit_setting() {
+        let s = Store::open_in_memory().unwrap();
+        let a = s
+            .insert_account("a", &ident("ua"), AccountState::Active)
+            .unwrap();
+        let b = s
+            .insert_account("b", &ident("ub"), AccountState::Parked)
+            .unwrap();
+        let c = s
+            .insert_account("c", &ident("uc"), AccountState::Parked)
+            .unwrap();
+        let order = |s: &Store| {
+            s.accounts()
+                .unwrap()
+                .iter()
+                .map(|x| x.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(order(&s), vec![a, b, c], "new accounts go to the end");
+
+        s.set_order(&[c]).unwrap();
+        assert_eq!(order(&s), vec![c, a, b]);
+        let positions: Vec<i64> = s.accounts().unwrap().iter().map(|x| x.position).collect();
+        assert_eq!(positions, vec![1, 2, 3]);
+        s.move_account(c, 3).unwrap();
+        assert_eq!(order(&s), vec![a, b, c]);
+        s.move_account(b, 1).unwrap();
+        assert_eq!(order(&s), vec![b, a, c]);
+        s.move_account(a, 99).unwrap();
+        assert_eq!(order(&s), vec![b, c, a], "past the end means last");
+        assert!(s.set_order(&[42]).is_err());
+
+        assert_eq!(
+            s.account(a).unwrap().unwrap().weekly_limit,
+            WeeklyLimitSetting::Auto
+        );
+        s.set_weekly_limit(a, "none".parse().unwrap()).unwrap();
+        assert_eq!(
+            s.account(a).unwrap().unwrap().weekly_limit,
+            WeeklyLimitSetting::No
+        );
+        assert!("maybe".parse::<WeeklyLimitSetting>().is_err());
+    }
+
+    #[test]
+    fn a_stored_login_refreshes_the_plan() {
+        let s = Store::open_in_memory().unwrap();
+        let a = s
+            .insert_account("a", &ident("ua"), AccountState::Parked)
+            .unwrap();
+        s.save_credential(
+            a,
+            &json!({"refreshToken": "r1", "subscriptionType": "max", "rateLimitTier": "default_claude_max_5x"}),
+            "login",
+        )
+        .unwrap();
+        let acct = s.account(a).unwrap().unwrap();
+        assert_eq!(acct.subscription_type.as_deref(), Some("max"));
+        s.save_credential(
+            a,
+            &json!({"refreshToken": "r2", "rateLimitTier": "default_claude_max_20x"}),
+            "sync",
+        )
+        .unwrap();
+        let acct = s.account(a).unwrap().unwrap();
+        assert_eq!(
+            acct.subscription_type.as_deref(),
+            Some("max"),
+            "kept when absent"
+        );
+        assert_eq!(
+            acct.rate_limit_tier.as_deref(),
+            Some("default_claude_max_20x")
+        );
+    }
+
+    /// A store written by cc-rotate at schema 2: two fixed usage columns and `priority`.
+    #[test]
+    fn schema_2_store_is_upgraded_keeping_samples_and_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("store.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.pragma_update(None, "user_version", 2).unwrap();
+            conn.execute_batch(
+                "INSERT INTO accounts (id, label, account_uuid, state, priority, added_at) VALUES
+                    (1, 'max', 'u1', 'active', 5, 0),
+                    (2, 'team', 'u2', 'parked', -1, 0),
+                    (3, 'tie', 'u3', 'parked', 5, 0);
+                 INSERT INTO samples (id, ts, account_id, profile, session_id, five_pct, five_resets_at, week_pct, week_resets_at) VALUES
+                    (10, 1000, 1, 'rotate', 's', 40.0, 5000, 70.0, 90000),
+                    (11, 2000, 2, 'rotate', NULL, 12.5, 6000, NULL, NULL),
+                    (12, 3000, 2, 'work', NULL, NULL, NULL, NULL, NULL);
+                 INSERT INTO settings (key, value) VALUES ('swap_threshold_5h', '90');",
+            )
+            .unwrap();
+        }
+
+        let s = Store::open(&db).unwrap();
+        let version: i64 = s
+            .conn()
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 3);
+
+        let accounts = s.accounts().unwrap();
+        let labels: Vec<_> = accounts.iter().map(|a| a.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec!["team", "max", "tie"],
+            "priorities kept as the order"
+        );
+        assert_eq!(accounts[1].position, 5);
+        assert!(
+            accounts
+                .iter()
+                .all(|a| a.weekly_limit == WeeklyLimitSetting::Auto)
+        );
+
+        let samples = s.samples_since(0).unwrap();
+        assert_eq!(
+            samples.len(),
+            3,
+            "every sample kept, even one without windows"
+        );
+        assert_eq!(
+            samples[0].windows,
+            vec![
+                SampleWindow {
+                    name: "five_hour".into(),
+                    pct: 40.0,
+                    resets_at: Some(5000)
+                },
+                SampleWindow {
+                    name: "seven_day".into(),
+                    pct: 70.0,
+                    resets_at: Some(90000)
+                },
+            ]
+        );
+        assert_eq!(samples[0].session_id.as_deref(), Some("s"));
+        assert_eq!(
+            samples[1].windows,
+            vec![SampleWindow {
+                name: "five_hour".into(),
+                pct: 12.5,
+                resets_at: Some(6000)
+            }],
+            "a missing weekly column is no window, not a 0% one"
+        );
+        assert!(samples[2].windows.is_empty());
+        assert_eq!(s.settings().unwrap().swap_threshold_5h, 90.0);
+
+        // New samples, accounts and removals work on the upgraded schema.
+        let id = s
+            .insert_account("new", &ident("u4"), AccountState::Parked)
+            .unwrap();
+        assert_eq!(s.account(id).unwrap().unwrap().position, 6);
+        s.remove_account(2).unwrap();
+        let left: i64 = s
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sample_windows WHERE account_id = 2",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0, "windows go with their samples");
+
+        drop(s);
+        let s = Store::open(&db).unwrap();
+        assert_eq!(
+            s.samples_since(0).unwrap().len(),
+            1,
+            "opening again changes nothing"
+        );
     }
 
     #[test]
