@@ -3,7 +3,8 @@
 use std::fmt::Write;
 
 use ccr_core::doctor::{Check, Status};
-use ccr_core::snapshot::Snapshot;
+use ccr_core::scheduler::{WeeklyLimit, WindowKind, WindowUsage};
+use ccr_core::snapshot::{AccountView, Snapshot};
 use ccr_core::store::{AccountState, Event, Store};
 use ccr_core::time;
 
@@ -21,16 +22,7 @@ pub fn statusline_prefix(label: &str, pool_exhausted: bool) -> String {
 
 /// "3h 12m", "45m", "2d 4h" until `at_s`, or "now" when it has passed.
 pub fn until(at_s: i64) -> String {
-    let secs = at_s - time::now_s();
-    if secs <= 0 {
-        return "now".into();
-    }
-    let (d, h, m) = (secs / 86_400, (secs % 86_400) / 3600, (secs % 3600) / 60);
-    match (d, h) {
-        (0, 0) => format!("{}m", m.max(1)),
-        (0, _) => format!("{h}h {m}m"),
-        _ => format!("{d}d {h}h"),
-    }
+    time::span(at_s - time::now_s())
 }
 
 fn ago(ts_ms: i64) -> String {
@@ -43,13 +35,43 @@ fn ago(ts_ms: i64) -> String {
     }
 }
 
-fn state_label(state: AccountState) -> &'static str {
-    match state {
+fn state_label(a: &AccountView) -> &'static str {
+    match a.account.state {
         AccountState::Active => "active",
-        AccountState::Parked => "ready",
+        AccountState::Parked if a.eligible => "ready",
+        AccountState::Parked => "resting",
         AccountState::NeedsLogin => "needs login",
         AccountState::Paused => "paused",
     }
+}
+
+fn reset(at: Option<i64>) -> String {
+    at.filter(|&t| t > time::now_s())
+        .map(until)
+        .unwrap_or_else(|| "-".into())
+}
+
+/// The weekly column: the reading, "none" for an account without a weekly limit, "-" without
+/// a reading.
+fn weekly_cells(a: &AccountView) -> (String, String) {
+    let week = a
+        .windows
+        .iter()
+        .find(|w| w.kind == WindowKind::Weekly && w.model.is_none());
+    match (week, a.weekly.effective) {
+        (Some(w), _) => (format!("{:.0}%", w.pct), reset(w.resets_at)),
+        (None, WeeklyLimit::None) => ("none".into(), "-".into()),
+        (None, _) => ("-".into(), "-".into()),
+    }
+}
+
+/// Windows other than the 5-hour and weekly ones on all models, such as one model's weekly
+/// limit: "Opus weekly 40% (resets in 2d 3h)".
+fn other_windows(a: &AccountView) -> Vec<&WindowUsage> {
+    a.windows
+        .iter()
+        .filter(|w| w.model.is_some() || w.kind == WindowKind::Other)
+        .collect()
 }
 
 pub fn status(snap: &Snapshot) -> String {
@@ -65,36 +87,75 @@ pub fn status(snap: &Snapshot) -> String {
         .max()
         .unwrap_or(5)
         .max(5);
+    let plan_width = snap
+        .accounts
+        .iter()
+        .filter_map(|a| a.plan.as_ref().map(String::len))
+        .max()
+        .unwrap_or(4)
+        .max(4);
     let _ = writeln!(
         out,
-        "{:<width$}  {:<11}  {:>5}  {:<9}  {:>5}  {:<9}  email",
-        "label", "state", "5h", "resets", "week", "resets"
+        "{:>2}  {:<width$}  {:<plan_width$}  {:<11}  {:>5}  {:<9}  {:>5}  {:<9}  email",
+        "#", "label", "plan", "state", "5h", "resets", "week", "resets"
     );
-    for a in &snap.accounts {
-        let reset = |at: Option<i64>| {
-            at.filter(|&t| t > time::now_s())
-                .map(until)
-                .unwrap_or_else(|| "-".into())
-        };
-        let s = a.last_sample.as_ref();
+    for (i, a) in snap.accounts.iter().enumerate() {
+        let five = a
+            .windows
+            .iter()
+            .find(|w| w.kind == WindowKind::Session && w.model.is_none());
+        let (week, week_reset) = weekly_cells(a);
         let _ = writeln!(
             out,
-            "{:<width$}  {:<11}  {:>4.0}%  {:<9}  {:>4.0}%  {:<9}  {}",
+            "{:>2}  {:<width$}  {:<plan_width$}  {:<11}  {:>5}  {:<9}  {:>5}  {:<9}  {}",
+            i + 1,
             a.account.label,
-            state_label(a.account.state),
-            a.usage.five_hour,
-            reset(s.and_then(|x| x.five_resets_at)),
-            a.usage.weekly,
-            reset(s.and_then(|x| x.week_resets_at)),
+            a.plan.as_deref().unwrap_or("-"),
+            state_label(a),
+            five.map_or("-".into(), |w| format!("{:.0}%", w.pct)),
+            reset(five.and_then(|w| w.resets_at)),
+            week,
+            week_reset,
             a.account.email.as_deref().unwrap_or("-"),
         );
+        for w in other_windows(a) {
+            let _ = writeln!(
+                out,
+                "{:>2}  {:<width$}  {DIM}{} {:.0}%{}{}{RESET}",
+                "",
+                "",
+                w.label,
+                w.pct,
+                w.resets_at
+                    .filter(|&t| t > time::now_s())
+                    .map(|t| format!(", resets in {}", until(t)))
+                    .unwrap_or_default(),
+                if w.applies {
+                    ""
+                } else {
+                    ", not for the model in use"
+                },
+            );
+        }
     }
     let p = &snap.pool;
-    let _ = writeln!(
-        out,
-        "\nPool: {:.1} accounts of weekly budget left, {} ready, {} swaps in 24h.",
-        p.weekly_accounts_left, p.eligible, p.swaps_24h
-    );
+    let _ = writeln!(out);
+    if p.weekly_limited > 0 {
+        let _ = write!(
+            out,
+            "Pool: {:.1} of {} accounts' weekly budget left",
+            p.weekly_accounts_left, p.weekly_limited
+        );
+        if p.no_weekly_limit > 0 {
+            let _ = write!(out, ", plus {} without a weekly limit", p.no_weekly_limit);
+        }
+    } else {
+        let _ = write!(out, "Pool: {} accounts, none with a weekly limit", p.usable);
+    }
+    let _ = writeln!(out, ", {} ready, {} swaps in 24h.", p.eligible, p.swaps_24h);
+    if let Some(next) = &snap.next {
+        let _ = writeln!(out, "Next: {} - {}", next.label, next.reason);
+    }
     if p.exhausted {
         let next = p
             .next_available_at
@@ -115,6 +176,68 @@ pub fn status(snap: &Snapshot) -> String {
     out
 }
 
+/// `next`: the account the next swap would pick, and with `explain`, every account in the
+/// order the scheduler would use them.
+pub fn next(snap: &Snapshot, explain: bool) -> String {
+    let mut out = String::new();
+    match &snap.next {
+        Some(n) => {
+            let _ = writeln!(out, "{} - {}", n.label, n.reason);
+        }
+        None if snap.accounts.is_empty() => {
+            let _ = writeln!(out, "No accounts yet. Add one with `cc-rotate-ctl login`.");
+            return out;
+        }
+        None => {
+            let _ = writeln!(
+                out,
+                "None: every other account is paused, needs a login, or is over a threshold"
+            );
+        }
+    }
+    if !explain {
+        return out;
+    }
+    let width = snap
+        .ranking
+        .iter()
+        .map(|r| r.label.len())
+        .max()
+        .unwrap_or(5)
+        .max(5);
+    let _ = writeln!(out);
+    for r in &snap.ranking {
+        let view = snap.accounts.iter().find(|a| a.account.id == r.account_id);
+        let state = view.map(state_label).unwrap_or("-");
+        let place = r.rank.map_or("-".to_string(), |n| n.to_string());
+        let marker = if snap
+            .next
+            .as_ref()
+            .is_some_and(|n| n.account_id == r.account_id)
+        {
+            "  <- next"
+        } else {
+            ""
+        };
+        let _ = writeln!(
+            out,
+            "{place:>2}  {:<width$}  {state:<11}  {}{marker}",
+            r.label, r.reason
+        );
+    }
+    let s = &snap.settings;
+    let _ = writeln!(
+        out,
+        "\n{DIM}Order: {} first, then your order, then the most room.{RESET}",
+        if s.prefer_no_weekly_limit {
+            "accounts without a weekly limit"
+        } else {
+            "your order"
+        }
+    );
+    out
+}
+
 pub fn events(store: &Store, events: &[Event]) -> String {
     let label = |id: Option<i64>| {
         id.and_then(|i| store.account(i).ok().flatten())
@@ -132,7 +255,7 @@ pub fn events(store: &Store, events: &[Event]) -> String {
             .unwrap_or_default();
         let _ = writeln!(
             out,
-            "{:>8}  {:<14} {:<12} {} -> {}{}",
+            "{:>8}  {:<14} {:<19} {} -> {}{}",
             ago(e.ts),
             e.kind,
             e.reason.as_deref().unwrap_or(""),

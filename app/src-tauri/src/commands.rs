@@ -5,7 +5,7 @@ use ccr_core::doctor::{self, Check};
 use ccr_core::profiles::{self, FoundProfile};
 use ccr_core::scheduler::Reason;
 use ccr_core::snapshot::{self, Snapshot};
-use ccr_core::store::{AccountState, Event, Sample, kind};
+use ccr_core::store::{AccountState, Event, Sample, WeeklyLimitSetting, kind};
 use ccr_core::swap::{self, SwapOutcome, SwapRequest};
 use ccr_core::{Paths, Store};
 use serde::Serialize;
@@ -116,6 +116,45 @@ pub async fn rename_account(id: i64, label: String) -> CmdResult<()> {
             anyhow::bail!("Another account is already called {label}.");
         }
         s.rename_account(id, &label)
+    })
+    .await
+}
+
+/// The order accounts are used in: `ids` first, in that order, then any others.
+#[tauri::command]
+pub async fn set_order(ids: Vec<i64>) -> CmdResult<()> {
+    blocking(move |s, _| {
+        s.set_order(&ids)?;
+        let labels: Vec<String> = s.accounts()?.into_iter().map(|a| a.label).collect();
+        s.log_event(
+            kind::STATE,
+            None,
+            None,
+            Some("order"),
+            Some(serde_json::json!({ "order": labels })),
+        )?;
+        Ok(())
+    })
+    .await
+}
+
+/// Whether an account has a weekly limit: `auto` (detect it), `yes` or `no`.
+#[tauri::command]
+pub async fn set_weekly_limit(id: i64, value: String) -> CmdResult<()> {
+    blocking(move |s, _| {
+        let setting: WeeklyLimitSetting = value.parse()?;
+        let account = s
+            .account(id)?
+            .ok_or_else(|| anyhow::anyhow!("that account no longer exists"))?;
+        s.set_weekly_limit(id, setting)?;
+        s.log_event(
+            kind::STATE,
+            Some(id),
+            None,
+            Some("weekly_limit"),
+            Some(serde_json::json!({ "label": account.label, "weekly_limit": setting.as_str() })),
+        )?;
+        Ok(())
     })
     .await
 }

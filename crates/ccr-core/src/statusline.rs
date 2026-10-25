@@ -4,20 +4,21 @@
 //! This runs after every reply and every 30 seconds in every session, so it must stay fast and
 //! must never fail in a way that breaks the user's status line; callers log errors and carry on.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::Result;
 use serde::{Deserialize, Deserializer};
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::credfile;
 use crate::paths::Paths;
 use crate::profile_account;
-use crate::scheduler::{self, Reason, Thresholds, Usage};
-use crate::store::{Account, AccountState, Sample, Store, kind};
+use crate::scheduler::{self, Reason, Timing};
+use crate::store::{Account, AccountState, Sample, SampleWindow, Store, kind};
 use crate::swap::{
-    META_CRED_SEEN, META_LAST_SWAP_AT, META_LAST_SWAP_FROM_FIVE_RESETS,
-    META_LAST_SWAP_FROM_WEEK_RESETS, META_PROFILE_FOREIGN, SwapRequest,
+    self, META_ACTIVE_SINCE, META_CRED_SEEN, META_LAST_SWAP_AT, META_LAST_SWAP_FROM_RESETS,
+    META_PROFILE_FOREIGN, META_PROFILE_MODEL, SwapRequest,
 };
 
 pub const META_LAST_TICK_AT: &str = "statusline_last_tick_at";
@@ -30,19 +31,37 @@ const META_DEAD_LOGIN_SEEN: &str = "dead_login_seen";
 /// Window after a swap during which samples matching the outgoing account's reset times are
 /// treated as stale readings of the old account.
 const STALE_SAMPLE_GUARD_MS: i64 = 120_000;
-/// Minimum gap between swap requests spawned by ticks.
-const REQUEST_INTERVAL_MS: i64 = 30_000;
 
+/// The parts of Claude Code's status line input cc-rotate reads.
 #[derive(Debug, Default, Deserialize)]
 pub struct StatusInput {
     pub session_id: Option<String>,
-    pub rate_limits: Option<RateLimits>,
+    pub model: Option<ModelInfo>,
+    /// Every usage window Claude Code reports, by name (`five_hour`, `seven_day`, ...). Kept
+    /// generic so a window Claude Code adds later is recorded without a code change; a window
+    /// is only present while the API reports it and its reset has not passed.
+    #[serde(default, deserialize_with = "lenient_windows")]
+    pub rate_limits: Option<BTreeMap<String, Window>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
-pub struct RateLimits {
-    pub five_hour: Option<Window>,
-    pub seven_day: Option<Window>,
+pub struct ModelInfo {
+    pub id: Option<String>,
+}
+
+/// A map of windows, skipping entries that are not window objects instead of failing the
+/// whole input.
+fn lenient_windows<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<Option<BTreeMap<String, Window>>, D::Error> {
+    let Some(raw) = Option::<BTreeMap<String, Value>>::deserialize(d)? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        raw.into_iter()
+            .filter_map(|(k, v)| serde_json::from_value::<Window>(v).ok().map(|w| (k, w)))
+            .collect(),
+    ))
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -117,13 +136,27 @@ impl StatusInput {
         serde_json::from_str(text).unwrap_or_default()
     }
 
+    pub fn model_id(&self) -> Option<&str> {
+        self.model
+            .as_ref()
+            .and_then(|m| m.id.as_deref())
+            .filter(|m| !m.is_empty())
+    }
+
     fn sample_for(&self, account_id: i64, profile: &str, now_ms: i64) -> Option<Sample> {
-        let rl = self.rate_limits.as_ref()?;
-        let five = rl.five_hour.as_ref();
-        let week = rl.seven_day.as_ref();
-        if five.and_then(|w| w.used_percentage).is_none()
-            && week.and_then(|w| w.used_percentage).is_none()
-        {
+        let windows: Vec<SampleWindow> = self
+            .rate_limits
+            .as_ref()?
+            .iter()
+            .filter_map(|(name, w)| {
+                Some(SampleWindow {
+                    name: name.clone(),
+                    pct: w.used_percentage?,
+                    resets_at: w.resets_at,
+                })
+            })
+            .collect();
+        if windows.is_empty() {
             return None;
         }
         Some(Sample {
@@ -131,10 +164,8 @@ impl StatusInput {
             account_id,
             profile: profile.to_string(),
             session_id: self.session_id.clone(),
-            five_pct: five.and_then(|w| w.used_percentage),
-            five_resets_at: five.and_then(|w| w.resets_at),
-            week_pct: week.and_then(|w| w.used_percentage),
-            week_resets_at: week.and_then(|w| w.resets_at),
+            model: self.model_id().map(str::to_string),
+            windows,
         })
     }
 }
@@ -142,7 +173,6 @@ impl StatusInput {
 #[derive(Debug, Default)]
 pub struct TickResult {
     pub active: Option<Account>,
-    pub usage: Option<Usage>,
     pub swap: Option<SwapRequest>,
     pub pool_exhausted: bool,
 }
@@ -169,42 +199,54 @@ pub fn tick(store: &Store, paths: &Paths, input: &StatusInput, now_ms: i64) -> R
         return Ok(result);
     };
 
+    if let Some(model) = input.model_id() {
+        if store.meta(META_PROFILE_MODEL)?.as_deref() != Some(model) {
+            store.set_meta(META_PROFILE_MODEL, model)?;
+        }
+    }
     if let Some(sample) = input.sample_for(active.id, "rotate", now_ms) {
         if !is_stale_reading(store, &sample, now_ms)? {
             store.record_sample(&sample)?;
         }
     }
-    let usage = Usage::from_sample(store.last_sample(active.id)?.as_ref(), now_ms / 1000);
-    result.usage = Some(usage);
 
-    let thresholds = Thresholds::from(&store.settings()?);
-    let reason = if dead_login {
-        Some(Reason::DeadLogin)
-    } else {
-        scheduler::threshold_trigger(usage, thresholds)
-    };
-
-    if let Some(reason) = reason {
-        result.pool_exhausted = crate::swap::next_target(store, Some(active.id))?.is_none();
-        let last_request = store.meta_i64(META_SWAP_REQUESTED_AT)?.unwrap_or(0);
-        let last_swap = store.meta_i64(META_LAST_SWAP_AT)?.unwrap_or(0);
-        let cooldown_ms = store.settings()?.swap_cooldown_s * 1000;
-        let throttled = now_ms - last_request < REQUEST_INTERVAL_MS
-            || (reason.respects_cooldown() && now_ms - last_swap < cooldown_ms);
-        if dead_login || !throttled {
-            store.set_meta(META_SWAP_REQUESTED_AT, now_ms)?;
-            result.swap = Some(SwapRequest {
-                from: Some(active.id),
-                to: None,
-                reason,
-                wait: false,
-            });
+    let (pool, policy) = swap::load_pool(store, now_ms / 1000)?;
+    if let Some(reason) = scheduler::decide(&pool, policy, timing(store, now_ms)?, dead_login, true)
+    {
+        if reason != Reason::PreferredAvailable {
+            result.pool_exhausted = scheduler::pick(&pool, policy, Some(active.id)).is_none();
         }
+        store.set_meta(META_SWAP_REQUESTED_AT, now_ms)?;
+        result.swap = Some(SwapRequest {
+            from: Some(active.id),
+            to: None,
+            reason,
+            wait: false,
+        });
+    } else if pool
+        .iter()
+        .any(|c| c.account.id == active.id && c.blocking().is_some())
+    {
+        result.pool_exhausted = scheduler::pick(&pool, policy, Some(active.id)).is_none();
     }
 
     store.prune(now_ms)?;
     result.active = store.active_account()?;
     Ok(result)
+}
+
+/// The throttling state a decision needs: the last swap, the last request, and how long the
+/// active account has been active.
+fn timing(store: &Store, now_ms: i64) -> Result<Timing> {
+    let settings = store.settings()?;
+    Ok(Timing {
+        now_ms,
+        last_swap_ms: store.meta_i64(META_LAST_SWAP_AT)?.unwrap_or(0),
+        active_since_ms: swap::active_since(store)?,
+        last_request_ms: store.meta_i64(META_SWAP_REQUESTED_AT)?.unwrap_or(0),
+        cooldown_ms: settings.swap_cooldown_s * 1000,
+        dwell_ms: settings.switch_back_dwell_s * 1000,
+    })
 }
 
 /// Observe-only tick for a profile outside the pool: record a sample for whichever pool
@@ -243,32 +285,44 @@ fn is_stale_reading(store: &Store, sample: &Sample, now_ms: i64) -> Result<bool>
     if now_ms - last_swap > STALE_SAMPLE_GUARD_MS {
         return Ok(false);
     }
-    let five = store
-        .meta_i64(META_LAST_SWAP_FROM_FIVE_RESETS)?
-        .unwrap_or(0);
-    let week = store
-        .meta_i64(META_LAST_SWAP_FROM_WEEK_RESETS)?
-        .unwrap_or(0);
-    let matches = |v: Option<i64>, old: i64| old != 0 && v == Some(old);
-    Ok(matches(sample.five_resets_at, five) || matches(sample.week_resets_at, week))
+    let old: Vec<i64> = store
+        .meta(META_LAST_SWAP_FROM_RESETS)?
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|v| v.trim().parse().ok())
+        .filter(|&v: &i64| v != 0)
+        .collect();
+    Ok(sample
+        .windows
+        .iter()
+        .any(|w| w.resets_at.is_some_and(|r| old.contains(&r))))
 }
 
 /// Write-back outside a statusline tick, for callers that run while no interactive session
 /// does (the desktop app's watcher, `cc-rotate-ctl status`). Returns a swap request when the
-/// profile's login turned out to be dead.
+/// profile's login turned out to be dead, or when a better ranked account is usable again
+/// (the same switch-back rule and throttling as a tick, but no threshold triggers, since
+/// those need a live reading).
 pub fn sync(store: &Store, paths: &Paths) -> Result<Option<SwapRequest>> {
+    sync_at(store, paths, crate::time::now_ms())
+}
+
+pub fn sync_at(store: &Store, paths: &Paths, now_ms: i64) -> Result<Option<SwapRequest>> {
     let mut dead_login = false;
     sync_profile_login(store, paths, &mut dead_login)?;
-    if !dead_login {
-        return Ok(None);
-    }
     let Some(active) = store.active_account()? else {
         return Ok(None);
     };
+    let (pool, policy) = swap::load_pool(store, now_ms / 1000)?;
+    let Some(reason) = scheduler::decide(&pool, policy, timing(store, now_ms)?, dead_login, false)
+    else {
+        return Ok(None);
+    };
+    store.set_meta(META_SWAP_REQUESTED_AT, now_ms)?;
     Ok(Some(SwapRequest {
         from: Some(active.id),
         to: None,
-        reason: Reason::DeadLogin,
+        reason,
         wait: false,
     }))
 }
@@ -365,6 +419,7 @@ fn adopt_manual_login(store: &Store, paths: &Paths) -> Result<bool> {
                     s.set_state(a.id, AccountState::Parked)?;
                 }
                 s.set_state(account.id, AccountState::Active)?;
+                s.set_meta(META_ACTIVE_SINCE, crate::time::now_ms())?;
                 if let Some(o) = oauth.as_ref().filter(|o| !credfile::is_dead(o)) {
                     s.save_credential(account.id, o, "sync")?;
                 }
@@ -403,13 +458,40 @@ mod tests {
     #[test]
     fn parses_statusline_payload() {
         let input = StatusInput::parse(
-            r#"{"session_id":"s1","rate_limits":{"five_hour":{"used_percentage":41.5,"resets_at":1792890000},
+            r#"{"session_id":"s1","model":{"id":"claude-opus-4-1","display_name":"Opus"},
+                "rate_limits":{"five_hour":{"used_percentage":41.5,"resets_at":1792890000},
                 "seven_day":{"used_percentage":12,"resets_at":"2026-10-30T00:00:00Z"}}}"#,
         );
-        let rl = input.rate_limits.unwrap();
-        assert_eq!(rl.five_hour.as_ref().unwrap().used_percentage, Some(41.5));
-        assert_eq!(rl.five_hour.unwrap().resets_at, Some(1_792_890_000));
-        assert_eq!(rl.seven_day.unwrap().resets_at, Some(1_793_318_400));
+        assert_eq!(input.model_id(), Some("claude-opus-4-1"));
+        let rl = input.rate_limits.as_ref().unwrap();
+        assert_eq!(rl["five_hour"].used_percentage, Some(41.5));
+        assert_eq!(rl["five_hour"].resets_at, Some(1_792_890_000));
+        assert_eq!(rl["seven_day"].resets_at, Some(1_793_318_400));
+    }
+
+    #[test]
+    fn records_every_window_it_is_given() {
+        let input = StatusInput::parse(
+            r#"{"rate_limits":{"five_hour":{"used_percentage":5,"resets_at":100},
+                "seven_day_opus":{"used_percentage":70,"resets_at":200},
+                "spend_limit":{"used_percentage":1,"resets_at":300,"used_usd":2},
+                "not_a_window":"text","no_reading":{"resets_at":400}}}"#,
+        );
+        let sample = input.sample_for(1, "rotate", 0).unwrap();
+        let names: Vec<_> = sample.windows.iter().map(|w| w.name.as_str()).collect();
+        assert_eq!(names, vec!["five_hour", "seven_day_opus", "spend_limit"]);
+        assert_eq!(sample.window("seven_day_opus").unwrap().pct, 70.0);
+
+        // A Team seat: only the 5-hour window.
+        let team = StatusInput::parse(
+            r#"{"rate_limits":{"five_hour":{"used_percentage":5,"resets_at":100}}}"#,
+        );
+        assert_eq!(team.sample_for(1, "rotate", 0).unwrap().windows.len(), 1);
+        assert!(
+            StatusInput::parse(r#"{"rate_limits":{}}"#)
+                .sample_for(1, "rotate", 0)
+                .is_none()
+        );
     }
 
     #[test]

@@ -1,9 +1,13 @@
 //! Polls the store once a second. When another process commits (a statusline tick, a swap,
-//! a CLI command) it tells the UI to refresh, updates the tray tooltip, and turns new
-//! attention-worthy events into native notifications.
+//! a CLI command) it tells the UI to refresh and turns new attention-worthy events into native
+//! notifications. Every 5 seconds it runs the background sync (write-back, dead logins,
+//! switching back to a better ranked account), and every 30 seconds it refreshes the tray
+//! tooltip and checks whether an exhausted pool has an account ready again, since both move
+//! with the clock even when nothing is written.
 
 use std::time::Duration;
 
+use ccr_core::snapshot::Snapshot;
 use ccr_core::store::{Event, Store, kind};
 use ccr_core::{Paths, snapshot, statusline, swap};
 use tauri::{AppHandle, Emitter};
@@ -11,72 +15,63 @@ use tauri_plugin_notification::NotificationExt;
 
 pub const CHANGED: &str = "store-changed";
 
+const SYNC_EVERY_S: u64 = 5;
+const STATUS_EVERY_S: u64 = 30;
+
+#[derive(Default)]
+struct Watch {
+    last_version: Option<i64>,
+    last_event_id: Option<i64>,
+    /// Whether the pool was exhausted at the last status check.
+    exhausted: Option<bool>,
+}
+
 pub fn start(app: AppHandle) {
     std::thread::spawn(move || {
-        let mut last_version = None;
-        let mut last_event_id = None;
+        let mut watch = Watch::default();
         loop {
             if let Ok((store, paths)) = ccr_core::open(None) {
-                run(&app, &store, &paths, &mut last_version, &mut last_event_id);
+                run(&app, &store, &paths, &mut watch);
             }
             std::thread::sleep(Duration::from_secs(5));
         }
     });
 }
 
-fn run(
-    app: &AppHandle,
-    store: &Store,
-    paths: &Paths,
-    last_version: &mut Option<i64>,
-    last_event_id: &mut Option<i64>,
-) {
+fn run(app: &AppHandle, store: &Store, paths: &Paths, watch: &mut Watch) {
     // `data_version` only reflects other connections' commits, so keep this connection open.
     let mut tick = 0u64;
     loop {
         // Keep the store's copy of the active login current even when no interactive session
         // is running a statusline (for example only `claude -p` jobs).
-        if tick % 5 == 0 {
+        if tick % SYNC_EVERY_S == 0 {
             if let Ok(Some(req)) = statusline::sync(store, paths) {
                 let _ = swap::run(store, paths, &req);
                 // Our own writes do not move `data_version` for this connection.
-                *last_version = None;
+                watch.last_version = None;
             }
         }
-        tick += 1;
         let Ok(version) = store.data_version() else {
             return;
         };
-        if *last_version != Some(version) {
-            *last_version = Some(version);
-            refresh(app, store, paths, last_event_id);
+        if watch.last_version != Some(version) {
+            watch.last_version = Some(version);
+            refresh(app, store, paths, watch);
+        } else if tick % STATUS_EVERY_S == 0 {
+            status(app, store, paths, watch);
         }
+        tick += 1;
         std::thread::sleep(Duration::from_secs(1));
     }
 }
 
-fn refresh(app: &AppHandle, store: &Store, paths: &Paths, last_event_id: &mut Option<i64>) {
+fn refresh(app: &AppHandle, store: &Store, paths: &Paths, watch: &mut Watch) {
     let _ = app.emit(CHANGED, ());
+    status(app, store, paths, watch);
 
-    if let Ok(snap) = snapshot::snapshot(store, paths) {
-        let tooltip = match snap
-            .accounts
-            .iter()
-            .find(|a| Some(a.account.id) == snap.active_id)
-        {
-            Some(a) => format!(
-                "cc-rotate: {}\n5-hour {:.0}%, week {:.0}%",
-                a.account.label, a.usage.five_hour, a.usage.weekly
-            ),
-            None if snap.accounts.is_empty() => "cc-rotate: no accounts yet".to_string(),
-            None => "cc-rotate: no active account".to_string(),
-        };
-        crate::tray::set_tooltip(app, &tooltip);
-    }
-
-    match *last_event_id {
+    match watch.last_event_id {
         None => {
-            *last_event_id = Some(
+            watch.last_event_id = Some(
                 store
                     .events(1)
                     .ok()
@@ -87,15 +82,80 @@ fn refresh(app: &AppHandle, store: &Store, paths: &Paths, last_event_id: &mut Op
         Some(after) => {
             let events = store.events_after(after).unwrap_or_default();
             if let Some(last) = events.last() {
-                *last_event_id = Some(last.id);
+                watch.last_event_id = Some(last.id);
             }
             for event in events {
                 if let Some((title, body)) = describe(store, &event) {
-                    let _ = app.notification().builder().title(title).body(body).show();
+                    notify(app, &title, &body);
                 }
             }
         }
     }
+}
+
+/// The tray tooltip, and the "ready again" notification when an exhausted pool has an account
+/// it can use again.
+fn status(app: &AppHandle, store: &Store, paths: &Paths, watch: &mut Watch) {
+    let Ok(snap) = snapshot::snapshot(store, paths) else {
+        return;
+    };
+    crate::tray::set_tooltip(app, &tooltip(&snap));
+
+    let exhausted = snap.pool.exhausted;
+    if watch.exhausted == Some(true) && !exhausted {
+        let ready = snap.next.as_ref().map(|n| n.label.clone()).or_else(|| {
+            snap.accounts
+                .iter()
+                .find(|a| Some(a.account.id) == snap.active_id)
+                .map(|a| a.account.label.clone())
+        });
+        if let Some(label) = ready {
+            notify(
+                app,
+                &format!("{label} is ready again"),
+                &format!("Every account was near a limit. cc-rotate can use {label} now."),
+            );
+        }
+    }
+    watch.exhausted = Some(exhausted && !snap.accounts.is_empty());
+}
+
+fn tooltip(snap: &Snapshot) -> String {
+    let Some(a) = snap
+        .accounts
+        .iter()
+        .find(|a| Some(a.account.id) == snap.active_id)
+    else {
+        return if snap.accounts.is_empty() {
+            "cc-rotate: no accounts yet".to_string()
+        } else {
+            "cc-rotate: no active account".to_string()
+        };
+    };
+    let five = a
+        .windows
+        .iter()
+        .find(|w| w.name == ccr_core::scheduler::FIVE_HOUR)
+        .map_or("no reading".to_string(), |w| format!("{:.0}%", w.pct));
+    let week = match (
+        a.windows
+            .iter()
+            .find(|w| w.name == ccr_core::scheduler::SEVEN_DAY),
+        a.weekly.effective,
+    ) {
+        (Some(w), _) => format!("week {:.0}%", w.pct),
+        (None, ccr_core::scheduler::WeeklyLimit::None) => "no weekly limit".to_string(),
+        (None, _) => "week no reading".to_string(),
+    };
+    let mut text = format!("cc-rotate: {}\n5-hour {five}, {week}", a.account.label);
+    if let Some(next) = &snap.next {
+        text.push_str(&format!("\nNext: {}", next.label));
+    }
+    text
+}
+
+fn notify(app: &AppHandle, title: &str, body: &str) {
+    let _ = app.notification().builder().title(title).body(body).show();
 }
 
 fn describe(store: &Store, event: &Event) -> Option<(String, String)> {

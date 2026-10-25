@@ -8,7 +8,9 @@ use std::time::Duration;
 use ccr_core::lock::{DirLock, LockOptions};
 use ccr_core::scheduler::Reason;
 use ccr_core::statusline::{self, StatusInput};
-use ccr_core::store::{AccountIdentity, AccountState, Sample, kind};
+use ccr_core::store::{
+    AccountIdentity, AccountState, Sample, SampleWindow, WeeklyLimitSetting, kind,
+};
 use ccr_core::swap::{self, SwapOutcome, SwapRequest};
 use ccr_core::{Paths, Store, credfile, login, time};
 use serde_json::{Value, json};
@@ -84,16 +86,37 @@ fn pool(env: &Env) -> (Store, i64, i64, i64) {
     (store, a, b, c)
 }
 
+fn window(name: &str, pct: f64, resets_at: i64) -> SampleWindow {
+    SampleWindow {
+        name: name.into(),
+        pct,
+        resets_at: Some(resets_at),
+    }
+}
+
 fn sample(account: i64, five: f64, week: f64) -> Sample {
     Sample {
         ts: time::now_ms(),
         account_id: account,
         profile: "rotate".into(),
         session_id: None,
-        five_pct: Some(five),
-        five_resets_at: Some(time::now_s() + 3600),
-        week_pct: Some(week),
-        week_resets_at: Some(time::now_s() + 86_400 * 3),
+        model: None,
+        windows: vec![
+            window("five_hour", five, time::now_s() + 3600),
+            window("seven_day", week, time::now_s() + 86_400 * 3),
+        ],
+    }
+}
+
+/// A reading of an account without a weekly limit (a Team seat): only the 5-hour window.
+fn five_only(account: i64, five: f64, resets_at: i64, ts: i64) -> Sample {
+    Sample {
+        ts,
+        account_id: account,
+        profile: "rotate".into(),
+        session_id: None,
+        model: None,
+        windows: vec![window("five_hour", five, resets_at)],
     }
 }
 
@@ -176,21 +199,38 @@ fn first_swap_of_the_day_keeps_an_encrypted_backup() {
 }
 
 #[test]
-fn scheduler_picks_least_used_and_skips_exhausted() {
+fn scheduler_follows_the_order_and_skips_exhausted() {
     let env = Env::new();
     let (store, a, b, c) = pool(&env);
+    // Usage is usage: b comes first in the order even though c has more weekly budget left.
+    store.record_sample(&sample(a, 10.0, 40.0)).unwrap();
     store.record_sample(&sample(b, 10.0, 60.0)).unwrap();
     store.record_sample(&sample(c, 50.0, 20.0)).unwrap();
+    store.set_order(&[b, c, a]).unwrap();
     let out = swap::run(&store, &env.paths, &manual(None)).unwrap();
     assert_eq!(
         out,
         SwapOutcome::Swapped {
             from: Some(a),
+            to: b
+        }
+    );
+    let event = store.last_event_of(kind::SWAP).unwrap().unwrap();
+    assert_eq!(
+        event.detail.unwrap()["pick"],
+        "weekly limit 60% used, 1st in your order"
+    );
+
+    // b is over its 5-hour limit, so c is next.
+    store.record_sample(&sample(b, 99.0, 60.0)).unwrap();
+    assert_eq!(
+        swap::run(&store, &env.paths, &manual(None)).unwrap(),
+        SwapOutcome::Swapped {
+            from: Some(b),
             to: c
         }
     );
 
-    store.record_sample(&sample(b, 99.0, 60.0)).unwrap();
     store.record_sample(&sample(a, 10.0, 98.5)).unwrap();
     let before = env.file_doc();
     assert_eq!(
@@ -364,7 +404,11 @@ fn swap_waits_for_claude_credentials_write_lock() {
 #[test]
 fn tick_records_usage_and_requests_swap_at_threshold() {
     let env = Env::new();
-    let (store, a, _, _) = pool(&env);
+    let (store, a, b, c) = pool(&env);
+    // Without readings, b and c would rank above a (an unknown weekly limit ranks above a
+    // known one) and the tick would ask to switch to them; say they have one too.
+    store.set_weekly_limit(b, WeeklyLimitSetting::Yes).unwrap();
+    store.set_weekly_limit(c, WeeklyLimitSetting::Yes).unwrap();
     let input = |pct: f64| {
         StatusInput::parse(&format!(
             r#"{{"session_id":"s","rate_limits":{{"five_hour":{{"used_percentage":{pct},"resets_at":{}}},"seven_day":{{"used_percentage":30,"resets_at":{}}}}}}}"#,
@@ -374,7 +418,16 @@ fn tick_records_usage_and_requests_swap_at_threshold() {
     };
     let r = statusline::tick(&store, &env.paths, &input(50.0), time::now_ms()).unwrap();
     assert!(r.swap.is_none());
-    assert_eq!(store.last_sample(a).unwrap().unwrap().five_pct, Some(50.0));
+    assert_eq!(
+        store
+            .last_sample(a)
+            .unwrap()
+            .unwrap()
+            .window("five_hour")
+            .unwrap()
+            .pct,
+        50.0
+    );
 
     let r = statusline::tick(&store, &env.paths, &input(98.0), time::now_ms()).unwrap();
     let req = r.swap.expect("swap requested at 98%");
@@ -447,8 +500,8 @@ fn readings_of_the_old_account_after_a_swap_are_ignored() {
 
     let stale = format!(
         r#"{{"rate_limits":{{"five_hour":{{"used_percentage":98,"resets_at":{}}},"seven_day":{{"used_percentage":40,"resets_at":{}}}}}}}"#,
-        old.five_resets_at.unwrap(),
-        old.week_resets_at.unwrap()
+        old.window("five_hour").unwrap().resets_at.unwrap(),
+        old.window("seven_day").unwrap().resets_at.unwrap()
     );
     let r = statusline::tick(
         &store,
@@ -599,4 +652,166 @@ fn manual_login_inside_profile_is_adopted() {
         "refresh-a1",
         "a's login not overwritten"
     );
+}
+
+/// Two Team seats ordered first and a Max account last: once the first seat's 5-hour window
+/// has reset and the second has been in use for the dwell time, a tick asks to switch back,
+/// and the swap records why.
+#[test]
+fn tick_switches_back_to_a_preferred_account() {
+    let env = Env::new();
+    let (store, a, b, c) = pool(&env);
+    // c (Max, weekly limit) is active; a and b are seats without a weekly limit, a first.
+    swap::run(&store, &env.paths, &manual(Some(c))).unwrap();
+    store.set_order(&[a, b, c]).unwrap();
+    let now_s = time::now_s();
+    for (account, offset) in [(a, 0), (b, 0)] {
+        // Two distinct 5-hour windows in the last week and never a weekly one: no limit.
+        store
+            .record_sample(&five_only(
+                account,
+                30.0,
+                now_s - 20 * 3600,
+                (now_s - 30 * 3600) * 1000 + offset,
+            ))
+            .unwrap();
+        store
+            .record_sample(&five_only(
+                account,
+                5.0,
+                now_s + 3 * 3600,
+                (now_s - 3600) * 1000,
+            ))
+            .unwrap();
+    }
+    store.record_sample(&sample(c, 10.0, 20.0)).unwrap();
+    store
+        .set_setting("switch_back_dwell_s", Some("600"))
+        .unwrap();
+
+    let input = format!(
+        r#"{{"model":{{"id":"claude-opus-4-1"}},"rate_limits":{{"five_hour":{{"used_percentage":12,"resets_at":{}}},"seven_day":{{"used_percentage":21,"resets_at":{}}}}}}}"#,
+        now_s + 3600,
+        now_s + 86_400 * 3
+    );
+    let tick = |at_ms: i64| {
+        statusline::tick(&store, &env.paths, &StatusInput::parse(&input), at_ms).unwrap()
+    };
+
+    let r = tick(time::now_ms());
+    assert!(r.swap.is_none(), "not before the dwell time");
+
+    let later = time::now_ms() + 601_000;
+    let req = tick(later).swap.expect("a better ranked account is ready");
+    assert_eq!(
+        (req.from, req.reason),
+        (Some(c), Reason::PreferredAvailable)
+    );
+    assert!(tick(later + 1000).swap.is_none(), "one request at a time");
+
+    // The swap itself re-checks the dwell against the real clock, so pretend c has been
+    // active for a while.
+    store
+        .set_meta(swap::META_ACTIVE_SINCE, time::now_ms() - 700_000)
+        .unwrap();
+    store
+        .set_meta(swap::META_LAST_SWAP_AT, time::now_ms() - 700_000)
+        .unwrap();
+    let out = swap::run(&store, &env.paths, &req).unwrap();
+    assert_eq!(
+        out,
+        SwapOutcome::Swapped {
+            from: Some(c),
+            to: a
+        }
+    );
+    let event = store.last_event_of(kind::SWAP).unwrap().unwrap();
+    assert_eq!(event.reason.as_deref(), Some("preferred_available"));
+    let detail = event.detail.unwrap();
+    assert_eq!(
+        detail["pick"], "no weekly limit, 1st in your order",
+        "{detail}"
+    );
+    assert!(
+        detail["why"]
+            .as_str()
+            .unwrap()
+            .starts_with("a ranks above c"),
+        "{detail}"
+    );
+    assert_eq!(
+        store.meta(swap::META_PROFILE_MODEL).unwrap().as_deref(),
+        Some("claude-opus-4-1")
+    );
+
+    // a and b rank equally apart from the order, and b is never preferred over a.
+    let r = statusline::tick(
+        &store,
+        &env.paths,
+        &StatusInput::default(),
+        time::now_ms() + 3_600_000,
+    )
+    .unwrap();
+    assert!(r.swap.is_none());
+}
+
+/// A switch back that is no longer warranted when the detached swap runs is skipped, not
+/// turned into another kind of swap.
+#[test]
+fn stale_switch_back_requests_are_skipped() {
+    let env = Env::new();
+    let (store, a, _, _) = pool(&env);
+    store
+        .set_meta(swap::META_ACTIVE_SINCE, time::now_ms() - 3_600_000)
+        .unwrap();
+    let req = SwapRequest {
+        from: Some(a),
+        to: None,
+        reason: Reason::PreferredAvailable,
+        wait: false,
+    };
+    // a is first in the order and nothing ranks above it.
+    assert_eq!(
+        swap::run(&store, &env.paths, &req).unwrap(),
+        SwapOutcome::Skipped {
+            why: "no better ranked account is ready".into()
+        }
+    );
+    store
+        .set_meta(swap::META_ACTIVE_SINCE, time::now_ms())
+        .unwrap();
+    assert!(matches!(
+        swap::run(&store, &env.paths, &req).unwrap(),
+        SwapOutcome::Skipped { .. }
+    ));
+    assert_eq!(store.active_account().unwrap().unwrap().id, a);
+}
+
+/// The app's background sync applies the same switch-back rule without a live reading.
+#[test]
+fn background_sync_switches_back_too() {
+    let env = Env::new();
+    let (store, a, b, _) = pool(&env);
+    swap::run(&store, &env.paths, &manual(Some(b))).unwrap();
+    store
+        .set_meta(swap::META_ACTIVE_SINCE, time::now_ms() - 3_600_000)
+        .unwrap();
+    store
+        .set_meta(swap::META_LAST_SWAP_AT, time::now_ms() - 3_600_000)
+        .unwrap();
+    let req = statusline::sync(&store, &env.paths)
+        .unwrap()
+        .expect("a ranks above b");
+    assert_eq!(
+        (req.from, req.reason),
+        (Some(b), Reason::PreferredAvailable)
+    );
+    assert_eq!(
+        swap::run(&store, &env.paths, &req).unwrap(),
+        SwapOutcome::Swapped {
+            from: Some(b),
+            to: a
+        }
+    );
+    assert!(statusline::sync(&store, &env.paths).unwrap().is_none());
 }
