@@ -110,16 +110,19 @@ impl Credentials {
         }
     }
 
-    /// Changes whenever Claude Code (or anyone) writes the credentials: the file's mtime, or a
-    /// fingerprint of the Keychain item, whose changes leave no timestamp to compare.
+    /// Changes whenever the credentials change: a fingerprint of the Keychain item or the file.
+    /// Not the file's modification time: Windows stamps it from a clock that advances only every
+    /// 15.6 ms or so, so a renewal right after a swap's write could keep the swap's time.
     pub fn change_marker(&self) -> Result<Option<String>> {
-        if let Some(keychain) = &self.keychain {
-            if let Some(text) = keychain.read()? {
-                let digest = Sha256::digest(text.as_bytes());
-                return Ok(Some(format!("keychain:{}", hex::encode(&digest[..12]))));
-            }
-        }
-        Ok(credfile::mtime_ms(&self.file).map(|m| m.to_string()))
+        let Some((location, bytes)) = self.read_raw()? else {
+            return Ok(None);
+        };
+        let digest = Sha256::digest(&bytes);
+        let kind = match location {
+            Location::Keychain => "keychain",
+            Location::File => "file",
+        };
+        Ok(Some(format!("{kind}:{}", hex::encode(&digest[..12]))))
     }
 
     /// Whether what `read_raw` returns is all there is: false on macOS while the Keychain cannot
@@ -495,6 +498,31 @@ mod tests {
         assert_eq!(doc["mcpOAuth"], json!({"s": 1}));
         assert_eq!(creds.read_oauth().unwrap().unwrap()["refreshToken"], "new");
         assert!(creds.change_marker().unwrap().is_some());
+    }
+
+    /// Two logins written within one tick of the clock that stamps file times (about 15.6 ms on
+    /// Windows) have the same modification time; the marker still tells them apart.
+    #[test]
+    fn the_marker_changes_with_the_login_not_the_file_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let creds = Credentials {
+            file: dir.path().join(".credentials.json"),
+            keychain: None,
+        };
+        let at = std::time::SystemTime::now();
+        let write = |token: &str| {
+            creds.write_oauth(&json!({"refreshToken": token})).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(creds.file())
+                .unwrap()
+                .set_modified(at)
+                .unwrap();
+            creds.change_marker().unwrap().unwrap()
+        };
+        let first = write("one");
+        assert_ne!(write("two"), first);
+        assert_eq!(write("one"), first, "the same login, the same marker");
     }
 
     #[test]

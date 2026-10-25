@@ -539,7 +539,7 @@ pub const META_ACTIVE_SINCE: &str = "active_since";
 /// scoped to one model family applies.
 pub const META_PROFILE_MODEL: &str = "profile_model_seen";
 /// The credentials change marker (`Credentials::change_marker`) last seen. Named for the file
-/// mtime it held before the marker could also be a Keychain fingerprint.
+/// modification time the marker once was.
 pub const META_CRED_SEEN: &str = "cred_mtime_seen";
 /// Set when the profile is signed in to an account outside the pool; a swap clears it.
 pub const META_PROFILE_FOREIGN: &str = "profile_foreign";
