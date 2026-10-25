@@ -158,7 +158,7 @@ While the account in use has a weekly limit, or it is not known yet whether it h
 So weekly budget is only spent while no account without a weekly limit can be used.
 That includes an account you picked by hand and an account spending a weekly budget that would otherwise reset unused.
 To keep using such an account, pause the accounts without a weekly limit, or turn off `prefer_no_weekly_limit`.
-An account that a session stopped on at a usage limit is not swapped back to until cc-rotate has a newer reading of it, or 5 hours have passed, so a limit that Claude Code does not report cannot make it swap back and forth.
+When a session stops at a usage limit that Claude Code's usage numbers did not show, that account is used last, and not swapped back to, until cc-rotate gets different numbers for it or 5 hours have passed, so such a limit cannot make it swap back and forth.
 cc-rotate never swaps back for anything else: not for an account higher in your order, and not to even out usage.
 
 To pick the next account by your order alone, turn on **Pick the next account by my order alone** in the app's **Settings**, or run `cc-rotate-ctl config strict_order true`.

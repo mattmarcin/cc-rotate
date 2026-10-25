@@ -470,7 +470,7 @@ fn candidates(
                     .unwrap_or_default(),
                 held_back: false,
                 expiring: None,
-                left_at_stop: false,
+                stop_hold_until: None,
                 account,
             }
         })

@@ -1,7 +1,7 @@
 //! Polls the store once a second. When another process commits (a statusline tick, a swap,
 //! a CLI command) it tells the UI to refresh and turns new attention-worthy events into native
 //! notifications. Every 5 seconds it runs the background sync (write-back, dead logins,
-//! switching back to a better ranked account), and every 30 seconds it refreshes the tray
+//! switching back to an account without a weekly limit), and every 30 seconds it refreshes the tray
 //! tooltip and checks whether an exhausted pool has an account ready again, since both move
 //! with the clock even when nothing is written. Every minute it starts the next background job
 //! (`usage_check::next_job`), one at a time: a usage check of the account most overdue for one,

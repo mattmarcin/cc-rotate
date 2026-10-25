@@ -1847,13 +1847,11 @@ fn a_weekly_budget_that_would_reset_unused_moves_its_account_ahead() {
     assert!((marked - week_reset).abs() <= 5, "{marked} vs {week_reset}");
 }
 
-/// A turn stopped at a limit that the account's readings did not show: the account is not
-/// switched back to on that out-of-date room, only once a newer reading shows it, or after
-/// `LEFT_AT_STOP_HOLD_MS`. Otherwise the swap back would stop the next turn again, every cooldown.
-#[test]
-fn an_account_left_at_a_stop_is_not_switched_back_to_on_old_readings() {
-    let env = Env::new();
-    let (store, a, b, c) = pool(&env);
+/// The pool of the stop tests: a and b without a weekly limit, c with one, b at its limit for 6
+/// hours and a with `a_five` points used in a window that resets in `a_resets_s`, then a stop
+/// on a.
+fn stopped_on_a(env: &Env, a_five: f64, a_resets_s: i64) -> (Store, i64, i64) {
+    let (store, a, b, c) = pool(env);
     for (account, weekly) in [
         (a, WeeklyLimitSetting::No),
         (b, WeeklyLimitSetting::No),
@@ -1861,14 +1859,13 @@ fn an_account_left_at_a_stop_is_not_switched_back_to_on_old_readings() {
     ] {
         store.set_weekly_limit(account, weekly).unwrap();
     }
-    // a has room by its last reading; b is at its limit.
     let now_s = time::now_s();
     let before = time::now_ms() - 60_000;
     store
-        .record_sample(&five_only(a, 20.0, now_s + 3 * 3600, before))
+        .record_sample(&five_only(a, a_five, now_s + a_resets_s, before))
         .unwrap();
     store
-        .record_sample(&five_only(b, 100.0, now_s + 3 * 3600, before))
+        .record_sample(&five_only(b, 100.0, now_s + 6 * 3600, before))
         .unwrap();
     let stop = SwapRequest {
         from: Some(a),
@@ -1886,21 +1883,115 @@ fn an_account_left_at_a_stop_is_not_switched_back_to_on_old_readings() {
     store
         .set_meta(swap::META_LAST_SWAP_AT, time::now_ms() - 3_600_000)
         .unwrap();
+    (store, a, c)
+}
+
+/// A stop whose reading showed the limit needs no hold: the account is switched back to as soon
+/// as that limit has reset.
+#[test]
+fn an_account_left_at_a_shown_limit_is_switched_back_to_once_it_resets() {
+    let env = Env::new();
+    let (store, _, c) = stopped_on_a(&env, 100.0, 30 * 60);
+    assert!(statusline::sync(&store, &env.paths).unwrap().is_none());
+    let req = statusline::sync_at(&store, &env.paths, time::now_ms() + 31 * 60_000)
+        .unwrap()
+        .expect("a has reset");
+    assert_eq!(
+        (req.from, req.reason),
+        (Some(c), Reason::PreferredAvailable)
+    );
+}
+
+/// The hold on an account left at a stop ends after `LEFT_AT_STOP_HOLD_MS`, with no new reading.
+#[test]
+fn the_hold_on_an_account_left_at_a_stop_ends() {
+    let env = Env::new();
+    let (store, a, c) = stopped_on_a(&env, 20.0, 3 * 3600);
+    let before = time::now_ms() + swap::LEFT_AT_STOP_HOLD_MS - 60_000;
+    let r = statusline::sync_at(&store, &env.paths, before).unwrap();
+    assert!(r.is_none(), "{r:?}");
+    let over = time::now_ms() + swap::LEFT_AT_STOP_HOLD_MS + 1000;
+    let req = statusline::sync_at(&store, &env.paths, over)
+        .unwrap()
+        .expect("the hold is over");
+    assert_eq!(
+        (req.from, req.reason),
+        (Some(c), Reason::PreferredAvailable)
+    );
+    let (pool, policy) = swap::load_pool(&store, over / 1000).unwrap();
+    let target = ccr_core::scheduler::switch_back_target(&pool, policy, over / 1000).unwrap();
+    assert_eq!(target.account.id, a);
+}
+
+/// A turn stopped at a limit that the account's readings did not show: the account is not
+/// switched back to on that out-of-date room, and it is picked last, until a different reading
+/// of it comes or `LEFT_AT_STOP_HOLD_MS` passes. Otherwise the swap back would stop the next turn
+/// again, every cooldown.
+#[test]
+fn an_account_left_at_a_stop_is_not_switched_back_to_on_old_readings() {
+    let env = Env::new();
+    // a has room by its last reading.
+    let (store, a, c) = stopped_on_a(&env, 20.0, 3 * 3600);
+    let now_s = time::now_s();
     assert!(
         statusline::sync(&store, &env.paths).unwrap().is_none(),
         "a's room is out of date"
     );
-    let latest = store.last_sample(a).unwrap();
-    let hold_over = time::now_ms() + swap::LEFT_AT_STOP_HOLD_MS;
-    assert!(!swap::left_at_stop(&store, a, latest.as_ref(), hold_over).unwrap());
+    // A tick on c, past the cooldown, does not ask either.
+    let input = format!(
+        r#"{{"model":{{"id":"claude-opus-4-1"}},"rate_limits":{{"five_hour":{{"used_percentage":12,"resets_at":{}}},"seven_day":{{"used_percentage":21,"resets_at":{}}}}}}}"#,
+        now_s + 3600,
+        now_s + 86_400 * 3
+    );
+    let tick = statusline::tick(
+        &store,
+        &env.paths,
+        &StatusInput::parse(&input),
+        time::now_ms(),
+    )
+    .unwrap();
+    assert!(tick.swap.is_none(), "{:?}", tick.swap);
+    // A stale request is skipped, saying why.
+    let back = SwapRequest {
+        from: Some(c),
+        to: None,
+        reason: Reason::PreferredAvailable,
+        wait: false,
+    };
+    assert!(matches!(
+        swap::run(&store, &env.paths, &back).unwrap(),
+        SwapOutcome::Skipped { why } if why.starts_with("a session stopped lately")
+    ));
+    // a goes last, with the reason.
+    let (pool, policy) = swap::load_pool(&store, now_s).unwrap();
+    let ranked = ccr_core::scheduler::ranking(&pool, policy, now_s);
+    let last = ranked.iter().rfind(|r| r.rank.is_some()).unwrap();
+    assert_eq!(last.account_id, a);
+    let reason = &ranked.iter().find(|r| r.account_id == a).unwrap().reason;
+    assert!(
+        reason.starts_with("a session stopped on it at a limit"),
+        "{reason}"
+    );
 
-    // A newer reading of a with room, from a usage check say.
-    store
-        .record_sample(&five_only(a, 20.0, now_s + 3 * 3600, time::now_ms() + 1000))
-        .unwrap();
+    // A newer reading of a with the same numbers (another profile's idle session, say) is no
+    // news; a different one is.
+    // A usage check, say, that rounds the reset time differently and reports a weekly window
+    // the status line did not.
+    let mut again = store.last_sample(a).unwrap().unwrap();
+    again.ts = time::now_ms() + 1000;
+    again.windows[0].resets_at = again.windows[0].resets_at.map(|r| r + 30);
+    again
+        .windows
+        .push(window("seven_day", 0.0, now_s + 86_400 * 7));
+    store.record_sample(&again).unwrap();
+    let r = statusline::sync(&store, &env.paths).unwrap();
+    assert!(r.is_none(), "{r:?}");
+    again.ts = time::now_ms() + 2000;
+    again.windows[0].pct = 25.0;
+    store.record_sample(&again).unwrap();
     let req = statusline::sync(&store, &env.paths)
         .unwrap()
-        .expect("a has room by a newer reading");
+        .expect("a has room by a different reading");
     assert_eq!(
         (req.from, req.reason),
         (Some(c), Reason::PreferredAvailable)

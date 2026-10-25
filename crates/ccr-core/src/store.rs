@@ -1382,14 +1382,19 @@ impl Store {
     }
 
     pub fn last_sample(&self, account_id: i64) -> Result<Option<Sample>> {
+        self.last_sample_until(account_id, i64::MAX)
+    }
+
+    /// The account's latest sample taken at or before `until_ms`.
+    pub fn last_sample_until(&self, account_id: i64, until_ms: i64) -> Result<Option<Sample>> {
         let row = self
             .conn
             .query_row(
                 &format!(
-                    "SELECT {SAMPLE_COLS} FROM samples WHERE account_id = ?1
+                    "SELECT {SAMPLE_COLS} FROM samples WHERE account_id = ?1 AND ts <= ?2
                      ORDER BY ts DESC, id DESC LIMIT 1"
                 ),
-                [account_id],
+                [account_id, until_ms],
                 sample_from_row,
             )
             .optional()?;

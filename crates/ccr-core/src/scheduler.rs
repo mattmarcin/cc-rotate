@@ -391,13 +391,18 @@ pub struct Candidate {
     pub held_back: bool,
     /// Its weekly budget would reset unused unless it is used now (`budget::expiring`).
     pub expiring: Option<crate::budget::Expiring>,
-    /// A swap left it lately because a turn stopped at a usage limit, and no reading of it has
-    /// come since, so its room may be out of date: it is not switched back to
-    /// (`swap::left_at_stop`).
-    pub left_at_stop: bool,
+    /// Until when (epoch seconds) its room is not trusted: a turn stopped on it at a usage limit
+    /// that its readings did not show, and no different reading has come since
+    /// (`swap::stop_hold_until`). Until then it is not switched back to, and it is picked last.
+    pub stop_hold_until: Option<i64>,
 }
 
 impl Candidate {
+    /// Its room is not trusted at `now_s` (`stop_hold_until`).
+    pub fn on_stop_hold(&self, now_s: i64) -> bool {
+        self.stop_hold_until.is_some_and(|until| now_s < until)
+    }
+
     /// The window that keeps this account from being used, if any: a weekly one before a
     /// 5-hour one, and of those the one that resets last.
     pub fn blocking(&self) -> Option<&WindowUsage> {
@@ -472,7 +477,7 @@ impl Candidate {
         self.account.state == AccountState::Parked && self.blocking().is_none() && !self.held_back
     }
 
-    fn has_margin(&self) -> bool {
+    pub fn has_margin(&self) -> bool {
         self.windows
             .iter()
             .filter(|w| w.applies)
@@ -564,8 +569,9 @@ impl Policy {
     }
 
     fn pick_order(&self, a: &Candidate, b: &Candidate, now_s: i64) -> Ordering {
-        self.rank(a)
-            .cmp(&self.rank(b))
+        a.on_stop_hold(now_s)
+            .cmp(&b.on_stop_hold(now_s))
+            .then(self.rank(a).cmp(&self.rank(b)))
             .then(self.place(a, now_s).cmp(&self.place(b, now_s)))
             .then(b.room(self.thresholds).total_cmp(&a.room(self.thresholds)))
             .then_with(|| a.account.label.cmp(&b.account.label))
@@ -589,9 +595,9 @@ pub fn pick(
 /// a weekly limit is in use, the best eligible account without one that has
 /// `SWITCH_BACK_MARGIN` to spare, so weekly budget is only spent while no such account can be
 /// used. Not to an account a turn just stopped on at a limit its readings do not show
-/// (`Candidate::left_at_stop`), which would swap back and forth every cooldown. Never with `prefer_no_weekly_limit` off, and `None` while the active account is over a
-/// threshold, since the threshold trigger handles that. The account in use is otherwise kept
-/// until a limit.
+/// (`Candidate::on_stop_hold`), which would swap back and forth every cooldown. Never with
+/// `prefer_no_weekly_limit` off, and `None` while the active account is over a threshold, since
+/// the threshold trigger handles that. The account in use is otherwise kept until a limit.
 pub fn switch_back_target(
     candidates: &[Candidate],
     policy: Policy,
@@ -609,7 +615,10 @@ pub fn switch_back_target(
     candidates
         .iter()
         .filter(|c| {
-            c.eligible() && c.weekly_limit == WeeklyLimit::None && c.has_margin() && !c.left_at_stop
+            c.eligible()
+                && c.weekly_limit == WeeklyLimit::None
+                && c.has_margin()
+                && !c.on_stop_hold(now_s)
         })
         .min_by(|a, b| policy.pick_order(a, b, now_s))
 }
@@ -733,6 +742,12 @@ pub fn ranking(candidates: &[Candidate], policy: Policy, now_s: i64) -> Vec<Rank
 }
 
 fn open_reason(c: &Candidate, policy: Policy, tied: bool, now_s: i64) -> String {
+    if let Some(until) = c.stop_hold_until.filter(|&u| now_s < u) {
+        return format!(
+            "a session stopped on it at a limit its usage didn't show, so it goes last for {} or until a new reading",
+            time::span(until - now_s)
+        );
+    }
     if let Some(e) = policy.expiring(c) {
         return format!(
             "weekly budget expires in {} with {:.0}% left",
@@ -876,7 +891,7 @@ mod tests {
             weekly_limit: weekly,
             held_back: false,
             expiring: None,
-            left_at_stop: false,
+            stop_hold_until: None,
             account,
         }
     }
@@ -1274,11 +1289,20 @@ mod tests {
                 "too close to its threshold to be worth it"
             );
             let mut stopped = other(9, 0.0, none);
-            stopped.left_at_stop = true;
+            stopped.stop_hold_until = Some(NOW + 60);
             assert_eq!(
-                d(&[active(1, WeeklyLimit::Has), stopped], timing),
+                d(&[active(1, WeeklyLimit::Has), stopped.clone()], timing),
                 None,
                 "a turn just stopped on it at a limit its readings do not show"
+            );
+            let later = Timing {
+                now_ms: (NOW + 60) * 1000,
+                ..timing
+            };
+            assert_eq!(
+                d(&[active(1, WeeklyLimit::Has), stopped], later),
+                Some(Reason::PreferredAvailable),
+                "the hold is over"
             );
             let cooling = Timing {
                 last_swap_ms: timing.now_ms - 60_000,
