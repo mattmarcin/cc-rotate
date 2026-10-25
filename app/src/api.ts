@@ -58,7 +58,7 @@ export interface Account {
 }
 
 export interface AccountView extends Account {
-  /** "Max 5x", "Team Premium", "Pro", or the raw subscription type. */
+  /** "Max 5x", "Max 20x", "Team 5x", "Pro", or the raw subscription type. */
   plan: string | null;
   windows: WindowUsage[];
   weekly: { setting: WeeklyLimitSetting; detected: WeeklyLimit; effective: WeeklyLimit };
