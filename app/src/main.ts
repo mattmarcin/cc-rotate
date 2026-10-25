@@ -333,7 +333,10 @@ function renderTop() {
       ),
     );
   } else if (snap && snap.pool.sign_ins_ending.length > 0) {
-    const ending = snap.accounts.filter((a) => a.sign_in_ends_soon);
+    // The sign-in that ends first, first.
+    const ending = snap.accounts
+      .filter((a) => a.sign_in_ends_soon)
+      .sort((x, y) => (x.refresh_expires_at ?? 0) - (y.refresh_expires_at ?? 0));
     const first = ending[0];
     banner.hidden = false;
     banner.className = "banner warn";
@@ -693,8 +696,7 @@ function renderAccounts() {
       actions.push(h("button", { class: "link", onclick: () => act(() => api.swapNow(a.id), () => `Swapped to ${a.label}`) }, "Use now"));
     if (a.state === "paused")
       actions.push(h("button", { class: "link", onclick: () => act(() => api.setPaused(a.id, false), () => `Resumed ${a.label}`) }, "Resume"));
-    if (a.state === "needs_login" || a.sign_in_ends_soon)
-      actions.push(h("button", { class: "link", onclick: () => openLogin(a) }, "Sign in again"));
+    if (a.state === "needs_login") actions.push(h("button", { class: "link", onclick: () => openLogin(a) }, "Sign in again"));
     actions.push(h("button", { class: "link quiet-link", onclick: () => openManage(a), "aria-label": `More options for ${a.label}` }, "More"));
 
     const grip = h(
@@ -1380,14 +1382,6 @@ async function openSettings() {
       h("label", { class: "check", for: "use-expiring" }, expiringBox, "Use weekly budget before it resets"),
       h("label", { class: "check", for: "usage-checks" }, checks, "Check usage of accounts not in use"),
       field(
-        "login_warning_days",
-        "Warn before a sign-in ends (days)",
-        snap.settings.login_warning_days,
-        "Each sign-in lasts about a month. Set to 0 to turn the warning off.",
-        0,
-        30,
-      ),
-      field(
         "usage_check_interval_s",
         "Check every (seconds)",
         snap.settings.usage_check_interval_s,
@@ -1402,6 +1396,14 @@ async function openSettings() {
         "Set to 0 to always check first.",
         0,
         86400,
+      ),
+      field(
+        "login_warning_days",
+        "Warn before a sign-in ends (days)",
+        snap.settings.login_warning_days,
+        "Each sign-in lasts about a month. Set to 0 to turn the warning off.",
+        0,
+        30,
       ),
     );
   }
