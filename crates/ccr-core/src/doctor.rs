@@ -9,7 +9,7 @@ use serde_json::Value;
 use crate::credstore::{self, Location};
 use crate::paths::{self, Paths};
 use crate::store::{AccountState, Store};
-use crate::{credfile, login, statusline, time};
+use crate::{credfile, herdr, login, statusline, time};
 
 /// Claude Code versions whose internals (credential reload, refresh locks, statusline and hook
 /// payloads) this release was verified against end to end.
@@ -81,6 +81,7 @@ pub fn run(store: &Store, paths: &Paths) -> Vec<Check> {
     }
 
     checks.push(profile_settings_check(paths));
+    checks.push(herdr_check(paths, herdr::detect()));
 
     let legacy = crate::setup::legacy_alias_files();
     if !legacy.is_empty() {
@@ -450,5 +451,96 @@ fn profile_settings_check(paths: &Paths) -> Check {
             Status::Warn,
             "the StopFailure hook is not installed",
         ),
+    }
+}
+
+/// herdr is optional: this only warns when herdr is here but would resume cc-rotate sessions
+/// with plain `claude` (spec section 19).
+fn herdr_check(paths: &Paths, detected: Option<herdr::Detected>) -> Check {
+    let name = "herdr";
+    let hook = std::fs::read_to_string(paths.settings_file())
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .is_some_and(|s| herdr::session_start_hook_installed(&s));
+    let Some(detected) = detected else {
+        return check(
+            name,
+            Status::Ok,
+            if hook {
+                "not detected (optional); the SessionStart hook is installed for when you use it"
+            } else {
+                "not detected (optional); if you start using it, run `cc-rotate-ctl setup --force` so it resumes sessions with cc-rotate"
+            },
+        );
+    };
+    // The check's name is "herdr", so the detail starts with what was found.
+    let version = herdr::version(detected.bin());
+    let found = match (&version, &detected) {
+        (Some(v), _) => format!("version {v}"),
+        (None, herdr::Detected::InPane(_)) => "running in a herdr pane".to_string(),
+        (None, herdr::Detected::OnPath(p)) => format!("found at {}", p.display()),
+    };
+    let (major, minor, patch) = herdr::MIN_VERSION;
+    if let Some(v) = version.as_deref().and_then(herdr::parse_version) {
+        if v < herdr::MIN_VERSION {
+            return check(
+                name,
+                Status::Warn,
+                format!(
+                    "{found} cannot be told how to resume cc-rotate sessions, so it resumes them with plain `claude` on your default profile; update herdr to {major}.{minor}.{patch} or newer"
+                ),
+            );
+        }
+    }
+    if !hook {
+        return check(
+            name,
+            Status::Warn,
+            format!(
+                "{found}, but the profile has no SessionStart hook for it, so herdr resumes cc-rotate sessions with plain `claude` on your default profile; run `cc-rotate-ctl setup --force`"
+            ),
+        );
+    }
+    check(
+        name,
+        Status::Ok,
+        format!(
+            "{found}; panes it restores resume with `cc-rotate --resume`, on the rotation profile"
+        ),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn herdr_check_is_soft() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path().join("data"), root.path().join("profile"));
+        std::fs::create_dir_all(&paths.profile_dir).unwrap();
+        let missing_bin = herdr::Detected::OnPath(root.path().join("no-such-herdr"));
+
+        // No profile settings at all: herdr is optional, so this never fails.
+        let c = herdr_check(&paths, None);
+        assert_eq!(c.status, Status::Ok);
+        assert!(c.detail.contains("setup --force"), "{}", c.detail);
+
+        let c = herdr_check(&paths, Some(missing_bin.clone()));
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.detail.contains("no SessionStart hook"), "{}", c.detail);
+
+        std::fs::write(
+            paths.settings_file(),
+            serde_json::json!({"hooks": {"SessionStart": [{"hooks": [
+                {"type": "command", "command": "/bin/cc-rotate-ctl hook session-start"}
+            ]}]}})
+            .to_string(),
+        )
+        .unwrap();
+        let c = herdr_check(&paths, Some(missing_bin));
+        assert_eq!(c.status, Status::Ok, "{}", c.detail);
+        assert!(c.detail.contains("cc-rotate --resume"), "{}", c.detail);
+        assert_eq!(herdr_check(&paths, None).status, Status::Ok);
     }
 }
