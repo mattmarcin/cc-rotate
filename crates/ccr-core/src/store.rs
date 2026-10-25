@@ -162,15 +162,16 @@ CREATE TABLE waiting_sessions (
 "#;
 
 /// Schema 7. `session_costs` holds the last `cost.total_cost_usd` from the status line of each
-/// session's process (`session_id` is the session and when its process started), so only what it
-/// adds is counted; `account_costs` sums that per account and hour (epoch
+/// session's process (told apart by when it started), so only what it adds is counted; `account_costs` sums that per account and hour (epoch
 /// hours); `extra_usage` is each account's latest extra-usage state from a usage report.
 const SCHEMA_V7: &str = r#"
 CREATE TABLE session_costs (
-    session_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    started_ms INTEGER NOT NULL,
     total_usd  REAL NOT NULL,
-    updated_at INTEGER NOT NULL
-);
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (session_id, started_ms)
+) WITHOUT ROWID;
 CREATE TABLE account_costs (
     account_id INTEGER NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
     hour       INTEGER NOT NULL,
@@ -496,6 +497,13 @@ pub struct WaitingSession {
 /// A new stop of a session woken this recently, and not seen working since, remembers the
 /// accounts it was woken on.
 pub const WAKE_MEMORY_MS: i64 = 30 * 60_000;
+
+/// Ticks of one process work out its start from when they arrive, so they agree on it to within
+/// their delivery time: starts this close are one process (`Store::note_session_cost`).
+const PROCESS_MATCH_MS: i64 = 30_000;
+/// A process whose status line first reports a total within this time of its start began then:
+/// its whole total counts. A resumed or forked one reports the run time it had.
+const NEW_PROCESS_MS: i64 = 60_000;
 
 /// Waiting-session rows are dropped this long after their last change.
 const WAITING_RETENTION_MS: i64 = 7 * 86_400_000;
@@ -1527,17 +1535,21 @@ impl Store {
 
     // ---- what use would cost at API prices ---------------------------------------------------
 
-    /// A session's `cost.total_cost_usd` from the status line, under `key` (the session and its
-    /// process). What it added since the last one counts for `account_id`, in the hour of
-    /// `now_ms`; returns that.
+    /// A session's `cost.total_cost_usd` from the status line, from the process of it that
+    /// started at `started_ms` (`None` when the status line did not say). What it added since that
+    /// process's last total counts for `account_id`, in the hour of `now_ms`; returns that.
     ///
-    /// A first total is only where counting starts: the status line runs as a session starts,
-    /// at $0, and a session first seen later carries what it spent before (a resumed or forked
-    /// one, which Claude Code gives the total it had, or one running before cc-rotate counted). A
-    /// total below the last one (a `/login` resets it) is also only where counting goes on from.
+    /// Two processes can run one session (resumed twice, each restoring the same total). A
+    /// process is matched by its start within `PROCESS_MATCH_MS`, since each tick works it out
+    /// from when the tick arrived. A process's first total counts whole when it started under
+    /// `NEW_PROCESS_MS` ago; otherwise it carries what the session spent before (a resumed or
+    /// forked one, given the total and run time it had, or one running before cc-rotate counted)
+    /// and is only where counting starts. A total below the last one (a `/login` resets it) is
+    /// also only where counting goes on from.
     pub fn note_session_cost(
         &self,
-        key: &str,
+        session_id: &str,
+        started_ms: Option<i64>,
         total_usd: f64,
         account_id: i64,
         now_ms: i64,
@@ -1545,24 +1557,32 @@ impl Store {
         if !total_usd.is_finite() || total_usd < 0.0 {
             return Ok(0.0);
         }
+        let started = started_ms.unwrap_or(0);
         self.immediate(|s| {
-            let last: Option<f64> = s
+            let last: Option<(i64, f64)> = s
                 .conn
                 .query_row(
-                    "SELECT total_usd FROM session_costs WHERE session_id = ?1",
-                    [key],
-                    |r| r.get(0),
+                    "SELECT started_ms, total_usd FROM session_costs
+                     WHERE session_id = ?1 AND started_ms BETWEEN ?2 - ?3 AND ?2 + ?3
+                     ORDER BY ABS(started_ms - ?2) LIMIT 1",
+                    params![session_id, started, PROCESS_MATCH_MS],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?;
+            let new = started_ms.is_some_and(|t| (0..NEW_PROCESS_MS).contains(&(now_ms - t)));
             let added = match last {
-                Some(last) if total_usd >= last => total_usd - last,
-                _ => 0.0,
+                Some((_, last)) if total_usd >= last => total_usd - last,
+                Some(_) => 0.0,
+                None if new => total_usd,
+                None => 0.0,
             };
+            let key = last.map_or(started, |(t, _)| t);
             s.conn.execute(
-                "INSERT INTO session_costs (session_id, total_usd, updated_at) VALUES (?1, ?2, ?3)
-                 ON CONFLICT (session_id) DO UPDATE SET total_usd = excluded.total_usd,
-                                                        updated_at = excluded.updated_at",
-                params![key, total_usd, now_ms],
+                "INSERT INTO session_costs (session_id, started_ms, total_usd, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (session_id, started_ms) DO UPDATE SET
+                    total_usd = excluded.total_usd, updated_at = excluded.updated_at",
+                params![session_id, key, total_usd, now_ms],
             )?;
             if added > 0.0 {
                 s.conn.execute(

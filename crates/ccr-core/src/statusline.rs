@@ -56,10 +56,6 @@ pub struct CostInfo {
     pub total_duration_ms: Option<f64>,
 }
 
-/// The process a cost total belongs to is told by when it started, to this precision: one
-/// process's ticks agree on it to within their delivery time.
-const PROCESS_START_PRECISION_MS: i64 = 10_000;
-
 #[derive(Debug, Default, Deserialize)]
 pub struct ModelInfo {
     pub id: Option<String>,
@@ -178,9 +174,13 @@ pub fn tick(store: &Store, paths: &Paths, input: &StatusInput, now_ms: i64) -> R
     )?;
 
     if !sync_profile_login(store, paths, &mut dead_login, &mut unidentified)? {
-        // Nothing can be trusted about the profile's login until the swap is settled.
+        // Nothing can be trusted about the profile's login until the swap is settled. The cost
+        // still counts, for the account cc-rotate last put in the profile.
         result.settle_login = settle_due(store, now_ms)?;
         result.active = store.active_account()?;
+        if let Some(active) = &result.active {
+            note_cost(store, input, active.id, now_ms)?;
+        }
         return Ok(result);
     }
     if unidentified && !crate::lock::is_held(&paths.swap_lock(), crate::lock::CLAUDE_STALE) {
@@ -262,10 +262,19 @@ pub fn tick(store: &Store, paths: &Paths, input: &StatusInput, now_ms: i64) -> R
             scheduler::pick(&pool, policy, Some(active.id), now_ms / 1000).is_none();
     }
 
-    // Paid extra usage judged by an old report: read the account in use again first.
+    // Paid extra usage judged by an old report: read the account in use again, in place of a
+    // swap that has nowhere to go (a sync runs one thing at a time: a swap, a settling, or a
+    // reading). A swap away from paying goes first.
+    let futile = result
+        .swap
+        .as_ref()
+        .is_some_and(|s| result.pool_exhausted && s.reason != Reason::AvoidExtraUsage);
     if !result.confirm
+        && !result.settle_login
+        && (result.swap.is_none() || futile)
         && crate::extra_usage::needs_fresh_reading(store, &pool, policy, &active, now_ms)?
     {
+        result.swap = None;
         result.confirm = true;
     }
 
@@ -464,17 +473,11 @@ fn note_cost(store: &Store, input: &StatusInput, account_id: i64, now_ms: i64) -
     }
     // Two processes can run one session (resumed twice, each restoring the same total): each
     // keeps its own count, told apart by when it started.
-    let key = match cost.total_duration_ms {
-        Some(d) if d.is_finite() && d >= 0.0 => {
-            let started = now_ms - d as i64;
-            format!(
-                "{session}@{}",
-                started.div_euclid(PROCESS_START_PRECISION_MS)
-            )
-        }
-        _ => session.to_string(),
-    };
-    store.note_session_cost(&key, total, account_id, now_ms)?;
+    let started = cost
+        .total_duration_ms
+        .filter(|d| d.is_finite() && *d >= 0.0)
+        .map(|d| now_ms - d as i64);
+    store.note_session_cost(session, started, total, account_id, now_ms)?;
     Ok(())
 }
 

@@ -15,7 +15,7 @@ use crate::swap::{self, SwapRequest};
 
 /// The account in use when the last `paid_usage` warning went out, until the episode ends.
 const META_WARNED: &str = "paid_usage_warned";
-/// When the current episode of paid extra usage began (epoch ms).
+/// When the account in use began paying for extra usage, as "<account id>:<epoch ms>".
 const META_PAYING_SINCE: &str = "paid_usage_since";
 /// When a fresh reading of the paying account was last asked for (epoch ms).
 const META_REFRESH_AT: &str = "paid_usage_refresh_at";
@@ -58,12 +58,19 @@ pub fn scan(store: &Store, now_ms: i64) -> Result<()> {
     };
     let (pool, policy) = swap::load_pool(store, now_ms / 1000)?;
     let paying = paying(store, &pool, policy, &active, now_ms / 1000)?;
+    // When the account in use began paying ("<account>:<ms>"): another account restarts it.
     let since = match &paying {
-        Some(_) => store.immediate(|s| match s.meta_i64(META_PAYING_SINCE)? {
-            Some(t) => Ok(t),
-            None => {
-                s.set_meta(META_PAYING_SINCE, now_ms)?;
-                Ok(now_ms)
+        Some(_) => store.immediate(|s| {
+            let recorded = s.meta(META_PAYING_SINCE)?.and_then(|v| {
+                let (id, t) = v.split_once(':')?;
+                Some((id.parse::<i64>().ok()?, t.parse::<i64>().ok()?))
+            });
+            match recorded {
+                Some((id, t)) if id == active.id => Ok(t),
+                _ => {
+                    s.set_meta(META_PAYING_SINCE, format!("{}:{now_ms}", active.id))?;
+                    Ok(now_ms)
+                }
             }
         })?,
         None => now_ms,
@@ -71,7 +78,7 @@ pub fn scan(store: &Store, now_ms: i64) -> Result<()> {
     let can_move =
         paying.is_some() && avoid_swap(store, &pool, policy, &active, now_ms / 1000)?.is_some();
     match paying {
-        Some(_) if can_move && now_ms - since < AVOID_GRACE_MS => Ok(()),
+        Some(_) if can_move && (0..AVOID_GRACE_MS).contains(&(now_ms - since)) => Ok(()),
         Some((extra, read_at)) => store.immediate(|s| {
             if s.meta_i64(META_WARNED)? == Some(active.id) {
                 return Ok(());

@@ -108,41 +108,35 @@ fn a_session_counts_only_what_it_adds() {
     let e = env();
     let hour = 1_000_000 * 3_600_000;
     let s = &e.store;
+    // A process that started at `hour`; its ticks work out its start a little late each time.
+    let s1 = |total: f64, account: i64, at: i64| {
+        s.note_session_cost("s1", Some(hour + (at - hour) % 7_000), total, account, at)
+            .unwrap()
+    };
     // The status line runs as a session starts, at $0: counting starts there.
-    assert_eq!(s.note_session_cost("s1", 0.0, e.a, hour).unwrap(), 0.0);
-    assert_eq!(
-        s.note_session_cost("s1", 0.50, e.a, hour + 30_000).unwrap(),
-        0.50
-    );
-    assert_eq!(
-        s.note_session_cost("s1", 0.75, e.a, hour + 60_000).unwrap(),
-        0.25
-    );
-    assert_eq!(
-        s.note_session_cost("s1", 0.75, e.a, hour + 120_000)
-            .unwrap(),
-        0.0
-    );
+    assert_eq!(s1(0.0, e.a, hour), 0.0);
+    assert_eq!(s1(0.50, e.a, hour + 30_000), 0.50);
+    assert_eq!(s1(0.75, e.a, hour + 60_000), 0.25);
+    assert_eq!(s1(0.75, e.a, hour + 120_000), 0.0);
     // A drop (a /login resets the total) is only where counting goes on from.
-    assert_eq!(
-        s.note_session_cost("s1", 0.60, e.a, hour + 180_000)
-            .unwrap(),
-        0.0
-    );
-    let added = s
-        .note_session_cost("s1", 0.70, e.b, hour + 3_600_000)
-        .unwrap();
+    assert_eq!(s1(0.60, e.a, hour + 180_000), 0.0);
+    let added = s1(0.70, e.b, hour + 3_600_000);
     assert!((added - 0.10).abs() < 1e-9, "{added}");
-    assert_eq!(s.note_session_cost("s1", f64::NAN, e.a, hour).unwrap(), 0.0);
-    assert_eq!(s.note_session_cost("s1", -1.0, e.a, hour).unwrap(), 0.0);
-    // A session first seen with a total (resumed, forked, or running before cc-rotate counted)
-    // carries what it spent before: only a starting point.
-    assert_eq!(s.note_session_cost("old", 80.0, e.a, hour).unwrap(), 0.0);
-    assert_eq!(
-        s.note_session_cost("old", 80.5, e.a, hour + 60_000)
-            .unwrap(),
-        0.5
-    );
+    assert_eq!(s1(f64::NAN, e.a, hour), 0.0);
+    assert_eq!(s1(-1.0, e.a, hour), 0.0);
+    // A process first seen moments after it started counts its first total whole.
+    let fresh = s
+        .note_session_cost("fresh", Some(hour + 3_600_000), 0.30, e.c, hour + 3_620_000)
+        .unwrap();
+    assert_eq!(fresh, 0.30);
+    // A session first seen with a total long after its process started (resumed, forked, or
+    // running before cc-rotate counted) carries what it spent before: only a starting point.
+    let old = |total: f64, at: i64| {
+        s.note_session_cost("old", Some(hour - 3_600_000), total, e.a, at)
+            .unwrap()
+    };
+    assert_eq!(old(80.0, hour), 0.0);
+    assert_eq!(old(80.5, hour + 60_000), 0.5);
 
     let from = hour / 1000;
     let a = s
@@ -151,7 +145,7 @@ fn a_session_counts_only_what_it_adds() {
         .unwrap();
     assert!((a - 1.25).abs() < 1e-9, "{a}");
     assert_eq!(
-        s.account_cost_between(e.c, from, from + 7_200).unwrap(),
+        s.account_cost_between(e.c, from, from + 3_600).unwrap(),
         None
     );
     let b = s
@@ -457,4 +451,24 @@ fn an_old_report_of_paid_usage_asks_for_a_fresh_reading_now_and_then() {
     assert!(
         !extra_usage::needs_fresh_reading(&e.store, &pool, policy, &active, now + 700_000).unwrap()
     );
+}
+
+#[test]
+fn a_reading_of_paid_usage_takes_the_place_of_a_swap_with_nowhere_to_go() {
+    let e = env();
+    let now = time::now_ms();
+    e.store.set_setting("usage_checks", Some("true")).unwrap();
+    e.store
+        .set_extra_usage(e.a, &extra(true, 10), now - 3_600_000)
+        .unwrap();
+    five_hour(&e.store, e.b, 100.0, 1_800);
+    five_hour(&e.store, e.c, 100.0, 900);
+    let resets = now / 1000 + 3_600;
+    let input = tick_input("s1", 3.0, 600_000, 100.0, resets);
+    let result = statusline::tick(&e.store, &e.paths, &input, now).unwrap();
+    assert!(result.confirm, "{result:?}");
+    assert!(result.swap.is_none(), "{result:?}");
+    // Read once; the next ticks go back to asking for swaps.
+    let result = statusline::tick(&e.store, &e.paths, &input, now + 40_000).unwrap();
+    assert!(!result.confirm);
 }
