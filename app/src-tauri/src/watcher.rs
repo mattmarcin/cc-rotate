@@ -311,14 +311,18 @@ fn describe(store: &Store, event: &Event) -> Option<(String, String)> {
             let currency = detail
                 .and_then(|d| d.get("currency"))
                 .and_then(|v| v.as_str());
+            // The account in use is rarely read, so the figures say when they are from.
+            let as_of = minor("read_at")
+                .map(|t| format!("As of {}, it", time::local(t / 1000, "%b %-d, %-I:%M %p")))
+                .unwrap_or_else(|| "It".into());
             let spend = match (minor("used"), minor("monthly_limit")) {
                 (Some(used), Some(limit)) => format!(
-                    " It has used {} of its {} this month.",
+                    " {as_of} had used {} of its {} this month.",
                     ccr_core::extra_usage::money(used, currency),
                     ccr_core::extra_usage::money(limit, currency)
                 ),
                 (Some(used), None) => format!(
-                    " It has used {} this month.",
+                    " {as_of} had used {} this month.",
                     ccr_core::extra_usage::money(used, currency)
                 ),
                 _ => String::new(),

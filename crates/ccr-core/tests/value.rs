@@ -108,33 +108,59 @@ fn a_session_counts_only_what_it_adds() {
     let e = env();
     let hour = 1_000_000 * 3_600_000;
     let s = &e.store;
-    assert_eq!(s.note_session_cost("s1", 0.50, e.a, hour).unwrap(), 0.50);
+    // A new session counts from its first total.
     assert_eq!(
-        s.note_session_cost("s1", 0.75, e.a, hour + 60_000).unwrap(),
+        s.note_session_cost("s1", 0.50, true, e.a, hour).unwrap(),
+        0.50
+    );
+    assert_eq!(
+        s.note_session_cost("s1", 0.75, false, e.a, hour + 60_000)
+            .unwrap(),
         0.25
     );
-    // The same total again adds nothing; a lower one is a fresh count.
     assert_eq!(
-        s.note_session_cost("s1", 0.75, e.a, hour + 120_000)
+        s.note_session_cost("s1", 0.75, false, e.a, hour + 120_000)
+            .unwrap(),
+        0.0
+    );
+    // A drop (two processes on one session) is only where counting goes on from.
+    assert_eq!(
+        s.note_session_cost("s1", 0.60, false, e.a, hour + 180_000)
+            .unwrap(),
+        0.0
+    );
+    let added = s
+        .note_session_cost("s1", 0.70, false, e.b, hour + 3_600_000)
+        .unwrap();
+    assert!((added - 0.10).abs() < 1e-9, "{added}");
+    assert_eq!(
+        s.note_session_cost("s1", f64::NAN, true, e.a, hour)
             .unwrap(),
         0.0
     );
     assert_eq!(
-        s.note_session_cost("s1", 0.10, e.b, hour + 3_600_000)
-            .unwrap(),
-        0.10
+        s.note_session_cost("s1", -1.0, true, e.a, hour).unwrap(),
+        0.0
     );
-    assert_eq!(s.note_session_cost("s1", f64::NAN, e.a, hour).unwrap(), 0.0);
-    assert_eq!(s.note_session_cost("s1", -1.0, e.a, hour).unwrap(), 0.0);
+    // A session first seen after it ran a while carries what it spent before: only a baseline.
+    assert_eq!(
+        s.note_session_cost("old", 80.0, false, e.a, hour).unwrap(),
+        0.0
+    );
+    assert_eq!(
+        s.note_session_cost("old", 80.5, false, e.a, hour + 60_000)
+            .unwrap(),
+        0.5
+    );
 
     let from = hour / 1000;
     let a = s
-        .account_cost_between(e.a, from, from + 7_200)
+        .account_cost_between(e.a, from, from + 3_600)
         .unwrap()
         .unwrap();
-    assert!((a - 0.75).abs() < 1e-9, "{a}");
+    assert!((a - 1.25).abs() < 1e-9, "{a}");
     assert_eq!(
-        s.account_cost_between(e.b, from, from + 3_600).unwrap(),
+        s.account_cost_between(e.c, from, from + 7_200).unwrap(),
         None
     );
     let b = s
@@ -148,7 +174,7 @@ fn tick_input(session: &str, cost: f64, pct: f64, resets_at: i64) -> StatusInput
     StatusInput::parse(
         &json!({
             "session_id": session,
-            "cost": {"total_cost_usd": cost},
+            "cost": {"total_cost_usd": cost, "total_duration_ms": 60_000},
             "rate_limits": {"five_hour": {"used_percentage": pct, "resets_at": resets_at}}
         })
         .to_string(),
@@ -317,4 +343,57 @@ fn moves_off_paid_extra_usage_only_when_asked_to() {
     let out = swap::run(&e.store, &e.paths, &swap::SwapRequest { wait: true, ..req }).unwrap();
     assert!(matches!(out, swap::SwapOutcome::Swapped { .. }), "{out:?}");
     assert_eq!(e.store.active_account().unwrap().unwrap().id, e.b);
+}
+
+#[test]
+fn an_account_past_its_threshold_but_not_used_up_does_not_bill() {
+    let e = env();
+    e.store
+        .set_extra_usage(e.a, &extra(true, 10), time::now_ms())
+        .unwrap();
+    // Past cc-rotate's 98% threshold, with 1.5% of its plan still free.
+    five_hour(&e.store, e.a, 98.5, 3_600);
+    five_hour(&e.store, e.b, 100.0, 1_800);
+    five_hour(&e.store, e.c, 100.0, 900);
+    extra_usage::scan(&e.store, time::now_ms()).unwrap();
+    assert_eq!(paid_events(&e.store), 0);
+    five_hour(&e.store, e.a, 100.0, 3_600);
+    extra_usage::scan(&e.store, time::now_ms()).unwrap();
+    assert_eq!(paid_events(&e.store), 1);
+    let detail = e
+        .store
+        .last_event_of(kind::PAID_USAGE)
+        .unwrap()
+        .unwrap()
+        .detail
+        .unwrap();
+    assert!(detail["read_at"].is_i64());
+}
+
+#[test]
+fn no_warning_while_a_swap_away_from_paying_is_due() {
+    let e = env();
+    let now = time::now_ms();
+    e.store.set_extra_usage(e.a, &extra(true, 10), now).unwrap();
+    e.store.set_extra_usage(e.b, &extra(false, 0), now).unwrap();
+    five_hour(&e.store, e.a, 100.0, 3_600);
+    five_hour(&e.store, e.b, 100.0, 1_800);
+    five_hour(&e.store, e.c, 100.0, 900);
+    e.store
+        .set_setting("avoid_extra_usage", Some("true"))
+        .unwrap();
+    extra_usage::scan(&e.store, now).unwrap();
+    assert_eq!(paid_events(&e.store), 0);
+    // With nowhere to move to, it warns, and says so.
+    e.store.set_state(e.b, AccountState::Paused).unwrap();
+    extra_usage::scan(&e.store, now).unwrap();
+    assert_eq!(paid_events(&e.store), 1);
+    let detail = e
+        .store
+        .last_event_of(kind::PAID_USAGE)
+        .unwrap()
+        .unwrap()
+        .detail
+        .unwrap();
+    assert_eq!(detail["avoiding"], true);
 }

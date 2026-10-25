@@ -225,7 +225,7 @@ The app shows the same numbers for the last 4 weeks as **Recent weeks** and **AP
 
 An account with extra usage turned on on claude.ai keeps working past its plan's limits, and bills the card on file.
 cc-rotate swaps before a limit, so that only happens once every account is at a limit.
-Each account's **More** dialog, and `cc-rotate-ctl status`, show whether extra usage is on and how much it spent this month, from the account's latest usage check.
+Each account's **More** dialog shows whether extra usage is on and how much it spent this month, from the account's latest usage report, and `cc-rotate-ctl status` lists the accounts that have it on.
 
 - When sessions start running on paid extra usage, the app sends a notification ("Sessions are using paid extra usage").
 - To have them wait for the next reset instead, turn on **When every account is at a limit, wait instead of paying for extra usage** in **Settings** (`avoid_extra_usage`).

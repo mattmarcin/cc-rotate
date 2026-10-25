@@ -1527,14 +1527,18 @@ impl Store {
     // ---- what use would cost at API prices ---------------------------------------------------
 
     /// A session's `cost.total_cost_usd` from the status line. What it added since the last one
-    /// counts for `account_id`, in the hour of `now_ms`; returns that. A total below the last
-    /// one is a new count (the session's cost was reset), and counts whole. The first total of a
-    /// session counts whole too: Claude Code restores a resumed session's total under its id,
-    /// which this table still holds.
+    /// counts for `account_id`, in the hour of `now_ms`; returns that.
+    ///
+    /// The first total of a session only counts when the session is `new` (it started moments
+    /// ago): a session first seen later carries what it spent before (one running before cc-rotate
+    /// counted, or a resumed one whose earlier total was pruned), and its total is only where
+    /// counting starts. A total below the last one (two processes resumed on one session, each
+    /// with its own total) is also only where counting goes on from.
     pub fn note_session_cost(
         &self,
         session_id: &str,
         total_usd: f64,
+        new: bool,
         account_id: i64,
         now_ms: i64,
     ) -> Result<f64> {
@@ -1552,7 +1556,9 @@ impl Store {
                 .optional()?;
             let added = match last {
                 Some(last) if total_usd >= last => total_usd - last,
-                _ => total_usd,
+                Some(_) => 0.0,
+                None if new => total_usd,
+                None => 0.0,
             };
             s.conn.execute(
                 "INSERT INTO session_costs (session_id, total_usd, updated_at) VALUES (?1, ?2, ?3)

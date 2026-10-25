@@ -51,7 +51,13 @@ pub struct StatusInput {
 #[derive(Debug, Default, Deserialize)]
 pub struct CostInfo {
     pub total_cost_usd: Option<f64>,
+    /// How long the session has run, restored with its cost on `--resume`.
+    pub total_duration_ms: Option<f64>,
 }
+
+/// A session whose status line reports having run for at most this long started moments ago: its
+/// whole cost counts (`Store::note_session_cost`).
+const NEW_SESSION_MS: f64 = 10.0 * 60_000.0;
 
 #[derive(Debug, Default, Deserialize)]
 pub struct ModelInfo {
@@ -198,7 +204,7 @@ pub fn tick(store: &Store, paths: &Paths, input: &StatusInput, now_ms: i64) -> R
     let mut cost_account = active.id;
     if let Some(sample) = input.sample_for(active.id, "rotate", now_ms) {
         if is_stale_reading(store, &sample, now_ms)? {
-            cost_account = left_account(store)?.unwrap_or(active.id);
+            cost_account = reading_account(store, &sample, active.id)?.unwrap_or(active.id);
         } else {
             match swap::attribute(store, &sample, active.id, now_ms / 1000)? {
                 swap::Attribution::Own => {
@@ -213,7 +219,7 @@ pub fn tick(store: &Store, paths: &Paths, input: &StatusInput, now_ms: i64) -> R
                 }
                 swap::Attribution::Elsewhere => {
                     result.confirm = confirm_due(store, &sample, active.id, now_ms)?;
-                    cost_account = left_account(store)?.unwrap_or(active.id);
+                    cost_account = reading_account(store, &sample, active.id)?.unwrap_or(active.id);
                 }
             }
         }
@@ -438,18 +444,41 @@ pub fn observe(
 /// Count what the session's use cost since its last reading, at API prices, for `account_id`
 /// (`Store::note_session_cost`).
 fn note_cost(store: &Store, input: &StatusInput, account_id: i64, now_ms: i64) -> Result<()> {
-    let total = input.cost.as_ref().and_then(|c| c.total_cost_usd);
-    match (input.session_id.as_deref(), total) {
+    let Some(cost) = input.cost.as_ref() else {
+        return Ok(());
+    };
+    let new = cost.total_duration_ms.is_some_and(|d| d <= NEW_SESSION_MS);
+    match (input.session_id.as_deref(), cost.total_cost_usd) {
         (Some(session), Some(total)) if !session.is_empty() => {
-            store.note_session_cost(session, total, account_id, now_ms)?;
+            store.note_session_cost(session, total, new, account_id, now_ms)?;
             Ok(())
         }
         _ => Ok(()),
     }
 }
 
-/// The account the last swap left.
-fn left_account(store: &Store) -> Result<Option<i64>> {
+/// The account other than `active_id` whose latest reading shares a reset time with `sample`:
+/// the one a reading that is not the active account's belongs to. Else the account the last swap
+/// left.
+fn reading_account(store: &Store, sample: &Sample, active_id: i64) -> Result<Option<i64>> {
+    for account in store.accounts()? {
+        if account.id == active_id {
+            continue;
+        }
+        let Some(latest) = store.last_sample(account.id)? else {
+            continue;
+        };
+        let shares = sample.windows.iter().any(|w| {
+            w.resets_at.is_some_and(|r| {
+                latest.windows.iter().any(|o| {
+                    o.name == w.name && o.resets_at.is_some_and(|or| swap::same_reset(or, r))
+                })
+            })
+        });
+        if shares {
+            return Ok(Some(account.id));
+        }
+    }
     Ok(store
         .last_event_of(kind::SWAP)?
         .and_then(|e| e.account_from)

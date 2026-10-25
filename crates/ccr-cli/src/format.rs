@@ -430,7 +430,6 @@ pub fn report_summary(h: &AccountHistory, weeks: usize) -> String {
     }
 }
 
-/// `report`: a table per account, then a one-line summary per account.
 /// "$12.40", or "$123" from $100 up.
 pub fn dollars(usd: f64) -> String {
     if usd >= 100.0 {
@@ -460,6 +459,7 @@ fn value_line(h: &AccountHistory, weeks: usize) -> Option<String> {
     })
 }
 
+/// `report`: a table per account, then a one-line summary per account.
 pub fn report(histories: &[AccountHistory], weeks: usize) -> String {
     let mut out = String::new();
     if histories.is_empty() {
