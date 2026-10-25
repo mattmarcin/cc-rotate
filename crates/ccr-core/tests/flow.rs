@@ -1662,3 +1662,21 @@ fn a_foreign_login_in_the_profile_is_never_stored_as_the_active_accounts() {
         "refresh-a1"
     );
 }
+
+/// A fresh login of the active account is not written into the profile while a stopped swap left
+/// the profile's login unidentified: that login may be the only copy of another account's.
+#[test]
+fn a_relogin_does_not_overwrite_an_unidentified_login() {
+    let env = Env::new();
+    let (store, a, b, _) = pool(&env);
+    let target = store.credential(b).unwrap().unwrap();
+    mark_pending(&store, &target.refresh_fp, Some(a), b);
+    credfile::write_oauth(&env.cred_file(), &oauth("whose")).unwrap();
+    assert!(!swap::install_active_login(&store, &env.paths, &oauth("a-fresh")).unwrap());
+    assert_eq!(refresh_of(&env.file_doc()), "refresh-whose");
+
+    // Without a stopped swap it is written as before.
+    store.delete_meta(swap::META_SWAP_PENDING).unwrap();
+    assert!(swap::install_active_login(&store, &env.paths, &oauth("a-fresh")).unwrap());
+    assert_eq!(refresh_of(&env.file_doc()), "refresh-a-fresh");
+}

@@ -253,13 +253,15 @@ impl Keychain {
     }
 
     /// Whether the Keychain can be read now (an item or not); false while it is locked or there
-    /// is no GUI session.
+    /// is no GUI session. The same read as `read` (with `-w`, which needs the password itself):
+    /// a search of the item's attributes alone succeeds on a locked Keychain too.
     pub fn usable(&self) -> Result<bool> {
         let (code, _) = self.security(
             &[
                 "find-generic-password",
                 "-a",
                 &self.account,
+                "-w",
                 "-s",
                 &self.service,
             ],
