@@ -397,19 +397,27 @@ function meter(w: WindowUsage | undefined, live: boolean) {
   const used = w?.pct ?? 0;
   const lvl = level(used, w?.threshold ?? 100);
   // A usage report names no reset time for a window that has not started (nothing used yet).
-  const reset =
-    w?.resets_at && w.resets_at * 1000 > Date.now()
+  // No window at all is not 0% used: nothing was reported for it, so no number is shown.
+  const reset = !w
+    ? live
+      ? "not reported yet"
+      : "no reading yet"
+    : w.resets_at && w.resets_at * 1000 > Date.now()
       ? `resets in ${until(w.resets_at)}`
-      : w && w.resets_at === null
+      : w.resets_at === null
         ? "not started"
-        : live && w
+        : live
           ? "window reset"
           : "no reading yet";
   return h(
     "div",
     { class: `meter ${lvl}` },
-    h("div", { class: "bar", role: "img", "aria-label": `${pct(used)} used` }, h("span", { style: { width: `${Math.min(100, used)}%` } })),
-    h("div", { class: "meter-text" }, h("strong", { class: "tnum" }, pct(used)), h("span", { class: "muted" }, reset)),
+    h(
+      "div",
+      { class: "bar", role: "img", "aria-label": w ? `${pct(used)} used` : reset },
+      h("span", { style: { width: `${Math.min(100, used)}%` } }),
+    ),
+    h("div", { class: "meter-text" }, h("strong", { class: "tnum" }, w ? pct(used) : "-"), h("span", { class: "muted" }, reset)),
   );
 }
 
