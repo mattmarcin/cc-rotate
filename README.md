@@ -208,7 +208,7 @@ The app shows the same numbers for the last 4 weeks as **Recent weeks** in the a
 Over SSH, or in a terminal pane without the app, `cc-rotate-ctl watch` keeps `status` and the latest events on screen and redraws them in place.
 It only reads: unlike `status`, it never swaps, syncs logins or starts Claude Code.
 Press q, Esc or Ctrl-C to quit.
-When its output isn't a terminal, it prints the status once and exits.
+When its input or output isn't a terminal, it prints the status once and exits.
 
 ### Commands
 

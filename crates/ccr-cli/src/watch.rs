@@ -39,8 +39,10 @@ const STOP_CHECK: Duration = Duration::from_millis(100);
 
 pub fn run(store: &Store, paths: &Paths, interval: Duration) -> Result<()> {
     let mut out = std::io::stdout();
-    if !out.is_terminal() {
-        // Piped or redirected: one frame, no cursor movement.
+    // Piped or redirected: one frame, no cursor movement. That includes input that isn't a
+    // terminal (`watch < /dev/null`): keys would then come from /dev/tty, which crossterm can't
+    // poll on macOS, so one frame is the same on every platform and never hangs.
+    if !out.is_terminal() || !std::io::stdin().is_terminal() {
         out.write_all(frame(store, paths, interval, false, None)?.as_bytes())?;
         return Ok(());
     }
