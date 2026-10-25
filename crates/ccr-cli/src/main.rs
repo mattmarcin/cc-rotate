@@ -13,7 +13,9 @@ use ccr_core::scheduler::Reason;
 use ccr_core::statusline::StatusInput;
 use ccr_core::store::{AccountState, kind};
 use ccr_core::swap::{SwapOutcome, SwapRequest};
-use ccr_core::{Paths, Store, doctor, login, profiles, setup, snapshot, statusline, swap, time};
+use ccr_core::{
+    Paths, Store, doctor, login, profiles, setup, snapshot, statusline, swap, time, usage_check,
+};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -60,6 +62,13 @@ enum Command {
         /// List every account in the order they would be used, with a reason for each.
         #[arg(long)]
         explain: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read the usage of accounts not in use with Claude Code's own `/usage` (no turn, no quota).
+    Check {
+        /// Accounts to check (label, email or id); every account not in use when none are given.
+        accounts: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -159,6 +168,10 @@ enum Command {
         #[command(subcommand)]
         hook: HookCommand,
     },
+    /// Read the usage of the account in use with a login Claude Code cannot renew (started in the
+    /// background by the statusline).
+    #[command(hide = true)]
+    ConfirmActive,
     /// Tell herdr how to resume a session (started in the background by `hook session-start`).
     #[command(hide = true)]
     HerdrReport {
@@ -333,6 +346,11 @@ fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> 
                 }
             }
         }
+        Command::Check { accounts, json } => check_cmd(store, paths, &accounts, json)?,
+        Command::ConfirmActive => match usage_check::confirm_active(store, paths) {
+            Ok(outcome) => println!("{}", usage_check::describe(&outcome)),
+            Err(e) => process::log_error("confirm-active", &e),
+        },
         Command::Pause { account } => set_state(store, &account, AccountState::Paused)?,
         Command::Resume { account } => set_state(store, &account, AccountState::Parked)?,
         Command::Remove { account, yes } => {
@@ -346,7 +364,7 @@ fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> 
                     a.label
                 );
             }
-            store.remove_account(a.id)?;
+            usage_check::remove_account(store, paths, a.id)?;
             store.log_event(
                 kind::STATE,
                 Some(a.id),
@@ -465,6 +483,45 @@ fn dunce_exe() -> Result<PathBuf> {
 fn strip_verbatim(p: &std::path::Path) -> PathBuf {
     let s = p.display().to_string();
     PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s))
+}
+
+fn check_cmd(store: &Store, paths: &Paths, references: &[String], json: bool) -> Result<()> {
+    // Settle anything an earlier check left behind first.
+    usage_check::sweep(store, paths)?;
+    let accounts = if references.is_empty() {
+        store
+            .accounts()?
+            .into_iter()
+            .filter(|a| matches!(a.state, AccountState::Parked | AccountState::Paused))
+            .collect()
+    } else {
+        references
+            .iter()
+            .map(|r| store.find_account(r))
+            .collect::<Result<Vec<_>>>()?
+    };
+    if accounts.is_empty() {
+        println!("No account to check: every account is in use or needs a new login.");
+        return Ok(());
+    }
+    let width = accounts.iter().map(|a| a.label.len()).max().unwrap_or(5);
+    let mut results = Vec::new();
+    for a in &accounts {
+        if !json {
+            print!("{:<width$}  ", a.label);
+            let _ = std::io::stdout().flush();
+        }
+        let outcome = usage_check::check(store, paths, a.id, usage_check::Trigger::Manual)?;
+        if json {
+            results.push(serde_json::json!({ "label": a.label, "result": outcome }));
+        } else {
+            println!("{}", usage_check::describe(&outcome));
+        }
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&results)?);
+    }
+    Ok(())
 }
 
 fn set_state(store: &Store, reference: &str, state: AccountState) -> Result<()> {
@@ -623,6 +680,8 @@ fn statusline_entry(profile: Option<PathBuf>, observe: bool, then: Option<String
         let result = statusline::tick(&store, &paths, &input, time::now_ms())?;
         if let Some(req) = &result.swap {
             process::spawn_swap(req, profile.as_deref())?;
+        } else if result.confirm {
+            process::spawn_confirm(profile.as_deref())?;
         }
         Ok(result
             .active
@@ -670,19 +729,19 @@ fn stop_failure(profile: Option<PathBuf>) -> Result<()> {
     if payload.get("error").and_then(|e| e.as_str()) != Some("rate_limit") {
         return Ok(());
     }
-    let (store, paths) = ccr_core::open(profile)?;
+    let (store, _) = ccr_core::open(profile.clone())?;
     let Some(active) = store.active_account()? else {
         return Ok(());
     };
-    swap::run(
-        &store,
-        &paths,
+    // In the background, like the statusline's: a swap may check accounts first, which can take
+    // longer than Claude Code gives a hook.
+    process::spawn_swap(
         &SwapRequest {
             from: Some(active.id),
             to: None,
             reason: Reason::StopFailure,
             wait: false,
         },
-    )?;
-    Ok(())
+        profile.as_deref(),
+    )
 }

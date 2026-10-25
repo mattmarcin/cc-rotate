@@ -57,14 +57,34 @@ export interface Account {
   last_login_at: number | null;
 }
 
+/** What cc-rotate remembers about an account's usage checks (Claude Code's `/usage`). */
+export interface CheckState {
+  last_attempt_at: number | null;
+  last_read_at: number | null;
+  /** No automatic check before this (epoch ms). */
+  not_before: number | null;
+  /** Why the last check failed. */
+  problem: string | null;
+  /** Not used until a check settles whether its login still works. */
+  held_back: boolean;
+}
+
+export type CheckOutcome =
+  | { outcome: "read"; windows: SampleWindow[] }
+  | { outcome: "skipped"; why: string }
+  | { outcome: "rate_limited"; until: number }
+  | { outcome: "login_rejected" }
+  | { outcome: "failed"; why: string };
+
 export interface AccountView extends Account {
   /** "Max 5x", "Max 20x", "Team 5x", "Pro", or the raw subscription type. */
   plan: string | null;
   windows: WindowUsage[];
   weekly: { setting: WeeklyLimitSetting; detected: WeeklyLimit; effective: WeeklyLimit };
   last_sample_at: number | null;
-  /** `rotate`, or the folder of another profile (`.claude-work`) that reported the reading. */
+  /** `rotate`, `check`, or the folder of another profile (`.claude-work`) that reported the reading. */
   last_sample_source: string | null;
+  usage_check: CheckState;
   login_expires_at: number | null;
   login_updated_at: number | null;
   refresh_expires_at: number | null;
@@ -94,6 +114,9 @@ export interface Settings {
   statusline_downstream: string | null;
   profile_dir: string | null;
   claude_path: string | null;
+  usage_checks: boolean;
+  usage_check_interval_s: number;
+  usage_check_max_age_s: number;
 }
 
 export interface Snapshot {
@@ -176,6 +199,7 @@ export const api = {
   series: (sinceMs: number) => invoke<Sample[]>("series", { sinceMs }),
   events: (limit: number) => invoke<EventRow[]>("events", { limit }),
   swapNow: (to: number | null) => invoke<SwapOutcome>("swap_now", { to }),
+  checkUsage: (id: number) => invoke<CheckOutcome>("check_usage", { id }),
   setPaused: (id: number, paused: boolean) => invoke<void>("set_paused", { id, paused }),
   removeAccount: (id: number) => invoke<void>("remove_account", { id }),
   renameAccount: (id: number, label: string) => invoke<void>("rename_account", { id, label }),

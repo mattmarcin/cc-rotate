@@ -36,6 +36,7 @@ fn main() {
             commands::series,
             commands::events,
             commands::swap_now,
+            commands::check_usage,
             commands::set_paused,
             commands::remove_account,
             commands::rename_account,

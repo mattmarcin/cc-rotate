@@ -38,6 +38,20 @@ pub fn spawn_swap(req: &SwapRequest, profile: Option<&Path>) -> Result<()> {
     )
 }
 
+/// Start `cc-rotate-ctl confirm-active` in the background: a usage check of the account in use,
+/// which takes a few seconds the statusline does not have.
+pub fn spawn_confirm(profile: Option<&Path>) -> Result<()> {
+    spawn_ctl(
+        |cmd| {
+            if let Some(p) = profile {
+                cmd.arg("--profile").arg(p);
+            }
+            cmd.arg("confirm-active");
+        },
+        "starting the background usage check",
+    )
+}
+
 /// Start `cc-rotate-ctl herdr-report` in the background so the SessionStart hook returns at once
 /// while the report waits for herdr to see Claude Code running.
 pub fn spawn_herdr_report(pane_id: &str, session_id: &str, seq: u64) -> Result<()> {

@@ -368,6 +368,12 @@ pub struct Settings {
     pub statusline_downstream: Option<String>,
     pub profile_dir: Option<String>,
     pub claude_path: Option<String>,
+    /// Read the usage of accounts that are not in use with Claude Code's own `/usage`.
+    pub usage_checks: bool,
+    /// Background checks read an account at most this often.
+    pub usage_check_interval_s: i64,
+    /// A swap first checks the account it picked when its latest reading is older than this.
+    pub usage_check_max_age_s: i64,
 }
 
 pub const SETTING_KEYS: &[&str] = &[
@@ -381,6 +387,9 @@ pub const SETTING_KEYS: &[&str] = &[
     "statusline_downstream",
     "profile_dir",
     "claude_path",
+    "usage_checks",
+    "usage_check_interval_s",
+    "usage_check_max_age_s",
 ];
 
 pub struct Store {
@@ -580,6 +589,10 @@ impl Store {
                 SETTING_KEYS.join(", ")
             );
         }
+        if key == "usage_checks" {
+            // Turning checks on (or off) again is how the user lifts a stop (usage_check).
+            self.delete_meta(crate::usage_check::META_BLOCKED)?;
+        }
         match value {
             Some(v) => {
                 let normalized = validate_setting(key, v)?;
@@ -620,6 +633,11 @@ impl Store {
             statusline_downstream: text("statusline_downstream")?,
             profile_dir: text("profile_dir")?,
             claude_path: text("claude_path")?,
+            usage_checks: get("usage_checks")?
+                .and_then(|v| parse_bool(&v))
+                .unwrap_or(true),
+            usage_check_interval_s: int("usage_check_interval_s", 3600)?,
+            usage_check_max_age_s: int("usage_check_max_age_s", 900)?,
         })
     }
 
@@ -632,6 +650,12 @@ impl Store {
 
     pub fn meta_i64(&self, key: &str) -> Result<Option<i64>> {
         Ok(self.meta(key)?.and_then(|v| v.parse().ok()))
+    }
+
+    pub fn delete_meta(&self, key: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM meta WHERE key = ?1", [key])?;
+        Ok(())
     }
 
     pub fn set_meta(&self, key: &str, value: impl ToString) -> Result<()> {
@@ -1239,6 +1263,9 @@ pub fn parse_bool(value: &str) -> Option<bool> {
     }
 }
 
+/// The shortest `usage_check_interval_s`.
+pub const MIN_CHECK_INTERVAL_S: i64 = 300;
+
 /// Check a setting's value. Returns the value to store instead, when it is spelled differently.
 fn validate_setting(key: &str, value: &str) -> Result<Option<String>> {
     match key {
@@ -1254,7 +1281,21 @@ fn validate_setting(key: &str, value: &str) -> Result<Option<String>> {
                 bail!("{key} must not be negative");
             }
         }
-        "prefer_no_weekly_limit" => {
+        "usage_check_interval_s" => {
+            let v: i64 = value.parse().context("expected an integer")?;
+            if v < MIN_CHECK_INTERVAL_S {
+                bail!(
+                    "{key} must be at least {MIN_CHECK_INTERVAL_S}: Anthropic refuses usage readings asked for more often"
+                );
+            }
+        }
+        "usage_check_max_age_s" => {
+            let v: i64 = value.parse().context("expected an integer")?;
+            if v < 0 {
+                bail!("{key} must not be negative");
+            }
+        }
+        "prefer_no_weekly_limit" | "usage_checks" => {
             let v = parse_bool(value).context("expected true or false")?;
             return Ok(Some(v.to_string()));
         }
@@ -1766,6 +1807,20 @@ mod tests {
         assert_eq!(s.settings().unwrap().swap_threshold_5h, 90.0);
         assert!(s.set_setting("swap_threshold_5h", Some("150")).is_err());
         assert!(s.set_setting("nope", Some("1")).is_err());
+
+        let d = s.settings().unwrap();
+        assert!(d.usage_checks);
+        assert_eq!(
+            (d.usage_check_interval_s, d.usage_check_max_age_s),
+            (3600, 900)
+        );
+        s.set_setting("usage_checks", Some("off")).unwrap();
+        assert_eq!(s.setting("usage_checks").unwrap().as_deref(), Some("false"));
+        assert!(!s.settings().unwrap().usage_checks);
+        assert!(s.set_setting("usage_check_interval_s", Some("60")).is_err());
+        s.set_setting("usage_check_interval_s", Some("1800"))
+            .unwrap();
+        assert_eq!(s.settings().unwrap().usage_check_interval_s, 1800);
     }
 
     #[test]

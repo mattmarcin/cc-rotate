@@ -353,6 +353,9 @@ pub struct Candidate {
     pub weekly_limit: WeeklyLimit,
     /// Place in the user's order, from 0; accounts at the same position share a place.
     pub order: usize,
+    /// Its login is not used until a usage check settles whether it still works
+    /// (`usage_check::CheckState::held_back`).
+    pub held_back: bool,
 }
 
 impl Candidate {
@@ -410,7 +413,7 @@ impl Candidate {
 
     /// Parked and below every threshold that applies: the scheduler may pick it.
     pub fn eligible(&self) -> bool {
-        self.account.state == AccountState::Parked && self.blocking().is_none()
+        self.account.state == AccountState::Parked && self.blocking().is_none() && !self.held_back
     }
 
     fn has_margin(&self) -> bool {
@@ -579,12 +582,12 @@ pub struct Ranked {
 pub fn ranking(candidates: &[Candidate], policy: Policy, now_s: i64) -> Vec<Ranked> {
     let mut open: Vec<&Candidate> = candidates
         .iter()
-        .filter(|c| c.usable() && c.blocking().is_none())
+        .filter(|c| c.usable() && c.blocking().is_none() && !c.held_back)
         .collect();
     open.sort_by(|a, b| policy.pick_order(a, b));
     let mut blocked: Vec<&Candidate> = candidates
         .iter()
-        .filter(|c| c.usable() && c.blocking().is_some())
+        .filter(|c| c.usable() && (c.blocking().is_some() || c.held_back))
         .collect();
     blocked.sort_by_key(|c| (c.blocked_until().unwrap_or(i64::MAX), c.order));
     let rest = candidates.iter().filter(|c| !c.usable());
@@ -639,6 +642,9 @@ fn closed_reason(c: &Candidate, now_s: i64) -> String {
         AccountState::Paused => return "paused".into(),
         AccountState::NeedsLogin => return "needs a new login".into(),
         _ => {}
+    }
+    if c.held_back && c.blocking().is_none() {
+        return "waiting for a usage check to confirm its login".into();
     }
     match c.blocking() {
         Some(w) => {
@@ -721,6 +727,7 @@ mod tests {
             windows: window_usage(Some(&sample(windows)), NOW, T, Some("claude-opus-4-1")),
             weekly_detected: weekly,
             weekly_limit: weekly,
+            held_back: false,
             account,
         }
     }

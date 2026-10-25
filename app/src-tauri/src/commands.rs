@@ -7,6 +7,7 @@ use ccr_core::scheduler::Reason;
 use ccr_core::snapshot::{self, Snapshot};
 use ccr_core::store::{AccountState, Event, Sample, WeeklyLimitSetting, kind};
 use ccr_core::swap::{self, SwapOutcome, SwapRequest};
+use ccr_core::usage_check::{self, CheckOutcome, Trigger};
 use ccr_core::{Paths, Store};
 use serde::Serialize;
 use tauri::AppHandle;
@@ -64,6 +65,12 @@ pub async fn swap_now(to: Option<i64>) -> CmdResult<SwapOutcome> {
     .await
 }
 
+/// Read an account's usage now with Claude Code's `/usage`.
+#[tauri::command]
+pub async fn check_usage(id: i64) -> CmdResult<CheckOutcome> {
+    blocking(move |s, p| usage_check::check(s, p, id, Trigger::Manual)).await
+}
+
 #[tauri::command]
 pub async fn set_paused(id: i64, paused: bool) -> CmdResult<()> {
     blocking(move |s, _| {
@@ -89,14 +96,14 @@ pub async fn set_paused(id: i64, paused: bool) -> CmdResult<()> {
 
 #[tauri::command]
 pub async fn remove_account(id: i64) -> CmdResult<()> {
-    blocking(move |s, _| {
+    blocking(move |s, p| {
         let account = s
             .account(id)?
             .ok_or_else(|| anyhow::anyhow!("that account no longer exists"))?;
         if account.state == AccountState::Active {
             anyhow::bail!("Swap to another account before removing {}.", account.label);
         }
-        s.remove_account(id)?;
+        usage_check::remove_account(s, p, id)?;
         s.log_event(
             kind::STATE,
             Some(id),

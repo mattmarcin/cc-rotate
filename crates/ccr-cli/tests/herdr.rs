@@ -231,16 +231,25 @@ fn report_retries_until_herdr_accepts() {
 #[test]
 fn report_gives_up_after_the_timeout_and_logs_it() {
     let f = fixture();
+    // Long enough for a retry even when starting the stand-in is slow (a loaded CI runner can
+    // take a second to start cmd.exe); what matters is that it retries, then stops.
+    let started = Instant::now();
     let out = f
         .ctl()
-        .args(["herdr-report", "--seq", "7", "--timeout-ms", "1200", "--"])
+        .args(["herdr-report", "--seq", "7", "--timeout-ms", "4000", "--"])
         .args([PANE, SESSION])
         .env("FAKE_HERDR_REJECT", "1000")
         .output()
         .unwrap();
     assert!(!out.status.success());
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "gave up after {:?}",
+        started.elapsed()
+    );
     let calls = f.calls();
-    assert!((2..=3).contains(&calls.len()), "{calls:?}");
+    // A call at most every 500 ms within the 4 s.
+    assert!((2..=9).contains(&calls.len()), "{calls:?}");
     let log = f.log();
     assert!(log.contains("herdr report"), "{log}");
     assert!(log.contains("resume_not_accepted"), "{log}");

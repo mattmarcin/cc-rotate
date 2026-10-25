@@ -9,6 +9,7 @@ use crate::store::{
     Account, AccountState, Event, Sample, Settings, Store, WeeklyLimitSetting, kind,
 };
 use crate::swap::{self, META_PROFILE_MODEL};
+use crate::usage_check::{self, CheckState};
 use crate::{plan, time};
 
 #[derive(Debug, Clone, Serialize)]
@@ -22,9 +23,12 @@ pub struct AccountView {
     pub weekly: WeeklyLimitView,
     /// When the latest reading was taken (epoch ms).
     pub last_sample_at: Option<i64>,
-    /// Where it came from: `rotate` (the rotation profile's status line), or the folder name of
-    /// another profile (`.claude-work`) whose status line or cached usage reported it.
+    /// Where it came from: `rotate` (the rotation profile's status line), `check` (a usage
+    /// check), or the folder name of another profile (`.claude-work`) whose status line or
+    /// cached usage reported it.
     pub last_sample_source: Option<String>,
+    /// The account's usage checks.
+    pub usage_check: CheckState,
     pub login_expires_at: Option<i64>,
     pub login_updated_at: Option<i64>,
     pub refresh_expires_at: Option<i64>,
@@ -132,6 +136,7 @@ pub fn snapshot_at(store: &Store, paths: &Paths, now_ms: i64) -> Result<Snapshot
             },
             last_sample_at: last.as_ref().map(|s| s.ts),
             last_sample_source: last.map(|s| s.profile),
+            usage_check: usage_check::state(store, c.account.id)?,
             login_expires_at: meta.as_ref().and_then(|m| m.expires_at),
             refresh_expires_at: meta.as_ref().and_then(|m| m.refresh_expires_at),
             login_updated_at: meta.as_ref().map(|m| m.updated_at),

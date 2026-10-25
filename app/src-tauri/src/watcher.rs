@@ -3,13 +3,18 @@
 //! notifications. Every 5 seconds it runs the background sync (write-back, dead logins,
 //! switching back to a better ranked account), and every 30 seconds it refreshes the tray
 //! tooltip and checks whether an exhausted pool has an account ready again, since both move
-//! with the clock even when nothing is written.
+//! with the clock even when nothing is written. Every minute it starts a usage check of the
+//! account that is most overdue for one (`usage_check::next_due`), one at a time, so the
+//! dashboard knows how much every account has left.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use ccr_core::snapshot::Snapshot;
 use ccr_core::store::{Event, Store, kind};
-use ccr_core::{Paths, snapshot, statusline, swap};
+use ccr_core::usage_check::{self, Trigger};
+use ccr_core::{Paths, snapshot, statusline, swap, time};
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_notification::NotificationExt;
 
@@ -17,6 +22,7 @@ pub const CHANGED: &str = "store-changed";
 
 const SYNC_EVERY_S: u64 = 5;
 const STATUS_EVERY_S: u64 = 30;
+const CHECK_EVERY_S: u64 = 60;
 
 #[derive(Default)]
 struct Watch {
@@ -24,6 +30,10 @@ struct Watch {
     last_event_id: Option<i64>,
     /// Whether the pool was exhausted at the last status check.
     exhausted: Option<bool>,
+    /// A background usage check is running.
+    checking: Arc<AtomicBool>,
+    /// A swap the background sync asked for is running.
+    swapping: Arc<AtomicBool>,
 }
 
 pub fn start(app: AppHandle) {
@@ -39,17 +49,30 @@ pub fn start(app: AppHandle) {
 }
 
 fn run(app: &AppHandle, store: &Store, paths: &Paths, watch: &mut Watch) {
+    // Settle what checks that died before the app started left behind.
+    let _ = usage_check::sweep(store, paths);
     // `data_version` only reflects other connections' commits, so keep this connection open.
     let mut tick = 0u64;
     loop {
         // Keep the store's copy of the active login current even when no interactive session
         // is running a statusline (for example only `claude -p` jobs).
-        if tick % SYNC_EVERY_S == 0 {
+        if tick % SYNC_EVERY_S == 0 && !watch.swapping.load(Ordering::Acquire) {
             if let Ok(Some(req)) = statusline::sync(store, paths) {
-                let _ = swap::run(store, paths, &req);
+                // On its own thread: it may check accounts first, which takes seconds.
+                watch.swapping.store(true, Ordering::Release);
+                let swapping = watch.swapping.clone();
+                std::thread::spawn(move || {
+                    if let Ok((store, paths)) = ccr_core::open(None) {
+                        let _ = swap::run(&store, &paths, &req);
+                    }
+                    swapping.store(false, Ordering::Release);
+                });
                 // Our own writes do not move `data_version` for this connection.
                 watch.last_version = None;
             }
+        }
+        if tick % CHECK_EVERY_S == 0 {
+            start_due_check(store, paths, &watch.checking);
         }
         let Ok(version) = store.data_version() else {
             return;
@@ -63,6 +86,25 @@ fn run(app: &AppHandle, store: &Store, paths: &Paths, watch: &mut Watch) {
         tick += 1;
         std::thread::sleep(Duration::from_secs(1));
     }
+}
+
+/// Check the most overdue account in the background, unless a check is still running. Its
+/// results arrive like any other write, through `data_version`.
+fn start_due_check(store: &Store, paths: &Paths, checking: &Arc<AtomicBool>) {
+    if checking.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let Ok(Some(id)) = usage_check::next_due(store, paths, time::now_ms()) else {
+        checking.store(false, Ordering::Release);
+        return;
+    };
+    let checking = checking.clone();
+    std::thread::spawn(move || {
+        if let Ok((store, paths)) = ccr_core::open(None) {
+            let _ = usage_check::check(&store, &paths, id, Trigger::Background);
+        }
+        checking.store(false, Ordering::Release);
+    });
 }
 
 fn refresh(app: &AppHandle, store: &Store, paths: &Paths, watch: &mut Watch) {
