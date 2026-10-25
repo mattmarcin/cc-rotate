@@ -187,6 +187,8 @@ pub fn snapshot_at(store: &Store, paths: &Paths, now_ms: i64) -> Result<Snapshot
             let rates = crate::budget::cached_rates(store)?;
             crate::forecast::pace(store, &rates, now_ms)?
                 .map(|pace| crate::forecast::forecast(&pool, policy, &rates, pace, now_s))
+                // Already out: the pool summary says so, with when one frees up.
+                .filter(|f| f.runs_out_at.is_none_or(|t| t > now_s))
         }
         None => None,
     };

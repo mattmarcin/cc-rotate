@@ -1898,3 +1898,41 @@ fn the_pace_counts_every_account_used_in_the_last_hour() {
             .is_none()
     );
 }
+
+/// One account, two sessions each reporting every 30 seconds for 40 minutes: one working (30%
+/// to 33%) and one idle, repeating 30%. The pace is the working one's, 3 points in 40 minutes
+/// at a usual 10 an hour (0.45), not every rebound from the idle session's value; and it fades
+/// once nothing is used.
+#[test]
+fn the_pace_ignores_an_idle_session_and_fades_when_work_stops() {
+    let env = Env::new();
+    let (store, a, _, _) = pool(&env);
+    let now = time::now_ms();
+    let reset = time::now_s() + 3 * 3600;
+    for half_minute in 0..=80i64 {
+        let ts = now - (80 - half_minute) * 30_000;
+        let working = 30.0 + (3 * half_minute / 80) as f64;
+        for (session, pct, offset) in [("w", working, 0), ("i", 30.0, 1_000)] {
+            store
+                .record_sample(&Sample {
+                    ts: ts - offset,
+                    account_id: a,
+                    profile: "rotate".into(),
+                    session_id: Some(session.into()),
+                    model: None,
+                    windows: vec![window("five_hour", pct, reset)],
+                })
+                .unwrap();
+        }
+    }
+    let rates = ccr_core::budget::Rates::default();
+    let pace = ccr_core::forecast::pace(&store, &rates, now)
+        .unwrap()
+        .unwrap();
+    assert!((pace - 0.45).abs() < 0.05, "{pace}");
+
+    let later = ccr_core::forecast::pace(&store, &rates, now + 20 * 60_000)
+        .unwrap()
+        .unwrap();
+    assert!(later < pace * 0.8, "{later} vs {pace}");
+}

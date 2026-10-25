@@ -30,7 +30,7 @@ struct Watch {
     last_event_id: Option<i64>,
     /// Whether the pool was exhausted at the last status check.
     exhausted: Option<bool>,
-    /// The "running out" notification went out, and the pool has not had room since.
+    /// The "running out" notification went out, and the forecast has not shown room since.
     warned_running_out: bool,
     /// A background usage check is running.
     checking: Arc<AtomicBool>,
@@ -209,7 +209,15 @@ fn status(app: &AppHandle, store: &Store, paths: &Paths, watch: &mut Watch) {
             notify(app, "Running out of accounts", &body);
             watch.warned_running_out = true;
         }
-        None => watch.warned_running_out = false,
+        // Room again only when the pool would last well past the warning, so a forecast that
+        // wavers around the hour does not warn again.
+        None if snap.forecast.is_none_or(|f| {
+            f.runs_out_at
+                .is_none_or(|t| t - now_s > 2 * RUNNING_OUT_WARNING_S)
+        }) =>
+        {
+            watch.warned_running_out = false
+        }
         _ => {}
     }
 }
