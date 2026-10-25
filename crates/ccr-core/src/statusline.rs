@@ -253,6 +253,8 @@ pub fn observe(
         .unwrap_or_default();
     if let Some(sample) = input.sample_for(account.id, &profile, now_ms) {
         store.record_sample(&sample)?;
+        // A profile that never swaps only ever shows its own account.
+        swap::note_known_resets(store, account.id, &sample.windows, now_ms / 1000)?;
     }
     Ok(Some(account))
 }
@@ -396,7 +398,6 @@ fn adopt_manual_login(store: &Store, paths: &Paths) -> Result<bool> {
                 }
                 s.set_state(account.id, AccountState::Active)?;
                 s.set_meta(META_ACTIVE_SINCE, crate::time::now_ms())?;
-                swap::reset_known_resets(s, account.id, crate::time::now_s())?;
                 if let Some(o) = oauth.as_ref().filter(|o| !credfile::is_dead(o)) {
                     s.save_credential(account.id, o, "sync")?;
                 }
