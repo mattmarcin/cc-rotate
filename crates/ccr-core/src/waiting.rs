@@ -71,7 +71,9 @@ pub fn decide(store: &Store, paths: &Paths, ws: &WaitingSession, now_ms: i64) ->
     if ws.woken_accounts.contains(&active.id) {
         return Ok(Decision::Wait);
     }
-    if ws.account_id != Some(active.id) {
+    // Moved on: another account is in the profile, or a swap since the stop put this one back,
+    // which it only does while the account has room.
+    if ws.account_id != Some(active.id) || swap::active_since(store)? > ws.since_ms {
         let (pool, _) = swap::load_pool(store, now_ms / 1000)?;
         let has_room = pool
             .iter()
@@ -95,52 +97,85 @@ pub fn decide(store: &Store, paths: &Paths, ws: &WaitingSession, now_ms: i64) ->
 /// still carried that account's login), else `active_id`. A first activation, from no account,
 /// does not count.
 pub fn stopped_on(store: &Store, active_id: i64, since_ms: i64) -> Result<i64> {
-    Ok(store
+    let left = store
         .last_event_of(kind::SWAP)?
         .filter(|e| {
             e.account_to == Some(active_id)
                 && e.ts >= since_ms - LANDED_GRACE_MS
                 && e.ts <= since_ms
         })
-        .and_then(|e| e.account_from)
-        .unwrap_or(active_id))
+        .and_then(|e| e.account_from);
+    // Events outlive accounts: one removed since cannot be the stop's.
+    Ok(match left {
+        Some(id) if store.account(id)?.is_some() => id,
+        _ => active_id,
+    })
 }
 
-/// The first reading of `account` taken at or after `since_ms` that is at a limit: the reading
-/// of a stop. Idle sessions repeat earlier numbers with a fresh time, so a reading with room says
-/// nothing about the stop.
-pub fn limit_reading_since(
+/// How far around a stop its reading is looked for: the status line may record it just before
+/// the hook starts, and moments after.
+const STOP_READING_BEFORE_MS: i64 = 30_000;
+const STOP_READING_AFTER_MS: i64 = 120_000;
+
+/// The reading of a stop: the first reading of `account` at a limit taken around `since_ms`,
+/// the session's own when it has one there (another session's may be at another limit). Idle
+/// sessions repeat earlier numbers with a fresh time, so a reading with room says nothing about
+/// the stop.
+pub fn stop_reading(
     store: &Store,
     account: &Account,
+    session_id: &str,
     since_ms: i64,
 ) -> Result<Option<Sample>> {
-    for sample in store.account_samples_since(account.id, since_ms)? {
-        if blocking(store, account, &sample, sample.ts / 1000)? {
-            return Ok(Some(sample));
-        }
-    }
-    Ok(None)
+    let limit = Limit::of(store, account)?;
+    let at_limit: Vec<Sample> = store
+        .account_samples_between(
+            account.id,
+            since_ms - STOP_READING_BEFORE_MS,
+            since_ms + STOP_READING_AFTER_MS,
+        )?
+        .into_iter()
+        .filter(|s| limit.blocking(s, s.ts / 1000))
+        .collect();
+    let own = at_limit
+        .iter()
+        .position(|s| s.session_id.as_deref() == Some(session_id));
+    Ok(match own {
+        Some(i) => at_limit.into_iter().nth(i),
+        None => at_limit.into_iter().next(),
+    })
 }
 
 /// The limit that stopped the session has reset: the stop's reading was at a limit, and that
 /// limit's reset time has passed.
 fn limit_reset(store: &Store, ws: &WaitingSession, account: &Account, now_ms: i64) -> Result<bool> {
-    let Some(sample) = limit_reading_since(store, account, ws.since_ms)? else {
+    let Some(sample) = stop_reading(store, account, &ws.session_id, ws.since_ms)? else {
         return Ok(false);
     };
-    Ok(!blocking(store, account, &sample, now_ms / 1000)?)
+    Ok(!Limit::of(store, account)?.blocking(&sample, now_ms / 1000))
 }
 
-/// Whether `sample` has a window at its threshold for `account` at `at_s` (a window counts as
-/// 0 once its reset time has passed).
-fn blocking(store: &Store, account: &Account, sample: &Sample, at_s: i64) -> Result<bool> {
-    let thresholds = Thresholds::from(&store.settings()?).for_account(account);
-    let model = store.meta(META_PROFILE_MODEL)?;
-    Ok(
-        scheduler::window_usage(Some(sample), at_s, thresholds, model.as_deref())
+/// What counts as at a limit for an account: its thresholds, for the model in use.
+struct Limit {
+    thresholds: Thresholds,
+    model: Option<String>,
+}
+
+impl Limit {
+    fn of(store: &Store, account: &Account) -> Result<Limit> {
+        Ok(Limit {
+            thresholds: Thresholds::from(&store.settings()?).for_account(account),
+            model: store.meta(META_PROFILE_MODEL)?,
+        })
+    }
+
+    /// Whether `sample` has a window at its threshold at `at_s` (a window counts as 0 once its
+    /// reset time has passed).
+    fn blocking(&self, sample: &Sample, at_s: i64) -> bool {
+        scheduler::window_usage(Some(sample), at_s, self.thresholds, self.model.as_deref())
             .iter()
-            .any(scheduler::WindowUsage::blocking),
-    )
+            .any(scheduler::WindowUsage::blocking)
+    }
 }
 
 /// Whether the user turned off Claude Code's own continue at a limit's reset for the profile
@@ -231,10 +266,15 @@ pub fn note_reading(
         return Ok(());
     };
     // Room now, and already at the stop (or the wake): a session idling at a limit repeats its
-    // reading, which shows room once the limit's reset time passes, but not before it.
-    if blocking(store, &account, sample, after / 1000)?
-        || blocking(store, &account, sample, now_ms / 1000)?
-    {
+    // reading, which shows room once the limit's reset time passes, but not before it. A reading
+    // with a window that had already reset by then is such a repeat too: a fresh response only
+    // reports windows still running.
+    let limit = Limit::of(store, &account)?;
+    let repeat = sample
+        .windows
+        .iter()
+        .any(|w| w.resets_at.is_some_and(|r| r <= after / 1000));
+    if repeat || limit.blocking(sample, after / 1000) || limit.blocking(sample, now_ms / 1000) {
         return Ok(());
     }
     store.immediate(|s| {

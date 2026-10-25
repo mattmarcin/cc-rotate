@@ -249,22 +249,110 @@ fn an_idle_session_repeating_its_limit_reading_after_the_reset_is_not_working() 
 }
 
 #[test]
-fn the_reading_of_a_stop_is_the_first_at_a_limit_since() {
+fn the_reading_of_a_stop_is_at_a_limit_around_it_and_the_sessions_own_first() {
     let e = env();
     let now = time::now_ms();
     let a = e.store.account(e.a).unwrap().unwrap();
-    // An idle session's pre-limit numbers, then the stop's reading.
+    // An idle session's pre-limit numbers say nothing about the stop.
     reading(&e.store, e.a, 85.0, now + 1_000);
     assert!(
-        waiting::limit_reading_since(&e.store, &a, now)
+        waiting::stop_reading(&e.store, &a, "s1", now)
             .unwrap()
             .is_none()
     );
-    reading(&e.store, e.a, 100.0, now + 2_000);
-    let found = waiting::limit_reading_since(&e.store, &a, now)
+    // The status line may record the stop's reading just before the hook starts.
+    e.store
+        .record_sample(&five_hour(e.a, None, 99.0, now - 10_000, now / 1000 + 600))
+        .unwrap();
+    assert_eq!(
+        waiting::stop_reading(&e.store, &a, "s1", now)
+            .unwrap()
+            .unwrap()
+            .ts,
+        now - 10_000
+    );
+    // The session's own reading wins over another session's at another limit.
+    e.store
+        .record_sample(&five_hour(
+            e.a,
+            Some("s1"),
+            100.0,
+            now + 2_000,
+            now / 1000 + 7_200,
+        ))
+        .unwrap();
+    let own = waiting::stop_reading(&e.store, &a, "s1", now)
         .unwrap()
         .unwrap();
-    assert_eq!(found.ts, now + 2_000);
+    assert_eq!(own.session_id.as_deref(), Some("s1"));
+    // Long after the stop, a reading at a limit is no longer the stop's.
+    let later = now + 3_600_000;
+    reading(&e.store, e.a, 100.0, later);
+    assert!(
+        waiting::stop_reading(&e.store, &a, "s2", later - 600_000)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn a_swap_back_to_the_account_it_stopped_on_wakes_it() {
+    let e = env();
+    let now = time::now_ms();
+    reading(&e.store, e.b, 10.0, now - 60_000);
+    let ws = stop(&e, "s1", now - 1_000);
+    swap_to_b(&e);
+    // b is used up, a reset, and the pool swaps back to a, which it only does with room.
+    reading(&e.store, e.b, 100.0, time::now_ms());
+    reading(&e.store, e.a, 2.0, time::now_ms());
+    let out = swap::run(
+        &e.store,
+        &e.paths,
+        &SwapRequest {
+            from: Some(e.b),
+            to: Some(e.a),
+            reason: Reason::Manual,
+            wait: true,
+        },
+    )
+    .unwrap();
+    assert!(matches!(out, swap::SwapOutcome::Swapped { .. }), "{out:?}");
+    let ws = e.store.waiting_session(&ws.session_id).unwrap().unwrap();
+    assert_eq!(
+        woken(waiting::decide(&e.store, &e.paths, &ws, time::now_ms()).unwrap()),
+        (e.a, WakeReason::Switched)
+    );
+}
+
+#[test]
+fn a_removed_account_is_never_the_stops() {
+    let e = env();
+    let now = time::now_ms();
+    reading(&e.store, e.b, 10.0, now - 60_000);
+    swap_to_b(&e);
+    e.store.remove_account(e.a).unwrap();
+    assert_eq!(
+        waiting::stopped_on(&e.store, e.b, time::now_ms() + 1_000).unwrap(),
+        e.b
+    );
+}
+
+#[test]
+fn a_repeat_with_a_window_reset_before_the_wake_is_not_work() {
+    let e = env();
+    let now = time::now_ms();
+    let ws = stop(&e, "s1", now);
+    let a = e.store.account(e.a).unwrap().unwrap();
+    // Woken on the same account after its limit reset at `now + 60 s`.
+    assert!(waiting::note_woken(&e.store, &ws, &a, now + 120_000).unwrap());
+    // The idle session repeats the at-limit reading of the stop: room at the wake and now, but
+    // its window had reset before the wake, so it is no new response.
+    let repeat = five_hour(e.a, Some("s1"), 100.0, now + 150_000, now / 1000 + 60);
+    waiting::note_reading(&e.store, "s1", e.a, &repeat, now + 150_000).unwrap();
+    assert_eq!(
+        e.store.waiting_session("s1").unwrap().unwrap().state,
+        WaitingState::Woken
+    );
 }
 
 #[test]

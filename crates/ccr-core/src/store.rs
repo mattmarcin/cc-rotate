@@ -1279,21 +1279,36 @@ impl Store {
     }
 
     pub fn samples_since(&self, since_ms: i64) -> Result<Vec<Sample>> {
-        self.samples_matching(None, since_ms)
+        self.samples_matching(None, since_ms, i64::MAX)
     }
 
     /// One account's samples taken at or after `since_ms`, oldest first.
     pub fn account_samples_since(&self, account_id: i64, since_ms: i64) -> Result<Vec<Sample>> {
-        self.samples_matching(Some(account_id), since_ms)
+        self.samples_matching(Some(account_id), since_ms, i64::MAX)
     }
 
-    fn samples_matching(&self, account_id: Option<i64>, since_ms: i64) -> Result<Vec<Sample>> {
+    /// One account's samples taken from `from_ms` up to `to_ms`, both included, oldest first.
+    pub fn account_samples_between(
+        &self,
+        account_id: i64,
+        from_ms: i64,
+        to_ms: i64,
+    ) -> Result<Vec<Sample>> {
+        self.samples_matching(Some(account_id), from_ms, to_ms)
+    }
+
+    fn samples_matching(
+        &self,
+        account_id: Option<i64>,
+        since_ms: i64,
+        until_ms: i64,
+    ) -> Result<Vec<Sample>> {
         let mut stmt = self.conn.prepare_cached(&format!(
             "SELECT {SAMPLE_COLS} FROM samples
-             WHERE ts >= ?1 AND (?2 IS NULL OR account_id = ?2) ORDER BY ts, id"
+             WHERE ts >= ?1 AND ts <= ?3 AND (?2 IS NULL OR account_id = ?2) ORDER BY ts, id"
         ))?;
         let mut samples: Vec<(i64, Sample)> = stmt
-            .query_map(params![since_ms, account_id], sample_from_row)?
+            .query_map(params![since_ms, account_id, until_ms], sample_from_row)?
             .collect::<rusqlite::Result<_>>()?;
         let index: std::collections::HashMap<i64, usize> = samples
             .iter()
@@ -1303,9 +1318,10 @@ impl Store {
         let mut stmt = self.conn.prepare_cached(
             "SELECT w.sample_id, w.name, w.pct, w.resets_at FROM sample_windows w
              JOIN samples s ON s.id = w.sample_id
-             WHERE s.ts >= ?1 AND (?2 IS NULL OR s.account_id = ?2) ORDER BY w.name",
+             WHERE s.ts >= ?1 AND s.ts <= ?3 AND (?2 IS NULL OR s.account_id = ?2)
+             ORDER BY w.name",
         )?;
-        let rows = stmt.query_map(params![since_ms, account_id], |r| {
+        let rows = stmt.query_map(params![since_ms, account_id, until_ms], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 SampleWindow {

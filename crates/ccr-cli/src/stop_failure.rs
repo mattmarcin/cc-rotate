@@ -98,13 +98,15 @@ pub fn run(profile: Option<PathBuf>, input: &str) -> Result<ExitCode> {
     // once, with no new swap. Otherwise the swap waits for the reading of the stop first, then
     // goes ahead unless the session can be woken by then.
     let mut decision = decide(&store, &paths, &ws, now);
+    let mut swap_requested = false;
     if matches!(decision, Decision::Wait) {
         if let Some(a) = &active {
-            wait_for_limit_reading(&store, a, now);
+            wait_for_stop_reading(&store, a, session, now);
         }
         decision = decide(&store, &paths, &ws, time::now_ms());
         if !matches!(decision, Decision::Wake(..)) {
             request_swap()?;
+            swap_requested = true;
         }
     }
     loop {
@@ -115,6 +117,11 @@ pub fn run(profile: Option<PathBuf>, input: &str) -> Result<ExitCode> {
                 Err(e) => process::log_error("hook stop-failure", &e),
             },
             Decision::TimedOut => return stop_waiting(&store, &ws),
+            // Waiting after all (a first wake could not be recorded): the swap is still due.
+            Decision::Wait if !swap_requested => {
+                request_swap()?;
+                swap_requested = true;
+            }
             Decision::Wait => {}
         }
         std::thread::sleep(Duration::from_millis(waiting::POLL_MS));
@@ -148,11 +155,11 @@ fn decide(store: &Store, paths: &Paths, ws: &WaitingSession, now_ms: i64) -> Dec
 }
 
 /// Wait, at most `waiting::READING_WAIT_MS`, for the status line to record the reading of the
-/// stop: one of the account, taken since, at a limit. Other sessions' idle readings do not count.
-fn wait_for_limit_reading(store: &Store, account: &Account, since_ms: i64) {
+/// stop (`waiting::stop_reading`). Other sessions' idle readings do not count.
+fn wait_for_stop_reading(store: &Store, account: &Account, session: &str, since_ms: i64) {
     let deadline = Instant::now() + Duration::from_millis(waiting::READING_WAIT_MS);
     while Instant::now() < deadline {
-        match waiting::limit_reading_since(store, account, since_ms) {
+        match waiting::stop_reading(store, account, session, since_ms) {
             Ok(Some(_)) => return,
             _ => std::thread::sleep(Duration::from_millis(250)),
         }
