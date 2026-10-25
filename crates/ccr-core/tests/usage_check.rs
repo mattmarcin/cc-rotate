@@ -735,7 +735,10 @@ fn a_login_during_a_swaps_checks_is_not_stored_as_the_outgoing_accounts() {
         },
     )
     .unwrap();
-    assert!(e.seen().contains("arg=/usage"), "b was checked before the swap");
+    assert!(
+        e.seen().contains("arg=/usage"),
+        "b was checked before the swap"
+    );
     assert!(matches!(out, SwapOutcome::Skipped { .. }), "{out:?}");
     assert_eq!(
         stored_refresh(&store, a),
