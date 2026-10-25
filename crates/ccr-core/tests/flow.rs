@@ -35,8 +35,19 @@ impl Env {
         }
     }
 
+    /// Usage checks are off: they would run whatever `claude` is on PATH. The tests of checks
+    /// turn them on with a stand-in (`fake_claude`).
     fn store(&self) -> Store {
-        Store::open(&self.paths.store_db()).unwrap()
+        let store = Store::open(&self.paths.store_db()).unwrap();
+        if store.setting("usage_checks").unwrap().is_none() {
+            store.set_setting("usage_checks", Some("false")).unwrap();
+            // And should one run anyway, it finds no Claude Code.
+            let nowhere = self.paths.data_dir.join("no-claude-here");
+            store
+                .set_setting("claude_path", Some(&nowhere.display().to_string()))
+                .unwrap();
+        }
+        store
     }
 
     fn cred_file(&self) -> PathBuf {
@@ -1371,4 +1382,44 @@ fn with_aligned_reset_times_a_copy_of_the_old_accounts_reading_is_not_counted() 
     )
     .unwrap();
     assert_eq!(store.last_sample(b).unwrap().unwrap().windows[0].pct, 41.0);
+}
+
+/// A swap writes the target's login into the profile before it commits. A status line tick in
+/// between still sees the outgoing account as active, and must not store the target's login as
+/// the outgoing account's.
+#[test]
+fn a_tick_during_a_swap_does_not_store_the_targets_login_as_the_outgoing_one() {
+    let env = Env::new();
+    let (store, a, b, _) = pool(&env);
+    let target = store.credential(b).unwrap().unwrap();
+    store
+        .set_meta(swap::META_SWAP_PENDING_FP, &target.refresh_fp)
+        .unwrap();
+    credfile::write_oauth(&env.cred_file(), &target.oauth).unwrap();
+
+    statusline::sync(&store, &env.paths).unwrap();
+    assert_eq!(
+        store.credential(a).unwrap().unwrap().oauth["refreshToken"],
+        "refresh-a1",
+        "a keeps its own login"
+    );
+
+    // The swap commits (b active, the mark gone, in one transaction); the login in the file is
+    // b's, and a's stays its own.
+    store
+        .immediate(|s| {
+            s.set_state(a, AccountState::Parked)?;
+            s.set_state(b, AccountState::Active)?;
+            s.delete_meta(swap::META_SWAP_PENDING_FP)
+        })
+        .unwrap();
+    statusline::sync(&store, &env.paths).unwrap();
+    assert_eq!(
+        store.credential(a).unwrap().unwrap().oauth["refreshToken"],
+        "refresh-a1"
+    );
+    assert_eq!(
+        store.credential(b).unwrap().unwrap().oauth["refreshToken"],
+        "refresh-b1"
+    );
 }

@@ -1,0 +1,380 @@
+//! Usage checks through a real child process: a stand-in `claude` (selected with the
+//! `claude_path` setting) that records how it was started and answers like Claude Code's
+//! `claude -p /usage` does, by writing a usage reading into the scratch profile's `.claude.json`.
+
+use std::path::{Path, PathBuf};
+
+use ccr_core::scheduler::Reason;
+use ccr_core::store::{AccountIdentity, AccountState, Sample, SampleWindow, kind};
+use ccr_core::swap::{self, SwapOutcome, SwapRequest};
+use ccr_core::usage_check::{self, CheckOutcome, Trigger};
+use ccr_core::{Paths, Store, time};
+use serde_json::{Value, json};
+
+struct Env {
+    root: tempfile::TempDir,
+    paths: Paths,
+    bin: PathBuf,
+}
+
+/// A stand-in `claude` that writes `seen.txt` (its config dir and arguments), copies the login
+/// it was given to `received.json`, then puts `config.json` and `credentials.json` from its own
+/// directory into the scratch profile when they exist.
+fn env() -> Env {
+    let root = tempfile::tempdir().unwrap();
+    let paths = Paths::new(root.path().join("data"), root.path().join("profile"))
+        .with_home(root.path().join("home"));
+    std::fs::create_dir_all(&paths.profile_dir).unwrap();
+    let bin = root.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    #[cfg(unix)]
+    let claude = {
+        use std::os::unix::fs::PermissionsExt;
+        let path = bin.join("claude");
+        std::fs::write(
+            &path,
+            r#"#!/bin/sh
+dir=$(dirname "$0")
+{ echo "config=$CLAUDE_CONFIG_DIR"; printf 'arg=%s\n' "$@"; } > "$dir/seen.txt"
+cp "$CLAUDE_CONFIG_DIR/.credentials.json" "$dir/received.json"
+[ -f "$dir/config.json" ] && cp "$dir/config.json" "$CLAUDE_CONFIG_DIR/.claude.json"
+[ -f "$dir/credentials.json" ] && cp "$dir/credentials.json" "$CLAUDE_CONFIG_DIR/.credentials.json"
+echo '{"type":"result","num_turns":0,"local_command":"usage"}'
+exit 0
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    };
+    #[cfg(windows)]
+    let claude = {
+        let path = bin.join("claude.cmd");
+        std::fs::write(
+            &path,
+            [
+                "@echo off",
+                "setlocal",
+                "set \"dir=%~dp0\"",
+                ">\"%dir%seen.txt\" echo config=%CLAUDE_CONFIG_DIR%",
+                "for %%a in (%*) do >>\"%dir%seen.txt\" echo arg=%%~a",
+                "copy /y \"%CLAUDE_CONFIG_DIR%\\.credentials.json\" \"%dir%received.json\" >nul",
+                "if exist \"%dir%config.json\" copy /y \"%dir%config.json\" \"%CLAUDE_CONFIG_DIR%\\.claude.json\" >nul",
+                "if exist \"%dir%credentials.json\" copy /y \"%dir%credentials.json\" \"%CLAUDE_CONFIG_DIR%\\.credentials.json\" >nul",
+                "echo {\"type\":\"result\",\"num_turns\":0,\"local_command\":\"usage\"}",
+                "exit /b 0",
+                "",
+            ]
+            .join("\r\n"),
+        )
+        .unwrap();
+        path
+    };
+    let e = Env { root, paths, bin };
+    e.store()
+        .set_setting("claude_path", Some(&claude.display().to_string()))
+        .unwrap();
+    e
+}
+
+impl Env {
+    fn store(&self) -> Store {
+        Store::open(&self.paths.store_db()).unwrap()
+    }
+
+    /// The reading the stand-in reports: `pct` of the 5-hour limit, stamped with `uuid`.
+    fn answer(&self, uuid: &str, pct: f64) {
+        let config = json!({
+            "oauthAccount": {"accountUuid": uuid},
+            "cachedUsageUtilization": {
+                "fetchedAtMs": time::now_ms() + 60_000,
+                "accountUuid": uuid,
+                "utilization": {"limits": [
+                    {"kind": "session", "percent": pct, "resets_at": "2099-01-01T00:00:00Z"}
+                ]}
+            }
+        });
+        std::fs::write(self.bin.join("config.json"), config.to_string()).unwrap();
+    }
+
+    fn seen(&self) -> String {
+        std::fs::read_to_string(self.bin.join("seen.txt")).unwrap_or_default()
+    }
+}
+
+fn oauth(tag: &str) -> Value {
+    json!({
+        "accessToken": format!("access-{tag}"),
+        "refreshToken": format!("refresh-{tag}"),
+        "expiresAt": time::now_ms() + 3_600_000,
+        "subscriptionType": "team",
+    })
+}
+
+fn add(store: &Store, label: &str, state: AccountState) -> i64 {
+    let ident = AccountIdentity {
+        account_uuid: Some(format!("u{label}")),
+        email: Some(format!("{label}@x.test")),
+        ..Default::default()
+    };
+    let id = store.insert_account(label, &ident, state).unwrap();
+    store
+        .save_credential(id, &oauth(&format!("{label}1")), "login")
+        .unwrap();
+    id
+}
+
+fn five_hour(account_id: i64, pct: f64, ts: i64) -> Sample {
+    Sample {
+        ts,
+        account_id,
+        profile: "rotate".into(),
+        session_id: None,
+        model: None,
+        windows: vec![SampleWindow {
+            name: "five_hour".into(),
+            pct,
+            resets_at: Some(time::now_s() + 3600),
+        }],
+    }
+}
+
+fn scratch_left(paths: &Paths) -> Vec<PathBuf> {
+    std::fs::read_dir(paths.staging_root())
+        .map(|d| d.filter_map(|e| e.ok()).map(|e| e.path()).collect())
+        .unwrap_or_default()
+}
+
+#[test]
+fn a_manual_check_runs_claude_code_in_a_scratch_profile() {
+    let e = env();
+    let store = e.store();
+    let a = add(&store, "a", AccountState::Parked);
+    e.answer("ua", 42.0);
+    std::fs::write(
+        e.bin.join("credentials.json"),
+        json!({"claudeAiOauth": oauth("a2")}).to_string(),
+    )
+    .unwrap();
+
+    let out = usage_check::check(&store, &e.paths, a, Trigger::Manual).unwrap();
+    assert!(
+        matches!(&out, CheckOutcome::Read { windows } if windows[0].pct == 42.0),
+        "{out:?}"
+    );
+
+    let seen = e.seen();
+    let staging = e.paths.staging_root();
+    assert!(
+        seen.lines()
+            .any(|l| l.starts_with("config=") && Path::new(&l[7..]).starts_with(&staging)),
+        "{seen}"
+    );
+    for arg in ["arg=-p", "arg=/usage", "arg=--debug-file"] {
+        assert!(seen.lines().any(|l| l == arg), "{arg} missing: {seen}");
+    }
+    let received: Value =
+        serde_json::from_str(&std::fs::read_to_string(e.bin.join("received.json")).unwrap())
+            .unwrap();
+    assert_eq!(received["claudeAiOauth"]["refreshToken"], "refresh-a1");
+    assert_eq!(
+        store.credential(a).unwrap().unwrap().oauth["refreshToken"],
+        "refresh-a2",
+        "the login Claude Code renewed is stored"
+    );
+    assert!(
+        scratch_left(&e.paths).is_empty(),
+        "{:?}",
+        scratch_left(&e.paths)
+    );
+    drop(e.root);
+}
+
+/// The swap's pick has a reading two hours old; checking it shows it was used up elsewhere, so
+/// the swap goes to the next account instead.
+#[test]
+fn a_swap_checks_an_old_pick_first() {
+    let e = env();
+    let store = e.store();
+    let a = add(&store, "a", AccountState::Active);
+    let b = add(&store, "b", AccountState::Parked);
+    let c = add(&store, "c", AccountState::Parked);
+    std::fs::write(
+        e.paths.credentials_file(),
+        json!({"claudeAiOauth": oauth("a1")}).to_string(),
+    )
+    .unwrap();
+    store
+        .record_sample(&five_hour(a, 99.0, time::now_ms()))
+        .unwrap();
+    store
+        .record_sample(&five_hour(b, 10.0, time::now_ms() - 2 * 3_600_000))
+        .unwrap();
+    store
+        .record_sample(&five_hour(c, 30.0, time::now_ms()))
+        .unwrap();
+    e.answer("ub", 100.0);
+
+    let out = swap::run(
+        &store,
+        &e.paths,
+        &SwapRequest {
+            from: Some(a),
+            to: None,
+            reason: Reason::FiveHour,
+            wait: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        SwapOutcome::Swapped {
+            from: Some(a),
+            to: c
+        }
+    );
+    let reading = store.last_sample(b).unwrap().unwrap();
+    assert_eq!(
+        (reading.profile.as_str(), reading.windows[0].pct),
+        ("check", 100.0)
+    );
+    let event = store.last_event_of(kind::SWAP).unwrap().unwrap();
+    assert_eq!(
+        event.detail.unwrap()["checked"],
+        json!([{"label": "b", "outcome": "read"}])
+    );
+    assert!(!e.paths.account_lock(c).exists());
+}
+
+/// With checks off, a swap never starts Claude Code.
+#[test]
+fn checks_can_be_turned_off() {
+    let e = env();
+    let store = e.store();
+    store.set_setting("usage_checks", Some("false")).unwrap();
+    let a = add(&store, "a", AccountState::Active);
+    let b = add(&store, "b", AccountState::Parked);
+    std::fs::write(
+        e.paths.credentials_file(),
+        json!({"claudeAiOauth": oauth("a1")}).to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        swap::run(
+            &store,
+            &e.paths,
+            &SwapRequest {
+                from: Some(a),
+                to: None,
+                reason: Reason::Manual,
+                wait: true,
+            },
+        )
+        .unwrap(),
+        SwapOutcome::Swapped {
+            from: Some(a),
+            to: b
+        }
+    );
+    assert!(e.seen().is_empty(), "Claude Code ran: {}", e.seen());
+}
+
+/// An account whose login is in doubt after an interrupted check is not swapped to.
+#[test]
+fn a_held_back_account_is_passed_over() {
+    let e = env();
+    let store = e.store();
+    store.set_setting("usage_checks", Some("false")).unwrap();
+    let a = add(&store, "a", AccountState::Active);
+    let b = add(&store, "b", AccountState::Parked);
+    let c = add(&store, "c", AccountState::Parked);
+    std::fs::write(
+        e.paths.credentials_file(),
+        json!({"claudeAiOauth": oauth("a1")}).to_string(),
+    )
+    .unwrap();
+    store
+        .set_meta(
+            &format!("usage_check:{b}"),
+            json!({"held_back": true}).to_string(),
+        )
+        .unwrap();
+    assert_eq!(
+        swap::run(
+            &store,
+            &e.paths,
+            &SwapRequest {
+                from: Some(a),
+                to: None,
+                reason: Reason::Manual,
+                wait: true,
+            },
+        )
+        .unwrap(),
+        SwapOutcome::Swapped {
+            from: Some(a),
+            to: c
+        }
+    );
+    assert!(
+        swap::run(
+            &store,
+            &e.paths,
+            &SwapRequest {
+                from: None,
+                to: Some(b),
+                reason: Reason::Manual,
+                wait: true,
+            },
+        )
+        .is_err(),
+        "not even by hand"
+    );
+}
+
+/// The status line reported the account in use at its limit, but with a reset time that is not
+/// known to be its own (it could be a session still showing the previous account). The swap
+/// reads the account's own usage first, finds it fine, and does not swap.
+#[test]
+fn a_threshold_swap_on_an_unsure_reading_confirms_first() {
+    let e = env();
+    let store = e.store();
+    let a = add(&store, "a", AccountState::Active);
+    add(&store, "b", AccountState::Parked);
+    std::fs::write(
+        e.paths.credentials_file(),
+        json!({"claudeAiOauth": oauth("a1")}).to_string(),
+    )
+    .unwrap();
+    store
+        .record_sample(&five_hour(a, 99.0, time::now_ms()))
+        .unwrap();
+    // a's own usage, as Claude Code's /usage reports it.
+    e.answer("ua", 30.0);
+
+    let out = swap::run(
+        &store,
+        &e.paths,
+        &SwapRequest {
+            from: Some(a),
+            to: None,
+            reason: Reason::FiveHour,
+            wait: false,
+        },
+    )
+    .unwrap();
+    assert!(matches!(out, SwapOutcome::Skipped { .. }), "{out:?}");
+    let reading = store.last_sample(a).unwrap().unwrap();
+    assert_eq!(
+        (reading.profile.as_str(), reading.windows[0].pct),
+        ("check", 30.0)
+    );
+    let received: Value =
+        serde_json::from_str(&std::fs::read_to_string(e.bin.join("received.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        received["claudeAiOauth"]["refreshToken"], "",
+        "the account in use is read with a login Claude Code cannot renew"
+    );
+    assert_eq!(store.active_account().unwrap().unwrap().id, a);
+}

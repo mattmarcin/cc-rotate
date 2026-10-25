@@ -22,6 +22,9 @@ use crate::swap::{
 use crate::{credfile, time};
 
 pub const META_LAST_TICK_AT: &str = "statusline_last_tick_at";
+/// When a tick last asked for a usage check of the account in use (`confirm_due`).
+const META_CONFIRM_REQUESTED_AT: &str = "confirm_requested_at";
+const CONFIRM_QUIET_MS: i64 = 10 * 60_000;
 pub const META_LAST_TICK_HAD_USAGE: &str = "statusline_last_tick_had_usage";
 const META_CONFIG_MTIME_SEEN: &str = "profile_config_mtime_seen";
 const META_PROFILE_UUID_SEEN: &str = "profile_account_uuid_seen";
@@ -131,6 +134,10 @@ pub struct TickResult {
     pub active: Option<Account>,
     pub swap: Option<SwapRequest>,
     pub pool_exhausted: bool,
+    /// Start a usage check of the account in use (`usage_check::confirm_active`) in the
+    /// background: readings at its limit keep coming that look like another account's, while
+    /// none of its own arrived for a while.
+    pub confirm: bool,
 }
 
 /// One statusline tick in the rotation profile.
@@ -171,7 +178,9 @@ pub fn tick(store: &Store, paths: &Paths, input: &StatusInput, now_ms: i64) -> R
                 swap::Attribution::Ambiguous => {
                     store.record_sample(&sample)?;
                 }
-                swap::Attribution::Elsewhere => {}
+                swap::Attribution::Elsewhere => {
+                    result.confirm = confirm_due(store, &sample, active.id, now_ms)?;
+                }
             }
         }
     }
@@ -199,6 +208,37 @@ pub fn tick(store: &Store, paths: &Paths, input: &StatusInput, now_ms: i64) -> R
     store.prune(now_ms)?;
     result.active = store.active_account()?;
     Ok(result)
+}
+
+/// Readings dropped as another account's may be the active account's after all, if the reset
+/// times known to be its own are wrong. When such a reading is at a limit and no reading of the
+/// active account itself came for `CONFIRM_QUIET_MS`, ask for a usage check of it (at most that
+/// often): its result is the account's own reading, which the next tick acts on.
+fn confirm_due(store: &Store, sample: &Sample, active_id: i64, now_ms: i64) -> Result<bool> {
+    let settings = store.settings()?;
+    if !settings.usage_checks {
+        return Ok(false);
+    }
+    let model = store.meta(META_PROFILE_MODEL)?;
+    let blocking = scheduler::window_usage(
+        Some(sample),
+        now_ms / 1000,
+        scheduler::Thresholds::from(&settings),
+        model.as_deref(),
+    )
+    .iter()
+    .any(scheduler::WindowUsage::blocking);
+    let quiet = store
+        .last_sample(active_id)?
+        .is_none_or(|s| now_ms - s.ts > CONFIRM_QUIET_MS);
+    let asked = store
+        .meta_i64(META_CONFIRM_REQUESTED_AT)?
+        .is_some_and(|t| now_ms - t < CONFIRM_QUIET_MS);
+    if blocking && quiet && !asked {
+        store.set_meta(META_CONFIRM_REQUESTED_AT, now_ms)?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// The throttling state a decision needs: the last swap, the last request, how long the active
@@ -319,11 +359,20 @@ fn sync_profile_login(store: &Store, paths: &Paths, dead_login: &mut bool) -> Re
     if store.meta(META_CRED_SEEN)?.as_deref() == Some(marker.as_str()) {
         return Ok(());
     }
-    let Some(active) = store.active_account()? else {
+    let Some(oauth) = creds.read_oauth()? else {
         store.set_meta(META_CRED_SEEN, &marker)?;
         return Ok(());
     };
-    let Some(oauth) = creds.read_oauth()? else {
+    // A swap writes the target's login before it commits; until then the store still names the
+    // outgoing account as active, and the login in the file is not the outgoing account's. The
+    // file is read first and the pending swap second: once the pending mark is gone, the commit
+    // is done and the active account read next is the target. Leave the change unseen.
+    if credfile::oauth_fingerprint(&oauth).is_some()
+        && store.meta(swap::META_SWAP_PENDING_FP)? == credfile::oauth_fingerprint(&oauth)
+    {
+        return Ok(());
+    }
+    let Some(active) = store.active_account()? else {
         store.set_meta(META_CRED_SEEN, &marker)?;
         return Ok(());
     };

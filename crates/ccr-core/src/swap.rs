@@ -10,7 +10,7 @@
 //!    write as well, so no other read-modify-write of the credentials (an MCP login, say) can
 //!    put the outgoing login back.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
@@ -20,7 +20,7 @@ use crate::lock::{DirLock, LockError, LockOptions};
 use crate::paths::Paths;
 use crate::scheduler::{self, Candidate, Policy, Reason, WeeklyEvidence, WeeklyLimit, WindowKind};
 use crate::store::{Account, AccountState, Sample, SampleWindow, Store, kind};
-use crate::{credfile, secret, time};
+use crate::{credfile, secret, time, usage_check};
 
 pub const META_LAST_SWAP_AT: &str = "last_swap_at";
 /// The reset times (comma-separated epoch seconds) of every window in the outgoing account's
@@ -28,6 +28,8 @@ pub const META_LAST_SWAP_AT: &str = "last_swap_at";
 /// of each other add to it, so a session that has not made a request since two swaps ago is
 /// recognized too.
 pub const META_LAST_SWAP_FROM_RESETS: &str = "last_swap_from_resets";
+/// The fingerprint of the login a swap is writing into the profile, until it commits.
+pub const META_SWAP_PENDING_FP: &str = "swap_pending_fp";
 /// Prefix of the meta keys holding, per account, the reset times known to be its own windows'
 /// (a JSON list of epoch seconds; only those still ahead count). See `attribute`.
 pub const META_OWN_RESETS_PREFIX: &str = "own_resets:";
@@ -46,6 +48,12 @@ pub const META_CRED_SEEN: &str = "cred_mtime_seen";
 pub const META_PROFILE_FOREIGN: &str = "profile_foreign";
 
 const POOL_EXHAUSTED_LOG_INTERVAL_MS: i64 = 10 * 60_000;
+/// A swap checks at most this many picks with `/usage` before it swaps...
+const MAX_PRE_SWAP_CHECKS: usize = 3;
+/// ...and starts no check after this long.
+const PRE_SWAP_CHECK_BUDGET: Duration = Duration::from_secs(25);
+/// Bounds re-picking when the pick keeps changing under the account locks.
+const MAX_PICK_ATTEMPTS: usize = 8;
 const BACKUPS_KEPT: usize = 7;
 const BACKUP_EXT: &str = "ccr";
 const LEGACY_BACKUP_EXT: &str = "dpapi";
@@ -94,6 +102,7 @@ pub fn load_pool(store: &Store, now_s: i64) -> Result<(Vec<Candidate>, Policy)> 
             weekly_detected: detected,
             windows,
             order,
+            held_back: usage_check::state(store, account.id)?.held_back,
             account,
         });
     }
@@ -266,6 +275,27 @@ pub fn copies_another(sample: &Sample, others: &[Sample]) -> bool {
         .any(|o| crate::store::same_windows(&o.windows, &sample.windows))
 }
 
+/// Whether the threshold the active account's latest reading reached may not be its own: the
+/// reading is from the status line and a window over its threshold has a reset time not known
+/// to be the account's (section 8). Then a threshold swap confirms first.
+fn needs_confirmation(store: &Store, active_id: i64, now_ms: i64) -> Result<bool> {
+    let Some(last) = store.last_sample(active_id)? else {
+        return Ok(false);
+    };
+    if last.profile != "rotate" {
+        return Ok(false);
+    }
+    let (pool, _) = load_pool(store, now_ms / 1000)?;
+    let Some(active) = pool.iter().find(|c| c.account.id == active_id) else {
+        return Ok(false);
+    };
+    let own = known_resets(store, active_id, now_ms / 1000)?;
+    Ok(active.windows.iter().filter(|w| w.blocking()).any(|w| {
+        w.resets_at
+            .is_none_or(|r| !own.iter().any(|&k| same_reset(k, r)))
+    }))
+}
+
 /// The reset times the stale-reading guard currently knows (`META_LAST_SWAP_FROM_RESETS`).
 pub fn left_resets(store: &Store) -> Result<Vec<i64>> {
     Ok(store
@@ -379,35 +409,128 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
     // picked. Best effort: an unreadable profile must not stop the swap.
     let _ = crate::profile_usage::import(store, paths, now);
 
-    let now_s = now / 1000;
-    let (pool, policy) = load_pool(store, now_s)?;
-    let target = match req.to {
-        Some(id) => {
-            let account = store
-                .account(id)?
-                .ok_or_else(|| anyhow!("account {id} does not exist"))?;
-            match account.state {
-                AccountState::Active => return skip(store, req, "that account is already active"),
-                AccountState::NeedsLogin => {
+    // A threshold swap that rests on a reading the status line could not attribute for sure
+    // (section 8) first reads the account in use's own usage (section 20.4). When that is not
+    // possible, the swap goes ahead as the reading says.
+    let mut confirmed = None;
+    if req.reason.is_threshold() {
+        if let Some(account) = &active {
+            if needs_confirmation(store, account.id, now)? {
+                let outcome = usage_check::confirm_active(store, paths).unwrap_or_else(|e| {
+                    usage_check::CheckOutcome::Failed {
+                        why: format!("{e:#}"),
+                    }
+                });
+                confirmed = Some(outcome.kind());
+                if matches!(outcome, usage_check::CheckOutcome::Read { .. }) {
+                    let (pool, _) = load_pool(store, time::now_s())?;
+                    let fine = pool
+                        .iter()
+                        .find(|c| c.account.id == account.id)
+                        .is_some_and(|c| c.blocking().is_none());
+                    if fine {
+                        return skip(
+                            store,
+                            req,
+                            "the account in use is below its limits by its own usage reading",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Pick the target. A pick whose latest reading is old is checked first with Claude Code's
+    // `/usage` (section 20), and the pick is made again with what that found, so a swap does
+    // not land on an account that was used up elsewhere. Then the target's account lock is
+    // taken, which waits for a background check of it to finish, and the target is settled
+    // again under it. An account whose lock or leftovers keep it busy is passed over.
+    let check_deadline = Instant::now() + PRE_SWAP_CHECK_BUDGET;
+    let mut checked: Vec<serde_json::Value> = Vec::new();
+    let mut checked_ids: Vec<i64> = Vec::new();
+    let mut passed_over: Vec<i64> = Vec::new();
+    let mut attempts = 0;
+    let (target, _target_lock, pool, policy) = loop {
+        attempts += 1;
+        let last_try = req.to.is_some() || attempts >= MAX_PICK_ATTEMPTS;
+        let (mut pool, policy) = load_pool(store, time::now_s())?;
+        pool.retain(|c| !passed_over.contains(&c.account.id));
+        let target = match choose(store, req, &pool, policy, active.as_ref())? {
+            Choice::Target(account) => account,
+            Choice::Done(outcome) => return Ok(outcome),
+        };
+        if req.to.is_none()
+            && checked_ids.len() < MAX_PRE_SWAP_CHECKS
+            && !checked_ids.contains(&target.id)
+            && Instant::now() < check_deadline
+            && usage_check::due_before_swap(store, &target, time::now_ms())?
+        {
+            let outcome =
+                usage_check::check(store, paths, target.id, usage_check::Trigger::BeforeSwap)
+                    .unwrap_or_else(|e| usage_check::CheckOutcome::Failed {
+                        why: format!("{e:#}"),
+                    });
+            checked.push(usage_check::summary(store, target.id, &outcome));
+            checked_ids.push(target.id);
+            continue;
+        }
+        let lock = match DirLock::acquire(
+            &paths.account_lock(target.id),
+            LockOptions::claude(lock_timeout),
+        ) {
+            Ok(lock) => lock,
+            Err(_) if !last_try => {
+                passed_over.push(target.id);
+                continue;
+            }
+            Err(e) => {
+                return Err(log_error(
+                    store,
+                    req,
+                    &target,
+                    format!("could not take the lock of {}'s login: {e}", target.label),
+                ));
+            }
+        };
+        if let usage_check::Recovery::Busy(why) = usage_check::recover(store, paths, target.id)? {
+            if !last_try {
+                passed_over.push(target.id);
+                continue;
+            }
+            return Err(log_error(
+                store,
+                req,
+                &target,
+                format!("{} cannot be used now: {why}", target.label),
+            ));
+        }
+        // Under the lock: a check that finished while it was awaited may have found the target
+        // used up, or its login rejected, or one in doubt.
+        let (mut pool, policy) = load_pool(store, time::now_s())?;
+        pool.retain(|c| !passed_over.contains(&c.account.id));
+        match choose(store, req, &pool, policy, active.as_ref())? {
+            Choice::Target(settled) if settled.id == target.id => {
+                if req.to.is_some() && usage_check::state(store, target.id)?.held_back {
                     return Err(anyhow!(
-                        "{} needs a new login before it can be used",
-                        account.label
+                        "{} is waiting for a usage check to confirm its login; check it first",
+                        target.label
                     ));
                 }
-                AccountState::Parked | AccountState::Paused => account,
+                break (settled, lock, pool, policy);
             }
-        }
-        None if req.reason == Reason::PreferredAvailable => {
-            match scheduler::switch_back_target(&pool, policy) {
-                Some(c) => c.account.clone(),
-                None => return skip(store, req, "no better ranked account is ready"),
+            Choice::Target(_) if !last_try => continue,
+            Choice::Target(_) => {
+                return skip(
+                    store,
+                    req,
+                    "the accounts kept changing while the swap waited for them",
+                );
             }
+            Choice::Done(outcome) => return Ok(outcome),
         }
-        None => match scheduler::pick(&pool, policy, active_id) {
-            Some(c) => c.account.clone(),
-            None => return pool_exhausted(store, req, active.as_ref(), now),
-        },
     };
+    let now = time::now_ms();
+    let now_s = now / 1000;
     let ranking = scheduler::ranking(&pool, policy, now_s);
     let reason_for = |id: i64| {
         ranking
@@ -481,7 +604,13 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
     }
 
     backup_daily(store, paths, now).context("backing up the profile's credentials")?;
-    creds.write_oauth(&target_login.oauth)?;
+    // Until the swap commits, the store still names the outgoing account as active; a status
+    // line write-back meanwhile must not store the target's login as the outgoing account's.
+    store.set_meta(META_SWAP_PENDING_FP, &target_login.refresh_fp)?;
+    if let Err(e) = creds.write_oauth(&target_login.oauth) {
+        let _ = store.delete_meta(META_SWAP_PENDING_FP);
+        return Err(e);
+    }
     let marker = creds.change_marker()?;
 
     let from_sample = match active_id {
@@ -535,6 +664,13 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
         if arrived_full {
             detail["arrived_over_limit"] = json!(true);
         }
+        if !checked.is_empty() {
+            detail["checked"] = json!(checked);
+        }
+        if let Some(outcome) = confirmed {
+            detail["confirmed"] = json!(outcome);
+        }
+        s.delete_meta(META_SWAP_PENDING_FP)?;
         s.log_event(
             kind::SWAP,
             active_id,
@@ -550,6 +686,7 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
         if let Some(oauth) = &previous {
             let _ = creds.write_oauth(oauth);
         }
+        let _ = store.delete_meta(META_SWAP_PENDING_FP);
         drop(storage_lock);
         drop(legacy_lock);
         drop(refresh_lock);
@@ -580,6 +717,69 @@ pub fn install_active_login(store: &Store, paths: &Paths, oauth: &serde_json::Va
         store.set_meta(META_CRED_SEEN, marker)?;
     }
     Ok(())
+}
+
+enum Choice {
+    Target(Account),
+    /// No swap: skipped or no account left, already logged.
+    Done(SwapOutcome),
+}
+
+/// The account a request swaps to: the one it names, the switch-back target, or the pick.
+fn choose(
+    store: &Store,
+    req: &SwapRequest,
+    pool: &[Candidate],
+    policy: Policy,
+    active: Option<&Account>,
+) -> Result<Choice> {
+    let target = match req.to {
+        Some(id) => {
+            let account = store
+                .account(id)?
+                .ok_or_else(|| anyhow!("account {id} does not exist"))?;
+            match account.state {
+                AccountState::Active => {
+                    return Ok(Choice::Done(skip(
+                        store,
+                        req,
+                        "that account is already active",
+                    )?));
+                }
+                AccountState::NeedsLogin => {
+                    return Err(anyhow!(
+                        "{} needs a new login before it can be used",
+                        account.label
+                    ));
+                }
+                AccountState::Parked | AccountState::Paused => account,
+            }
+        }
+        None if req.reason == Reason::PreferredAvailable => {
+            match scheduler::switch_back_target(pool, policy) {
+                Some(c) => c.account.clone(),
+                None => {
+                    return Ok(Choice::Done(skip(
+                        store,
+                        req,
+                        "no better ranked account is ready",
+                    )?));
+                }
+            }
+        }
+        None => match scheduler::pick(pool, policy, active.map(|a| a.id)) {
+            Some(c) => c.account.clone(),
+            None => {
+                return Ok(Choice::Done(pool_exhausted(
+                    store,
+                    req,
+                    active,
+                    time::now_ms(),
+                )?));
+            }
+        },
+    };
+    Ok(Choice::Target(target))
 }
 
 fn skip(store: &Store, req: &SwapRequest, why: &str) -> Result<SwapOutcome> {

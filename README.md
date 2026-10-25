@@ -25,9 +25,11 @@ Because every session lives in one profile, sessions can see and message each ot
 - If a request already hit the limit, Claude Code waits and retries on its own, and the retry goes out on the new account.
 - Before picking an account, cc-rotate also reads the last usage Claude Code saw in each of your other Claude Code profiles, so an account an agent used up in its own profile is not picked.
   If an account still turns out to be used up right after a swap, cc-rotate moves on at once instead of waiting out the 2-minute minimum between swaps.
+- Accounts that are not in use get a usage check from time to time: cc-rotate runs Claude Code's own `/usage` with that account's login in a scratch folder, which shows how much of each limit is used without sending a prompt or using any of the account's limits.
+  A swap also checks the account it is about to use first when its last reading is more than 15 minutes old.
 
-cc-rotate never talks to Anthropic itself.
-All traffic is the unmodified Claude Code talking to Anthropic, exactly as it does today.
+cc-rotate never sends a request to Anthropic itself.
+All traffic is the unmodified Claude Code talking to Anthropic: your sessions, the sign-ins, and the usage checks.
 
 The design, with the Claude Code behavior it relies on, is in [docs/specs/2026-10-24-cc-rotate.md](docs/specs/2026-10-24-cc-rotate.md).
 
@@ -144,7 +146,18 @@ Accounts in the same place never swap just to even out usage.
 
 `cc-rotate-ctl next --explain` lists every account in the order it would be used, with the reason for each.
 
-cc-rotate knows how much of each limit an account has used from three places: the status line of sessions in the rotation profile, the status line of your other profiles if you turn on observe mode for them (see **Tracking your other profiles too**), and the last `/usage` reading Claude Code saved in each of your other profiles.
+cc-rotate knows how much of each limit an account has used from four places: the status line of sessions in the rotation profile, the status line of your other profiles if you turn on observe mode for them (see **Tracking your other profiles too**), the last `/usage` reading Claude Code saved in each of your other profiles, and usage checks.
+
+Usage checks read the accounts that are not in use:
+- While the app runs, it checks one account a minute that has not been read for `usage_check_interval_s` (an hour by default), in the order the accounts would be used.
+- Before a swap uses an account whose last reading is older than `usage_check_max_age_s` (15 minutes), the swap checks it first and picks again if it turns out to be used up, up to three accounts per swap.
+- `cc-rotate-ctl check` checks every account that is not in use now, and the app's **More** dialog has **Check usage** for one.
+- Anthropic only answers a few usage requests per login in a while, and asks to wait, sometimes up to an hour, when there were too many. cc-rotate does not check that account again before then.
+- If Claude Code renews the account's login during a check, cc-rotate stores the renewed login, as it does for the account in use.
+- Paused accounts are only checked when you ask, and `cc-rotate-ctl config usage_checks false` turns the automatic checks off.
+- If a check is interrupted while Claude Code may have been renewing a login, that account is not used until its next check confirms the login still works.
+- When the status line reports the account in use at a limit but cannot be sure the reading is that account's (a session that has not made a request since the last swap still shows the account it used before), the swap first checks the account in use. That check uses a copy of its login that Claude Code cannot renew.
+
 An account used up elsewhere since its last reading can still be picked.
 When the first readings after a swap show that, cc-rotate swaps again without waiting for `swap_cooldown_s` (it still waits 30 seconds between swap requests, so many sessions reporting at once start one swap).
 
@@ -159,6 +172,7 @@ When Claude Code reports one, cc-rotate records it too and only counts it while 
 | `cc-rotate-ctl status` | Every account with its plan, usage and reset times, and the next pick. |
 | `cc-rotate-ctl next` | The account the next swap would pick, and why. `--explain` lists every account in order with a reason. |
 | `cc-rotate-ctl swap` | Swap now to the next pick. `--to <label>` picks one. |
+| `cc-rotate-ctl check [<label>...]` | Read the usage of accounts not in use now with Claude Code's `/usage`, all of them when none are listed. |
 | `cc-rotate-ctl login` | Add an account. `--relogin <label>` signs an existing account in again. `--from-profile <name>` adds the account another profile uses. |
 | `cc-rotate-ctl profiles` | List your other Claude Code profiles and the account each belongs to. |
 | `cc-rotate-ctl pause <label>` / `resume <label>` | Keep an account out of rotation, or bring it back. |
@@ -186,7 +200,10 @@ When Claude Code reports one, cc-rotate records it too and only counts it while 
 | `sample_retention_days` | 90 | How long usage history is kept. |
 | `statusline_downstream` | your old status line | The status line command shown after cc-rotate's label. |
 | `profile_dir` | `~/.claude-rotate` | The rotation profile, recorded by `setup`. |
-| `claude_path` | found on `PATH` | The `claude` executable to use for logins and for `cc-rotate`. |
+| `claude_path` | found on `PATH` | The `claude` executable to use for logins, usage checks and `cc-rotate`. |
+| `usage_checks` | true | Check the usage of accounts not in use with Claude Code's `/usage`. |
+| `usage_check_interval_s` | 3600 | How often the app checks each account that is not in use (at least 300). |
+| `usage_check_max_age_s` | 900 | A swap checks the account it picked first when its last reading is older than this. |
 
 ### Tracking your other profiles too
 
@@ -235,7 +252,7 @@ When you quit Claude Code in a pane, herdr forgets the command, just as it forge
 
 ## Troubleshooting
 
-- Run `cc-rotate-ctl doctor` first.
+- Run `cc-rotate-ctl doctor` first. Its **Usage checks** line says when an account's last check failed and why.
 - Errors from the status line and hooks go to `logs/cc-rotate.log` in the data folder (see **Platforms**).
 - An account marked **needs login** had its login rejected by Anthropic. Sign it in again with `cc-rotate-ctl login --relogin <label>`.
 - A daily encrypted backup of the profile's login file is kept in `backups` in the data folder.

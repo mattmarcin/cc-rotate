@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
@@ -14,11 +15,13 @@ use serde_json::{Value, json};
 
 use crate::credfile;
 use crate::credstore::Credentials;
+use crate::lock::{DirLock, LockOptions};
 use crate::paths::Paths;
 use crate::profile_account::{self, ProfileAccount};
 use crate::scheduler::Reason;
 use crate::store::{Account, AccountIdentity, AccountState, Store, kind};
 use crate::swap::{self, SwapRequest};
+use crate::usage_check;
 
 #[derive(Debug, Clone, Default)]
 pub struct LoginRequest {
@@ -149,13 +152,28 @@ pub fn import(
     };
 
     let has_active = store.active_account()?.is_some();
+    // A usage check may be running Claude Code with this account's previous login; it must not
+    // store a renewal of that login over the new one (usage_check).
+    // Long enough for a check that is running to finish (it is killed after RUN_TIMEOUT).
+    let wait = Duration::from_millis(store.settings()?.lock_timeout_ms) + usage_check::RUN_TIMEOUT;
+    let account_lock = match &existing {
+        Some(account) => Some(
+            DirLock::acquire(&paths.account_lock(account.id), LockOptions::claude(wait))
+                .context("waiting for a usage check of the account to finish")?,
+        ),
+        None => None,
+    };
     let (id, created) = store.immediate(|s| match &existing {
         Some(account) => {
             s.update_identity(account.id, &ident)?;
             s.save_credential(account.id, &oauth, "login")?;
-            if account.state == AccountState::NeedsLogin {
+            // Read again under the lock: a check may have marked it meanwhile.
+            let now = s.account(account.id)?.map(|a| a.state);
+            if now == Some(AccountState::NeedsLogin) {
                 s.set_state(account.id, AccountState::Parked)?;
             }
+            // A fresh login settles whatever earlier checks of the account left open.
+            usage_check::forget(s, account.id)?;
             Ok((account.id, false))
         }
         None => {
@@ -186,6 +204,8 @@ pub fn import(
         }
     })?;
 
+    // The swap below takes the account's lock itself.
+    drop(account_lock);
     let mut activated = false;
     let current = store.account(id)?.expect("account just written");
     if current.state == AccountState::Active {

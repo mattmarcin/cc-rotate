@@ -6,6 +6,7 @@ import {
   onLoginProgress,
   onStoreChanged,
   type AccountView,
+  type CheckOutcome,
   type EventRow,
   type LoginProgress,
   type Snapshot,
@@ -154,18 +155,46 @@ function readIn(source: string | null): string | null {
   return source.replace(/^\.claude-/, "").replace(/^\./, "");
 }
 
-/** "read 5m ago", or "read 5m ago in work" for a reading another profile reported. */
+/** "read 5m ago", "checked 5m ago", or "read 5m ago in work" for a reading another profile reported. */
 function readText(a: AccountView): string {
   if (!a.last_sample_at) return "never read";
+  if (a.last_sample_source === "check") return `checked ${ago(a.last_sample_at)}`;
   const other = readIn(a.last_sample_source);
   return `read ${ago(a.last_sample_at)}${other ? ` in ${other}` : ""}`;
 }
 
 function readTitle(a: AccountView): string {
   if (!a.last_sample_at) return "";
-  const other = readIn(a.last_sample_source);
   const at = new Date(a.last_sample_at).toLocaleString();
+  if (a.last_sample_source === "check") return `${at}, from a usage check`;
+  const other = readIn(a.last_sample_source);
   return other ? `${at}, from the ${other} profile` : at;
+}
+
+/** A toast for the outcome of a usage check the user asked for. */
+function checkMessage(label: string, r: CheckOutcome): string {
+  switch (r.outcome) {
+    case "read":
+      return `Checked ${label}`;
+    case "rate_limited":
+      return `Anthropic asked to wait ${until(r.until / 1000)} before the next reading of ${label}`;
+    case "skipped":
+      return `Did not check ${label}: ${r.why}`;
+    case "login_rejected":
+      return `${label}'s login was rejected. Log in again.`;
+    case "failed":
+      return `Could not check ${label}: ${r.why}`;
+  }
+}
+
+/** The usage check facts in the account dialog. */
+function checkText(a: AccountView): string {
+  const c = a.usage_check;
+  if (a.state === "active") return "not needed while in use";
+  if (c.held_back) return "not used until a check confirms its login";
+  if (c.problem) return c.problem;
+  const read = c.last_read_at ? `read ${ago(c.last_read_at)}` : "not checked yet";
+  return c.not_before && c.not_before > Date.now() ? `${read}, next after ${clock(c.not_before)}` : read;
 }
 
 const WEEKLY_TEXT = { none: "no weekly limit", unknown: "not known yet", has: "has a weekly limit" } as const;
@@ -356,7 +385,15 @@ function renderOverview() {
 function meter(w: WindowUsage | undefined, live: boolean) {
   const used = w?.pct ?? 0;
   const lvl = level(used, w?.threshold ?? 100);
-  const reset = w?.resets_at && w.resets_at * 1000 > Date.now() ? `resets in ${until(w.resets_at)}` : live && w ? "window reset" : "no reading yet";
+  // A usage report names no reset time for a window that has not started (nothing used yet).
+  const reset =
+    w?.resets_at && w.resets_at * 1000 > Date.now()
+      ? `resets in ${until(w.resets_at)}`
+      : w && w.resets_at === null
+        ? "not started"
+        : live && w
+          ? "window reset"
+          : "no reading yet";
   return h(
     "div",
     { class: `meter ${lvl}` },
@@ -702,6 +739,15 @@ const REASONS: Record<string, string> = {
   login: "after its first login",
 };
 
+/** A usage check's outcome, as a swap event lists it. */
+const CHECKED: Record<string, string> = {
+  read: "read",
+  skipped: "skipped",
+  rate_limited: "asked to wait",
+  login_rejected: "login rejected",
+  failed: "failed",
+};
+
 const nb = (text: string) => h("span", { class: "nb" }, text);
 
 function describe(e: EventRow): { parts: Child[]; tone?: "warn" | "danger" } {
@@ -715,8 +761,12 @@ function describe(e: EventRow): { parts: Child[]; tone?: "warn" | "danger" } {
       const arrived = e.detail?.arrived_over_limit
         ? h("small", { class: "why" }, `${labelOf(e.account_from)} was already at this limit when cc-rotate switched to it.`)
         : null;
+      const checkedList = (e.detail?.checked as { label: string; outcome: string }[] | undefined) ?? [];
+      const checked = checkedList.length
+        ? h("small", { class: "why" }, `Checked first: ${checkedList.map((c) => `${c.label} (${CHECKED[c.outcome] ?? c.outcome})`).join(", ")}`)
+        : null;
       return e.account_from
-        ? { parts: ["Swapped from ", from, " to ", to, ` ${REASONS[e.reason ?? ""] ?? ""}`.trimEnd(), arrived, why] }
+        ? { parts: ["Swapped from ", from, " to ", to, ` ${REASONS[e.reason ?? ""] ?? ""}`.trimEnd(), arrived, checked, why] }
         : { parts: ["Started using ", to, why] };
     }
     case "swap_skipped":
@@ -724,7 +774,9 @@ function describe(e: EventRow): { parts: Child[]; tone?: "warn" | "danger" } {
     case "login":
       return { parts: e.reason === "added" ? ["Added ", to] : ["Logged ", to, " in again"] };
     case "sync":
-      return { parts: ["Saved a refreshed login for ", from] };
+      return e.reason === "usage_check" || e.reason === "recovered"
+        ? { parts: ["Saved the login Claude Code renewed while checking ", from] }
+        : { parts: ["Saved a refreshed login for ", from] };
     case "dead_login":
       return { parts: [from, "'s login stopped working"], tone: "danger" };
     case "pool_exhausted":
@@ -976,6 +1028,8 @@ function openManage(a: AccountView) {
     a.state === "parked" && h("button", { class: "btn small", onclick: run(() => api.swapNow(a.id), `Swapped to ${a.label}`) }, "Use now"),
     a.state === "parked" && h("button", { class: "btn small", onclick: run(() => api.setPaused(a.id, true), `Paused ${a.label}`) }, "Pause"),
     a.state === "paused" && h("button", { class: "btn small", onclick: run(() => api.setPaused(a.id, false), `Resumed ${a.label}`) }, "Resume"),
+    (a.state === "parked" || a.state === "paused") &&
+      h("button", { class: "btn small", onclick: () => (d.close(), act(() => api.checkUsage(a.id), (r) => checkMessage(a.label, r))) }, "Check usage"),
     h("button", { class: "btn small", onclick: () => (d.close(), openLogin(a)) }, a.state === "needs_login" ? "Log in again" : "Re-login"),
   );
   const order = h(
@@ -1021,6 +1075,8 @@ function openManage(a: AccountView) {
     h("dd", null, a.rank ? `${ordinal(a.rank)} (${a.reason})` : `not now (${a.reason || "unavailable"})`),
     h("dt", null, "Login saved"),
     h("dd", null, a.login_updated_at ? ago(a.login_updated_at) : "never"),
+    h("dt", null, "Usage check"),
+    h("dd", null, checkText(a)),
   );
   const d = dialog(
     a.label,
@@ -1092,6 +1148,13 @@ async function openHealth() {
       );
       return h("label", null, h("span", null, text), input, h("small", { class: "muted" }, hint));
     };
+    const checks = h("input", { type: "checkbox", id: "usage-checks", checked: snap.settings.usage_checks });
+    checks.addEventListener("change", () =>
+      api
+        .setSetting("usage_checks", String(checks.checked))
+        .then(() => (say(checks.checked ? "Usage checks are on" : "Usage checks are off"), refresh()))
+        .catch((e) => say(String(e), "error")),
+    );
     const prefer = h("input", { type: "checkbox", id: "prefer-no-weekly", checked: snap.settings.prefer_no_weekly_limit });
     prefer.addEventListener("change", () =>
       api
@@ -1113,6 +1176,23 @@ async function openHealth() {
         86400,
       ),
       h("label", { class: "check", for: "prefer-no-weekly" }, prefer, "Use accounts without a weekly limit first"),
+      h("label", { class: "check", for: "usage-checks" }, checks, "Check the usage of accounts not in use with Claude Code's /usage"),
+      field(
+        "usage_check_interval_s",
+        "Check accounts not in use every (seconds)",
+        snap.settings.usage_check_interval_s,
+        "A check makes no request to a model and uses none of the account's limits. Anthropic allows a reading now and then, so at least 300.",
+        300,
+        86400,
+      ),
+      field(
+        "usage_check_max_age_s",
+        "Check before switching when the reading is older than (seconds)",
+        snap.settings.usage_check_max_age_s,
+        "Before a swap uses an account whose last reading is older than this, cc-rotate checks it first.",
+        0,
+        86400,
+      ),
     );
   }
   api.autostartEnabled().then((on) => (autostart.checked = on)).catch(() => (autostart.disabled = true));

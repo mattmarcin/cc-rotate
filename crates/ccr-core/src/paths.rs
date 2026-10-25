@@ -60,6 +60,14 @@ impl Paths {
         self.data_dir.join("swap.lock")
     }
 
+    /// Held by whoever uses a parked account's stored login outside the store: a usage check
+    /// running Claude Code with it, or a swap writing it into the profile.
+    pub fn account_lock(&self, account_id: i64) -> PathBuf {
+        self.data_dir
+            .join("locks")
+            .join(format!("account-{account_id}.lock"))
+    }
+
     pub fn staging_root(&self) -> PathBuf {
         self.data_dir.join("staging")
     }

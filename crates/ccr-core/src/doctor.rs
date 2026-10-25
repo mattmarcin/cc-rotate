@@ -8,8 +8,8 @@ use serde_json::Value;
 
 use crate::credstore::{self, Location};
 use crate::paths::{self, Paths};
-use crate::store::{AccountState, Store};
-use crate::{credfile, herdr, login, statusline, time};
+use crate::store::{Account, AccountState, Store};
+use crate::{credfile, herdr, login, statusline, time, usage_check};
 
 /// Claude Code versions whose internals (credential reload, refresh locks, statusline and hook
 /// payloads) this release was verified against end to end.
@@ -293,8 +293,55 @@ pub fn run(store: &Store, paths: &Paths) -> Vec<Check> {
             "none yet; they arrive once a session runs in the profile",
         ),
     });
+    checks.push(usage_checks_check(store, &accounts));
 
     checks
+}
+
+/// Whether usage checks of the accounts not in use work (section 20).
+fn usage_checks_check(store: &Store, accounts: &[Account]) -> Check {
+    let name = "Usage checks";
+    if !store.settings().is_ok_and(|s| s.usage_checks) {
+        return check(
+            name,
+            Status::Ok,
+            "off; accounts not in use are only read from the status line and your other profiles",
+        );
+    }
+    if let Ok(Some(reason)) = usage_check::blocked(store) {
+        return check(
+            name,
+            Status::Warn,
+            format!(
+                "stopped: {reason}; after updating Claude Code, turn them on again with `cc-rotate-ctl config usage_checks true`"
+            ),
+        );
+    }
+    let mut failing = Vec::new();
+    let mut last_read = None;
+    for a in accounts {
+        let Ok(st) = usage_check::state(store, a.id) else {
+            continue;
+        };
+        last_read = last_read.max(st.last_read_at);
+        // The account in use and one that needs a login are not checked; old problems of
+        // theirs do not matter now.
+        if !matches!(a.state, AccountState::Parked | AccountState::Paused) {
+            continue;
+        }
+        if let Some(problem) = st.problem {
+            failing.push(format!("{}: {problem}", a.label));
+        }
+    }
+    match (failing.is_empty(), last_read) {
+        (false, _) => check(name, Status::Warn, failing.join("; ")),
+        (true, Some(ts)) => check(
+            name,
+            Status::Ok,
+            format!("on; last reading {}", age(time::now_ms() - ts)),
+        ),
+        (true, None) => check(name, Status::Ok, "on; no account has been checked yet"),
+    }
 }
 
 /// Working folders of the Claude Code sessions registered in the profile (`sessions/<pid>.json`)
@@ -311,36 +358,10 @@ fn session_cwds(paths: &Paths) -> Vec<PathBuf> {
         .filter(|s| {
             s.get("pid")
                 .and_then(Value::as_u64)
-                .is_some_and(|pid| process_alive(pid as u32))
+                .is_some_and(|pid| crate::process::alive(pid as u32))
         })
         .filter_map(|s| s.get("cwd").and_then(Value::as_str).map(PathBuf::from))
         .collect()
-}
-
-#[cfg(windows)]
-fn process_alive(pid: u32) -> bool {
-    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
-    use windows_sys::Win32::System::Threading::{
-        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    };
-    // SAFETY: plain Win32 calls on a handle opened and closed here.
-    unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        if handle.is_null() {
-            return false;
-        }
-        let mut code = 0u32;
-        let ok = GetExitCodeProcess(handle, &mut code);
-        CloseHandle(handle);
-        ok != 0 && code == STILL_ACTIVE as u32
-    }
-}
-
-#[cfg(not(windows))]
-fn process_alive(pid: u32) -> bool {
-    // Linux has /proc; elsewhere assume the registration is current.
-    let proc = std::path::Path::new("/proc");
-    !proc.is_dir() || proc.join(pid.to_string()).exists()
 }
 
 /// Where Claude Code keeps the profile's login, which is where swaps write it.
