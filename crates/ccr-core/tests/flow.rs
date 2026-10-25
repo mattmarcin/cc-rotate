@@ -1050,14 +1050,19 @@ fn session_input(session: &str, api_ms: u64, pct: f64, resets_at: i64) -> Status
 
 /// With the default settings (guard and cooldown both 120 s): a session that has been idle
 /// since before a swap keeps reporting the old account's usage for as long as it stays idle.
-/// Its reading is never recorded for the new account, so it cannot walk the rotation through the
-/// pool; once it makes a request, its readings count again.
+/// With the new account's own reset time known (a check before the swap usually just read it),
+/// that reading is never recorded for the new account, so it cannot walk the rotation through
+/// the pool; once the session makes a request, its readings count again.
 #[test]
 fn a_session_idle_since_before_a_swap_is_ignored_however_long_it_idles() {
     let env = Env::new();
     let (store, a, b, _) = pool(&env);
     let now = time::now_ms();
     let a_resets = time::now_s() + 3 * 86_400;
+    let b_resets = time::now_s() + 4 * 3600;
+    store
+        .record_sample(&five_only(b, 10.0, b_resets, now - 60_000))
+        .unwrap();
     // The idle session's last reading on a, before the swap.
     statusline::tick(
         &store,
@@ -1095,8 +1100,9 @@ fn a_session_idle_since_before_a_swap_is_ignored_however_long_it_idles() {
         .unwrap();
         assert!(tick.swap.is_none(), "after {later} ms: {:?}", tick.swap);
     }
-    assert!(
-        store.last_sample(b).unwrap().is_none(),
+    assert_eq!(
+        store.last_sample(b).unwrap().unwrap().windows[0].pct,
+        10.0,
         "a's usage is never recorded as b's"
     );
 
@@ -1104,7 +1110,7 @@ fn a_session_idle_since_before_a_swap_is_ignored_however_long_it_idles() {
     statusline::tick(
         &store,
         &env.paths,
-        &session_input("idle", 7000, 12.0, time::now_s() + 4 * 3600),
+        &session_input("idle", 7000, 12.0, b_resets),
         now + 3_700_000,
     )
     .unwrap();
@@ -1168,6 +1174,9 @@ fn a_request_that_finishes_after_a_swap_still_counts_for_the_old_account() {
     let (store, a, b, _) = pool(&env);
     let now = time::now_ms();
     let a_resets = time::now_s() + 3 * 86_400;
+    store
+        .record_sample(&five_only(b, 10.0, time::now_s() + 4 * 3600, now - 60_000))
+        .unwrap();
     statusline::tick(
         &store,
         &env.paths,
@@ -1186,21 +1195,29 @@ fn a_request_that_finishes_after_a_swap_still_counts_for_the_old_account() {
         },
     )
     .unwrap();
-    for (later, api, pct) in [
-        (20_000, 65_000, 99.0),
-        (150_000, 65_000, 99.0),
-        (900_000, 90_000, 99.4),
+    // "agent" ran on a before; "new" is seen for the first time, its first turn having started
+    // on a before the swap.
+    for (session, later, api, pct) in [
+        ("agent", 20_000, 65_000, 99.0),
+        ("new", 25_000, 3_000, 98.9),
+        ("agent", 150_000, 65_000, 99.0),
+        ("new", 160_000, 3_000, 98.9),
+        ("agent", 900_000, 90_000, 99.4),
     ] {
         let tick = statusline::tick(
             &store,
             &env.paths,
-            &session_input("agent", api, pct, a_resets),
+            &session_input(session, api, pct, a_resets),
             now + later,
         )
         .unwrap();
-        assert!(tick.swap.is_none(), "after {later} ms: {:?}", tick.swap);
+        assert!(
+            tick.swap.is_none(),
+            "{session} after {later} ms: {:?}",
+            tick.swap
+        );
     }
-    assert!(store.last_sample(b).unwrap().is_none());
+    assert_eq!(store.last_sample(b).unwrap().unwrap().windows[0].pct, 10.0);
 }
 
 /// Windows reset at round times, so the new account's window can reset at the same moment as
@@ -1241,4 +1258,53 @@ fn a_reading_sharing_the_new_accounts_own_reset_time_counts() {
     )
     .unwrap();
     assert_eq!(store.last_sample(b).unwrap().unwrap().windows[0].pct, 100.0);
+}
+
+/// Nothing current is known of the new account (its last reading is from a window that has
+/// reset) and its window resets at the same moment as the old account's. A reading at its limit
+/// may be either account's; it counts, so sessions are not left waiting at the limit, but it does
+/// not vouch for the account's reset times.
+#[test]
+fn with_nothing_known_of_the_new_account_an_ambiguous_reading_counts() {
+    let env = Env::new();
+    let (store, a, b, _) = pool(&env);
+    let now = time::now_ms();
+    let shared = time::now_s() + 2 * 3600;
+    store
+        .record_sample(&five_only(
+            b,
+            20.0,
+            time::now_s() - 86_400,
+            now - 86_400_000,
+        ))
+        .unwrap();
+    store
+        .record_sample(&five_only(a, 98.5, shared, now))
+        .unwrap();
+    swap::run(
+        &store,
+        &env.paths,
+        &SwapRequest {
+            from: Some(a),
+            to: Some(b),
+            reason: Reason::Manual,
+            wait: true,
+        },
+    )
+    .unwrap();
+    let tick = statusline::tick(
+        &store,
+        &env.paths,
+        &session_input("s", 6000, 100.0, shared),
+        now + 130_000,
+    )
+    .unwrap();
+    assert_eq!(store.last_sample(b).unwrap().unwrap().windows[0].pct, 100.0);
+    assert!(tick.swap.is_some(), "b at its limit is left");
+    assert!(
+        swap::known_resets(&store, b, time::now_s())
+            .unwrap()
+            .is_empty(),
+        "an ambiguous reading does not vouch for b's reset times"
+    );
 }
