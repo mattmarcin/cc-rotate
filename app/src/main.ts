@@ -779,7 +779,13 @@ function renderAccounts() {
       "p",
       { class: "muted table-note" },
       [
-        snap.settings.prefer_no_weekly_limit ? "Used top to bottom, accounts without a weekly limit first." : "Used top to bottom.",
+        snap.settings.strict_order
+          ? snap.settings.prefer_no_weekly_limit
+            ? "Used top to bottom, accounts without a weekly limit first."
+            : "Used top to bottom."
+          : snap.settings.prefer_no_weekly_limit
+            ? "Accounts without a weekly limit first. Within those, the account in use stays until a limit, then accounts whose 5-hour window is already running, then top to bottom."
+            : "The account in use stays until a limit, then accounts whose 5-hour window is already running, then top to bottom.",
         snap.settings.use_expiring_weekly ? "An account whose weekly budget would go unused goes first." : null,
         "Drag to reorder.",
       ]
@@ -1356,6 +1362,13 @@ async function openSettings() {
     );
     const prefer = h("input", { type: "checkbox", id: "prefer-no-weekly", checked: snap.settings.prefer_no_weekly_limit });
     const expiringBox = h("input", { type: "checkbox", id: "use-expiring", checked: snap.settings.use_expiring_weekly });
+    const strictBox = h("input", { type: "checkbox", id: "strict-order", checked: snap.settings.strict_order });
+    strictBox.addEventListener("change", () =>
+      api
+        .setSetting("strict_order", String(strictBox.checked))
+        .then(() => (say(strictBox.checked ? "Accounts higher in your order are used again as soon as they're ready" : "The account in use is kept until a limit"), refresh()))
+        .catch((e) => say(String(e), "error")),
+    );
     expiringBox.addEventListener("change", () =>
       api
         .setSetting("use_expiring_weekly", String(expiringBox.checked))
@@ -1377,11 +1390,12 @@ async function openSettings() {
         "switch_back_dwell_s",
         "Swap back after (seconds)",
         snap.settings.switch_back_dwell_s,
-        "Minimum time on an account before swapping back to one higher in your order.",
+        "Minimum time on an account before swapping back to a better one.",
         0,
         86400,
       ),
       h("label", { class: "check", for: "prefer-no-weekly" }, prefer, "Use accounts without a weekly limit first"),
+      h("label", { class: "check", for: "strict-order" }, strictBox, "Always go back to accounts higher in my order"),
       h("label", { class: "check", for: "use-expiring" }, expiringBox, "Use weekly budget before it resets"),
       h("label", { class: "check", for: "usage-checks" }, checks, "Check usage of accounts not in use"),
       field(

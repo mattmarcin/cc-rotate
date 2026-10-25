@@ -11,12 +11,16 @@
 //!    soonest reset first.
 //! 2. With `prefer_no_weekly_limit` on: accounts without a weekly limit, then accounts whose
 //!    weekly limit is not known yet, then accounts with one.
-//! 3. The user's order (`position`).
+//! 3. Within those (`Policy::place`): the account in use, then accounts whose 5-hour window is
+//!    already running, the soonest reset first, then the user's order (`position`). With
+//!    `strict_order` on, the user's order alone.
 //! 4. The most room before a threshold, then the label.
 //!
-//! Only the first three decide whether a better account is worth switching back to; the last
-//! only breaks ties when picking, so equally ranked accounts never swap just to balance. An
-//! account's weekly cap (`Account::weekly_cap`) lowers its weekly thresholds.
+//! Only the first two (and the order, with `strict_order`) decide whether a better account is
+//! worth switching back to; the rest only order picks. So the account in use is kept until a
+//! limit while no better tier is ready: what is left in a 5-hour window is lost when it
+//! resets, so leaving a running window for a fresh one only adds swaps. An account's weekly cap
+//! (`Account::weekly_cap`) lowers its weekly thresholds.
 
 use std::cmp::Ordering;
 
@@ -422,6 +426,14 @@ impl Candidate {
             .find(|w| w.kind == WindowKind::Session && w.model.is_none())
     }
 
+    /// When the account's running 5-hour window resets, if one is running at `now_s`. An
+    /// account without one starts a new window with its next request.
+    pub fn session_reset(&self, now_s: i64) -> Option<i64> {
+        self.five_hour()
+            .and_then(|w| w.resets_at)
+            .filter(|&r| r > now_s)
+    }
+
     pub fn usable(&self) -> bool {
         matches!(
             self.account.state,
@@ -448,6 +460,10 @@ pub struct Policy {
     pub prefer_no_weekly_limit: bool,
     /// Accounts whose weekly budget would reset unused come first (`Candidate::expiring`).
     pub use_expiring_weekly: bool,
+    /// Go by the user's order alone within a tier, switching back to an account higher in it
+    /// as soon as it is ready, instead of keeping the account in use and using running 5-hour
+    /// windows first.
+    pub strict_order: bool,
 }
 
 impl From<&Settings> for Policy {
@@ -456,6 +472,7 @@ impl From<&Settings> for Policy {
             thresholds: Thresholds::from(s),
             prefer_no_weekly_limit: s.prefer_no_weekly_limit,
             use_expiring_weekly: s.use_expiring_weekly,
+            strict_order: s.strict_order,
         }
     }
 }
@@ -484,46 +501,73 @@ impl Policy {
 
     /// The rank that decides switching back: lower is better. Room is deliberately not part
     /// of it. Accounts whose weekly budget would reset unused go by their reset, the soonest
-    /// first, since only one account is in use at a time.
+    /// first, since only one account is in use at a time. The user's order is part of it only
+    /// with `strict_order`.
     pub fn rank(&self, c: &Candidate) -> (u8, i64) {
         match self.expiring(c) {
             Some(e) => (0, e.resets_at),
-            None => (self.tier(c), c.account.position),
+            None if self.strict_order => (self.tier(c), c.account.position),
+            None => (self.tier(c), 0),
         }
     }
 
-    fn pick_order(&self, a: &Candidate, b: &Candidate) -> Ordering {
+    /// Where an account goes among accounts of the same rank, best first. The account in use
+    /// comes first: it is kept until a limit. Then accounts whose 5-hour window is already
+    /// running with `SWITCH_BACK_MARGIN` to spare, the soonest reset first, since what is left
+    /// in a window is lost when it resets. Then accounts with no window running, in the user's
+    /// order. Last, running windows close to a limit, which would only last a moment. With
+    /// `strict_order` the rank already holds the order, and this changes nothing.
+    pub fn place(&self, c: &Candidate, now_s: i64) -> (u8, i64) {
+        if self.strict_order || c.account.state == AccountState::Active {
+            return (0, 0);
+        }
+        match c.session_reset(now_s) {
+            Some(reset) if c.has_margin() => (1, reset),
+            Some(reset) => (3, reset),
+            None => (2, c.account.position),
+        }
+    }
+
+    fn pick_order(&self, a: &Candidate, b: &Candidate, now_s: i64) -> Ordering {
         self.rank(a)
             .cmp(&self.rank(b))
+            .then(self.place(a, now_s).cmp(&self.place(b, now_s)))
             .then(b.room(self.thresholds).total_cmp(&a.room(self.thresholds)))
             .then_with(|| a.account.label.cmp(&b.account.label))
     }
 }
 
-/// The best eligible account, excluding `exclude`.
-pub fn pick(candidates: &[Candidate], policy: Policy, exclude: Option<i64>) -> Option<&Candidate> {
+/// The best eligible account at `now_s`, excluding `exclude`.
+pub fn pick(
+    candidates: &[Candidate],
+    policy: Policy,
+    exclude: Option<i64>,
+    now_s: i64,
+) -> Option<&Candidate> {
     candidates
         .iter()
         .filter(|c| c.eligible() && Some(c.account.id) != exclude)
-        .min_by(|a, b| policy.pick_order(a, b))
+        .min_by(|a, b| policy.pick_order(a, b, now_s))
 }
 
 /// The account to switch back to: the best eligible account that ranks strictly above the
 /// active one and has `SWITCH_BACK_MARGIN` to spare. `None` while the active account is over a
 /// threshold, since the threshold trigger handles that.
-pub fn switch_back_target(candidates: &[Candidate], policy: Policy) -> Option<&Candidate> {
+pub fn switch_back_target(
+    candidates: &[Candidate],
+    policy: Policy,
+    now_s: i64,
+) -> Option<&Candidate> {
     let active = candidates
         .iter()
         .find(|c| c.account.state == AccountState::Active)?;
     if active.blocking().is_some() {
         return None;
     }
-    let mut better: Vec<&Candidate> = candidates
+    candidates
         .iter()
         .filter(|c| c.eligible() && policy.rank(c) < policy.rank(active) && c.has_margin())
-        .collect();
-    better.sort_by(|a, b| policy.pick_order(a, b));
-    better.first().copied()
+        .min_by(|a, b| policy.pick_order(a, b, now_s))
 }
 
 /// The threshold trigger for the active account's live usage, if any.
@@ -596,7 +640,7 @@ pub fn decide(
     if timing.throttled(reason) || !timing.dwell_done() {
         return None;
     }
-    switch_back_target(candidates, policy).map(|_| reason)
+    switch_back_target(candidates, policy, timing.now_ms / 1000).map(|_| reason)
 }
 
 /// One account in the pick order, with a short reason for its place.
@@ -617,7 +661,7 @@ pub fn ranking(candidates: &[Candidate], policy: Policy, now_s: i64) -> Vec<Rank
         .iter()
         .filter(|c| c.usable() && c.blocking().is_none() && !c.held_back)
         .collect();
-    open.sort_by(|a, b| policy.pick_order(a, b));
+    open.sort_by(|a, b| policy.pick_order(a, b, now_s));
     let mut blocked: Vec<&Candidate> = candidates
         .iter()
         .filter(|c| c.usable() && (c.blocking().is_some() || c.held_back))
@@ -627,9 +671,10 @@ pub fn ranking(candidates: &[Candidate], policy: Policy, now_s: i64) -> Vec<Rank
 
     let mut out = Vec::with_capacity(candidates.len());
     for (i, c) in open.iter().enumerate() {
+        let key = |x: &Candidate| (policy.rank(x), policy.place(x, now_s));
         let tied = open
             .iter()
-            .any(|o| o.account.id != c.account.id && policy.rank(o) == policy.rank(c));
+            .any(|o| o.account.id != c.account.id && key(o) == key(c));
         out.push(Ranked {
             account_id: c.account.id,
             label: c.account.label.clone(),
@@ -667,7 +712,20 @@ fn open_reason(c: &Candidate, policy: Policy, tied: bool, now_s: i64) -> String 
             (WeeklyLimit::Has, None) => "has a weekly limit".into(),
         });
     }
-    parts.push(format!("{} in your order", ordinal(c.order + 1)));
+    let in_order = || format!("{} in your order", ordinal(c.order + 1));
+    parts.push(match policy.place(c, now_s) {
+        _ if policy.strict_order => in_order(),
+        (0, _) => "in use".into(),
+        (1, reset) => format!(
+            "5-hour window already running, resets in {}",
+            time::span(reset - now_s)
+        ),
+        (3, reset) => format!(
+            "close to a limit, 5-hour window resets in {}",
+            time::span(reset - now_s)
+        ),
+        _ => in_order(),
+    });
     if tied {
         parts.push(format!(
             "tied, {:.0}% room left",
@@ -724,6 +782,11 @@ mod tests {
         thresholds: T,
         prefer_no_weekly_limit: true,
         use_expiring_weekly: true,
+        strict_order: false,
+    };
+    const STRICT: Policy = Policy {
+        strict_order: true,
+        ..POLICY
     };
     const NOW: i64 = 1_800_000_000;
 
@@ -925,22 +988,27 @@ mod tests {
         );
         let pool = vec![max, unknown, team_b, team_a, paused];
 
-        // No weekly limit first, then by order (team-a before team-b despite less room),
-        // then unknown, then weekly-limited.
-        let order: Vec<i64> = ranking(&pool, POLICY, NOW)
-            .iter()
-            .map(|r| r.account_id)
-            .collect();
-        assert_eq!(order, vec![4, 3, 2, 1, 5]);
-        assert_eq!(pick(&pool, POLICY, None).unwrap().account.id, 4);
-        assert_eq!(pick(&pool, POLICY, Some(4)).unwrap().account.id, 3);
+        // With strict_order: no weekly limit first, then by order (team-a before team-b
+        // despite less room), then unknown, then weekly-limited.
+        let order = |policy| -> Vec<i64> {
+            ranking(&pool, policy, NOW)
+                .iter()
+                .map(|r| r.account_id)
+                .collect()
+        };
+        assert_eq!(order(STRICT), vec![4, 3, 2, 1, 5]);
+        assert_eq!(pick(&pool, STRICT, None, NOW).unwrap().account.id, 4);
+        assert_eq!(pick(&pool, STRICT, Some(4), NOW).unwrap().account.id, 3);
+        // Without it, the two seats' windows reset together, so the one with more room goes
+        // first; the tiers are the same.
+        assert_eq!(order(POLICY), vec![3, 4, 2, 1, 5]);
 
-        // With the preference off, the user's order alone decides.
+        // With the preference off, only running windows and the user's order decide.
         let off = Policy {
             prefer_no_weekly_limit: false,
-            ..POLICY
+            ..STRICT
         };
-        assert_eq!(pick(&pool, off, None).unwrap().account.id, 1);
+        assert_eq!(pick(&pool, off, None, NOW).unwrap().account.id, 1);
 
         // Equal places in the order fall back to the most room.
         let tie_a = cand(
@@ -954,9 +1022,98 @@ mod tests {
             &[("five_hour", 20.0, NOW + 3600)],
         );
         let ties = vec![tie_a, tie_b];
-        assert_eq!(pick(&ties, POLICY, None).unwrap().account.id, 11);
-        let ranked = ranking(&ties, POLICY, NOW);
-        assert!(ranked[0].reason.contains("tied"), "{}", ranked[0].reason);
+        for policy in [POLICY, STRICT] {
+            assert_eq!(pick(&ties, policy, None, NOW).unwrap().account.id, 11);
+            let ranked = ranking(&ties, policy, NOW);
+            assert!(ranked[0].reason.contains("tied"), "{}", ranked[0].reason);
+        }
+    }
+
+    /// Within a tier: the account in use, then running 5-hour windows with room, the soonest
+    /// reset first whatever the order, then fresh accounts in the user's order, then running
+    /// windows close to a limit.
+    #[test]
+    fn running_windows_go_first_the_soonest_reset_first() {
+        let seat = |id, state, position, windows: &[(&str, f64, i64)]| {
+            cand(
+                acct(id, &format!("s{id}"), state, position),
+                WeeklyLimit::None,
+                windows,
+            )
+        };
+        let pool = vec![
+            seat(1, AccountState::Parked, 0, &[]),
+            // A window that reset an hour ago: fresh again.
+            seat(
+                2,
+                AccountState::Parked,
+                1,
+                &[("five_hour", 70.0, NOW - 3600)],
+            ),
+            seat(
+                3,
+                AccountState::Parked,
+                2,
+                &[("five_hour", 40.0, NOW + 4 * 3600)],
+            ),
+            seat(
+                4,
+                AccountState::Parked,
+                3,
+                &[("five_hour", 80.0, NOW + 3600)],
+            ),
+            seat(
+                5,
+                AccountState::Parked,
+                4,
+                &[("five_hour", 95.0, NOW + 600)],
+            ),
+            seat(
+                6,
+                AccountState::Active,
+                5,
+                &[("five_hour", 50.0, NOW + 2 * 3600)],
+            ),
+            seat(
+                7,
+                AccountState::Parked,
+                6,
+                &[("five_hour", 99.0, NOW + 1800)],
+            ),
+        ];
+        let order: Vec<i64> = ranking(&pool, POLICY, NOW)
+            .iter()
+            .map(|r| r.account_id)
+            .collect();
+        assert_eq!(order, vec![6, 4, 3, 1, 2, 5, 7]);
+        assert_eq!(pick(&pool, POLICY, Some(6), NOW).unwrap().account.id, 4);
+        // Once 4's window has reset, 3's is the soonest to reset.
+        assert_eq!(
+            pick(&pool, POLICY, Some(6), NOW + 3600).unwrap().account.id,
+            3
+        );
+
+        let ranked = ranking(&pool, POLICY, NOW);
+        let reason = |id| &ranked.iter().find(|r| r.account_id == id).unwrap().reason;
+        assert_eq!(reason(6), "no weekly limit, in use");
+        assert_eq!(
+            reason(4),
+            "no weekly limit, 5-hour window already running, resets in 1h 0m"
+        );
+        assert_eq!(reason(1), "no weekly limit, 1st in your order");
+        assert_eq!(reason(2), "no weekly limit, 2nd in your order");
+        assert_eq!(
+            reason(5),
+            "no weekly limit, close to a limit, 5-hour window resets in 10m"
+        );
+
+        // A better tier still comes first, running window or not.
+        let mut tiers = pool.clone();
+        tiers[0].weekly_limit = WeeklyLimit::None;
+        for c in &mut tiers[1..] {
+            c.weekly_limit = WeeklyLimit::Has;
+        }
+        assert_eq!(pick(&tiers, POLICY, Some(6), NOW).unwrap().account.id, 1);
     }
 
     #[test]
@@ -978,7 +1135,7 @@ mod tests {
             ],
         );
         let pool = vec![five, week];
-        assert!(pick(&pool, POLICY, None).is_none());
+        assert!(pick(&pool, POLICY, None, NOW).is_none());
         let ranked = ranking(&pool, POLICY, NOW);
         assert_eq!(
             ranked[0].account_id, 1,
@@ -1012,9 +1169,15 @@ mod tests {
                 ("seven_day", 41.6, NOW + 86_400),
             ],
         );
-        let ranked = ranking(&[team, max], POLICY, NOW);
+        let ranked = ranking(&[team.clone(), max.clone()], STRICT, NOW);
         assert_eq!(ranked[0].reason, "no weekly limit, 1st in your order");
         assert_eq!(ranked[1].reason, "weekly limit 42% used, 2nd in your order");
+        let ranked = ranking(&[team, max], POLICY, NOW);
+        assert_eq!(ranked[0].reason, "no weekly limit, in use");
+        assert_eq!(
+            ranked[1].reason,
+            "weekly limit 42% used, 5-hour window already running, resets in 1h 0m"
+        );
         assert_eq!(ordinal(11), "11th");
         assert_eq!(ordinal(22), "22nd");
         assert_eq!(ordinal(103), "103rd");
@@ -1042,11 +1205,16 @@ mod tests {
                 &[("five_hour", pct, NOW + 3600)],
             )
         };
-        let d = |pool: &[Candidate], t: Timing| decide(pool, POLICY, t, false, true);
+        let d = |pool: &[Candidate], t: Timing| decide(pool, STRICT, t, false, true);
 
         assert_eq!(
             d(&[active(2), other(1, 0.0)], timing),
             Some(Reason::PreferredAvailable)
+        );
+        assert_eq!(
+            decide(&[active(2), other(1, 0.0)], POLICY, timing, false, true),
+            None,
+            "without strict_order, the account in use is kept within its tier"
         );
         assert_eq!(
             d(&[active(1), other(1, 0.0)], timing),
@@ -1080,10 +1248,18 @@ mod tests {
                 ("seven_day", 10.0, NOW + 86_400),
             ],
         );
-        assert_eq!(
-            d(&[max_active, other(9, 0.0)], timing),
-            Some(Reason::PreferredAvailable)
-        );
+        for policy in [POLICY, STRICT] {
+            assert_eq!(
+                decide(
+                    &[max_active.clone(), other(9, 0.0)],
+                    policy,
+                    timing,
+                    false,
+                    true
+                ),
+                Some(Reason::PreferredAvailable)
+            );
+        }
     }
 
     #[test]
@@ -1147,6 +1323,25 @@ mod tests {
     /// it was left, and equally ranked accounts never trade places.
     #[test]
     fn a_day_of_ticks_does_not_ping_pong() {
+        let strict = day_of_ticks(STRICT);
+        let kept = day_of_ticks(POLICY);
+        // strict_order goes back to the first seat as soon as it resets; otherwise the seat in
+        // use is kept until its limit, which saves those swaps.
+        let back_to_seat_1 = |swaps: &[(i64, i64, i64, Reason)]| {
+            swaps
+                .iter()
+                .filter(|s| (s.1, s.2, s.3) == (2, 1, Reason::PreferredAvailable))
+                .count()
+        };
+        assert!(back_to_seat_1(&strict) > 0, "{strict:?}");
+        // Without it, the two seats carry the day between them, each fresh again by the time
+        // the other is at its limit.
+        assert!(kept.iter().all(|s| s.3 == Reason::FiveHour), "{kept:?}");
+        assert_eq!(back_to_seat_1(&kept), 0, "{kept:?}");
+        assert!(kept.len() < strict.len(), "{kept:?} vs {strict:?}");
+    }
+
+    fn day_of_ticks(policy: Policy) -> Vec<(i64, i64, i64, Reason)> {
         struct Sim {
             id: i64,
             position: i64,
@@ -1247,17 +1442,17 @@ mod tests {
                 .collect();
 
             timing.now_ms = now * 1000;
-            if let Some(reason) = decide(&pool, POLICY, timing, false, true) {
+            if let Some(reason) = decide(&pool, policy, timing, false, true) {
                 timing.last_request_ms = timing.now_ms;
                 let target = match reason {
-                    Reason::PreferredAvailable => switch_back_target(&pool, POLICY),
-                    _ => pick(&pool, POLICY, Some(active)),
+                    Reason::PreferredAvailable => switch_back_target(&pool, policy, now),
+                    _ => pick(&pool, policy, Some(active), now),
                 };
                 if let Some(target) = target {
                     let from = pool.iter().find(|c| c.account.id == active).unwrap();
                     if reason == Reason::PreferredAvailable {
                         assert!(
-                            POLICY.rank(target) < POLICY.rank(from),
+                            policy.rank(target) < policy.rank(from),
                             "switch back only to a strictly better rank"
                         );
                     }
@@ -1296,9 +1491,7 @@ mod tests {
                 );
             }
         }
-        // The two seats carry the day, so the weekly-limited account sees little use, and the
-        // first seat is preferred again as soon as it is usable.
-        assert!(swaps.iter().any(|s| s.3 == Reason::PreferredAvailable));
         assert!(swaps.len() <= 8, "too many swaps: {swaps:?}");
+        swaps
     }
 }

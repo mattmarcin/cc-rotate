@@ -155,6 +155,8 @@ export interface Settings {
   swap_cooldown_s: number;
   prefer_no_weekly_limit: boolean;
   use_expiring_weekly: boolean;
+  /** Go by the user's order alone, switching back up it as soon as an account is ready. */
+  strict_order: boolean;
   /** Warn this many days before an account's sign-in ends; 0 turns the warning off. */
   login_warning_days: number;
   switch_back_dwell_s: number;

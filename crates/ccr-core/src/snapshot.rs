@@ -121,7 +121,7 @@ pub fn snapshot_at(store: &Store, paths: &Paths, now_ms: i64) -> Result<Snapshot
         .iter()
         .find(|c| c.account.state == AccountState::Active)
         .map(|c| c.account.id);
-    let next = scheduler::pick(&pool, policy, active_id).map(|c| NextPick {
+    let next = scheduler::pick(&pool, policy, active_id, now_s).map(|c| NextPick {
         account_id: c.account.id,
         label: c.account.label.clone(),
         reason: ranking
