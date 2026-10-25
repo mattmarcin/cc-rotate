@@ -45,6 +45,7 @@ fn main() {
             commands::set_weekly_limit,
             commands::set_weekly_cap,
             commands::set_use_expiring,
+            commands::set_keep_running,
             commands::doctor,
             commands::other_profiles,
             commands::set_setting,

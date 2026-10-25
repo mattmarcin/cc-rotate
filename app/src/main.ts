@@ -43,7 +43,7 @@ const state: UiState = {
   focusGrip: null,
 };
 
-const ROUTINE = new Set(["sync", "swap_skipped", "claude_version"]);
+const ROUTINE = new Set(["sync", "swap_skipped", "claude_version", "warm_up"]);
 
 // ---- layout ----------------------------------------------------------------------------
 
@@ -197,6 +197,12 @@ function checkText(a: AccountView): string {
   if (c.problem) return c.problem;
   const read = c.last_read_at ? `checked ${ago(c.last_read_at)}` : "not checked yet";
   return c.not_before && c.not_before > Date.now() ? `${read}, next after ${clock(c.not_before)}` : read;
+}
+
+function warmText(a: AccountView): string {
+  const c = a.usage_check;
+  if (c.warm_problem) return `last try failed: ${c.warm_problem}`;
+  return c.warmed_at ? `last started its window ${ago(c.warmed_at)}` : "hasn't started a window yet";
 }
 
 const WEEKLY_TEXT = { none: "none found", unknown: "not known yet", has: "has one" } as const;
@@ -956,6 +962,8 @@ function describe(e: EventRow): { parts: Child[]; tone?: "warn" | "danger" } {
         ? { parts: [`Claude Code ${version} is in use, not yet tested with cc-rotate`] }
         : { parts: [`Claude Code ${version} is in use`] };
     }
+    case "warm_up":
+      return { parts: ["Started ", from, "'s next 5-hour window"] };
     case "pool_exhausted":
       return { parts: ["No other account was ready to take over"], tone: "warn" };
     case "adopted_login":
@@ -979,6 +987,12 @@ function describe(e: EventRow): { parts: Child[]; tone?: "warn" | "danger" } {
         return e.detail?.use_expiring
           ? { parts: ["Set ", who, " to use its weekly budget before it resets"] }
           : { parts: ["Set ", who, " to never move ahead for its weekly budget"] };
+      }
+      if (e.reason === "keep_running") {
+        const who = nb(detail("label") || labelOf(e.account_from));
+        return e.detail?.keep_running
+          ? { parts: ["Set ", who, " to keep its 5-hour window running"] }
+          : { parts: ["Set ", who, " to start its 5-hour window only when it's used"] };
       }
       if (e.reason === "weekly_cap") {
         const value = e.detail?.weekly_cap as number | null | undefined;
@@ -1275,6 +1289,8 @@ function openManage(a: AccountView) {
       replace(value, h("span", { class: "muted" }, "couldn't be read"));
     });
   const useExpiring = h("input", { type: "checkbox", checked: a.use_expiring });
+  const keepRunning = h("input", { type: "checkbox", checked: a.keep_running });
+  const checksOff = state.snap?.settings.usage_checks === false;
   const details = h(
     "dl",
     { class: "facts info" },
@@ -1309,6 +1325,8 @@ function openManage(a: AccountView) {
       ),
     h("dt", null, "Usage check"),
     h("dd", null, checkText(a)),
+    a.keep_running && h("dt", null, "Keeping it running"),
+    a.keep_running && h("dd", null, warmText(a)),
   );
   const d = dialog(
     a.label,
@@ -1329,6 +1347,17 @@ function openManage(a: AccountView) {
         ),
       a.weekly.effective !== "none" &&
         h("label", { class: "check" }, useExpiring, "Use its weekly budget before it resets"),
+      h(
+        "div",
+        { class: "check-field" },
+        h("label", { class: "check" }, keepRunning, "Keep its 5-hour window running"),
+        h(
+          "small",
+          { class: "muted" },
+          "While it's not in use, starts its next window with a short Haiku request as soon as one ends, so a window is already counting down when it's needed.",
+          checksOff ? " Needs usage checks, which are off in Settings." : "",
+        ),
+      ),
       h("label", null, h("span", null, "Label"), label),
     ),
     error,
@@ -1351,6 +1380,10 @@ function openManage(a: AccountView) {
       if (useExpiring.checked !== a.use_expiring) {
         await api.setUseExpiring(a.id, useExpiring.checked);
         a.use_expiring = useExpiring.checked;
+      }
+      if (keepRunning.checked !== a.keep_running) {
+        await api.setKeepRunning(a.id, keepRunning.checked);
+        a.keep_running = keepRunning.checked;
       }
       if (label.value.trim() !== a.label) await api.renameAccount(a.id, label.value.trim());
       d.close();

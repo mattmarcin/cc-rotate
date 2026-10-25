@@ -57,6 +57,8 @@ export interface Account {
   weekly_cap: number | null;
   /** The account moves ahead when its weekly budget would reset unused. */
   use_expiring: boolean;
+  /** cc-rotate starts its next 5-hour window with a short request as soon as one ends while it's not in use. */
+  keep_running: boolean;
   added_at: number;
   last_login_at: number | null;
 }
@@ -71,6 +73,10 @@ export interface CheckState {
   problem: string | null;
   /** Not used until a check settles whether its login still works. */
   held_back: boolean;
+  /** When a warm-up last started the account's 5-hour window (epoch ms). */
+  warmed_at: number | null;
+  /** Why the last warm-up's request didn't go through. */
+  warm_problem: string | null;
 }
 
 export type CheckOutcome =
@@ -285,6 +291,7 @@ export const api = {
   setWeeklyLimit: (id: number, value: WeeklyLimitSetting) => invoke<void>("set_weekly_limit", { id, value }),
   setWeeklyCap: (id: number, cap: number | null) => invoke<void>("set_weekly_cap", { id, cap }),
   setUseExpiring: (id: number, on: boolean) => invoke<void>("set_use_expiring", { id, on }),
+  setKeepRunning: (id: number, on: boolean) => invoke<void>("set_keep_running", { id, on }),
   doctor: () => invoke<Check[]>("doctor"),
   setSetting: (key: string, value: string | null) => invoke<void>("set_setting", { key, value }),
   appInfo: () => invoke<AppInfo>("app_info"),

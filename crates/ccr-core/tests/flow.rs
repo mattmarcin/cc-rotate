@@ -2037,3 +2037,24 @@ fn an_account_left_out_is_not_moved_ahead_for_its_budget() {
     store.set_use_expiring(c, true).unwrap();
     assert_eq!(swap::next_target(&store, Some(a)).unwrap().unwrap().id, c);
 }
+
+/// Keeping an account's 5-hour window running is off until the user turns it on, and turning it
+/// on for an account lets warm-ups that were stopped run again.
+#[test]
+fn keeping_a_window_running_is_opt_in() {
+    let env = Env::new();
+    let (store, a, _, _) = pool(&env);
+    assert!(!store.account(a).unwrap().unwrap().keep_running);
+    store
+        .set_meta(usage_check::META_WARM_BLOCKED, "a test")
+        .unwrap();
+    store.set_keep_running(a, false).unwrap();
+    assert!(
+        usage_check::warm_ups_blocked(&store).unwrap().is_some(),
+        "turning it off leaves warm-ups stopped"
+    );
+    store.set_keep_running(a, true).unwrap();
+    assert!(store.account(a).unwrap().unwrap().keep_running);
+    assert_eq!(usage_check::warm_ups_blocked(&store).unwrap(), None);
+    assert!(store.set_keep_running(9_999, true).is_err());
+}

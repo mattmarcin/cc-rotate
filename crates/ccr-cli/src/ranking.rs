@@ -2,7 +2,7 @@
 
 use anyhow::{Result, bail};
 use ccr_core::store::{Store, WeeklyLimitSetting, kind};
-use ccr_core::{Paths, scheduler, snapshot, swap};
+use ccr_core::{Paths, scheduler, snapshot, swap, usage_check};
 use serde_json::json;
 
 use crate::format;
@@ -109,6 +109,42 @@ pub fn weekly_cap(store: &Store, label: &str, value: Option<&str>) -> Result<()>
             "{}: rotation stops using it at {threshold:.0}% weekly usage (Settings)",
             account.label
         ),
+    }
+    Ok(())
+}
+
+/// `keep-running <account> [yes|no]`.
+pub fn keep_running(store: &Store, label: &str, value: Option<&str>) -> Result<()> {
+    let account = store.find_account(label)?;
+    if let Some(value) = value {
+        let on = value == "yes";
+        store.set_keep_running(account.id, on)?;
+        store.log_event(
+            kind::STATE,
+            Some(account.id),
+            None,
+            Some("keep_running"),
+            Some(json!({ "label": account.label, "keep_running": on })),
+        )?;
+    }
+    let account = store.find_account(label)?;
+    if !account.keep_running {
+        println!(
+            "{}: off. Its 5-hour window starts when it's next used.",
+            account.label
+        );
+        return Ok(());
+    }
+    println!(
+        "{}: on. While it's not in use, cc-rotate starts its next 5-hour window with a short request as soon as one ends.",
+        account.label
+    );
+    if !store.settings()?.usage_checks {
+        println!(
+            "It needs usage checks, which are off: turn them on in Settings or with `cc-rotate-ctl config usage_checks true`."
+        );
+    } else if let Some(why) = usage_check::blocked(store)? {
+        println!("It's stopped while usage checks are: {why}.");
     }
     Ok(())
 }

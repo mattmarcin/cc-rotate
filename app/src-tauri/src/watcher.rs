@@ -3,9 +3,10 @@
 //! notifications. Every 5 seconds it runs the background sync (write-back, dead logins,
 //! switching back to a better ranked account), and every 30 seconds it refreshes the tray
 //! tooltip and checks whether an exhausted pool has an account ready again, since both move
-//! with the clock even when nothing is written. Every minute it starts a usage check of the
-//! account that is most overdue for one (`usage_check::next_due`), one at a time, so the
-//! dashboard knows how much every account has left.
+//! with the clock even when nothing is written. Every minute it starts the next background job
+//! (`usage_check::next_job`), one at a time: a usage check of the account most overdue for one,
+//! so the dashboard knows how much every account has left, or a warm-up that starts the 5-hour
+//! window of an account the user keeps running.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,7 +14,7 @@ use std::time::Duration;
 
 use ccr_core::snapshot::Snapshot;
 use ccr_core::store::{Event, Store, kind};
-use ccr_core::usage_check::{self, Trigger};
+use ccr_core::usage_check::{self, Due, Trigger};
 use ccr_core::{Paths, snapshot, statusline, swap, time};
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_notification::NotificationExt;
@@ -119,20 +120,27 @@ fn run(app: &AppHandle, store: &Store, paths: &Paths, watch: &mut Watch) {
     }
 }
 
-/// Check the most overdue account in the background, unless a check is still running. Its
+/// Run the next background job (a check or a warm-up), unless one is still running. Its
 /// results arrive like any other write, through `data_version`.
 fn start_due_check(store: &Store, paths: &Paths, checking: &Arc<AtomicBool>) {
     if checking.swap(true, Ordering::AcqRel) {
         return;
     }
-    let Ok(Some(id)) = usage_check::next_due(store, paths, time::now_ms()) else {
+    let Ok(Some(due)) = usage_check::next_job(store, paths, time::now_ms()) else {
         checking.store(false, Ordering::Release);
         return;
     };
     let checking = checking.clone();
     std::thread::spawn(move || {
         if let Ok((store, paths)) = ccr_core::open(None) {
-            let _ = usage_check::check(&store, &paths, id, Trigger::Background);
+            match due {
+                Due::Check(id) => {
+                    let _ = usage_check::check(&store, &paths, id, Trigger::Background);
+                }
+                Due::WarmUp(id) => {
+                    let _ = usage_check::warm_up(&store, &paths, id, Trigger::WarmUp);
+                }
+            }
         }
         checking.store(false, Ordering::Release);
     });

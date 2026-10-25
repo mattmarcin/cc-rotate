@@ -1033,6 +1033,12 @@ dialog.drawer {
   margin-top: 2px;
 }
 
+.check-field {
+  display: grid;
+  gap: 4px;
+  justify-items: start;
+}
+
 input[type="text"],
 input[type="email"],
 input[type="number"],
