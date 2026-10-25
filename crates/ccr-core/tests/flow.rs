@@ -1775,7 +1775,7 @@ fn seats_and_an_expiring_week(env: &Env) -> (Store, i64, i64, i64) {
 #[test]
 fn a_weekly_budget_that_would_reset_unused_moves_its_account_ahead() {
     let env = Env::new();
-    let (store, a, b, c) = seats_and_an_expiring_week(&env);
+    let (store, a, _, c) = seats_and_an_expiring_week(&env);
     assert_eq!(swap::next_target(&store, Some(a)).unwrap().unwrap().id, c);
     let (pool, policy) = swap::load_pool(&store, time::now_s()).unwrap();
     let ranked = ccr_core::scheduler::ranking(&pool, policy, time::now_s());
