@@ -250,15 +250,16 @@ pub fn next(snap: &Snapshot, explain: bool) -> String {
         );
     }
     let s = &snap.settings;
-    let _ = writeln!(
-        out,
-        "\n{DIM}Order: {}{RESET}",
-        if s.prefer_no_weekly_limit {
-            "accounts without a weekly limit first, then your order, then the most room."
-        } else {
-            "your order, then the most room."
-        }
-    );
+    let mut order: Vec<&str> = Vec::new();
+    if s.use_expiring_weekly {
+        order.push("accounts whose weekly budget would go unused");
+    }
+    if s.prefer_no_weekly_limit {
+        order.push("accounts without a weekly limit");
+    }
+    order.push("your order");
+    order.push("the most room");
+    let _ = writeln!(out, "\n{DIM}Order: {}.{RESET}", order.join(", then "));
     out
 }
 
