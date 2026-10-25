@@ -617,7 +617,7 @@ fn statusline_entry(profile: Option<PathBuf>, observe: bool, then: Option<String
                     .map(PathBuf::from)
                     .unwrap_or(ccr_core::paths::default_template_dir()?),
             };
-            statusline::observe(&store, &dir, &input, time::now_ms())?;
+            statusline::observe(&store, &dir, &paths.home, &input, time::now_ms())?;
             return Ok(None);
         }
         let result = statusline::tick(&store, &paths, &input, time::now_ms())?;

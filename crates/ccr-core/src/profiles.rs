@@ -52,8 +52,9 @@ pub fn profile_dirs(rotation: &Paths) -> Result<Vec<PathBuf>> {
     let rotation_dir = dunce::canonicalize(&rotation.profile_dir).ok();
     let mut dirs: Vec<PathBuf> = std::fs::read_dir(&rotation.home)?
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
         .map(|e| e.path())
+        // Following links: a dotfiles manager may link `~/.claude` from elsewhere.
+        .filter(|p| std::fs::metadata(p).is_ok_and(|m| m.is_dir()))
         .filter(|p| {
             p.file_name()
                 .is_some_and(|n| n.to_string_lossy().starts_with(".claude"))

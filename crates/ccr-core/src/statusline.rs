@@ -16,8 +16,8 @@ use crate::profile_account;
 use crate::scheduler::{self, Reason, Timing};
 use crate::store::{Account, AccountState, Sample, SampleWindow, Store, kind};
 use crate::swap::{
-    self, META_ACTIVE_SINCE, META_CRED_SEEN, META_LAST_SWAP_AT, META_LAST_SWAP_FROM_RESETS,
-    META_PROFILE_FOREIGN, META_PROFILE_MODEL, SwapRequest,
+    self, META_ACTIVE_SINCE, META_CRED_SEEN, META_LAST_SWAP_AT, META_PROFILE_FOREIGN,
+    META_PROFILE_MODEL, STALE_SAMPLE_GUARD_MS, SwapRequest,
 };
 use crate::{credfile, time};
 
@@ -28,9 +28,6 @@ const META_PROFILE_UUID_SEEN: &str = "profile_account_uuid_seen";
 const META_SWAP_REQUESTED_AT: &str = "swap_requested_at";
 /// The credentials change marker a dead login was last reported for, so it is logged once.
 const META_DEAD_LOGIN_SEEN: &str = "dead_login_seen";
-/// Window after a swap during which samples matching the outgoing account's reset times are
-/// treated as stale readings of the old account.
-const STALE_SAMPLE_GUARD_MS: i64 = 120_000;
 
 /// The parts of Claude Code's status line input cc-rotate reads.
 #[derive(Debug, Default, Deserialize)]
@@ -215,14 +212,17 @@ fn timing(store: &Store, active_id: i64, now_ms: i64) -> Result<Timing> {
 }
 
 /// Observe-only tick for a profile outside the pool: record a sample for whichever pool
-/// account that profile is signed in as. Never touches credentials or swaps.
+/// account that profile is signed in as. Never touches credentials or swaps. `home` is where
+/// the default profile (`~/.claude`) keeps its `.claude.json`.
 pub fn observe(
     store: &Store,
     profile_dir: &Path,
+    home: &Path,
     input: &StatusInput,
     now_ms: i64,
 ) -> Result<Option<Account>> {
-    let Some(ident) = profile_account::read(&profile_dir.join(".claude.json"))? else {
+    let config = crate::profiles::config_file_for(profile_dir, home);
+    let Some(ident) = profile_account::read(&config)? else {
         return Ok(None);
     };
     let account = match (&ident.account_uuid, &ident.email) {
@@ -250,13 +250,7 @@ fn is_stale_reading(store: &Store, sample: &Sample, now_ms: i64) -> Result<bool>
     if now_ms - last_swap > STALE_SAMPLE_GUARD_MS {
         return Ok(false);
     }
-    let old: Vec<i64> = store
-        .meta(META_LAST_SWAP_FROM_RESETS)?
-        .unwrap_or_default()
-        .split(',')
-        .filter_map(|v| v.trim().parse().ok())
-        .filter(|&v: &i64| v != 0)
-        .collect();
+    let old = swap::left_resets(store)?;
     Ok(sample
         .windows
         .iter()
@@ -276,7 +270,8 @@ pub fn sync(store: &Store, paths: &Paths) -> Result<Option<SwapRequest>> {
 pub fn sync_at(store: &Store, paths: &Paths, now_ms: i64) -> Result<Option<SwapRequest>> {
     let mut dead_login = false;
     sync_profile_login(store, paths, &mut dead_login)?;
-    crate::profile_usage::import(store, paths, now_ms)?;
+    // Best effort, like before a swap: an unreadable profile must not stop the write-back.
+    let _ = crate::profile_usage::import(store, paths, now_ms);
     let Some(active) = store.active_account()? else {
         return Ok(None);
     };

@@ -24,8 +24,13 @@ use crate::{credfile, secret, time};
 
 pub const META_LAST_SWAP_AT: &str = "last_swap_at";
 /// The reset times (comma-separated epoch seconds) of every window in the outgoing account's
-/// last reading, for the stale-reading guard after a swap.
+/// last reading, for the stale-reading guard after a swap. Swaps within `STALE_SAMPLE_GUARD_MS`
+/// of each other add to it, so a session that has not made a request since two swaps ago is
+/// recognized too.
 pub const META_LAST_SWAP_FROM_RESETS: &str = "last_swap_from_resets";
+/// Window after a swap during which readings carrying the reset times of an account just left
+/// are treated as stale readings of that account (sessions that have not made a request yet).
+pub const STALE_SAMPLE_GUARD_MS: i64 = 120_000;
 /// When the active account became active: a swap, or a login adopted from the profile.
 pub const META_ACTIVE_SINCE: &str = "active_since";
 /// The model id the rotation profile's sessions last reported, which decides whether a window
@@ -117,17 +122,49 @@ pub fn next_target(store: &Store, exclude: Option<i64>) -> Result<Option<Account
     Ok(scheduler::pick(&pool, policy, exclude).map(|c| c.account.clone()))
 }
 
+/// The reset times the stale-reading guard currently knows (`META_LAST_SWAP_FROM_RESETS`).
+pub fn left_resets(store: &Store) -> Result<Vec<i64>> {
+    Ok(store
+        .meta(META_LAST_SWAP_FROM_RESETS)?
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|v| v.trim().parse().ok())
+        .filter(|&v: &i64| v != 0)
+        .collect())
+}
+
 /// Whether the active account was already over a threshold when it became active: it has
 /// readings since then, and every one of them has a window that applies at or above its
 /// threshold. Its last reading before the swap was out of date, for example because another
 /// profile used it meanwhile. `scheduler::Timing::leaves_at_once` lets such an account go
 /// without waiting out the swap cooldown.
+///
+/// Only readings that are clearly the account's own count: one sharing a reset time with
+/// another account's latest reading may be a session that has not made a request since an
+/// earlier swap, still reporting the account it used then. Leaving out a genuine reading only
+/// means the cooldown applies as usual.
 pub fn arrived_over_limit(store: &Store, account_id: i64, now_ms: i64) -> Result<bool> {
     let policy = Policy::from(&store.settings()?);
     let model = store.meta(META_PROFILE_MODEL)?;
-    let samples = store.account_samples_since(account_id, active_since(store)?)?;
-    Ok(!samples.is_empty()
-        && samples.iter().all(|s| {
+    let mut others: Vec<i64> = Vec::new();
+    for account in store.accounts()? {
+        if account.id != account_id {
+            if let Some(sample) = store.last_sample(account.id)? {
+                others.extend(sample.windows.iter().filter_map(|w| w.resets_at));
+            }
+        }
+    }
+    let own: Vec<_> = store
+        .account_samples_since(account_id, active_since(store)?)?
+        .into_iter()
+        .filter(|s| {
+            !s.windows
+                .iter()
+                .any(|w| w.resets_at.is_some_and(|r| others.contains(&r)))
+        })
+        .collect();
+    Ok(!own.is_empty()
+        && own.iter().all(|s| {
             scheduler::window_usage(Some(s), now_ms / 1000, policy.thresholds, model.as_deref())
                 .iter()
                 .any(scheduler::WindowUsage::blocking)
@@ -306,6 +343,7 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
         Some(id) => store.last_sample(id)?,
         None => None,
     };
+    let previous_swap = store.meta_i64(META_LAST_SWAP_AT)?;
     let committed = store.immediate(|s| {
         if let Some(account) = &active {
             s.set_state(account.id, outgoing_state)?;
@@ -314,12 +352,19 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
         s.set_meta(META_LAST_SWAP_AT, now)?;
         s.set_meta(META_PROFILE_FOREIGN, "0")?;
         s.set_meta(META_ACTIVE_SINCE, now)?;
-        let resets: Vec<String> = from_sample
-            .iter()
-            .flat_map(|x| &x.windows)
-            .filter_map(|w| w.resets_at)
-            .map(|r| r.to_string())
-            .collect();
+        let mut resets: Vec<i64> = match previous_swap {
+            Some(last) if now - last <= STALE_SAMPLE_GUARD_MS => left_resets(s)?,
+            _ => Vec::new(),
+        };
+        resets.extend(
+            from_sample
+                .iter()
+                .flat_map(|x| &x.windows)
+                .filter_map(|w| w.resets_at),
+        );
+        resets.sort_unstable();
+        resets.dedup();
+        let resets: Vec<String> = resets.iter().map(i64::to_string).collect();
         s.set_meta(META_LAST_SWAP_FROM_RESETS, resets.join(","))?;
         if let Some(marker) = &marker {
             s.set_meta(META_CRED_SEEN, marker)?;

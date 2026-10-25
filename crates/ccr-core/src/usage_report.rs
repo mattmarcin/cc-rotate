@@ -47,7 +47,12 @@ pub struct CachedReport {
 
 /// The report cached in a `.claude.json` document, if it has one.
 pub fn from_config(doc: &Map<String, Value>) -> Option<CachedReport> {
-    let cached = doc.get(CACHE_KEY)?.as_object()?;
+    from_cache(doc.get(CACHE_KEY)?)
+}
+
+/// A `cachedUsageUtilization` value.
+pub fn from_cache(cached: &Value) -> Option<CachedReport> {
+    let cached = cached.as_object()?;
     Some(CachedReport {
         fetched_at_ms: cached.get("fetchedAtMs")?.as_f64()? as i64,
         account_uuid: cached
@@ -57,6 +62,19 @@ pub fn from_config(doc: &Map<String, Value>) -> Option<CachedReport> {
             .map(str::to_string),
         windows: windows(cached.get("utilization")?),
     })
+}
+
+/// Whether a report can hold a window of this name: the ones `windows` produces. Any other
+/// window (from the status line) is simply not something a report describes.
+pub fn expresses(name: &str) -> bool {
+    let family = |rest: &str| scheduler::model_family(rest) == Some(rest);
+    match name {
+        FIVE_HOUR | SEVEN_DAY => true,
+        _ => name
+            .strip_prefix("five_hour_")
+            .or_else(|| name.strip_prefix("seven_day_"))
+            .is_some_and(family),
+    }
 }
 
 /// Every usage window in a report body, named as the status line names them.
@@ -210,6 +228,26 @@ mod tests {
         assert_eq!(names(&w), vec!["five_hour", "seven_day"]);
         assert_eq!(w[0].resets_at, None);
         assert_eq!(w[1].pct, 30.0);
+    }
+
+    #[test]
+    fn what_a_report_can_express() {
+        for name in [
+            "five_hour",
+            "seven_day",
+            "seven_day_opus",
+            "five_hour_fable",
+        ] {
+            assert!(expresses(name), "{name}");
+        }
+        for name in [
+            "spend_limit",
+            "seven_day_oauth_apps",
+            "seven_day_mystery",
+            "overage",
+        ] {
+            assert!(!expresses(name), "{name}");
+        }
     }
 
     #[test]
