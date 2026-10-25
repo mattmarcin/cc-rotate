@@ -1158,3 +1158,87 @@ fn a_changed_reading_counts_even_without_new_api_time() {
         }
     );
 }
+
+/// A threshold swap while a turn is still streaming on the old account: the turn finishes after
+/// the swap with the old account's latest usage, and the session then idles. Neither reading is
+/// recorded for the new account, however long after the swap it comes.
+#[test]
+fn a_request_that_finishes_after_a_swap_still_counts_for_the_old_account() {
+    let env = Env::new();
+    let (store, a, b, _) = pool(&env);
+    let now = time::now_ms();
+    let a_resets = time::now_s() + 3 * 86_400;
+    statusline::tick(
+        &store,
+        &env.paths,
+        &session_input("agent", 5000, 98.5, a_resets),
+        now,
+    )
+    .unwrap();
+    swap::run(
+        &store,
+        &env.paths,
+        &SwapRequest {
+            from: Some(a),
+            to: None,
+            reason: Reason::FiveHour,
+            wait: false,
+        },
+    )
+    .unwrap();
+    for (later, api, pct) in [
+        (20_000, 65_000, 99.0),
+        (150_000, 65_000, 99.0),
+        (900_000, 90_000, 99.4),
+    ] {
+        let tick = statusline::tick(
+            &store,
+            &env.paths,
+            &session_input("agent", api, pct, a_resets),
+            now + later,
+        )
+        .unwrap();
+        assert!(tick.swap.is_none(), "after {later} ms: {:?}", tick.swap);
+    }
+    assert!(store.last_sample(b).unwrap().is_none());
+}
+
+/// Windows reset at round times, so the new account's window can reset at the same moment as
+/// the old one's. Then a reading cannot be told apart, and it counts: hiding a genuine reading of
+/// a used-up account would leave its sessions waiting at the limit.
+#[test]
+fn a_reading_sharing_the_new_accounts_own_reset_time_counts() {
+    let env = Env::new();
+    let (store, a, b, _) = pool(&env);
+    let now = time::now_ms();
+    let shared = time::now_s() + 2 * 3600;
+    store
+        .record_sample(&five_only(b, 20.0, shared, now - 60_000))
+        .unwrap();
+    statusline::tick(
+        &store,
+        &env.paths,
+        &session_input("s", 5000, 99.0, shared),
+        now,
+    )
+    .unwrap();
+    swap::run(
+        &store,
+        &env.paths,
+        &SwapRequest {
+            from: Some(a),
+            to: Some(b),
+            reason: Reason::Manual,
+            wait: true,
+        },
+    )
+    .unwrap();
+    statusline::tick(
+        &store,
+        &env.paths,
+        &session_input("s", 6000, 100.0, shared),
+        now + 130_000,
+    )
+    .unwrap();
+    assert_eq!(store.last_sample(b).unwrap().unwrap().windows[0].pct, 100.0);
+}
