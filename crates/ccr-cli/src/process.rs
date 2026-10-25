@@ -225,7 +225,7 @@ pub fn launch_app() -> Result<()> {
     let app = exe.with_file_name(name);
     if !app.is_file() {
         bail!(
-            "{} not found; install the desktop app next to cc-rotate-ctl",
+            "{} not found. Install the desktop app next to cc-rotate-ctl.",
             app.display()
         );
     }

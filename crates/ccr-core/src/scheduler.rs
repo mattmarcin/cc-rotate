@@ -640,11 +640,11 @@ fn open_reason(c: &Candidate, policy: Policy, tied: bool) -> String {
 fn closed_reason(c: &Candidate, now_s: i64) -> String {
     match c.account.state {
         AccountState::Paused => return "paused".into(),
-        AccountState::NeedsLogin => return "needs a new login".into(),
+        AccountState::NeedsLogin => return "signed out".into(),
         _ => {}
     }
     if c.held_back && c.blocking().is_none() {
-        return "waiting for a usage check to confirm its login".into();
+        return "on hold until a check confirms its login".into();
     }
     match c.blocking() {
         Some(w) => {

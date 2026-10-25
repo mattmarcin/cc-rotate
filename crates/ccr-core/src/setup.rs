@@ -74,7 +74,7 @@ pub fn run(store: &Store, opts: &SetupOptions) -> Result<SetupReport> {
         );
     }
     if same_dir(&template, &profile) {
-        bail!("the template and the rotation profile must be different directories");
+        bail!("the template and the cc-rotate profile must be different directories");
     }
     std::fs::create_dir_all(&profile)?;
     let profile = dunce::canonicalize(&profile)?;

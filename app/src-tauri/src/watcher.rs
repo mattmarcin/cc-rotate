@@ -174,7 +174,7 @@ fn status(app: &AppHandle, store: &Store, paths: &Paths, watch: &mut Watch) {
             notify(
                 app,
                 &format!("{label} is ready again"),
-                &format!("Every account was near a limit. cc-rotate can use {label} now."),
+                &format!("Every account had been near a limit. cc-rotate can use {label} now."),
             );
         }
     }
@@ -190,23 +190,23 @@ fn tooltip(snap: &Snapshot) -> String {
         return if snap.accounts.is_empty() {
             "cc-rotate: no accounts yet".to_string()
         } else {
-            "cc-rotate: no active account".to_string()
+            "cc-rotate: no account in use".to_string()
         };
     };
     let five = a
         .windows
         .iter()
         .find(|w| w.name == ccr_core::scheduler::FIVE_HOUR)
-        .map_or("no reading".to_string(), |w| format!("{:.0}%", w.pct));
+        .map_or("no data".to_string(), |w| format!("{:.0}%", w.pct));
     let week = match (
         a.windows
             .iter()
             .find(|w| w.name == ccr_core::scheduler::SEVEN_DAY),
         a.weekly.effective,
     ) {
-        (Some(w), _) => format!("week {:.0}%", w.pct),
+        (Some(w), _) => format!("weekly {:.0}%", w.pct),
         (None, ccr_core::scheduler::WeeklyLimit::None) => "no weekly limit".to_string(),
-        (None, _) => "week no reading".to_string(),
+        (None, _) => "weekly no data".to_string(),
     };
     let mut text = format!("cc-rotate: {}\n5-hour {five}, {week}", a.account.label);
     if let Some(next) = &snap.next {
@@ -231,15 +231,15 @@ fn describe(store: &Store, event: &Event) -> Option<(String, String)> {
             "Every other account is near a limit, paused or signed out.".into(),
         )),
         kind::DEAD_LOGIN => Some((
-            format!("{} needs a new login", label(event.account_from)),
-            "Its login stopped working. Open cc-rotate and choose Log in again.".into(),
+            format!("{} is signed out", label(event.account_from)),
+            "Its login stopped working. Open cc-rotate and choose Sign in again.".into(),
         )),
         kind::FOREIGN_LOGIN => Some((
             "cc-rotate profile signed in to another account".into(),
             "A /login in the cc-rotate profile signed in to an account that isn't in cc-rotate. Add that account, or use Swap now to go back to one of yours.".into(),
         )),
         kind::ERROR => Some((
-            "cc-rotate hit an error".into(),
+            "cc-rotate ran into a problem".into(),
             event
                 .detail
                 .as_ref()

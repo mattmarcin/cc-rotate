@@ -25,7 +25,7 @@ use clap::{Parser, Subcommand};
     about = "Run one Claude Code profile on a pool of accounts"
 )]
 struct Cli {
-    /// Rotation profile directory (defaults to the one recorded by `setup`).
+    /// cc-rotate profile directory (defaults to the one recorded by `setup`).
     #[arg(long, global = true, value_name = "DIR")]
     profile: Option<PathBuf>,
     #[command(subcommand)]
@@ -39,7 +39,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Add an account, or re-login one, through Claude Code's own sign-in flow.
+    /// Add an account, or sign in to one again, through Claude Code's own sign-in.
     Login {
         /// Pre-fill the sign-in page with this email.
         #[arg(long)]
@@ -47,7 +47,7 @@ enum Command {
         /// Label for a new account (defaults to the email's local part).
         #[arg(long)]
         label: Option<String>,
-        /// Re-login this existing account (label, email or id).
+        /// Sign in to this existing account again (label, email or id).
         #[arg(long, value_name = "ACCOUNT")]
         relogin: Option<String>,
         /// Sign in fresh as the account another profile uses (see `profiles`); its email and
@@ -65,7 +65,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Read the usage of accounts not in use with Claude Code's own `/usage` (no turn, no quota).
+    /// Check the usage of accounts not in use with Claude Code's own `/usage` (no turn, no quota).
     Check {
         /// Accounts to check (label, email or id); every account not in use when none are given.
         accounts: Vec<String>,
@@ -77,7 +77,7 @@ enum Command {
         /// Swap to this account instead of the scheduler's pick.
         #[arg(long, value_name = "ACCOUNT")]
         to: Option<String>,
-        /// Only swap if this account id is still active (used by the statusline).
+        /// Only swap if this account id is still in use (used by the status line).
         #[arg(long, hide = true)]
         from_id: Option<i64>,
         #[arg(long, hide = true, default_value = "manual")]
@@ -92,7 +92,7 @@ enum Command {
     Pause { account: String },
     /// Return a paused account to the pool.
     Resume { account: String },
-    /// Remove an account and its stored login.
+    /// Remove an account and its saved login.
     Remove {
         account: String,
         #[arg(long)]
@@ -114,7 +114,7 @@ enum Command {
         #[arg(value_parser = ["auto", "yes", "no"])]
         value: Option<String>,
     },
-    /// Show recent swaps, logins and errors.
+    /// Show recent swaps, sign-ins and errors.
     Events {
         #[arg(long, default_value_t = 30)]
         limit: usize,
@@ -128,12 +128,12 @@ enum Command {
         #[arg(long)]
         unset: bool,
     },
-    /// Create the rotation profile from an existing Claude Code profile.
+    /// Create the cc-rotate profile from an existing Claude Code profile.
     Setup {
         /// Profile to copy settings, hooks, skills and plugins from (default: ~/.claude).
         #[arg(long, value_name = "DIR")]
         from: Option<PathBuf>,
-        /// Rebuild an existing rotation profile (its login is kept).
+        /// Rebuild an existing cc-rotate profile (its login is kept).
         #[arg(long)]
         force: bool,
         /// Remove the `cc-rotate` PowerShell function older versions added to your PowerShell
@@ -141,12 +141,12 @@ enum Command {
         /// --force, this is all setup does.
         #[arg(long)]
         remove_alias: bool,
-        /// Leave an existing rotation profile as it is instead of failing (the installer runs
+        /// Leave an existing cc-rotate profile as it is instead of failing (the installer runs
         /// setup on every upgrade).
         #[arg(long, conflicts_with = "force")]
         keep_existing: bool,
     },
-    /// Check the store, the profile and Claude Code.
+    /// Check cc-rotate's data, the profile and Claude Code.
     Doctor {
         #[arg(long)]
         json: bool,
@@ -158,9 +158,9 @@ enum Command {
     },
     /// Open the cc-rotate desktop app.
     Dashboard,
-    /// Statusline entry point (configured by `setup`; reads Claude Code's JSON on stdin).
+    /// Status line entry point (configured by `setup`; reads Claude Code's JSON on stdin).
     Statusline {
-        /// Only record usage for a profile outside the pool; never swaps.
+        /// Only record usage, for a profile other than the cc-rotate profile; never swaps.
         #[arg(long)]
         observe: bool,
         /// Status line command to run after cc-rotate's (overrides the `statusline_downstream` setting).
@@ -172,12 +172,12 @@ enum Command {
         #[command(subcommand)]
         hook: HookCommand,
     },
-    /// Read the usage of the account in use with a login Claude Code cannot renew (started in the
-    /// background by the statusline).
+    /// Check the usage of the account in use with a login Claude Code can't renew (started in the
+    /// background by the status line).
     #[command(hide = true)]
     ConfirmActive,
-    /// Identify the profile's login after a swap stopped half way, or when it changed without
-    /// cc-rotate writing it (started in the background by the statusline).
+    /// Identify the profile's login after an interrupted swap, or when it changed without
+    /// cc-rotate writing it (started in the background by the status line).
     #[command(hide = true)]
     SettleLogin,
     /// Tell herdr how to resume a session (started in the background by `hook session-start`).
@@ -286,11 +286,11 @@ fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> 
                     .into_iter()
                     .find(|p| p.name.eq_ignore_ascii_case(&name))
                     .with_context(|| {
-                        format!("no profile named {name:?}; see `cc-rotate-ctl profiles`")
+                        format!("No profile named {name:?}. See `cc-rotate-ctl profiles`.")
                     })?;
                 if let Some(label) = &found.in_pool_as {
                     bail!(
-                        "{} is already in the pool as {label}",
+                        "{} is already added as {label}",
                         found.email.as_deref().unwrap_or(&name)
                     );
                 }
@@ -309,7 +309,7 @@ fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> 
             }
             for p in &found {
                 let status = match &p.in_pool_as {
-                    Some(label) => format!("in the pool as {label}"),
+                    Some(label) => format!("added as {label}"),
                     None => format!("add with: cc-rotate-ctl login --from-profile {}", p.name),
                 };
                 println!(
@@ -356,7 +356,7 @@ fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> 
                     SwapOutcome::Skipped { why } => println!("No swap: {why}"),
                     SwapOutcome::PoolExhausted => {
                         println!(
-                            "No swap: every other account is paused, needs a login, or is over a threshold"
+                            "No swap: every other account is near a limit, paused or signed out"
                         );
                     }
                 }
@@ -373,11 +373,11 @@ fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> 
             println!(
                 "{}",
                 match outcome {
-                    swap::Settle::Nothing => "Nothing to settle: the profile's login is known.",
+                    swap::Settle::Nothing => "Nothing to do: the profile's login is known.",
                     swap::Settle::Settled =>
-                        "Settled which account the profile's login belongs to.",
+                        "Identified which account the profile's login belongs to.",
                     swap::Settle::Unsure =>
-                        "Cannot tell which account the profile is signed in to yet; cc-rotate tries again in a minute.",
+                        "Can't tell yet which account the profile is signed in to. Retrying in a minute.",
                 }
             );
         }
@@ -390,11 +390,11 @@ fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> 
         Command::Remove { account, yes } => {
             let a = store.find_account(&account)?;
             if a.state == AccountState::Active {
-                bail!("{} is active; swap to another account first", a.label);
+                bail!("{} is in use. Swap to another account first.", a.label);
             }
             if !yes {
                 bail!(
-                    "this deletes {} and its stored login; re-run with --yes to confirm",
+                    "This removes {} and its saved login. Run again with --yes to confirm.",
                     a.label
                 );
             }
@@ -437,7 +437,7 @@ fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> 
             if (remove_alias || keep_existing) && !force && paths.settings_file().exists() {
                 if keep_existing {
                     println!(
-                        "The rotation profile at {} is already set up; leaving it as it is.",
+                        "The cc-rotate profile at {} is already set up. Leaving it as it is.",
                         paths.profile_dir.display()
                     );
                     println!(
@@ -466,14 +466,14 @@ fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> 
                     remove_alias,
                 },
             )?;
-            println!("Rotation profile ready at {}", report.profile.display());
+            println!("cc-rotate profile ready at {}", report.profile.display());
             println!("  copied: {}", report.copied.join(", "));
             if let Some(how) = &report.claude_md {
                 println!("  CLAUDE.md: {how}");
             }
             match &report.statusline_downstream {
-                Some(cmd) => println!("  your statusline still runs after cc-rotate's: {cmd}"),
-                None => println!("  no existing statusline to chain"),
+                Some(cmd) => println!("  your status line still runs after cc-rotate's: {cmd}"),
+                None => println!("  no existing status line to chain"),
             }
             if !report.mcp_servers.is_empty() {
                 println!("  MCP servers: {}", report.mcp_servers.join(", "));
@@ -547,7 +547,7 @@ fn check_cmd(store: &Store, paths: &Paths, references: &[String], json: bool) ->
             .collect::<Result<Vec<_>>>()?
     };
     if accounts.is_empty() {
-        println!("No account to check: every account is in use or needs a new login.");
+        println!("No account to check: every account is in use or signed out.");
         return Ok(());
     }
     let width = accounts.iter().map(|a| a.label.len()).max().unwrap_or(5);
@@ -575,23 +575,26 @@ fn set_state(store: &Store, reference: &str, state: AccountState) -> Result<()> 
     match (a.state, state) {
         (AccountState::Active, AccountState::Paused) => {
             bail!(
-                "{} is active; swap to another account first, then pause it",
+                "{} is in use. Swap to another account before pausing it.",
                 a.label
             )
         }
         (AccountState::NeedsLogin, AccountState::Parked) => {
             bail!(
-                "{} needs a new login: cc-rotate-ctl login --relogin {}",
+                "{} is signed out. Sign in again with `cc-rotate-ctl login --relogin {}`.",
                 a.label,
                 a.label
             )
         }
-        (AccountState::Active, _) => bail!("{} is active", a.label),
+        (AccountState::Active, _) => bail!("{} is in use", a.label),
         _ => {}
     }
     store.set_state(a.id, state)?;
     store.log_event(kind::STATE, Some(a.id), None, Some(state.as_str()), None)?;
-    println!("{} is now {}", a.label, state.as_str().replace('_', " "));
+    match state {
+        AccountState::Paused => println!("Paused {}", a.label),
+        _ => println!("Resumed {}", a.label),
+    }
     Ok(())
 }
 
@@ -635,7 +638,9 @@ fn config_cmd(
             }
         }
         (Some(key), Some(value)) => {
-            store.set_setting(&key, Some(&value))?;
+            store
+                .set_setting(&key, Some(&value))
+                .with_context(|| key.clone())?;
             println!("{key} = {value}");
         }
     }
@@ -657,13 +662,15 @@ fn login_cmd(
 
     match (&relogin, &email) {
         (Some(a), Some(e)) => println!(
-            "Re-logging {} ({e}). Sign in to that account in your browser.",
+            "Signing in to {} again ({e}). Sign in to that account in your browser.",
             a.label
         ),
         (None, Some(e)) => println!("Adding {e}. Sign in to that account in your browser."),
         _ => println!("Adding an account. Sign in to the account you want to add in your browser."),
     }
-    println!("Tip: your browser signs in as whichever claude.ai account it is logged into.\n");
+    println!(
+        "Your browser signs in with the claude.ai account it's signed in to. Switch accounts there first if needed.\n"
+    );
 
     let status = login::login_command(&claude, staging.dir(), email.as_deref())
         .status()
@@ -684,12 +691,16 @@ fn login_cmd(
     )?;
     let a = &imported.account;
     println!(
-        "\n{} {} ({}){}",
-        if imported.created { "Added" } else { "Updated" },
+        "\n{} {} ({}).{}",
+        if imported.created {
+            "Added"
+        } else {
+            "Signed in again to"
+        },
         a.label,
         a.email.as_deref().unwrap_or("unknown email"),
         if imported.activated {
-            "; it is now the active account"
+            " It's now in use."
         } else {
             ""
         },

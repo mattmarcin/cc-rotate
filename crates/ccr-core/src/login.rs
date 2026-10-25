@@ -71,7 +71,7 @@ pub fn claude_executable(store: &Store) -> Result<PathBuf> {
         return Ok(PathBuf::from(path));
     }
     which::which("claude")
-        .context("could not find `claude` on PATH; install Claude Code or set claude_path")
+        .context("Couldn't find `claude` on PATH. Install Claude Code or set claude_path.")
 }
 
 /// `claude auth login --claudeai [--email <email>]` against the staging directory.
@@ -109,7 +109,7 @@ pub fn import(
     let oauth = Credentials::for_profile(staging)
         .read_oauth()?
         .filter(|o| !credfile::is_dead(o))
-        .ok_or_else(|| anyhow!("the login did not complete; no account login was written"))?;
+        .ok_or_else(|| anyhow!("Sign-in didn't finish, so no login was saved."))?;
 
     let mut ident = identity(
         &oauth,
@@ -122,13 +122,13 @@ pub fn import(
         }
     }
     if ident.account_uuid.is_none() && ident.email.is_none() {
-        bail!("the login completed but Claude Code did not record which account signed in");
+        bail!("Signed in, but Claude Code didn't say which account it was. Try again.");
     }
 
     if let (Some(expected), Some(got)) = (&req.expect_email, &ident.email) {
         if !expected.eq_ignore_ascii_case(got) {
             bail!(
-                "signed in as {got}, but this sign-in was for {expected}; switch to that account in your browser and try again"
+                "Signed in as {got}, not {expected}. Switch to {expected} in your browser and try again."
             );
         }
     }
@@ -193,7 +193,7 @@ pub fn import(
                 Some(l) => {
                     crate::store::validate_label(l)?;
                     if s.account_by_label(l)?.is_some() {
-                        bail!("an account is already labelled {l:?}");
+                        bail!("Another account is already named {l}.");
                     }
                     l.clone()
                 }
@@ -217,7 +217,7 @@ pub fn import(
                 None,
                 Some(id),
                 Some("login"),
-                Some(json!({ "message": format!("Saved the new login of {}, but did not put it into the profile yet: a swap stopped half way and cc-rotate is still finding out which account the profile is signed in to.", current.label) })),
+                Some(json!({ "message": format!("Saved {}'s new login but didn't put it in the profile: an interrupted swap left it unclear which account the profile is signed in to.", current.label) })),
             )?;
         }
     } else if !has_active && current.state == AccountState::Parked {
@@ -293,9 +293,9 @@ fn check_same_account(target: &Account, ident: &AccountIdentity) -> Result<()> {
     };
     if mismatch {
         bail!(
-            "signed in as {}, but this login was for {}; sign in to the right account in your browser and try again",
+            "Signed in as {}, not {expected}. Switch to {expected} in your browser and try again.",
             ident.email.as_deref().unwrap_or("a different account"),
-            target.email.as_deref().unwrap_or(&target.label),
+            expected = target.email.as_deref().unwrap_or(&target.label),
         );
     }
     Ok(())

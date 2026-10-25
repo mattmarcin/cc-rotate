@@ -48,7 +48,7 @@ const ROUTINE = new Set(["sync", "swap_skipped"]);
 const root = document.getElementById("app")!;
 const topActions = h("div", { class: "top-actions" });
 const banner = h("div", { class: "banner", hidden: true });
-const bank = h("div", { class: "bank", role: "list", "aria-label": "Accounts in the pool" });
+const bank = h("div", { class: "bank", role: "list", "aria-label": "Accounts" });
 const summary = h("div", { class: "summary" });
 const accountsBody = h("div", { class: "accounts" });
 const chartControls = h("div", { class: "chart-controls" });
@@ -97,7 +97,7 @@ root.append(
         "div",
         { class: "panel-head" },
         h("h2", null, "Activity"),
-        h("label", { class: "check", for: "routine" }, routineToggle, "Show routine"),
+        h("label", { class: "check", for: "routine" }, routineToggle, "Show all"),
       ),
       activity,
     ),
@@ -155,12 +155,12 @@ function readIn(source: string | null): string | null {
   return source.replace(/^\.claude-/, "").replace(/^\./, "");
 }
 
-/** "read 5m ago", "checked 5m ago", or "read 5m ago in work" for a reading another profile reported. */
+/** "updated 5m ago", "checked 5m ago", or "updated 5m ago from work" for a reading another profile reported. */
 function readText(a: AccountView): string {
-  if (!a.last_sample_at) return "never read";
+  if (!a.last_sample_at) return "no data yet";
   if (a.last_sample_source === "check") return `checked ${ago(a.last_sample_at)}`;
   const other = readIn(a.last_sample_source);
-  return `read ${ago(a.last_sample_at)}${other ? ` in ${other}` : ""}`;
+  return `updated ${ago(a.last_sample_at)}${other ? ` from ${other}` : ""}`;
 }
 
 function readTitle(a: AccountView): string {
@@ -177,13 +177,13 @@ function checkMessage(label: string, r: CheckOutcome): string {
     case "read":
       return `Checked ${label}`;
     case "rate_limited":
-      return `Anthropic asked to wait ${until(r.until / 1000)} before the next reading of ${label}`;
+      return `Too soon to check ${label}. Anthropic asked to wait ${until(r.until / 1000)}.`;
     case "skipped":
-      return `Did not check ${label}: ${r.why}`;
+      return `Didn't check ${label}: ${r.why}`;
     case "login_rejected":
-      return `${label}'s login was rejected. Log in again.`;
+      return `${label}'s login was rejected. Sign in again.`;
     case "failed":
-      return `Could not check ${label}: ${r.why}`;
+      return `Couldn't check ${label}: ${r.why}`;
   }
 }
 
@@ -191,13 +191,13 @@ function checkMessage(label: string, r: CheckOutcome): string {
 function checkText(a: AccountView): string {
   const c = a.usage_check;
   if (a.state === "active") return "not needed while in use";
-  if (c.held_back) return "not used until a check confirms its login";
+  if (c.held_back) return "on hold until a check confirms its login";
   if (c.problem) return c.problem;
-  const read = c.last_read_at ? `read ${ago(c.last_read_at)}` : "not checked yet";
+  const read = c.last_read_at ? `checked ${ago(c.last_read_at)}` : "not checked yet";
   return c.not_before && c.not_before > Date.now() ? `${read}, next after ${clock(c.not_before)}` : read;
 }
 
-const WEEKLY_TEXT = { none: "no weekly limit", unknown: "not known yet", has: "has a weekly limit" } as const;
+const WEEKLY_TEXT = { none: "none found", unknown: "not known yet", has: "has one" } as const;
 
 function level(used: number, threshold: number): "ok" | "warn" | "over" {
   if (used >= threshold) return "over";
@@ -214,7 +214,7 @@ function stateText(a: AccountView): string {
     case "paused":
       return "Paused";
     case "needs_login":
-      return "Needs login";
+      return "Signed out";
   }
 }
 
@@ -225,7 +225,7 @@ function renderTop() {
   const hasAccounts = !!snap && snap.accounts.length > 0;
   replace(
     topActions,
-    h("button", { class: "btn quiet", onclick: openHealth }, "Health"),
+    h("button", { class: "btn quiet", onclick: openSettings }, "Settings"),
     hasAccounts &&
       h(
         "button",
@@ -258,7 +258,7 @@ function renderTop() {
       h(
         "span",
         null,
-        "A swap stopped half way. cc-rotate is finding out which account the profile is signed in to, and does not swap until it knows. Your sessions keep working meanwhile.",
+        "A swap was interrupted. Swaps are on hold until cc-rotate confirms which account the profile is signed in to. Your sessions keep working.",
       ),
     );
   } else if (needs.length > 0) {
@@ -270,10 +270,10 @@ function renderTop() {
         "span",
         null,
         needs.length === 1
-          ? `${needs[0].label} needs a new login before it can be used again.`
-          : `${needs.map((a) => a.label).join(", ")} need new logins before they can be used again.`,
+          ? `${needs[0].label} is signed out. Sign in again to use it.`
+          : `${needs.map((a) => a.label).join(", ")} are signed out. Sign in again to use them.`,
       ),
-      h("button", { class: "btn small", onclick: () => openLogin(needs[0]) }, `Log in to ${needs[0].label}`),
+      h("button", { class: "btn small", onclick: () => openLogin(needs[0]) }, `Sign in to ${needs[0].label}`),
     );
   } else if (snap?.pool.exhausted && snap.accounts.length > 0) {
     banner.hidden = false;
@@ -284,7 +284,7 @@ function renderTop() {
       h(
         "span",
         null,
-        "Every account is near a limit, paused, or waiting for a login. ",
+        "No account is ready to take over. ",
         next ? `The next one frees up in ${until(next)}.` : "",
       ),
     );
@@ -307,7 +307,7 @@ function renderOverview() {
         h(
           "p",
           null,
-          "Each account signs in through Claude Code's own login page. cc-rotate keeps the logins encrypted on this computer and swaps the cc-rotate profile between them as limits approach.",
+          "Sign in to each of your Claude accounts once. cc-rotate keeps the logins encrypted on this computer and swaps the cc-rotate profile to another account when one nears its limits.",
         ),
         h("button", { class: "btn primary", onclick: () => openLogin(null) }, "Add account"),
       ),
@@ -338,17 +338,17 @@ function renderOverview() {
       const title = [
         `${a.label}${a.email ? ` (${a.email})` : ""}`,
         [stateText(a), a.plan].filter(Boolean).join(", "),
-        noWeekly(a) ? "No weekly limit" : `Week: ${week ? `${pct(week.pct)} used` : "no reading"}`,
-        `5-hour: ${five ? `${pct(five.pct)} used` : "no reading"}`,
+        noWeekly(a) ? "No weekly limit" : `Weekly: ${week ? `${pct(week.pct)} used` : "no data"}`,
+        `5-hour: ${five ? `${pct(five.pct)} used` : "no data"}`,
         ...otherWindows(a).map((w) => `${w.label}: ${pct(w.pct)} used`),
       ].join("\n");
       const sub =
         a.state === "needs_login"
-          ? "Log in"
+          ? "Signed out"
           : a.state === "paused"
             ? "Paused"
             : !a.last_sample_at
-              ? "No reading"
+              ? "No data"
               : noWeekly(a)
                 ? `5h ${pct(tankLeft)} left`
                 : `${pct(tankLeft)} left`;
@@ -369,7 +369,7 @@ function renderOverview() {
   const swapEvent = state.events.find((e) => e.kind === "swap" && e.account_to === snap.active_id);
   const headline =
     p.weekly_limited > 0
-      ? `${p.weekly_accounts_left.toFixed(1)} of ${p.weekly_limited} accounts' weekly use left`
+      ? `Weekly usage left: ${p.weekly_accounts_left.toFixed(1)} of ${p.weekly_limited} accounts`
       : `${plural(p.usable, "account")}, none with a weekly limit`;
   replace(
     summary,
@@ -378,13 +378,13 @@ function renderOverview() {
       "dl",
       { class: "facts" },
       h("dt", null, "Using"),
-      h("dd", null, active ? active.label : "No account", active && swapEvent ? h("span", { class: "muted" }, ` since ${clock(swapEvent.ts)}`) : null),
+      h("dd", null, active ? active.label : "None", active && swapEvent ? h("span", { class: "muted" }, ` since ${clock(swapEvent.ts)}`) : null),
       h("dt", null, "Next"),
       h("dd", null, snap.next ? [snap.next.label, h("span", { class: "muted" }, ` - ${snap.next.reason}`)] : "None ready"),
       p.weekly_limited > 0 && p.no_weekly_limit > 0 && h("dt", null, "No weekly limit"),
       p.weekly_limited > 0 && p.no_weekly_limit > 0 && h("dd", null, plural(p.no_weekly_limit, "account")),
       unavailable > 0 && h("dt", null, "Unavailable"),
-      unavailable > 0 && h("dd", null, `${unavailable}`, h("span", { class: "muted" }, " paused or logged out")),
+      unavailable > 0 && h("dd", null, `${unavailable}`, h("span", { class: "muted" }, " paused or signed out")),
       h("dt", null, "Swaps"),
       h("dd", null, String(p.swaps_24h), h("span", { class: "muted" }, " in the last 24 hours")),
     ),
@@ -401,14 +401,14 @@ function meter(w: WindowUsage | undefined, live: boolean) {
   const reset = !w
     ? live
       ? "not reported yet"
-      : "no reading yet"
+      : "no data yet"
     : w.resets_at && w.resets_at * 1000 > Date.now()
       ? `resets in ${until(w.resets_at)}`
       : w.resets_at === null
         ? "not started"
         : live
-          ? "window reset"
-          : "no reading yet";
+          ? "has reset"
+          : "no data yet";
   return h(
     "div",
     { class: `meter ${lvl}` },
@@ -430,7 +430,7 @@ function weeklyCell(a: AccountView) {
           "div",
           { class: "meter-text none" },
           h("strong", null, "No weekly limit"),
-          h("span", { class: "muted" }, a.weekly.setting === "no" ? "set by you" : "detected from its usage"),
+          h("span", { class: "muted" }, a.weekly.setting === "no" ? "set by you" : "detected"),
         );
   const others = otherWindows(a);
   return [
@@ -444,7 +444,7 @@ function weeklyCell(a: AccountView) {
             "li",
             { class: `${w.applies ? "" : "muted"} ${w.applies && w.pct >= w.threshold ? "over" : ""}`.trim() || null },
             `${w.label[0].toUpperCase()}${w.label.slice(1)} ${pct(w.pct)}`,
-            !w.applies && h("span", null, ", not for this model"),
+            !w.applies && h("span", null, ", not for the model in use"),
           ),
         ),
       ),
@@ -490,7 +490,7 @@ function saveOrder(ids: number[], moved: AccountView) {
   pendingOrderSaves += 1;
   orderSaves = orderSaves
     .then(() => api.setOrder(ids))
-    .then(() => say(`${moved.label} is now ${ordinal(ids.indexOf(moved.id) + 1)} in the order`))
+    .then(() => say(`${moved.label} is now ${ordinal(ids.indexOf(moved.id) + 1)} in your order`))
     .catch((e) => say(String(e), "error"))
     .finally(() => {
       pendingOrderSaves -= 1;
@@ -616,16 +616,16 @@ function renderAccounts() {
       actions.push(h("button", { class: "link", onclick: () => act(() => api.swapNow(a.id), () => `Swapped to ${a.label}`) }, "Use now"));
     if (a.state === "paused")
       actions.push(h("button", { class: "link", onclick: () => act(() => api.setPaused(a.id, false), () => `Resumed ${a.label}`) }, "Resume"));
-    if (a.state === "needs_login") actions.push(h("button", { class: "link", onclick: () => openLogin(a) }, "Log in again"));
-    actions.push(h("button", { class: "link quiet-link", onclick: () => openManage(a), "aria-label": `More for ${a.label}` }, "More"));
+    if (a.state === "needs_login") actions.push(h("button", { class: "link", onclick: () => openLogin(a) }, "Sign in again"));
+    actions.push(h("button", { class: "link quiet-link", onclick: () => openManage(a), "aria-label": `More options for ${a.label}` }, "More"));
 
     const grip = h(
       "button",
       {
         class: "grip",
         type: "button",
-        title: "Drag to change the order, or use the arrow keys",
-        "aria-label": `${a.label}, ${ordinal(i + 1)} of ${count} in the order. Press the up or down arrow to move it.`,
+        title: "Drag to reorder",
+        "aria-label": `${a.label}, ${ordinal(i + 1)} of ${count} in your order. Use the up and down arrow keys to move it.`,
         "data-grip": a.id,
         onpointerdown: (e: PointerEvent) => startDrag(e, a),
         onkeydown: (e: KeyboardEvent) => gripKeys(e, a),
@@ -692,8 +692,8 @@ function renderAccounts() {
       "p",
       { class: "muted table-note" },
       snap.settings.prefer_no_weekly_limit
-        ? "Accounts are used in this order, with the ones without a weekly limit first. Drag the handles to change it."
-        : "Accounts are used in this order. Drag the handles to change it.",
+        ? "Used top to bottom, accounts without a weekly limit first. Drag to reorder."
+        : "Used top to bottom. Drag to reorder.",
     ),
   );
   // Keep keyboard focus on the same account's handle across re-renders.
@@ -751,20 +751,21 @@ const REASONS: Record<string, string> = {
   threshold_5h: "at the 5-hour limit",
   threshold_7d: "at the weekly limit",
   threshold_other: "at a usage limit",
-  preferred_available: "because a better ranked account is ready again",
-  stop_failure: "after a turn hit a limit",
-  dead_login: "because its login stopped working",
+  preferred_available: "now that it's ready again",
+  stop_failure: "after Claude Code hit a limit",
+  dead_login: "because the login stopped working",
   manual: "by hand",
-  login: "after its first login",
+  login: "after its first sign-in",
+  completed: "after an interrupted swap",
 };
 
-/** A usage check's outcome, as a swap event lists it. */
+/** A usage check's outcome, as a swap event lists it. A check that read the usage needs no note. */
 const CHECKED: Record<string, string> = {
-  read: "read",
+  read: "",
   skipped: "skipped",
   rate_limited: "asked to wait",
   login_rejected: "login rejected",
-  failed: "failed",
+  failed: "check failed",
 };
 
 const nb = (text: string) => h("span", { class: "nb" }, text);
@@ -778,43 +779,43 @@ function describe(e: EventRow): { parts: Child[]; tone?: "warn" | "danger" } {
       const pick = detail("pick");
       const why = pick ? h("small", { class: "why" }, `Picked: ${pick}`) : null;
       const arrived = e.detail?.arrived_over_limit
-        ? h("small", { class: "why" }, `${labelOf(e.account_from)} was already at this limit when cc-rotate switched to it.`)
+        ? h("small", { class: "why" }, `${labelOf(e.account_from)} was already at this limit when it was swapped in`)
         : null;
       const checkedList = (e.detail?.checked as { label: string; outcome: string }[] | undefined) ?? [];
       const checked = checkedList.length
-        ? h("small", { class: "why" }, `Checked first: ${checkedList.map((c) => `${c.label} (${CHECKED[c.outcome] ?? c.outcome})`).join(", ")}`)
+        ? h("small", { class: "why" }, `Checked first: ${checkedList.map((c) => { const note = CHECKED[c.outcome] ?? c.outcome; return note ? `${c.label} (${note})` : c.label; }).join(", ")}`)
         : null;
       return e.account_from
         ? { parts: ["Swapped from ", from, " to ", to, ` ${REASONS[e.reason ?? ""] ?? ""}`.trimEnd(), arrived, checked, why] }
         : { parts: ["Started using ", to, why] };
     }
     case "swap_skipped":
-      return { parts: [`Swap skipped: ${detail("why")}`] };
+      return { parts: [`No swap: ${detail("why")}`] };
     case "login":
-      return { parts: e.reason === "added" ? ["Added ", to] : ["Logged ", to, " in again"] };
+      return { parts: e.reason === "added" ? ["Added ", to] : ["Signed in to ", to, " again"] };
     case "sync":
       return e.reason === "usage_check" || e.reason === "recovered"
-        ? { parts: ["Saved the login Claude Code renewed while checking ", from] }
-        : { parts: ["Saved a refreshed login for ", from] };
+        ? { parts: ["Saved ", from, "'s renewed login after a usage check"] }
+        : { parts: ["Saved ", from, "'s renewed login"] };
     case "dead_login":
       return { parts: [from, "'s login stopped working"], tone: "danger" };
     case "pool_exhausted":
       return { parts: ["No other account was ready to take over"], tone: "warn" };
     case "adopted_login":
-      return { parts: ["Picked up a /login as ", to] };
+      return { parts: ["Now using ", to, " after a /login in the profile"] };
     case "foreign_login":
-      return { parts: ["The profile was signed in to an account outside the pool"], tone: "warn" };
+      return { parts: ["The cc-rotate profile was signed in to an account that isn't in cc-rotate"], tone: "warn" };
     case "state":
       if (e.reason === "removed") return { parts: ["Removed ", nb(detail("label") || "an account")] };
       if (e.reason === "paused") return { parts: ["Paused ", from] };
       if (e.reason === "parked") return { parts: ["Resumed ", from] };
-      if (e.reason === "order") return { parts: ["Changed the order of the accounts"] };
+      if (e.reason === "order") return { parts: ["Changed the order"] };
       if (e.reason === "weekly_limit") {
         const value = detail("weekly_limit");
         const who = nb(detail("label") || labelOf(e.account_from));
-        if (value === "yes") return { parts: ["Marked ", who, " as having a weekly limit"] };
-        if (value === "no") return { parts: ["Marked ", who, " as having no weekly limit"] };
-        return { parts: ["Detecting the weekly limit of ", who, " from its usage again"] };
+        if (value === "yes") return { parts: ["Set ", who, " to have a weekly limit"] };
+        if (value === "no") return { parts: ["Set ", who, " to no weekly limit"] };
+        return { parts: ["Set ", who, " to detect its weekly limit from usage"] };
       }
       return { parts: [from, ` is now ${e.reason ?? "updated"}`] };
     case "error":
@@ -836,7 +837,7 @@ function renderActivity() {
   const routine = (e: EventRow) => ROUTINE.has(e.kind) || (e.kind === "state" && e.reason === "order");
   const items = state.events.filter((e) => state.showRoutine || !routine(e));
   if (items.length === 0) {
-    replace(activity, h("li", { class: "muted empty" }, "Swaps, logins and problems show up here."));
+    replace(activity, h("li", { class: "muted empty" }, "Swaps, sign-ins and problems show up here."));
     return;
   }
   const rows: HTMLElement[] = [];
@@ -875,7 +876,7 @@ let currentLogin: { id: string; dialog: HTMLDialogElement; update: (p: LoginProg
 
 function openLogin(account: AccountView | null) {
   const email = h("input", { type: "email", placeholder: "you@example.com", value: account?.email ?? "", autocomplete: "off" });
-  const label = h("input", { type: "text", placeholder: "Defaults to the email name", maxlength: 40, autocomplete: "off" });
+  const label = h("input", { type: "text", placeholder: "From the email if left empty", maxlength: 40, autocomplete: "off" });
   const steps = h("ol", { class: "steps" });
   const status = h("p", { class: "login-status muted" });
   const codeRow = h("div", { class: "code-row", hidden: true });
@@ -888,14 +889,14 @@ function openLogin(account: AccountView | null) {
     "div",
     { class: "fields" },
     h("label", null, h("span", null, "Email"), email, h("small", { class: "muted" }, "Optional. Pre-fills the sign-in page.")),
-    h("label", null, h("span", null, "Label"), label, h("small", { class: "muted" }, "Optional. A short name like work or team-3.")),
-    h("p", { class: "muted" }, "Your browser signs in as whichever claude.ai account it is logged in to. Switch accounts there first if needed."),
+    h("label", null, h("span", null, "Label"), label, h("small", { class: "muted" }, "Optional. A short name, like work or team-3.")),
+    h("p", { class: "muted" }, "Sign-in uses the claude.ai account your browser is signed in to. Switch accounts there first if you need to."),
   );
   const form = account
-    ? h("p", null, `Sign in as ${account.email ?? account.label} in the browser window that opens. If the browser is logged in to a different claude.ai account, switch accounts there first.`)
+    ? h("p", null, `Sign in as ${account.email ?? account.label} in the browser window that opens. If the browser is signed in to another claude.ai account, switch accounts there first.`)
     : h("div", null, found, fields);
 
-  const d = dialog(account ? `Log in to ${account.label}` : "Add an account", form, steps, status, codeRow, h("div", { class: "dialog-actions" }, cancel, start));
+  const d = dialog(account ? `Sign in to ${account.label}` : "Add account", form, steps, status, codeRow, h("div", { class: "dialog-actions" }, cancel, start));
 
   // Accounts the other Claude Code profiles on this computer belong to: one click starts a fresh
   // sign-in with the email and the profile's name filled in. Those profiles are left untouched.
@@ -919,10 +920,10 @@ function openLogin(account: AccountView | null) {
                   "div",
                   { class: "found-who" },
                   h("div", { class: "who-label" }, p.email ?? p.name),
-                  h("div", { class: "muted who-email" }, `${p.name} profile${p.subscription_type ? `, ${p.subscription_type}` : ""}`),
+                  h("div", { class: "muted who-email" }, `${p.name} profile${p.subscription_type ? `, ${p.subscription_type[0].toUpperCase()}${p.subscription_type.slice(1)}` : ""}`),
                 ),
                 p.in_pool_as
-                  ? h("span", { class: "muted found-state" }, `In the pool as ${p.in_pool_as}`)
+                  ? h("span", { class: "muted found-state" }, `Added as ${p.in_pool_as}`)
                   : h(
                       "button",
                       {
@@ -942,7 +943,7 @@ function openLogin(account: AccountView | null) {
               ),
             ),
           ),
-          h("h3", null, "Or another account"),
+          h("h3", null, "Or add another account"),
         );
         found.hidden = false;
       })
@@ -958,19 +959,19 @@ function openLogin(account: AccountView | null) {
     switch (p.stage) {
       case "starting":
         setSteps(0);
-        status.textContent = "Starting Claude Code's sign-in.";
+        status.textContent = "Starting sign-in…";
         break;
       case "browser": {
         setSteps(1);
         status.replaceChildren(
-          "Finish signing in in your browser. ",
+          "Finish in your browser. ",
           h("button", { class: "link", onclick: () => p.url && api.openUrl(p.url) }, "Open the page again"),
         );
-        const code = h("input", { type: "text", placeholder: "Paste the code here", autocomplete: "off" });
+        const code = h("input", { type: "text", placeholder: "Code", autocomplete: "off" });
         replace(
           codeRow,
-          h("label", null, h("span", null, "If the browser shows a code instead of finishing, paste it here"), code),
-          h("button", { class: "btn small", onclick: () => code.value.trim() && api.submitLoginCode(p.id, code.value).catch((e) => say(String(e), "error")) }, "Submit code"),
+          h("label", null, h("span", null, "If the browser shows a code, paste it here"), code),
+          h("button", { class: "btn small", onclick: () => code.value.trim() && api.submitLoginCode(p.id, code.value).catch((e) => say(String(e), "error")) }, "Submit"),
         );
         codeRow.hidden = false;
         break;
@@ -978,7 +979,7 @@ function openLogin(account: AccountView | null) {
       case "importing":
         setSteps(2);
         codeRow.hidden = true;
-        status.textContent = "Saving the login.";
+        status.textContent = "Saving login…";
         break;
       case "done":
         setSteps(3);
@@ -991,7 +992,7 @@ function openLogin(account: AccountView | null) {
         currentLogin = null;
         codeRow.hidden = true;
         status.className = "login-status error";
-        status.textContent = p.message ?? "The sign-in did not finish.";
+        status.textContent = p.message ?? "Sign-in didn't finish.";
         start.disabled = false;
         start.textContent = "Try again";
         cancel.textContent = "Close";
@@ -1049,7 +1050,7 @@ function openManage(a: AccountView) {
     a.state === "paused" && h("button", { class: "btn small", onclick: run(() => api.setPaused(a.id, false), `Resumed ${a.label}`) }, "Resume"),
     (a.state === "parked" || a.state === "paused") &&
       h("button", { class: "btn small", onclick: () => (d.close(), act(() => api.checkUsage(a.id), (r) => checkMessage(a.label, r))) }, "Check usage"),
-    h("button", { class: "btn small", onclick: () => (d.close(), openLogin(a)) }, a.state === "needs_login" ? "Log in again" : "Re-login"),
+    h("button", { class: "btn small", onclick: () => (d.close(), openLogin(a)) }, "Sign in again"),
   );
   const order = h(
     "div",
@@ -1069,15 +1070,15 @@ function openManage(a: AccountView) {
         const value = (e.target as HTMLSelectElement).value as WeeklyLimitSetting;
         api
           .setWeeklyLimit(a.id, value)
-          .then(() => (say(`Saved the weekly limit of ${a.label}`), refresh()))
+          .then(() => (say("Weekly limit saved"), refresh()))
           .catch((err) => say(String(err), "error"));
       },
     },
     (
       [
-        ["auto", `Detect it (${WEEKLY_TEXT[a.weekly.detected]})`],
-        ["yes", "It has a weekly limit"],
-        ["no", "It has no weekly limit"],
+        ["auto", `Detect from usage (${WEEKLY_TEXT[a.weekly.detected]})`],
+        ["yes", "Has a weekly limit"],
+        ["no", "No weekly limit"],
       ] as const
     ).map(([value, text]) => h("option", { value, selected: a.weekly.setting === value }, text)),
   );
@@ -1090,9 +1091,9 @@ function openManage(a: AccountView) {
     a.org_name && h("dd", null, a.org_name),
     a.plan && h("dt", null, "Plan"),
     a.plan && h("dd", null, a.plan),
-    h("dt", null, "Picked"),
-    h("dd", null, a.rank ? `${ordinal(a.rank)} (${a.reason})` : `not now (${a.reason || "unavailable"})`),
-    h("dt", null, "Login saved"),
+    h("dt", null, "Pick order"),
+    h("dd", null, a.rank ? `${ordinal(a.rank)} - ${a.reason}` : `not available${a.reason ? ` - ${a.reason}` : ""}`),
+    h("dt", null, "Login updated"),
     h("dd", null, a.login_updated_at ? ago(a.login_updated_at) : "never"),
     h("dt", null, "Usage check"),
     h("dd", null, checkText(a)),
@@ -1126,7 +1127,7 @@ function openManage(a: AccountView) {
   remove.addEventListener("click", async () => {
     if (!armed) {
       armed = true;
-      remove.textContent = `Remove ${a.label} and its login`;
+      remove.textContent = `Yes, remove ${a.label}`;
       return;
     }
     try {
@@ -1141,13 +1142,13 @@ function openManage(a: AccountView) {
   });
 }
 
-async function openHealth() {
-  const checks = h("ul", { class: "checks" }, h("li", { class: "muted" }, "Running checks."));
+async function openSettings() {
+  const checks = h("ul", { class: "checks" }, h("li", { class: "muted" }, "Running checks…"));
   const info = h("dl", { class: "facts info" });
   const settingsForm = h("div", { class: "fields" });
   const autostart = h("input", { type: "checkbox", id: "autostart" });
   const d = dialog(
-    "Health and settings",
+    "Settings",
     checks,
     h("h3", null, "Settings"),
     settingsForm,
@@ -1184,31 +1185,31 @@ async function openHealth() {
     replace(
       settingsForm,
       field("swap_threshold_5h", "Swap at 5-hour usage (%)", snap.settings.swap_threshold_5h, "Swap before a 5-hour limit is reached.", 1, 100),
-      field("swap_threshold_7d", "Swap at weekly usage (%)", snap.settings.swap_threshold_7d, "Swap before a weekly limit is reached, on all models or on one.", 1, 100),
-      field("swap_cooldown_s", "Minimum time between swaps (seconds)", snap.settings.swap_cooldown_s, "Limit swaps caused by usage readings.", 0, 3600),
+      field("swap_threshold_7d", "Swap at weekly usage (%)", snap.settings.swap_threshold_7d, "Also applies to weekly limits on a single model.", 1, 100),
+      field("swap_cooldown_s", "Minimum time between swaps (seconds)", snap.settings.swap_cooldown_s, "Applies to swaps at a limit and swaps back.", 0, 3600),
       field(
         "switch_back_dwell_s",
-        "Switch back after (seconds)",
+        "Swap back after (seconds)",
         snap.settings.switch_back_dwell_s,
-        "How long an account stays in use before cc-rotate switches back to a better ranked one that is ready again.",
+        "Minimum time on an account before swapping back to one higher in your order.",
         0,
         86400,
       ),
       h("label", { class: "check", for: "prefer-no-weekly" }, prefer, "Use accounts without a weekly limit first"),
-      h("label", { class: "check", for: "usage-checks" }, checks, "Check the usage of accounts not in use with Claude Code's /usage"),
+      h("label", { class: "check", for: "usage-checks" }, checks, "Check usage of accounts not in use"),
       field(
         "usage_check_interval_s",
-        "Check accounts not in use every (seconds)",
+        "Check every (seconds)",
         snap.settings.usage_check_interval_s,
-        "A check makes no request to a model and uses none of the account's limits. Anthropic allows a reading now and then, so at least 300.",
+        "Runs Claude Code's /usage, which doesn't count against limits. Minimum 300.",
         300,
         86400,
       ),
       field(
         "usage_check_max_age_s",
-        "Check before switching when the reading is older than (seconds)",
+        "Check before swapping if usage is older than (seconds)",
         snap.settings.usage_check_max_age_s,
-        "Before a swap uses an account whose last reading is older than this, cc-rotate checks it first.",
+        "0 checks every time.",
         0,
         86400,
       ),
@@ -1216,7 +1217,7 @@ async function openHealth() {
   }
   api.autostartEnabled().then((on) => (autostart.checked = on)).catch(() => (autostart.disabled = true));
   autostart.addEventListener("change", () =>
-    api.setAutostart(autostart.checked).then(() => say(autostart.checked ? "cc-rotate will start when you sign in" : "cc-rotate will not start on its own")).catch((e) => say(String(e), "error")),
+    api.setAutostart(autostart.checked).then(() => say(autostart.checked ? "cc-rotate will start when you sign in" : "cc-rotate won't start when you sign in")).catch((e) => say(String(e), "error")),
   );
 
   const [results, about] = await Promise.all([api.doctor().catch(() => []), api.appInfo().catch(() => null)]);
@@ -1231,9 +1232,9 @@ async function openHealth() {
       h("dd", null, about.version),
       h("dt", null, "Claude Code"),
       h("dd", null, about.claude_version ?? "not found"),
-      h("dt", null, "Profile"),
+      h("dt", null, "Profile folder"),
       h("dd", { class: "path" }, about.profile_dir),
-      h("dt", null, "Data"),
+      h("dt", null, "Data folder"),
       h("dd", { class: "path" }, about.data_dir),
     );
   }
@@ -1258,7 +1259,7 @@ async function refresh() {
       renderActivity();
       await renderChart();
     } catch (e) {
-      say(`Could not read the cc-rotate store: ${e}`, "error");
+      say(`Couldn't load cc-rotate's data: ${e}`, "error");
     } finally {
       refreshing = null;
     }
