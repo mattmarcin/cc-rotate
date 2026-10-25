@@ -3,6 +3,7 @@
 //! The design is in `docs/specs/2026-10-24-cc-rotate.md`. Every entry point (the statusline,
 //! the StopFailure hook, the CLI and the desktop app) goes through this crate.
 
+pub mod budget;
 pub mod credfile;
 pub mod credstore;
 pub mod doctor;

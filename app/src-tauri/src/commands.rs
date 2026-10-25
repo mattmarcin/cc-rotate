@@ -166,6 +166,26 @@ pub async fn set_weekly_limit(id: i64, value: String) -> CmdResult<()> {
     .await
 }
 
+/// Rotation stops using the account at this weekly usage (percent); `None` uses the setting.
+#[tauri::command]
+pub async fn set_weekly_cap(id: i64, cap: Option<f64>) -> CmdResult<()> {
+    blocking(move |s, _| {
+        let account = s
+            .account(id)?
+            .ok_or_else(|| anyhow::anyhow!("That account no longer exists."))?;
+        s.set_weekly_cap(id, cap)?;
+        s.log_event(
+            kind::STATE,
+            Some(id),
+            None,
+            Some("weekly_cap"),
+            Some(serde_json::json!({ "label": account.label, "weekly_cap": cap })),
+        )?;
+        Ok(())
+    })
+    .await
+}
+
 /// Other Claude Code profiles on this computer, with the account each belongs to.
 #[tauri::command]
 pub async fn other_profiles() -> CmdResult<Vec<FoundProfile>> {

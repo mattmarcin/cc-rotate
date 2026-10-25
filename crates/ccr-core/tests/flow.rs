@@ -41,6 +41,11 @@ impl Env {
         let store = Store::open(&self.paths.store_db()).unwrap();
         if store.setting("usage_checks").unwrap().is_none() {
             store.set_setting("usage_checks", Some("false")).unwrap();
+            // These tests are about the order and limits; spending weekly budget before it
+            // resets has its own tests, which turn it on.
+            store
+                .set_setting("use_expiring_weekly", Some("false"))
+                .unwrap();
             // And should one run anyway, it finds no Claude Code.
             let nowhere = self.paths.data_dir.join("no-claude-here");
             store
@@ -1731,4 +1736,109 @@ fn a_relogin_ends_a_foreign_login_in_the_profile() {
         store.credential(a).unwrap().unwrap().oauth["refreshToken"],
         "refresh-a-renewed"
     );
+}
+
+/// Seats a and b without a weekly limit (two distinct 5-hour windows and never a weekly one),
+/// and c with a weekly limit, 20% used, resetting in three days: spending its 78 points at the
+/// guessed pace needs more working hours than three days hold.
+fn seats_and_an_expiring_week(env: &Env) -> (Store, i64, i64, i64) {
+    let (store, a, b, c) = pool(env);
+    store.set_order(&[a, b, c]).unwrap();
+    let now_s = time::now_s();
+    for account in [a, b] {
+        store
+            .record_sample(&five_only(
+                account,
+                30.0,
+                now_s - 20 * 3600,
+                (now_s - 30 * 3600) * 1000,
+            ))
+            .unwrap();
+        store
+            .record_sample(&five_only(
+                account,
+                5.0,
+                now_s + 3 * 3600,
+                (now_s - 3600) * 1000,
+            ))
+            .unwrap();
+    }
+    store.record_sample(&sample(c, 0.0, 20.0)).unwrap();
+    store
+        .set_setting("use_expiring_weekly", Some("true"))
+        .unwrap();
+    (store, a, b, c)
+}
+
+/// An account whose weekly budget would reset unused goes ahead of the seats without a weekly
+/// limit, with the reason; with the setting off, the seats come first as before.
+#[test]
+fn a_weekly_budget_that_would_reset_unused_moves_its_account_ahead() {
+    let env = Env::new();
+    let (store, a, b, c) = seats_and_an_expiring_week(&env);
+    assert_eq!(swap::next_target(&store, Some(a)).unwrap().unwrap().id, c);
+    let (pool, policy) = swap::load_pool(&store, time::now_s()).unwrap();
+    let ranked = ccr_core::scheduler::ranking(&pool, policy, time::now_s());
+    let first = ranked.iter().find(|r| r.account_id == c).unwrap();
+    assert!(
+        first.reason.starts_with("weekly budget expires in"),
+        "{}",
+        first.reason
+    );
+
+    store
+        .set_setting("use_expiring_weekly", Some("false"))
+        .unwrap();
+    assert_eq!(swap::next_target(&store, Some(a)).unwrap().unwrap().id, b);
+}
+
+/// The account in use is spending a weekly budget that would otherwise reset unused: the seats
+/// that rank above it by the user's order do not take it back.
+#[test]
+fn the_account_in_use_keeps_spending_a_budget_that_would_reset_unused() {
+    let env = Env::new();
+    let (store, _, _, c) = seats_and_an_expiring_week(&env);
+    swap::run(&store, &env.paths, &manual(Some(c))).unwrap();
+    store
+        .set_setting("switch_back_dwell_s", Some("600"))
+        .unwrap();
+    let now_s = time::now_s();
+    let input = format!(
+        r#"{{"model":{{"id":"claude-opus-4-1"}},"rate_limits":{{"five_hour":{{"used_percentage":12,"resets_at":{}}},"seven_day":{{"used_percentage":21,"resets_at":{}}}}}}}"#,
+        now_s + 3600,
+        now_s + 86_400 * 3
+    );
+    let later = time::now_ms() + 601_000;
+    let tick = statusline::tick(&store, &env.paths, &StatusInput::parse(&input), later).unwrap();
+    assert!(tick.swap.is_none(), "{:?}", tick.swap);
+}
+
+/// A weekly cap below the weekly threshold keeps the rest of the account's week for the user:
+/// rotation stops using it at the cap.
+#[test]
+fn a_weekly_cap_keeps_the_rest_of_the_week_for_you() {
+    let env = Env::new();
+    let (store, a, b, c) = pool(&env);
+    // The order alone decides here.
+    store
+        .set_setting("prefer_no_weekly_limit", Some("false"))
+        .unwrap();
+    store.set_order(&[c, b, a]).unwrap();
+    store.record_sample(&sample(c, 10.0, 55.0)).unwrap();
+    assert_eq!(swap::next_target(&store, Some(a)).unwrap().unwrap().id, c);
+
+    store.set_weekly_cap(c, Some(50.0)).unwrap();
+    assert_eq!(swap::next_target(&store, Some(a)).unwrap().unwrap().id, b);
+    let (pool, policy) = swap::load_pool(&store, time::now_s()).unwrap();
+    let ranked = ccr_core::scheduler::ranking(&pool, policy, time::now_s());
+    let capped = ranked.iter().find(|r| r.account_id == c).unwrap();
+    assert!(
+        capped.reason.starts_with("weekly limit at 55%"),
+        "{}",
+        capped.reason
+    );
+
+    store.set_weekly_cap(c, None).unwrap();
+    assert_eq!(swap::next_target(&store, Some(a)).unwrap().unwrap().id, c);
+    assert!(store.set_weekly_cap(c, Some(0.5)).is_err());
 }

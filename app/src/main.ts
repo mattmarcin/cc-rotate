@@ -691,9 +691,13 @@ function renderAccounts() {
     h(
       "p",
       { class: "muted table-note" },
-      snap.settings.prefer_no_weekly_limit
-        ? "Used top to bottom, accounts without a weekly limit first. Drag to reorder."
-        : "Used top to bottom. Drag to reorder.",
+      [
+        snap.settings.prefer_no_weekly_limit ? "Used top to bottom, accounts without a weekly limit first." : "Used top to bottom.",
+        snap.settings.use_expiring_weekly ? "An account whose weekly budget would go unused goes first." : null,
+        "Drag to reorder.",
+      ]
+        .filter(Boolean)
+        .join(" "),
     ),
   );
   // Keep keyboard focus on the same account's handle across re-renders.
@@ -816,6 +820,13 @@ function describe(e: EventRow): { parts: Child[]; tone?: "warn" | "danger" } {
         if (value === "yes") return { parts: ["Set ", who, " to have a weekly limit"] };
         if (value === "no") return { parts: ["Set ", who, " to no weekly limit"] };
         return { parts: ["Set ", who, " to detect its weekly limit from usage"] };
+      }
+      if (e.reason === "weekly_cap") {
+        const value = e.detail?.weekly_cap as number | null | undefined;
+        const who = nb(detail("label") || labelOf(e.account_from));
+        return value == null
+          ? { parts: ["Set ", who, " to stop at the weekly usage in Settings"] }
+          : { parts: ["Set ", who, ` to stop at ${value}% weekly usage`] };
       }
       return { parts: [from, ` is now ${e.reason ?? "updated"}`] };
     case "error":
@@ -1082,6 +1093,15 @@ function openManage(a: AccountView) {
       ] as const
     ).map(([value, text]) => h("option", { value, selected: a.weekly.setting === value }, text)),
   );
+  const weeklyThreshold = state.snap?.settings.swap_threshold_7d ?? 98;
+  const cap = h("input", {
+    type: "number",
+    min: 1,
+    max: 100,
+    step: 1,
+    value: a.weekly_cap === null ? "" : String(a.weekly_cap),
+    placeholder: String(weeklyThreshold),
+  });
   const details = h(
     "dl",
     { class: "facts info" },
@@ -1107,6 +1127,14 @@ function openManage(a: AccountView) {
       "div",
       { class: "fields" },
       h("label", null, h("span", null, "Weekly limit"), weekly, h("small", { class: "muted" }, "Detected from the usage Claude Code reports.")),
+      a.weekly.effective !== "none" &&
+        h(
+          "label",
+          null,
+          h("span", null, "Stop using it at weekly usage (%)"),
+          cap,
+          h("small", { class: "muted" }, `Keeps the rest of its week for you. Empty uses ${weeklyThreshold}% from Settings.`),
+        ),
       h("label", null, h("span", null, "Label"), label),
     ),
     error,
@@ -1115,6 +1143,8 @@ function openManage(a: AccountView) {
   close.addEventListener("click", () => d.close());
   save.addEventListener("click", async () => {
     try {
+      const capValue = cap.value.trim() === "" ? null : Number(cap.value);
+      if (capValue !== a.weekly_cap) await api.setWeeklyCap(a.id, capValue);
       if (label.value.trim() !== a.label) await api.renameAccount(a.id, label.value.trim());
       d.close();
       await refresh();
@@ -1178,6 +1208,13 @@ async function openSettings() {
         .catch((e) => say(String(e), "error")),
     );
     const prefer = h("input", { type: "checkbox", id: "prefer-no-weekly", checked: snap.settings.prefer_no_weekly_limit });
+    const expiringBox = h("input", { type: "checkbox", id: "use-expiring", checked: snap.settings.use_expiring_weekly });
+    expiringBox.addEventListener("change", () =>
+      api
+        .setSetting("use_expiring_weekly", String(expiringBox.checked))
+        .then(() => (say(expiringBox.checked ? "Weekly budget is used before it resets" : "Weekly budget is no longer moved ahead"), refresh()))
+        .catch((e) => say(String(e), "error")),
+    );
     prefer.addEventListener("change", () =>
       api
         .setSetting("prefer_no_weekly_limit", String(prefer.checked))
@@ -1198,6 +1235,7 @@ async function openSettings() {
         86400,
       ),
       h("label", { class: "check", for: "prefer-no-weekly" }, prefer, "Use accounts without a weekly limit first"),
+      h("label", { class: "check", for: "use-expiring" }, expiringBox, "Use weekly budget before it resets"),
       h("label", { class: "check", for: "usage-checks" }, checks, "Check usage of accounts not in use"),
       field(
         "usage_check_interval_s",

@@ -53,6 +53,8 @@ export interface Account {
   /** Place in the user's order: lower is used first. */
   position: number;
   weekly_limit: WeeklyLimitSetting;
+  /** Rotation stops using the account at this weekly usage (percent); null uses the setting. */
+  weekly_cap: number | null;
   added_at: number;
   last_login_at: number | null;
 }
@@ -93,6 +95,8 @@ export interface AccountView extends Account {
   /** Place in the pick order among the accounts usable now. */
   rank: number | null;
   reason: string;
+  /** Its weekly budget would reset unused unless it is used now. */
+  expiring: { left: number; hours_needed: number; hours_available: number; resets_at: number } | null;
 }
 
 export interface Ranked {
@@ -108,6 +112,7 @@ export interface Settings {
   swap_threshold_7d: number;
   swap_cooldown_s: number;
   prefer_no_weekly_limit: boolean;
+  use_expiring_weekly: boolean;
   switch_back_dwell_s: number;
   lock_timeout_ms: number;
   sample_retention_days: number;
@@ -207,6 +212,7 @@ export const api = {
   renameAccount: (id: number, label: string) => invoke<void>("rename_account", { id, label }),
   setOrder: (ids: number[]) => invoke<void>("set_order", { ids }),
   setWeeklyLimit: (id: number, value: WeeklyLimitSetting) => invoke<void>("set_weekly_limit", { id, value }),
+  setWeeklyCap: (id: number, cap: number | null) => invoke<void>("set_weekly_cap", { id, cap }),
   doctor: () => invoke<Check[]>("doctor"),
   setSetting: (key: string, value: string | null) => invoke<void>("set_setting", { key, value }),
   appInfo: () => invoke<AppInfo>("app_info"),
