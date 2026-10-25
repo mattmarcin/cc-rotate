@@ -22,7 +22,8 @@ use crate::{credfile, time};
 /// 3: usage windows as rows (`sample_windows`), the account order (`position`, formerly
 ///    `priority`) and the per-account weekly limit override.
 /// 4: the per-account weekly cap (`weekly_cap`).
-const SCHEMA_VERSION: i64 = 4;
+/// 5: whether an account's weekly budget is used before it resets (`use_expiring`).
+const SCHEMA_VERSION: i64 = 5;
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE accounts (
@@ -132,6 +133,13 @@ ALTER TABLE accounts ADD COLUMN weekly_cap REAL
     CHECK (weekly_cap IS NULL OR (weekly_cap >= 1 AND weekly_cap <= 100));
 "#;
 
+/// Schema 5: whether the account moves ahead when its weekly budget would reset unused
+/// (`budget::expiring`); on unless the user turned it off for the account.
+const SCHEMA_V5: &str = r#"
+ALTER TABLE accounts ADD COLUMN use_expiring INTEGER NOT NULL DEFAULT 1
+    CHECK (use_expiring IN (0, 1));
+"#;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountState {
@@ -215,12 +223,15 @@ pub struct Account {
     /// Rotation stops using the account once its weekly usage reaches this (percent), when it
     /// is below `swap_threshold_7d`: the rest is kept for the user's own use.
     pub weekly_cap: Option<f64>,
+    /// The account moves ahead when its weekly budget would reset unused (`budget::expiring`),
+    /// unless the user turned that off for it.
+    pub use_expiring: bool,
     pub added_at: i64,
     pub last_login_at: Option<i64>,
 }
 
 const ACCOUNT_COLS: &str = "id, label, email, account_uuid, org_uuid, org_name, subscription_type, \
-    rate_limit_tier, state, position, added_at, last_login_at, weekly_limit, weekly_cap";
+    rate_limit_tier, state, position, added_at, last_login_at, weekly_limit, weekly_cap, use_expiring";
 
 fn parse_col<T: FromStr<Err = anyhow::Error>>(row: &Row, i: usize) -> rusqlite::Result<T> {
     let text: String = row.get(i)?;
@@ -245,6 +256,7 @@ fn account_from_row(row: &Row) -> rusqlite::Result<Account> {
         last_login_at: row.get(11)?,
         weekly_limit: parse_col(row, 12)?,
         weekly_cap: row.get(13)?,
+        use_expiring: row.get(14)?,
     })
 }
 
@@ -533,6 +545,10 @@ impl Store {
             if version < 4 {
                 s.conn.execute_batch(SCHEMA_V4)?;
                 s.conn.pragma_update(None, "user_version", 4)?;
+            }
+            if version < 5 {
+                s.conn.execute_batch(SCHEMA_V5)?;
+                s.conn.pragma_update(None, "user_version", 5)?;
             }
             Ok(())
         })
@@ -930,6 +946,18 @@ impl Store {
         let n = self.conn.execute(
             "UPDATE accounts SET weekly_cap = ?2 WHERE id = ?1",
             params![id, cap],
+        )?;
+        if n == 0 {
+            bail!("account {id} does not exist");
+        }
+        Ok(())
+    }
+
+    /// Whether the account moves ahead when its weekly budget would reset unused.
+    pub fn set_use_expiring(&self, id: i64, on: bool) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE accounts SET use_expiring = ?2 WHERE id = ?1",
+            params![id, on],
         )?;
         if n == 0 {
             bail!("account {id} does not exist");

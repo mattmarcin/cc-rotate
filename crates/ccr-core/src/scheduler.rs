@@ -741,6 +741,7 @@ mod tests {
             position,
             weekly_limit: WeeklyLimitSetting::Auto,
             weekly_cap: None,
+            use_expiring: true,
             added_at: 0,
             last_login_at: None,
         }

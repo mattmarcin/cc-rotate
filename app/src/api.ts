@@ -55,6 +55,8 @@ export interface Account {
   weekly_limit: WeeklyLimitSetting;
   /** Rotation stops using the account at this weekly usage (percent); null uses the setting. */
   weekly_cap: number | null;
+  /** The account moves ahead when its weekly budget would reset unused. */
+  use_expiring: boolean;
   added_at: number;
   last_login_at: number | null;
 }
@@ -253,6 +255,7 @@ export const api = {
   setOrder: (ids: number[]) => invoke<void>("set_order", { ids }),
   setWeeklyLimit: (id: number, value: WeeklyLimitSetting) => invoke<void>("set_weekly_limit", { id, value }),
   setWeeklyCap: (id: number, cap: number | null) => invoke<void>("set_weekly_cap", { id, cap }),
+  setUseExpiring: (id: number, on: boolean) => invoke<void>("set_use_expiring", { id, on }),
   doctor: () => invoke<Check[]>("doctor"),
   setSetting: (key: string, value: string | null) => invoke<void>("set_setting", { key, value }),
   appInfo: () => invoke<AppInfo>("app_info"),

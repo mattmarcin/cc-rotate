@@ -879,6 +879,12 @@ function describe(e: EventRow): { parts: Child[]; tone?: "warn" | "danger" } {
         if (value === "no") return { parts: ["Set ", who, " to no weekly limit"] };
         return { parts: ["Set ", who, " to detect its weekly limit from usage"] };
       }
+      if (e.reason === "use_expiring") {
+        const who = nb(detail("label") || labelOf(e.account_from));
+        return e.detail?.use_expiring
+          ? { parts: ["Set ", who, " to use its weekly budget before it resets"] }
+          : { parts: ["Set ", who, " to never move ahead for its weekly budget"] };
+      }
       if (e.reason === "weekly_cap") {
         const value = e.detail?.weekly_cap as number | null | undefined;
         const who = nb(detail("label") || labelOf(e.account_from));
@@ -1166,6 +1172,7 @@ function openManage(a: AccountView) {
     .usageHistory(a.id)
     .then((hist) => replace(history, recentWeeks(hist)))
     .catch(() => replace(history, h("span", { class: "muted" }, "couldn't be read")));
+  const useExpiring = h("input", { type: "checkbox", checked: a.use_expiring });
   const details = h(
     "dl",
     { class: "facts info" },
@@ -1201,6 +1208,8 @@ function openManage(a: AccountView) {
           cap,
           h("small", { class: "muted" }, `Keeps the rest of its week for you. Empty uses ${weeklyThreshold}% from Settings.`),
         ),
+      a.weekly.effective !== "none" &&
+        h("label", { class: "check" }, useExpiring, "Use its weekly budget before it resets"),
       h("label", null, h("span", null, "Label"), label),
     ),
     error,
@@ -1215,6 +1224,7 @@ function openManage(a: AccountView) {
         throw new Error("Use a number from 1 to 100, or leave it empty.");
       }
       if (capValue !== a.weekly_cap) await api.setWeeklyCap(a.id, capValue);
+      if (useExpiring.checked !== a.use_expiring) await api.setUseExpiring(a.id, useExpiring.checked);
       if (label.value.trim() !== a.label) await api.renameAccount(a.id, label.value.trim());
       d.close();
       await refresh();

@@ -2011,3 +2011,19 @@ fn idle_sessions_before_work_do_not_count_as_time_used() {
             .is_none()
     );
 }
+
+/// An account the user left out of using weekly budget before it resets is used in the order
+/// like any other, even when its budget would reset unused; turned back on, it moves ahead again.
+#[test]
+fn an_account_left_out_is_not_moved_ahead_for_its_budget() {
+    let env = Env::new();
+    let (store, a, b, c) = seats_and_an_expiring_week(&env);
+    assert!(
+        store.account(c).unwrap().unwrap().use_expiring,
+        "on by default"
+    );
+    store.set_use_expiring(c, false).unwrap();
+    assert_eq!(swap::next_target(&store, Some(a)).unwrap().unwrap().id, b);
+    store.set_use_expiring(c, true).unwrap();
+    assert_eq!(swap::next_target(&store, Some(a)).unwrap().unwrap().id, c);
+}
