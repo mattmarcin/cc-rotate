@@ -2,6 +2,7 @@ mod format;
 mod herdr;
 mod process;
 mod ranking;
+mod watch;
 
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
@@ -14,7 +15,8 @@ use ccr_core::statusline::StatusInput;
 use ccr_core::store::{AccountState, kind};
 use ccr_core::swap::{SwapOutcome, SwapRequest};
 use ccr_core::{
-    Paths, Store, doctor, login, profiles, setup, snapshot, statusline, swap, time, usage_check,
+    Paths, Store, doctor, history, login, profiles, setup, snapshot, statusline, swap, time,
+    usage_check,
 };
 use clap::{Parser, Subcommand};
 
@@ -119,6 +121,25 @@ enum Command {
     WeeklyCap {
         account: String,
         value: Option<String>,
+    },
+    /// Show the status and recent events live, until you press q.
+    ///
+    /// Redraws in place every few seconds. Read-only: it never swaps, syncs logins or starts
+    /// Claude Code. Piped, it prints the status once.
+    Watch {
+        /// Seconds between redraws.
+        #[arg(long, value_name = "SECONDS", default_value_t = 2,
+              value_parser = clap::value_parser!(u64).range(1..=3600))]
+        interval: u64,
+    },
+    /// Show how much of its limits each account used, week by week.
+    Report {
+        /// How many weeks back to report.
+        #[arg(long, value_name = "N", default_value_t = 4,
+              value_parser = clap::value_parser!(u64).range(1..=52))]
+        weeks: u64,
+        #[arg(long)]
+        json: bool,
     },
     /// Show recent swaps, sign-ins and errors.
     Events {
@@ -429,6 +450,10 @@ fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> 
         Command::WeeklyCap { account, value } => {
             ranking::weekly_cap(store, &account, value.as_deref())?
         }
+        Command::Watch { interval } => {
+            watch::run(store, paths, Duration::from_secs(interval))?;
+        }
+        Command::Report { weeks, json } => report_cmd(store, weeks as usize, json)?,
         Command::Events { limit, json } => {
             let events = store.events(limit)?;
             if json {
@@ -576,6 +601,28 @@ fn check_cmd(store: &Store, paths: &Paths, references: &[String], json: bool) ->
     }
     if json {
         println!("{}", serde_json::to_string_pretty(&results)?);
+    }
+    Ok(())
+}
+
+/// `report [--weeks N] [--json]`: read-only, like `watch`.
+fn report_cmd(store: &Store, weeks: usize, json: bool) -> Result<()> {
+    let now = time::now_ms();
+    let bounds = history::local_weeks(now / 1000, weeks);
+    let histories = history::report(store, now, &bounds)?;
+    if json {
+        let mut rows = Vec::with_capacity(histories.len());
+        for h in &histories {
+            let mut row = serde_json::to_value(h)?;
+            row["summary"] = format::report_summary(h, weeks).into();
+            rows.push(row);
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "weeks": weeks, "accounts": rows }))?
+        );
+    } else {
+        print!("{}", format::report(&histories, weeks));
     }
     Ok(())
 }
