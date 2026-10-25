@@ -274,8 +274,10 @@ impl Stop {
         }
     }
 
-    /// Once the terminal is restored: stop catching the signals, and end the process the way
-    /// the one that arrived would have (so `timeout` and shells see the signal, not a normal exit).
+    /// Once the terminal is restored: end the process the way the signal that arrived would have
+    /// (so `timeout` and shells see the signal, not a normal exit). Unregistering leaves the three
+    /// signals ignored, since signal-hook doesn't put the default action back; that's fine, as
+    /// `watch` is about to exit either way.
     fn finish(self) {
         let requested = self.requested();
         drop(self);
@@ -430,11 +432,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_termination_signal_quits() {
-        use signal_hook::consts::SIGTERM;
+        // SIGQUIT rather than SIGTERM: unregistering leaves the signal ignored for the rest of
+        // the test run, and a test runner may still need SIGTERM to stop this process.
+        use signal_hook::consts::SIGQUIT;
         let stop = Stop::register().unwrap();
         assert_eq!(stop.requested(), None);
-        signal_hook::low_level::raise(SIGTERM).unwrap();
-        assert_eq!(stop.requested(), Some(SIGTERM), "caught, not fatal");
+        signal_hook::low_level::raise(SIGQUIT).unwrap();
+        assert_eq!(stop.requested(), Some(SIGQUIT), "caught, not fatal");
         assert_eq!(wait(Duration::from_secs(30), &stop).unwrap(), Wake::Quit);
         // Dropping it (rather than `finish`) unregisters without ending the test process.
         drop(stop);
