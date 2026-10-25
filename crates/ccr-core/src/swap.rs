@@ -253,6 +253,9 @@ fn unsure(store: &Store, pending: &PendingSwap, raw: &str) -> Result<Settle> {
 
 /// A login in the profile that could not be identified yet (JSON `Unidentified`).
 pub const META_LOGIN_UNIDENTIFIED: &str = "login_unidentified";
+/// Set by the write-back while a changed login waits to be identified (its change marker), so
+/// the app's frequent `statusline::needs_settling` reads the store, not the credentials.
+pub(crate) const META_LOGIN_TO_IDENTIFY: &str = "login_to_identify";
 /// How long a changed login may stay unidentified (no swap runs meanwhile) before it is stored
 /// as the active account's without Claude Code's word, as before logins were identified.
 pub const UNIDENTIFIED_FOR_AT_MOST_MS: i64 = 10 * 60_000;
@@ -278,22 +281,18 @@ pub(crate) struct ChangedLogin {
 /// `.claude.json` cannot tell apart after a swap (F14). `None` when there is nothing to identify,
 /// or logins are not identified (`usage_check::identifies_logins`).
 pub(crate) fn changed_login(store: &Store, paths: &Paths) -> Result<Option<ChangedLogin>> {
-    if !usage_check::identifies_logins(store, paths)?
-        || pending_swap(store)?.is_some()
-        || store.meta(META_PROFILE_FOREIGN)?.as_deref() == Some("1")
-    {
+    if pending_swap(store)?.is_some() || store.meta(META_PROFILE_FOREIGN)?.as_deref() == Some("1") {
         return Ok(None);
     }
     let Some(active) = store.active_account()? else {
         return Ok(None);
     };
-    // The change marker first: it is all the app's frequent calls read while nothing changed.
     let creds = paths.credentials();
     let Some(marker) = creds.change_marker()? else {
         return Ok(None);
     };
     if store.meta(META_CRED_SEEN)?.as_deref() == Some(marker.as_str())
-        || !creds.complete().unwrap_or(false)
+        || !usage_check::identifies_logins(store, paths)?
     {
         return Ok(None);
     }
@@ -333,6 +332,7 @@ pub(crate) fn changed_login(store: &Store, paths: &Paths) -> Result<Option<Chang
 pub fn identify_changed_login(store: &Store, paths: &Paths) -> Result<Settle> {
     let Some(changed) = changed_login(store, paths)? else {
         store.delete_meta(META_LOGIN_UNIDENTIFIED)?;
+        store.delete_meta(META_LOGIN_TO_IDENTIFY)?;
         return Ok(Settle::Nothing);
     };
     let who = usage_check::identify_profile_login(store, paths)?;
@@ -355,14 +355,14 @@ pub fn identify_changed_login(store: &Store, paths: &Paths) -> Result<Settle> {
     let verdict = match who {
         Some(who) => match who.is(&changed.active) {
             Some(true) => Verdict::Own,
-            // Nothing to compare the active account with: stored as before.
-            None => Verdict::Own,
-            Some(false) => match store
+            active_is => match store
                 .accounts()?
                 .into_iter()
-                .find(|a| who.is(a) == Some(true))
+                .find(|a| a.id != changed.active.id && who.is(a) == Some(true))
             {
                 Some(account) => Verdict::Adopt(account),
+                // Nothing to compare the active account with: stored as before.
+                None if active_is.is_none() => Verdict::Own,
                 None => Verdict::Foreign(who.uuid),
             },
         },
@@ -402,6 +402,7 @@ pub fn identify_changed_login(store: &Store, paths: &Paths) -> Result<Settle> {
             }
         }
         s.set_meta(META_CRED_SEEN, &changed.marker)?;
+        s.delete_meta(META_LOGIN_TO_IDENTIFY)?;
         s.delete_meta(META_LOGIN_UNIDENTIFIED)
     })?;
     Ok(Settle::Settled)
@@ -1123,6 +1124,23 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
     // A login of an account outside the pool (a `/login` in the profile) is never stored as the
     // active account's: it keeps the login it has stored.
     let foreign = store.meta(META_PROFILE_FOREIGN)?.as_deref() == Some("1");
+    // The login identified above may have changed since, while this swap checked accounts (a
+    // renewal, or a `/login`): identified first, by the next swap request.
+    if let (Some(account), Some(oauth)) = (&active, &previous) {
+        let fp = credfile::oauth_fingerprint(oauth);
+        if !foreign
+            && !credfile::is_dead(oauth)
+            && fp.is_some()
+            && fp != store.credential_meta(account.id)?.map(|m| m.refresh_fp)
+            && usage_check::identifies_logins(store, paths)?
+        {
+            return skip(
+                store,
+                req,
+                "the login in the profile changed during the swap, and is identified first",
+            );
+        }
+    }
     if let Some(account) = active.as_ref().filter(|_| !foreign) {
         match &previous {
             Some(oauth) if !credfile::is_dead(oauth) => {
