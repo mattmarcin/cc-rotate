@@ -232,7 +232,7 @@ function renderTop() {
         {
           class: "btn",
           disabled: !snap!.pool.eligible,
-          title: snap!.pool.eligible ? "Swap to the account with the most room" : "No other account is ready",
+          title: snap!.pool.eligible ? "Swap to the next account in line" : "No other account is ready",
           onclick: () =>
             act(
               () => api.swapNow(null),
@@ -350,7 +350,7 @@ function renderOverview() {
             : !a.last_sample_at
               ? "No reading"
               : noWeekly(a)
-                ? `${pct(tankLeft)} of 5h`
+                ? `5h ${pct(tankLeft)} left`
                 : `${pct(tankLeft)} left`;
       return h(
         "div",
@@ -1105,7 +1105,7 @@ function openManage(a: AccountView) {
     h(
       "div",
       { class: "fields" },
-      h("label", null, h("span", null, "Weekly limit"), weekly, h("small", { class: "muted" }, "Accounts without one are used first. cc-rotate detects it from the usage Claude Code reports.")),
+      h("label", null, h("span", null, "Weekly limit"), weekly, h("small", { class: "muted" }, "Detected from the usage Claude Code reports.")),
       h("label", null, h("span", null, "Label"), label),
     ),
     error,
@@ -1163,7 +1163,7 @@ async function openHealth() {
     const field = (key: string, text: string, value: number, hint: string, min: number, max: number) => {
       const input = h("input", { type: "number", value: String(value), min, max, step: 1 });
       input.addEventListener("change", () =>
-        api.setSetting(key, input.value).then(() => (say(`${text} saved`), refresh())).catch((e) => say(String(e), "error")),
+        api.setSetting(key, input.value).then(() => (say("Saved"), refresh())).catch((e) => say(String(e), "error")),
       );
       return h("label", null, h("span", null, text), input, h("small", { class: "muted" }, hint));
     };

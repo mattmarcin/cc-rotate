@@ -371,6 +371,7 @@ button {
   margin-top: -5px;
   font-size: 12px;
   color: var(--muted);
+  white-space: nowrap;
 }
 
 .cell.dead .cell-sub {

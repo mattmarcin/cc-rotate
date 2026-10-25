@@ -228,11 +228,11 @@ pub fn next(snap: &Snapshot, explain: bool) -> String {
     let s = &snap.settings;
     let _ = writeln!(
         out,
-        "\n{DIM}Order: {} first, then your order, then the most room.{RESET}",
+        "\n{DIM}Order: {}{RESET}",
         if s.prefer_no_weekly_limit {
-            "accounts without a weekly limit"
+            "accounts without a weekly limit first, then your order, then the most room."
         } else {
-            "your order"
+            "your order, then the most room."
         }
     );
     out

@@ -350,7 +350,7 @@ fn usage_checks_check(store: &Store, accounts: &[Account]) -> Check {
         return check(
             name,
             Status::Ok,
-            "off; accounts not in use are only read from the status line and your other profiles",
+            "Off. Accounts not in use only get usage from your other Claude Code profiles.",
         );
     }
     if let Ok(Some(reason)) = usage_check::blocked(store) {
@@ -358,7 +358,7 @@ fn usage_checks_check(store: &Store, accounts: &[Account]) -> Check {
             name,
             Status::Warn,
             format!(
-                "stopped: {reason}; after updating Claude Code, turn them on again with `cc-rotate-ctl config usage_checks true`"
+                "Stopped: {reason}. After updating Claude Code, turn usage checks off and on again in Settings, or run `cc-rotate-ctl config usage_checks true`."
             ),
         );
     }
@@ -432,7 +432,7 @@ fn credential_storage_check(paths: &Paths) -> Check {
             name,
             Status::Ok,
             format!(
-                "{} (macOS support is experimental; a swap reaches running sessions within about 30 seconds)",
+                "{}. Swaps reach running sessions within about 30 seconds.",
                 creds.describe(Location::Keychain)
             ),
         ),
