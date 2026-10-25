@@ -3,7 +3,9 @@
 //! The last hour of readings gives the pace, as a multiple of each account's usual pace (so it
 //! carries across swaps and plans of different sizes). The pool is then played forward in short
 //! steps the way rotation would run it: the account in use fills its windows, a limit hands over
-//! to the account the scheduler would pick, and windows reset when they reset. The first moment
+//! to the account the scheduler would pick, an account with a weekly limit gives way to one
+//! without that is ready (`scheduler::switch_back_target`), and windows reset when they reset.
+//! The first moment
 //! no account is left is when the pool runs out, and the earliest reset after it is when an
 //! account frees up again.
 
@@ -183,13 +185,18 @@ pub fn forecast(
                 start_window(c, t, 0.0, policy);
             }
         }
-        if current.is_none_or(|i| pool[i].blocking().is_some()) {
+        let blocked = current.is_none_or(|i| pool[i].blocking().is_some());
+        let next = if blocked {
+            scheduler::pick(&pool, policy, None, t)
+        } else {
+            scheduler::switch_back_target(&pool, policy, t)
+        }
+        .map(|c| c.account.id);
+        if blocked || next.is_some() {
             if let Some(i) = current {
                 pool[i].account.state = AccountState::Parked;
             }
-            current = scheduler::pick(&pool, policy, None, t)
-                .map(|c| c.account.id)
-                .and_then(|id| pool.iter().position(|c| c.account.id == id));
+            current = next.and_then(|id| pool.iter().position(|c| c.account.id == id));
             match current {
                 Some(i) => pool[i].account.state = AccountState::Active,
                 None => {
@@ -286,6 +293,7 @@ mod tests {
             order: id as usize,
             held_back: false,
             expiring: None,
+            stop_hold_until: None,
         }
     }
 
@@ -343,6 +351,33 @@ mod tests {
         // Kept running, s2's window started at once instead of when s2 was first used.
         assert_eq!(kept.free_again_at, Some(NOW + 5 * 3600));
         assert_eq!(used.free_again_at, Some(NOW + STEP_S + 5 * 3600));
+    }
+
+    #[test]
+    fn a_seat_that_is_ready_takes_over_from_an_account_with_a_weekly_limit() {
+        // s1 has a weekly limit and is near it; s2, a seat, is ready. Each 5-hour window lasts
+        // an hour at this pace.
+        let mut s1 = seat(1, AccountState::Active, 0.0, None);
+        s1.weekly_limit = WeeklyLimit::Has;
+        let weekly = Sample {
+            ts: NOW * 1000,
+            account_id: 1,
+            profile: "rotate".into(),
+            session_id: None,
+            model: None,
+            windows: vec![SampleWindow {
+                name: "seven_day".into(),
+                pct: 90.0,
+                resets_at: Some(NOW + 3 * 86_400),
+            }],
+        };
+        s1.windows = window_usage(Some(&weekly), NOW, T, None);
+        let pool = [s1, seat(2, AccountState::Parked, 0.0, None)];
+        let f = forecast(&pool, POLICY, &same_pace(), 98.0 / 20.0, NOW);
+        assert!(f.runs_out_at.is_some(), "{f:?}");
+        // s2 took over at once, so its window resets 5 hours from now, not 5 hours from when s1
+        // reached its weekly limit.
+        assert_eq!(f.free_again_at, Some(NOW + 5 * 3600), "{f:?}");
     }
 
     #[test]

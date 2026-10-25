@@ -11,6 +11,7 @@ import {
   type EventRow,
   type ExtraUsage,
   type LoginProgress,
+  type Settings,
   type Snapshot,
   type WeeklyLimitSetting,
   type WindowUsage,
@@ -725,6 +726,27 @@ function gripKeys(e: KeyboardEvent, a: AccountView) {
   moveBy(a, delta);
 }
 
+/** The account table's note: the order accounts are used in, as the settings make it. */
+function orderNote(s: Settings): string[] {
+  const groups = [
+    s.prefer_no_weekly_limit ? "Accounts without a weekly limit first" : null,
+    s.use_expiring_weekly ? "an account whose weekly budget would go unused" : null,
+  ].filter((g): g is string => g !== null);
+  const within = s.strict_order
+    ? "top to bottom"
+    : "the account in use stays until a limit, then accounts with a running 5-hour window, then top to bottom";
+  const note = [];
+  if (groups.length > 0) {
+    const first = groups.join(", then ");
+    note.push(`${first[0].toUpperCase()}${first.slice(1)}${s.prefer_no_weekly_limit ? "" : " first"}.`);
+    note.push(`Within each group, ${within}.`);
+  } else {
+    note.push(`${within[0].toUpperCase()}${within.slice(1)}.`);
+  }
+  if (s.prefer_no_weekly_limit) note.push("An account with a weekly limit gives way as soon as one without is ready.");
+  return note;
+}
+
 function renderAccounts() {
   if (state.dragging) return;
   const snap = state.snap;
@@ -824,14 +846,7 @@ function renderAccounts() {
       "p",
       { class: "muted table-note" },
       [
-        snap.settings.strict_order
-          ? snap.settings.prefer_no_weekly_limit
-            ? "Used top to bottom, accounts without a weekly limit first."
-            : "Used top to bottom."
-          : snap.settings.prefer_no_weekly_limit
-            ? "Accounts without a weekly limit first. Within each group, the account in use stays until a limit, then accounts whose 5-hour window is already running, then top to bottom."
-            : "The account in use stays until a limit, then accounts whose 5-hour window is already running, then top to bottom.",
-        snap.settings.use_expiring_weekly ? "An account whose weekly budget would go unused goes first." : null,
+        ...orderNote(snap.settings),
         "Drag to reorder.",
       ]
         .filter(Boolean)
@@ -1466,7 +1481,9 @@ async function openSettings() {
     strictBox.addEventListener("change", () =>
       api
         .setSetting("strict_order", String(strictBox.checked))
-        .then(() => (say(strictBox.checked ? "Accounts higher in your order are used again as soon as they're ready" : "The account in use is kept until a limit"), refresh()))
+        .then(() =>
+          (say(strictBox.checked ? "The next account is picked by your order alone" : "The next account is one whose 5-hour window is already running, when one is"), refresh()),
+        )
         .catch((e) => say(String(e), "error")),
     );
     const avoidPaid = h("input", { type: "checkbox", id: "avoid-extra-usage", checked: snap.settings.avoid_extra_usage });
@@ -1495,16 +1512,13 @@ async function openSettings() {
       field("swap_threshold_5h", "Swap at 5-hour usage (%)", snap.settings.swap_threshold_5h, "Swap before a 5-hour limit is reached.", 1, 100),
       field("swap_threshold_7d", "Swap at weekly usage (%)", snap.settings.swap_threshold_7d, "Also applies to weekly limits on a single model.", 1, 100),
       field("swap_cooldown_s", "Minimum time between swaps (seconds)", snap.settings.swap_cooldown_s, "Applies to swaps at a limit and swaps back.", 0, 3600),
-      field(
-        "switch_back_dwell_s",
-        "Swap back after (seconds)",
-        snap.settings.switch_back_dwell_s,
-        "Minimum time on an account before swapping back to a better one.",
-        0,
-        86400,
+      h(
+        "label",
+        { class: "check", for: "prefer-no-weekly" },
+        prefer,
+        "Use accounts without a weekly limit first, and swap back to one as soon as it's ready",
       ),
-      h("label", { class: "check", for: "prefer-no-weekly" }, prefer, "Use accounts without a weekly limit first"),
-      h("label", { class: "check", for: "strict-order" }, strictBox, "Always go back to accounts higher in my order"),
+      h("label", { class: "check", for: "strict-order" }, strictBox, "Pick the next account by my order alone"),
       h("label", { class: "check", for: "use-expiring" }, expiringBox, "Use weekly budget before it resets"),
       h(
         "label",

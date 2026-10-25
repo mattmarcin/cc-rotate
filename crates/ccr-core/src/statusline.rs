@@ -403,17 +403,15 @@ fn confirm_due(store: &Store, sample: &Sample, active_id: i64, now_ms: i64) -> R
     })
 }
 
-/// The throttling state a decision needs: the last swap, the last request, how long the active
-/// account has been active, and whether it was already over a threshold when it became active.
+/// The throttling state a decision needs: the last swap, the last request, and whether the
+/// active account was already over a threshold when it became active.
 fn timing(store: &Store, active_id: i64, now_ms: i64) -> Result<Timing> {
     let settings = store.settings()?;
     let mut timing = Timing {
         now_ms,
         last_swap_ms: store.meta_i64(META_LAST_SWAP_AT)?.unwrap_or(0),
-        active_since_ms: swap::active_since(store)?,
         last_request_ms: store.meta_i64(META_SWAP_REQUESTED_AT)?.unwrap_or(0),
         cooldown_ms: settings.swap_cooldown_s * 1000,
-        dwell_ms: settings.switch_back_dwell_s * 1000,
         arrived_over_limit: false,
     };
     // Only matters during the cooldown, which keeps the readings to look at few.
@@ -546,7 +544,8 @@ fn is_stale_reading(store: &Store, sample: &Sample, now_ms: i64) -> Result<bool>
 /// does (the desktop app's watcher, `cc-rotate-ctl status`). It also records the usage the
 /// user's other profiles read (`profile_usage`), which the tick leaves out to stay within its
 /// time budget. Returns a swap request when the profile's login turned out to be dead, or when
-/// a better ranked account is usable again (the same switch-back rule and throttling as a tick,
+/// an account without a weekly limit is ready to switch back to (the same rule and throttling
+/// as a tick,
 /// but no threshold triggers, since those need a live reading).
 pub fn sync(store: &Store, paths: &Paths) -> Result<Option<SwapRequest>> {
     sync_at(store, paths, crate::time::now_ms())

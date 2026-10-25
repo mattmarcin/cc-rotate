@@ -286,24 +286,46 @@ pub fn next(snap: &Snapshot, explain: bool) -> String {
         );
     }
     let s = &snap.settings;
-    let mut order: Vec<&str> = Vec::new();
-    if s.use_expiring_weekly {
-        order.push("accounts whose weekly budget would go unused");
-    }
-    if s.prefer_no_weekly_limit {
-        order.push("accounts without a weekly limit");
-    }
-    if !s.strict_order {
-        order.push("the account in use");
-        order.push("accounts whose 5-hour window is already running, the soonest reset first");
-    }
-    order.push("your order");
-    if !s.strict_order {
-        order.push("running windows close to a limit");
-    }
-    order.push("the most room");
-    let _ = writeln!(out, "\n{DIM}Order: {}.{RESET}", order.join(", then "));
+    let order = pick_order(
+        s.prefer_no_weekly_limit,
+        s.use_expiring_weekly,
+        s.strict_order,
+    );
+    let _ = writeln!(out, "\n{DIM}Order: {order}{RESET}");
     out
+}
+
+/// The order picks follow, as the settings make it: the groups, then the order within each.
+fn pick_order(prefer_no_weekly_limit: bool, use_expiring_weekly: bool, strict: bool) -> String {
+    let mut groups: Vec<&str> = Vec::new();
+    if prefer_no_weekly_limit {
+        groups.push("accounts without a weekly limit");
+    }
+    if use_expiring_weekly {
+        groups.push("accounts whose weekly budget would go unused");
+    }
+    if prefer_no_weekly_limit {
+        groups.push("accounts whose weekly limit is not known yet");
+        groups.push("accounts with a weekly limit");
+    } else if !groups.is_empty() {
+        groups.push("every other account");
+    }
+    let mut within: Vec<&str> = Vec::new();
+    if !strict {
+        within.push("the account in use");
+        within.push("accounts whose 5-hour window is already running, the soonest reset first");
+    }
+    within.push("your order");
+    if !strict {
+        within.push("running windows close to a limit");
+    }
+    within.push("the most room");
+    let within = within.join(", then ");
+    if groups.is_empty() {
+        format!("{within}.")
+    } else {
+        format!("{}. Within each: {within}.", groups.join(", then "))
+    }
 }
 
 pub fn events(store: &Store, events: &[Event]) -> String {
@@ -572,6 +594,27 @@ pub fn doctor(checks: &[Check]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pick_order_names_the_groups_then_the_order_within_each() {
+        assert_eq!(
+            pick_order(true, true, false),
+            "accounts without a weekly limit, then accounts whose weekly budget would go unused, \
+             then accounts whose weekly limit is not known yet, then accounts with a weekly limit. \
+             Within each: the account in use, then accounts whose 5-hour window is already \
+             running, the soonest reset first, then your order, then running windows close to a \
+             limit, then the most room."
+        );
+        assert_eq!(
+            pick_order(false, true, true),
+            "accounts whose weekly budget would go unused, then every other account. Within each: \
+             your order, then the most room."
+        );
+        assert_eq!(
+            pick_order(false, false, true),
+            "your order, then the most room."
+        );
+    }
 
     /// Every detail starts in the same column, however long the longest check's name is.
     #[test]

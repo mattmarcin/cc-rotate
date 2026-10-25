@@ -554,6 +554,12 @@ pub const META_OWN_RESETS_PREFIX: &str = "own_resets:";
 /// Window after a swap during which readings carrying the reset times of an account just left
 /// are treated as stale readings of that account (sessions that have not made a request yet).
 pub const STALE_SAMPLE_GUARD_MS: i64 = 120_000;
+/// Prefix of the meta keys holding, per account, when a swap left it because a turn stopped at a
+/// usage limit (epoch ms). See `stop_hold_until`.
+pub const META_LEFT_AT_STOP_PREFIX: &str = "left_at_stop:";
+/// How long an account left at a stop is not switched back to without a newer reading of it:
+/// every 5-hour window has reset by then.
+pub const LEFT_AT_STOP_HOLD_MS: i64 = 5 * 3600 * 1000;
 /// When the active account became active: a swap, or a login adopted from the profile.
 pub const META_ACTIVE_SINCE: &str = "active_since";
 /// The model id the rotation profile's sessions last reported, which decides whether a window
@@ -612,12 +618,16 @@ pub fn load_pool(store: &Store, now_s: i64) -> Result<(Vec<Candidate>, Policy)> 
             .position(|&p| p == account.position)
             .unwrap_or_default();
         let sample = store.last_sample(account.id)?;
-        let windows = scheduler::window_usage(
+        let thresholds = policy.thresholds.for_account(&account);
+        let windows = scheduler::window_usage(sample.as_ref(), now_s, thresholds, model.as_deref());
+        let stop_hold_until = stop_hold_until(
+            store,
+            account.id,
             sample.as_ref(),
-            now_s,
-            policy.thresholds.for_account(&account),
+            thresholds,
             model.as_deref(),
-        );
+            now_s * 1000,
+        )?;
         let detected = detect_weekly_limit(store, account.id, now_s)?;
         pool.push(Candidate {
             weekly_limit: scheduler::weekly_limit(account.weekly_limit, detected),
@@ -626,6 +636,7 @@ pub fn load_pool(store: &Store, now_s: i64) -> Result<(Vec<Candidate>, Policy)> 
             order,
             held_back: usage_check::state(store, account.id)?.held_back,
             expiring: None,
+            stop_hold_until,
             account,
         });
     }
@@ -659,6 +670,84 @@ pub fn detect_weekly_limit(store: &Store, account_id: i64, now_s: i64) -> Result
     Ok(scheduler::detect_weekly_limit(
         WeeklyEvidence::from_history(&names, &session_resets),
     ))
+}
+
+/// Until when (epoch seconds) the account's room is not trusted, if a swap left it within
+/// `LEFT_AT_STOP_HOLD_MS` because a turn stopped at a usage limit (`Reason::StopFailure`).
+///
+/// Usually the reading the account was left on shows the limit, and its thresholds and reset
+/// time keep it out by themselves: no hold. When it does not (a limit the status line does not
+/// report, or a stop reading that never came), its room is out of date, and switching back to
+/// it would only stop the next turn again. A later reading that differs from that one (a usage
+/// check after a reset, say) is news and ends the hold; one with the same numbers is not.
+/// `latest` is the account's latest reading, `thresholds` and `model` what applies to it.
+pub fn stop_hold_until(
+    store: &Store,
+    account_id: i64,
+    latest: Option<&Sample>,
+    thresholds: scheduler::Thresholds,
+    model: Option<&str>,
+    now_ms: i64,
+) -> Result<Option<i64>> {
+    let Some(left) = store.meta_i64(&left_at_stop_key(account_id))? else {
+        return Ok(None);
+    };
+    let until_ms = left + LEFT_AT_STOP_HOLD_MS;
+    if now_ms >= until_ms {
+        return Ok(None);
+    }
+    let at_stop = match latest {
+        Some(s) if s.ts <= left => Some(s.clone()),
+        _ => store.last_sample_until(account_id, left)?,
+    };
+    if let Some(s) = &at_stop {
+        // As the session that sent it saw it: a window scoped to its model applied to it.
+        let model = s.model.as_deref().or(model);
+        let shown = scheduler::window_usage(Some(s), s.ts / 1000, thresholds, model)
+            .iter()
+            .any(|w| w.blocking());
+        if shown {
+            return Ok(None);
+        }
+    }
+    let news = match (latest, &at_stop) {
+        (Some(l), _) if l.ts <= left => false,
+        (Some(l), Some(s)) => {
+            let reset_since = s
+                .windows
+                .iter()
+                .any(|w| w.resets_at.is_some_and(|r| r * 1000 <= l.ts));
+            reset_since || !same_numbers(l, s)
+        }
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
+    Ok((!news).then_some(until_ms / 1000))
+}
+
+/// Two readings say the same of the windows both have: the same usage within a point and the
+/// same reset time. The status line and a usage check may round usage and reset times
+/// differently, and one may report windows the other does not.
+fn same_numbers(a: &Sample, b: &Sample) -> bool {
+    let mut shared = 0;
+    for w in &a.windows {
+        let Some(o) = b.window(&w.name) else {
+            continue;
+        };
+        shared += 1;
+        let resets = match (w.resets_at, o.resets_at) {
+            (Some(x), Some(y)) => same_reset(x, y),
+            (x, y) => x == y,
+        };
+        if !resets || (w.pct - o.pct).abs() >= 1.0 {
+            return false;
+        }
+    }
+    shared > 0
+}
+
+pub fn left_at_stop_key(account_id: i64) -> String {
+    format!("{META_LEFT_AT_STOP_PREFIX}{account_id}")
 }
 
 /// The account the scheduler would pick right now, excluding `exclude`.
@@ -959,12 +1048,6 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
             }
         }
     }
-    if req.reason == Reason::PreferredAvailable
-        && now - active_since(store)? < settings.switch_back_dwell_s * 1000
-    {
-        return skip(store, req, "too soon to swap back");
-    }
-
     // What the user's other profiles read since, so an account an agent used up there is not
     // picked. Best effort: an unreadable profile must not stop the swap.
     let _ = crate::profile_usage::import(store, paths, now);
@@ -1120,10 +1203,14 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
     let outgoing = pool.iter().find(|c| Some(c.account.id) == active_id);
     let why = match (req.reason, outgoing) {
         (Reason::PreferredAvailable, Some(from)) => Some(format!(
-            "{} ranks above {}: {}",
+            "{} has no weekly limit, and {} {}",
             target.label,
             from.account.label,
-            reason_for(target.id).unwrap_or_default()
+            if from.weekly_limit == WeeklyLimit::Has {
+                "has one"
+            } else {
+                "may have one"
+            }
         )),
         _ => None,
     };
@@ -1240,6 +1327,11 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
     let committed = store.immediate(|s| {
         if let Some(account) = &active {
             s.set_state(account.id, outgoing_state)?;
+            if req.reason == Reason::StopFailure {
+                // At the commit: a reading of the account taken while it was still in use,
+                // during the swap's lock waits, is older and so not news (`stop_hold_until`).
+                s.set_meta(&left_at_stop_key(account.id), time::now_ms())?;
+            }
         }
         s.set_state(target.id, AccountState::Active)?;
         if let Some(reset) = promoted_until {
@@ -1407,11 +1499,27 @@ fn choose(
             match scheduler::switch_back_target(pool, policy, now_s) {
                 Some(c) => c.account.clone(),
                 None => {
-                    return Ok(Choice::Done(skip(
-                        store,
-                        req,
-                        "no better ranked account is ready",
-                    )?));
+                    let in_use = pool
+                        .iter()
+                        .find(|c| Some(c.account.id) == active.map(|a| a.id));
+                    let held = pool.iter().any(|c| {
+                        c.eligible()
+                            && c.weekly_limit == WeeklyLimit::None
+                            && c.has_margin()
+                            && c.on_stop_hold(now_s)
+                    });
+                    let why = if !policy.prefer_no_weekly_limit {
+                        "accounts without a weekly limit no longer go first"
+                    } else if in_use.is_some_and(|c| c.weekly_limit == WeeklyLimit::None) {
+                        "the account in use has no weekly limit"
+                    } else if in_use.is_some_and(|c| c.blocking().is_some()) {
+                        "the account in use is at a limit"
+                    } else if held {
+                        "every ready account without a weekly limit had a session stop at a limit its usage didn't show"
+                    } else {
+                        "no account without a weekly limit is ready to swap back to"
+                    };
+                    return Ok(Choice::Done(skip(store, req, why)?));
                 }
             }
         }

@@ -6,21 +6,22 @@
 //! models or on one model family. An account is ineligible while any window that applies to the
 //! model in use is at or above its threshold.
 //!
-//! Ranking, best first:
-//! 1. Accounts whose weekly budget would otherwise reset unused (`budget::expiring`), the
+//! Ranking, best first (`Policy::tier`):
+//! 1. With `prefer_no_weekly_limit` on: accounts without a weekly limit.
+//! 2. Accounts whose weekly budget would otherwise reset unused (`budget::expiring`), the
 //!    soonest reset first.
-//! 2. With `prefer_no_weekly_limit` on: accounts without a weekly limit, then accounts whose
-//!    weekly limit is not known yet, then accounts with one.
-//! 3. Within those (`Policy::place`): the account in use, then accounts whose 5-hour window is
+//! 3. With `prefer_no_weekly_limit` on: accounts whose weekly limit is not known yet, then
+//!    accounts with one.
+//! 4. Within a tier (`Policy::place`): the account in use, then accounts whose 5-hour window is
 //!    already running with `RUNNING_MARGIN` points to spare, the soonest reset first, then the
 //!    user's order (`position`), then running 5-hour windows closer to their limit. With
 //!    `strict_order` on, the user's order alone.
-//! 4. The most room before a threshold, then the label.
+//! 5. The most room before a threshold, then the label.
 //!
-//! Only the first two (and the order, with `strict_order`) decide whether a better account is
-//! worth switching back to; the rest only order picks. So the account in use is kept until a
-//! limit while no better tier is ready: what is left in a 5-hour window is lost when it
-//! resets, so leaving a running window for a fresh one only adds swaps. An account's weekly cap
+//! The ranking only orders picks. The account in use is kept until a limit, since what is left
+//! in a 5-hour window is lost when it resets, so leaving a running window for a fresh one only
+//! adds swaps. The one exception is `switch_back_target`: an account that may have a weekly
+//! limit gives way to one without as soon as one is ready. An account's weekly cap
 //! (`Account::weekly_cap`) lowers its weekly thresholds.
 
 use std::cmp::Ordering;
@@ -44,8 +45,8 @@ pub fn model_family(model: &str) -> Option<&'static str> {
     MODEL_FAMILIES.iter().copied().find(|f| model.contains(f))
 }
 
-/// A better ranked account is only switched back to while every window that applies is at
-/// least this many points below its threshold, so it is not left again a moment later.
+/// An account without a weekly limit is only switched back to while every window that applies
+/// is at least this many points below its threshold, so it is not left again a moment later.
 pub const SWITCH_BACK_MARGIN: f64 = 5.0;
 
 /// A running 5-hour window goes before fresh accounts only while it is at least this many
@@ -322,7 +323,8 @@ pub enum Reason {
     Weekly,
     /// A window of a kind cc-rotate does not know reached its threshold.
     OtherLimit,
-    /// A better ranked account is usable again (switch back).
+    /// An account without a weekly limit is usable while one with a weekly limit is in use
+    /// (switch back, `switch_back_target`).
     PreferredAvailable,
     StopFailure,
     DeadLogin,
@@ -389,9 +391,20 @@ pub struct Candidate {
     pub held_back: bool,
     /// Its weekly budget would reset unused unless it is used now (`budget::expiring`).
     pub expiring: Option<crate::budget::Expiring>,
+    /// Until when (epoch seconds) its room is not trusted: a turn stopped on it at a usage limit
+    /// that its readings did not show, and no different reading has come since
+    /// (`swap::stop_hold_until`). Until then it is not switched back to, and it is picked last.
+    pub stop_hold_until: Option<i64>,
 }
 
 impl Candidate {
+    /// Its room is not trusted at `now_s` (`stop_hold_until`). Never the account in use, which
+    /// is picked as a last resort when it is.
+    pub fn on_stop_hold(&self, now_s: i64) -> bool {
+        self.account.state != AccountState::Active
+            && self.stop_hold_until.is_some_and(|until| now_s < until)
+    }
+
     /// The window that keeps this account from being used, if any: a weekly one before a
     /// 5-hour one, and of those the one that resets last.
     pub fn blocking(&self) -> Option<&WindowUsage> {
@@ -466,7 +479,7 @@ impl Candidate {
         self.account.state == AccountState::Parked && self.blocking().is_none() && !self.held_back
     }
 
-    fn has_margin(&self) -> bool {
+    pub fn has_margin(&self) -> bool {
         self.windows
             .iter()
             .filter(|w| w.applies)
@@ -480,9 +493,8 @@ pub struct Policy {
     pub prefer_no_weekly_limit: bool,
     /// Accounts whose weekly budget would reset unused come first (`Candidate::expiring`).
     pub use_expiring_weekly: bool,
-    /// Go by the user's order alone within a tier, switching back to an account higher in it
-    /// as soon as it is ready, instead of keeping the account in use and using running 5-hour
-    /// windows first.
+    /// Pick by the user's order alone within a tier, instead of keeping the account in use and
+    /// using running 5-hour windows first.
     pub strict_order: bool,
 }
 
@@ -503,31 +515,33 @@ impl Policy {
         c.expiring.as_ref().filter(|_| self.use_expiring_weekly)
     }
 
-    /// 0 for an account whose weekly budget would reset unused; then 1 for no weekly limit, 2
-    /// for not known yet, 3 for a weekly limit, all 1 when the preference is off.
+    /// 0 for no weekly limit, which always goes first, even before a weekly budget that would
+    /// reset unused; then 1 for an account whose weekly budget would reset unused, 2 for not
+    /// known yet, 3 for a weekly limit. With the preference off: 1 for a weekly budget that would
+    /// reset unused, 2 for every other account.
     pub fn tier(&self, c: &Candidate) -> u8 {
-        if self.expiring(c).is_some() {
-            return 0;
-        }
+        let expiring = self.expiring(c).is_some();
         if !self.prefer_no_weekly_limit {
-            return 1;
+            return if expiring { 1 } else { 2 };
         }
         match c.weekly_limit {
-            WeeklyLimit::None => 1,
+            WeeklyLimit::None => 0,
+            _ if expiring => 1,
             WeeklyLimit::Unknown => 2,
             WeeklyLimit::Has => 3,
         }
     }
 
-    /// The rank that decides switching back: lower is better. Room is deliberately not part
+    /// The rank of an account in the pick order: lower is better. Room is deliberately not part
     /// of it. Accounts whose weekly budget would reset unused go by their reset, the soonest
     /// first, since only one account is in use at a time. The user's order is part of it only
     /// with `strict_order`.
     pub fn rank(&self, c: &Candidate) -> (u8, i64) {
+        let tier = self.tier(c);
         match self.expiring(c) {
-            Some(e) => (0, e.resets_at),
-            None if self.strict_order => (self.tier(c), c.account.position),
-            None => (self.tier(c), 0),
+            Some(e) if tier == 1 => (tier, e.resets_at),
+            _ if self.strict_order => (tier, c.account.position),
+            _ => (tier, 0),
         }
     }
 
@@ -557,8 +571,9 @@ impl Policy {
     }
 
     fn pick_order(&self, a: &Candidate, b: &Candidate, now_s: i64) -> Ordering {
-        self.rank(a)
-            .cmp(&self.rank(b))
+        a.on_stop_hold(now_s)
+            .cmp(&b.on_stop_hold(now_s))
+            .then(self.rank(a).cmp(&self.rank(b)))
             .then(self.place(a, now_s).cmp(&self.place(b, now_s)))
             .then(b.room(self.thresholds).total_cmp(&a.room(self.thresholds)))
             .then_with(|| a.account.label.cmp(&b.account.label))
@@ -578,9 +593,13 @@ pub fn pick(
         .min_by(|a, b| policy.pick_order(a, b, now_s))
 }
 
-/// The account to switch back to: the best eligible account that ranks strictly above the
-/// active one and has `SWITCH_BACK_MARGIN` to spare. `None` while the active account is over a
-/// threshold, since the threshold trigger handles that.
+/// The account to switch back to, the only switch back there is: while an account that may have
+/// a weekly limit is in use, the best eligible account without one that has
+/// `SWITCH_BACK_MARGIN` to spare, so weekly budget is only spent while no such account can be
+/// used. Not to an account a turn just stopped on at a limit its readings do not show
+/// (`Candidate::on_stop_hold`), which would swap back and forth every cooldown. Never with
+/// `prefer_no_weekly_limit` off, and `None` while the active account is over a threshold, since
+/// the threshold trigger handles that. The account in use is otherwise kept until a limit.
 pub fn switch_back_target(
     candidates: &[Candidate],
     policy: Policy,
@@ -589,12 +608,20 @@ pub fn switch_back_target(
     let active = candidates
         .iter()
         .find(|c| c.account.state == AccountState::Active)?;
-    if active.blocking().is_some() {
+    if !policy.prefer_no_weekly_limit
+        || active.weekly_limit == WeeklyLimit::None
+        || active.blocking().is_some()
+    {
         return None;
     }
     candidates
         .iter()
-        .filter(|c| c.eligible() && policy.rank(c) < policy.rank(active) && c.has_margin())
+        .filter(|c| {
+            c.eligible()
+                && c.weekly_limit == WeeklyLimit::None
+                && c.has_margin()
+                && !c.on_stop_hold(now_s)
+        })
         .min_by(|a, b| policy.pick_order(a, b, now_s))
 }
 
@@ -614,11 +641,8 @@ pub fn threshold_trigger(active: &Candidate) -> Option<(Reason, &WindowUsage)> {
 pub struct Timing {
     pub now_ms: i64,
     pub last_swap_ms: i64,
-    /// When the active account became active.
-    pub active_since_ms: i64,
     pub last_request_ms: i64,
     pub cooldown_ms: i64,
-    pub dwell_ms: i64,
     /// Every reading of the active account since it became active had it over a threshold: it
     /// was already used up when it was picked (`swap::arrived_over_limit`).
     pub arrived_over_limit: bool,
@@ -639,10 +663,6 @@ impl Timing {
     /// cannot: the account swapped away from was itself over a threshold, or ranked lower.
     pub fn leaves_at_once(&self, reason: Reason) -> bool {
         self.arrived_over_limit && reason.is_threshold()
-    }
-
-    pub fn dwell_done(&self) -> bool {
-        self.now_ms - self.active_since_ms >= self.dwell_ms
     }
 }
 
@@ -665,7 +685,7 @@ pub fn decide(
         return (thresholds && !timing.throttled(reason)).then_some(reason);
     }
     let reason = Reason::PreferredAvailable;
-    if timing.throttled(reason) || !timing.dwell_done() {
+    if timing.throttled(reason) {
         return None;
     }
     switch_back_target(candidates, policy, timing.now_ms / 1000).map(|_| reason)
@@ -699,7 +719,13 @@ pub fn ranking(candidates: &[Candidate], policy: Policy, now_s: i64) -> Vec<Rank
 
     let mut out = Vec::with_capacity(candidates.len());
     for (i, c) in open.iter().enumerate() {
-        let key = |x: &Candidate| (policy.rank(x), policy.place(x, now_s));
+        let key = |x: &Candidate| {
+            (
+                x.on_stop_hold(now_s),
+                policy.rank(x),
+                policy.place(x, now_s),
+            )
+        };
         let tied = open
             .iter()
             .any(|o| o.account.id != c.account.id && key(o) == key(c));
@@ -724,6 +750,12 @@ pub fn ranking(candidates: &[Candidate], policy: Policy, now_s: i64) -> Vec<Rank
 }
 
 fn open_reason(c: &Candidate, policy: Policy, tied: bool, now_s: i64) -> String {
+    if let Some(until) = c.stop_hold_until.filter(|_| c.on_stop_hold(now_s)) {
+        return format!(
+            "a session stopped on it at a limit its usage didn't show, so it goes last for {} or until its usage changes",
+            time::span(until - now_s)
+        );
+    }
     if let Some(e) = policy.expiring(c) {
         return format!(
             "weekly budget expires in {} with {:.0}% left",
@@ -867,6 +899,7 @@ mod tests {
             weekly_limit: weekly,
             held_back: false,
             expiring: None,
+            stop_hold_until: None,
             account,
         }
     }
@@ -1217,82 +1250,144 @@ mod tests {
     }
 
     #[test]
-    fn switch_back_needs_a_strictly_better_rank_and_some_margin() {
+    fn the_only_switch_back_is_to_an_account_without_a_weekly_limit() {
         let timing = Timing {
             now_ms: NOW * 1000,
-            dwell_ms: 600_000,
             cooldown_ms: 120_000,
             ..Default::default()
         };
-        let active = |pos| {
+        let active = |pos, weekly| {
             cand(
                 acct(1, "active", AccountState::Active, pos),
-                WeeklyLimit::None,
+                weekly,
                 &[("five_hour", 50.0, NOW + 3600)],
             )
         };
-        let other = |pos, pct| {
+        let other = |pos, pct, weekly| {
             cand(
                 acct(2, "other", AccountState::Parked, pos),
-                WeeklyLimit::None,
+                weekly,
                 &[("five_hour", pct, NOW + 3600)],
             )
         };
-        let d = |pool: &[Candidate], t: Timing| decide(pool, STRICT, t, false, true);
-
-        assert_eq!(
-            d(&[active(2), other(1, 0.0)], timing),
-            Some(Reason::PreferredAvailable)
-        );
-        assert_eq!(
-            decide(&[active(2), other(1, 0.0)], POLICY, timing, false, true),
-            None,
-            "without strict_order, the account in use is kept within its tier"
-        );
-        assert_eq!(
-            d(&[active(1), other(1, 0.0)], timing),
-            None,
-            "equal rank never swaps for balance, however much room the other has"
-        );
-        assert_eq!(d(&[active(1), other(2, 0.0)], timing), None);
-        assert_eq!(
-            d(&[active(2), other(1, 95.0)], timing),
-            None,
-            "too close to its threshold to be worth it"
-        );
-        let early = Timing {
-            active_since_ms: timing.now_ms - 599_000,
-            ..timing
-        };
-        assert_eq!(d(&[active(2), other(1, 0.0)], early), None, "dwell");
-        let cooling = Timing {
-            last_swap_ms: timing.now_ms - 60_000,
-            ..timing
-        };
-        assert_eq!(d(&[active(2), other(1, 0.0)], cooling), None, "cooldown");
-
-        // A weekly-limited account ranks below a no-limit one even when it is first in the
-        // order, so the no-limit account is switched back to.
-        let max_active = cand(
-            acct(1, "max", AccountState::Active, 1),
-            WeeklyLimit::Has,
-            &[
-                ("five_hour", 10.0, NOW + 3600),
-                ("seven_day", 10.0, NOW + 86_400),
-            ],
-        );
+        let none = WeeklyLimit::None;
         for policy in [POLICY, STRICT] {
+            let d = |pool: &[Candidate], t: Timing| decide(pool, policy, t, false, true);
+            // Within a tier the account in use is kept, however high the other is in the order
+            // and however much room it has.
+            assert_eq!(d(&[active(2, none), other(1, 0.0, none)], timing), None);
             assert_eq!(
-                decide(
-                    &[max_active.clone(), other(9, 0.0)],
-                    policy,
-                    timing,
-                    false,
-                    true
+                d(
+                    &[active(2, WeeklyLimit::Has), other(1, 0.0, WeeklyLimit::Has)],
+                    timing
                 ),
-                Some(Reason::PreferredAvailable)
+                None
+            );
+            // An account with a weekly limit gives way to one without as soon as it is ready,
+            // with no minimum time in use, even when it is first in the order.
+            for weekly in [WeeklyLimit::Has, WeeklyLimit::Unknown] {
+                assert_eq!(
+                    d(&[active(1, weekly), other(9, 0.0, none)], timing),
+                    Some(Reason::PreferredAvailable)
+                );
+            }
+            assert_eq!(
+                d(&[active(1, WeeklyLimit::Has), other(9, 95.0, none)], timing),
+                None,
+                "too close to its threshold to be worth it"
+            );
+            let mut stopped = other(9, 0.0, none);
+            stopped.stop_hold_until = Some(NOW + 60);
+            assert_eq!(
+                d(&[active(1, WeeklyLimit::Has), stopped.clone()], timing),
+                None,
+                "a turn just stopped on it at a limit its readings do not show"
+            );
+            let later = Timing {
+                now_ms: (NOW + 60) * 1000,
+                ..timing
+            };
+            assert_eq!(
+                d(&[active(1, WeeklyLimit::Has), stopped], later),
+                Some(Reason::PreferredAvailable),
+                "the hold is over"
+            );
+            let cooling = Timing {
+                last_swap_ms: timing.now_ms - 60_000,
+                ..timing
+            };
+            assert_eq!(
+                d(&[active(1, WeeklyLimit::Has), other(9, 0.0, none)], cooling),
+                None,
+                "cooldown"
             );
         }
+        // Without the preference there is no switch back at all.
+        let off = Policy {
+            prefer_no_weekly_limit: false,
+            ..POLICY
+        };
+        assert_eq!(
+            decide(
+                &[active(1, WeeklyLimit::Has), other(9, 0.0, none)],
+                off,
+                timing,
+                false,
+                true
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn no_weekly_limit_goes_before_a_weekly_budget_that_would_reset_unused() {
+        let mut expiring = cand(
+            acct(1, "max", AccountState::Parked, 1),
+            WeeklyLimit::Has,
+            &[("seven_day", 20.0, NOW + 86_400)],
+        );
+        expiring.expiring = Some(crate::budget::Expiring {
+            resets_at: NOW + 86_400,
+            left: 80.0,
+            hours_needed: 30.0,
+            hours_available: 20.0,
+        });
+        let seat = cand(
+            acct(2, "seat", AccountState::Parked, 2),
+            WeeklyLimit::None,
+            &[("five_hour", 10.0, NOW + 3600)],
+        );
+        let plain = cand(
+            acct(3, "alt", AccountState::Parked, 0),
+            WeeklyLimit::Has,
+            &[("seven_day", 10.0, NOW + 86_400)],
+        );
+        let pool = vec![expiring.clone(), seat.clone(), plain.clone()];
+        assert_eq!(pick(&pool, POLICY, None, NOW).unwrap().account.id, 2);
+        // Among accounts with a weekly limit, the budget that would reset unused goes first.
+        let pool = vec![expiring.clone(), plain.clone()];
+        assert_eq!(pick(&pool, POLICY, None, NOW).unwrap().account.id, 1);
+
+        // Without the preference, the budget that would reset unused goes first of all.
+        let off = Policy {
+            prefer_no_weekly_limit: false,
+            ..POLICY
+        };
+        let pool = vec![expiring.clone(), seat.clone(), plain.clone()];
+        assert_eq!(pick(&pool, off, None, NOW).unwrap().account.id, 1);
+
+        // Spending an expiring budget, the account in use still gives way to a ready seat.
+        let mut in_use = expiring;
+        in_use.account.state = AccountState::Active;
+        let timing = Timing {
+            now_ms: NOW * 1000,
+            cooldown_ms: 120_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            decide(&[in_use, seat], POLICY, timing, false, true),
+            Some(Reason::PreferredAvailable)
+        );
     }
 
     #[test]
@@ -1301,9 +1396,7 @@ mod tests {
         let timing = Timing {
             now_ms,
             last_swap_ms: now_ms - 20_000,
-            active_since_ms: now_ms - 20_000,
             cooldown_ms: 120_000,
-            dwell_ms: 600_000,
             ..Default::default()
         };
         let full = cand(
@@ -1437,30 +1530,56 @@ mod tests {
     }
 
     /// A day of status line ticks on a pool of two Team seats (no weekly limit) and one Max
-    /// account, with steady use from 08:00 to 22:00. Checks that rotation never ping-pongs:
-    /// every switch back goes to a strictly better ranked account whose window has reset since
-    /// it was left, and equally ranked accounts never trade places.
+    /// account, with steady use from 08:00 to 22:00. Checks that rotation never ping-pongs: the
+    /// account in use is kept until a limit, the only switch back is from the Max account to a
+    /// seat that is ready again, and no account is returned to before its window reset.
     #[test]
     fn a_day_of_ticks_does_not_ping_pong() {
-        let strict = day_of_ticks(STRICT);
-        let kept = day_of_ticks(POLICY);
-        // strict_order goes back to the first seat as soon as it resets; otherwise the seat in
-        // use is kept until its limit, which saves those swaps.
-        let back_to_seat_1 = |swaps: &[(i64, i64, i64, Reason)]| {
-            swaps
-                .iter()
-                .filter(|s| (s.1, s.2, s.3) == (2, 1, Reason::PreferredAvailable))
-                .count()
-        };
-        assert!(back_to_seat_1(&strict) > 0, "{strict:?}");
-        // Without it, the two seats carry the day between them, each fresh again by the time
-        // the other is at its limit.
-        assert!(kept.iter().all(|s| s.3 == Reason::FiveHour), "{kept:?}");
-        assert_eq!(back_to_seat_1(&kept), 0, "{kept:?}");
-        assert!(kept.len() < strict.len(), "{kept:?} vs {strict:?}");
+        for policy in [POLICY, STRICT] {
+            let swaps = day_of_ticks(policy, 0.225, 8);
+            for s in &swaps {
+                if s.3 == Reason::PreferredAvailable {
+                    assert_eq!(s.1, 3, "only the Max account swaps back: {swaps:?}");
+                } else {
+                    assert_eq!(s.3, Reason::FiveHour, "{swaps:?}");
+                }
+            }
+            // The two seats carry the day between them, each fresh again by the time the other
+            // is at its limit: the Max account's weekly budget is never needed.
+            assert!(swaps.iter().all(|s| s.2 != 3), "{swaps:?}");
+        }
     }
 
-    fn day_of_ticks(policy: Policy) -> Vec<(i64, i64, i64, Reason)> {
+    /// A busier day: both seats reach their limits before either resets, so the Max account
+    /// carries the gaps, and gives way to a seat as soon as one has reset.
+    #[test]
+    fn a_busy_day_switches_back_to_the_seats_without_ping_pong() {
+        for policy in [POLICY, STRICT] {
+            let swaps = day_of_ticks(policy, 0.45, 16);
+            let backs: Vec<_> = swaps
+                .iter()
+                .filter(|s| s.3 == Reason::PreferredAvailable)
+                .collect();
+            assert!(!backs.is_empty(), "{swaps:?}");
+            for s in &swaps {
+                if s.3 == Reason::PreferredAvailable {
+                    assert!(s.1 == 3 && s.2 != 3, "only from the Max account: {swaps:?}");
+                } else {
+                    assert_eq!(s.3, Reason::FiveHour, "{swaps:?}");
+                }
+                if s.2 == 3 {
+                    assert_eq!(s.3, Reason::FiveHour, "the Max account only at a limit");
+                }
+            }
+        }
+    }
+
+    /// `per_tick`: 5-hour points the account in use spends every 30 s of the busy hours.
+    fn day_of_ticks(
+        policy: Policy,
+        per_tick: f64,
+        max_swaps: usize,
+    ) -> Vec<(i64, i64, i64, Reason)> {
         struct Sim {
             id: i64,
             position: i64,
@@ -1503,7 +1622,6 @@ mod tests {
         let mut active = 1i64;
         let mut timing = Timing {
             cooldown_ms: 120_000,
-            dwell_ms: 600_000,
             ..Default::default()
         };
         // (time, from, to, reason)
@@ -1521,13 +1639,13 @@ mod tests {
                     s.five_resets = None;
                 }
                 if s.id == active && busy {
-                    // About 0.45 points a minute: a 5-hour window fills in under four hours.
+                    // At 0.225 a tick, a 5-hour window fills in under four hours.
                     if s.five_resets.is_none() {
                         s.five_resets = Some(now + 5 * 3600);
                     }
-                    s.five += 0.225;
+                    s.five += per_tick;
                     if s.weekly {
-                        s.week += 0.02;
+                        s.week += per_tick * 0.09;
                     }
                 }
             }
@@ -1568,11 +1686,11 @@ mod tests {
                     _ => pick(&pool, policy, Some(active), now),
                 };
                 if let Some(target) = target {
-                    let from = pool.iter().find(|c| c.account.id == active).unwrap();
                     if reason == Reason::PreferredAvailable {
-                        assert!(
-                            policy.rank(target) < policy.rank(from),
-                            "switch back only to a strictly better rank"
+                        assert_eq!(
+                            target.weekly_limit,
+                            WeeklyLimit::None,
+                            "switch back only to an account without a weekly limit"
                         );
                     }
                     // Leaving an account at its limit: it must not come back before it reset.
@@ -1592,7 +1710,6 @@ mod tests {
                     swaps.push((now, active, target.account.id, reason));
                     active = target.account.id;
                     timing.last_swap_ms = timing.now_ms;
-                    timing.active_since_ms = timing.now_ms;
                 }
             }
             now += 30;
@@ -1604,13 +1721,13 @@ mod tests {
             assert_eq!(b, c);
             if d == a {
                 assert!(
-                    t2 - t1 >= 600,
-                    "{a} -> {b} -> {a} within {}s: ping-pong",
+                    t2 - t1 >= 120,
+                    "{a} -> {b} -> {a} within the cooldown ({}s)",
                     t2 - t1
                 );
             }
         }
-        assert!(swaps.len() <= 8, "too many swaps: {swaps:?}");
+        assert!(swaps.len() <= max_swaps, "too many swaps: {swaps:?}");
         swaps
     }
 }
