@@ -8,13 +8,15 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::Result;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 
 use crate::paths::Paths;
 use crate::profile_account;
 use crate::scheduler::{self, Reason, Timing};
-use crate::store::{Account, AccountState, Sample, SampleWindow, Store, kind};
+use crate::store::{
+    Account, AccountState, META_SESSION_PREFIX, Sample, SampleWindow, Store, kind, same_windows,
+};
 use crate::swap::{
     self, META_ACTIVE_SINCE, META_CRED_SEEN, META_LAST_SWAP_AT, META_PROFILE_FOREIGN,
     META_PROFILE_MODEL, STALE_SAMPLE_GUARD_MS, SwapRequest,
@@ -39,6 +41,21 @@ pub struct StatusInput {
     /// is only present while the API reports it and its reset has not passed.
     #[serde(default, deserialize_with = "lenient_windows")]
     pub rate_limits: Option<BTreeMap<String, Window>>,
+    /// The session's totals; its API time only grows when the session made a request.
+    pub cost: Option<CostInfo>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct CostInfo {
+    pub total_api_duration_ms: Option<f64>,
+}
+
+/// What a session last reported (`store::META_SESSION_PREFIX`).
+#[derive(Debug, Serialize, Deserialize)]
+struct SessionReading {
+    at: i64,
+    api_ms: Option<f64>,
+    windows: Vec<SampleWindow>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -90,6 +107,10 @@ fn epoch_seconds<'de, D: Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Erro
 impl StatusInput {
     pub fn parse(text: &str) -> Self {
         serde_json::from_str(text).unwrap_or_default()
+    }
+
+    fn api_duration_ms(&self) -> Option<f64> {
+        self.cost.as_ref().and_then(|c| c.total_api_duration_ms)
     }
 
     pub fn model_id(&self) -> Option<&str> {
@@ -161,7 +182,9 @@ pub fn tick(store: &Store, paths: &Paths, input: &StatusInput, now_ms: i64) -> R
         }
     }
     if let Some(sample) = input.sample_for(active.id, "rotate", now_ms) {
-        if !is_stale_reading(store, &sample, now_ms)? {
+        if !frozen_reading(store, input, &sample, now_ms)?
+            && !is_stale_reading(store, &sample, now_ms)?
+        {
             store.record_sample(&sample)?;
         }
     }
@@ -230,7 +253,11 @@ pub fn observe(
         (_, Some(email)) => store.account_by_email(email)?,
         _ => None,
     };
-    let Some(account) = account else {
+    // Limits are per organization, and one person can be in several with the same account id
+    // and email (a personal plan and a Team seat): only count the profile for the pool account
+    // when it is signed in to that account's organization.
+    let Some(account) = account.filter(|a| a.org_uuid.is_some() && a.org_uuid == ident.org_uuid)
+    else {
         return Ok(None);
     };
     let profile = profile_dir
@@ -241,6 +268,46 @@ pub fn observe(
         store.record_sample(&sample)?;
     }
     Ok(Some(account))
+}
+
+/// A session only notices a new login when it next makes a request (F1), so a session idle since
+/// before the active account became active keeps reporting the usage of the account it used
+/// then, for as long as it stays idle. Such a reading is exactly the session's last one from
+/// before, and the session's API time has not grown since; drop it. A genuine reading of the new
+/// account differs (another account's percentages and reset times), and follows a request.
+/// Readings without a session id are left to `is_stale_reading`.
+fn frozen_reading(
+    store: &Store,
+    input: &StatusInput,
+    sample: &Sample,
+    now_ms: i64,
+) -> Result<bool> {
+    let Some(session) = input.session_id.as_deref().filter(|s| !s.is_empty()) else {
+        return Ok(false);
+    };
+    let key = format!("{META_SESSION_PREFIX}{session}");
+    let api_ms = input.api_duration_ms();
+    let previous: Option<SessionReading> = store
+        .meta(&key)?
+        .and_then(|v| serde_json::from_str(&v).ok());
+    if let Some(prev) = previous {
+        let before = prev.at < swap::active_since(store)?;
+        let no_request = match (api_ms, prev.api_ms) {
+            (Some(now), Some(then)) => now <= then,
+            _ => true,
+        };
+        if before && no_request && same_windows(&prev.windows, &sample.windows) {
+            // Keep the record from before, so the session stays recognized until it moves.
+            return Ok(true);
+        }
+    }
+    let reading = SessionReading {
+        at: now_ms,
+        api_ms,
+        windows: sample.windows.clone(),
+    };
+    store.set_meta(&key, serde_json::to_string(&reading)?)?;
+    Ok(false)
 }
 
 /// Shortly after a swap, a session that has not made a request yet still reports the old

@@ -112,7 +112,8 @@ pub fn import(
         &oauth,
         profile_account::read(&staging.join(".claude.json"))?,
     );
-    if ident.email.is_none() || ident.account_uuid.is_none() {
+    // The organization decides which usage readings belong to the account (section 9.1).
+    if ident.email.is_none() || ident.account_uuid.is_none() || ident.org_uuid.is_none() {
         if let Ok(claude) = claude_executable(store) {
             fill_from_auth_status(&mut ident, &claude, staging);
         }
