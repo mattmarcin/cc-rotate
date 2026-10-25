@@ -701,6 +701,8 @@ pub fn stop_hold_until(
         _ => store.last_sample_until(account_id, left)?,
     };
     if let Some(s) = &at_stop {
+        // As the session that sent it saw it: a window scoped to its model applied to it.
+        let model = s.model.as_deref().or(model);
         let shown = scheduler::window_usage(Some(s), s.ts / 1000, thresholds, model)
             .iter()
             .any(|w| w.blocking());
@@ -710,16 +712,22 @@ pub fn stop_hold_until(
     }
     let news = match (latest, &at_stop) {
         (Some(l), _) if l.ts <= left => false,
-        (Some(l), Some(s)) => !same_numbers(l, s),
+        (Some(l), Some(s)) => {
+            let reset_since = s
+                .windows
+                .iter()
+                .any(|w| w.resets_at.is_some_and(|r| r * 1000 <= l.ts));
+            reset_since || !same_numbers(l, s)
+        }
         (Some(_), None) => true,
         (None, _) => false,
     };
     Ok((!news).then_some(until_ms / 1000))
 }
 
-/// Two readings say the same of the windows both have: the same usage within half a point and
-/// the same reset time. The status line and a usage check may round reset times differently,
-/// and one may report windows the other does not.
+/// Two readings say the same of the windows both have: the same usage within a point and the
+/// same reset time. The status line and a usage check may round usage and reset times
+/// differently, and one may report windows the other does not.
 fn same_numbers(a: &Sample, b: &Sample) -> bool {
     let mut shared = 0;
     for w in &a.windows {
@@ -731,7 +739,7 @@ fn same_numbers(a: &Sample, b: &Sample) -> bool {
             (Some(x), Some(y)) => same_reset(x, y),
             (x, y) => x == y,
         };
-        if !resets || (w.pct - o.pct).abs() >= 0.5 {
+        if !resets || (w.pct - o.pct).abs() >= 1.0 {
             return false;
         }
     }
@@ -1507,7 +1515,7 @@ fn choose(
                     } else if in_use.is_some_and(|c| c.blocking().is_some()) {
                         "the account in use is at a limit"
                     } else if held {
-                        "a session stopped lately on each account without a weekly limit that looks ready, at a limit its usage didn't show"
+                        "every ready account without a weekly limit had a session stop at a limit its usage didn't show"
                     } else {
                         "no account without a weekly limit is ready to swap back to"
                     };

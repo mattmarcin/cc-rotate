@@ -398,9 +398,11 @@ pub struct Candidate {
 }
 
 impl Candidate {
-    /// Its room is not trusted at `now_s` (`stop_hold_until`).
+    /// Its room is not trusted at `now_s` (`stop_hold_until`). Never the account in use, which
+    /// is picked as a last resort when it is.
     pub fn on_stop_hold(&self, now_s: i64) -> bool {
-        self.stop_hold_until.is_some_and(|until| now_s < until)
+        self.account.state != AccountState::Active
+            && self.stop_hold_until.is_some_and(|until| now_s < until)
     }
 
     /// The window that keeps this account from being used, if any: a weekly one before a
@@ -717,7 +719,13 @@ pub fn ranking(candidates: &[Candidate], policy: Policy, now_s: i64) -> Vec<Rank
 
     let mut out = Vec::with_capacity(candidates.len());
     for (i, c) in open.iter().enumerate() {
-        let key = |x: &Candidate| (policy.rank(x), policy.place(x, now_s));
+        let key = |x: &Candidate| {
+            (
+                x.on_stop_hold(now_s),
+                policy.rank(x),
+                policy.place(x, now_s),
+            )
+        };
         let tied = open
             .iter()
             .any(|o| o.account.id != c.account.id && key(o) == key(c));
@@ -742,9 +750,9 @@ pub fn ranking(candidates: &[Candidate], policy: Policy, now_s: i64) -> Vec<Rank
 }
 
 fn open_reason(c: &Candidate, policy: Policy, tied: bool, now_s: i64) -> String {
-    if let Some(until) = c.stop_hold_until.filter(|&u| now_s < u) {
+    if let Some(until) = c.stop_hold_until.filter(|_| c.on_stop_hold(now_s)) {
         return format!(
-            "a session stopped on it at a limit its usage didn't show, so it goes last for {} or until a new reading",
+            "a session stopped on it at a limit its usage didn't show, so it goes last for {} or until its usage changes",
             time::span(until - now_s)
         );
     }

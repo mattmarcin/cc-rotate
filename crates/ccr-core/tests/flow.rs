@@ -1851,6 +1851,12 @@ fn a_weekly_budget_that_would_reset_unused_moves_its_account_ahead() {
 /// hours and a with `a_five` points used in a window that resets in `a_resets_s`, then a stop
 /// on a.
 fn stopped_on_a(env: &Env, a_five: f64, a_resets_s: i64) -> (Store, i64, i64) {
+    let resets = time::now_s() + a_resets_s;
+    stopped_on_a_with(env, vec![window("five_hour", a_five, resets)])
+}
+
+/// `stopped_on_a`, with a left on a reading of these windows.
+fn stopped_on_a_with(env: &Env, a_windows: Vec<SampleWindow>) -> (Store, i64, i64) {
     let (store, a, b, c) = pool(env);
     for (account, weekly) in [
         (a, WeeklyLimitSetting::No),
@@ -1862,7 +1868,10 @@ fn stopped_on_a(env: &Env, a_five: f64, a_resets_s: i64) -> (Store, i64, i64) {
     let now_s = time::now_s();
     let before = time::now_ms() - 60_000;
     store
-        .record_sample(&five_only(a, a_five, now_s + a_resets_s, before))
+        .record_sample(&Sample {
+            windows: a_windows,
+            ..five_only(a, 0.0, 0, before)
+        })
         .unwrap();
     store
         .record_sample(&five_only(b, 100.0, now_s + 6 * 3600, before))
@@ -1923,6 +1932,35 @@ fn the_hold_on_an_account_left_at_a_stop_ends() {
     assert_eq!(target.account.id, a);
 }
 
+/// A reading taken after a window of the one the account was left on reset is news, even when it
+/// leaves that window out and says the same of the others.
+#[test]
+fn a_reading_after_a_reset_ends_the_hold() {
+    let env = Env::new();
+    let now_s = time::now_s();
+    let (store, a, c) = stopped_on_a_with(
+        &env,
+        vec![
+            window("five_hour", 20.0, now_s + 30 * 60),
+            window("seven_day", 10.0, now_s + 3 * 86_400),
+        ],
+    );
+    let after = time::now_ms() + 31 * 60_000;
+    store
+        .record_sample(&Sample {
+            windows: vec![window("seven_day", 10.0, now_s + 3 * 86_400)],
+            ..five_only(a, 0.0, 0, after)
+        })
+        .unwrap();
+    let req = statusline::sync_at(&store, &env.paths, after + 1000)
+        .unwrap()
+        .expect("a's window has reset since");
+    assert_eq!(
+        (req.from, req.reason),
+        (Some(c), Reason::PreferredAvailable)
+    );
+}
+
 /// A turn stopped at a limit that the account's readings did not show: the account is not
 /// switched back to on that out-of-date room, and it is picked last, until a different reading
 /// of it comes or `LEFT_AT_STOP_HOLD_MS` passes. Otherwise the swap back would stop the next turn
@@ -1960,7 +1998,7 @@ fn an_account_left_at_a_stop_is_not_switched_back_to_on_old_readings() {
     };
     assert!(matches!(
         swap::run(&store, &env.paths, &back).unwrap(),
-        SwapOutcome::Skipped { why } if why.starts_with("a session stopped lately")
+        SwapOutcome::Skipped { why } if why.starts_with("every ready account without a weekly limit had a session stop")
     ));
     // a goes last, with the reason.
     let (pool, policy) = swap::load_pool(&store, now_s).unwrap();
@@ -1973,10 +2011,9 @@ fn an_account_left_at_a_stop_is_not_switched_back_to_on_old_readings() {
         "{reason}"
     );
 
-    // A newer reading of a with the same numbers (another profile's idle session, say) is no
-    // news; a different one is.
-    // A usage check, say, that rounds the reset time differently and reports a weekly window
-    // the status line did not.
+    // A newer reading of a with the same numbers is no news: a usage check, say, that rounds the
+    // reset time differently and reports a weekly window the status line did not. A different
+    // one is.
     let mut again = store.last_sample(a).unwrap().unwrap();
     again.ts = time::now_ms() + 1000;
     again.windows[0].resets_at = again.windows[0].resets_at.map(|r| r + 30);
