@@ -578,6 +578,34 @@ impl Store {
         Self::init(conn, Some(secret::key_path(dir)), OnceCell::new())
     }
 
+    /// Open an existing store without changing it: read only, never migrated, and refused when
+    /// its schema is not this build's. For tools that only read the real store, such as
+    /// `examples/e2e_stage.rs`, so running one never upgrades the store under the installed
+    /// cc-rotate.
+    pub fn open_read_only(path: &Path) -> Result<Store> {
+        let dir = path
+            .parent()
+            .context("the store path has no parent directory")?;
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("opening store {} read-only", path.display()))?;
+        conn.busy_timeout(Duration::from_millis(5000))?;
+        let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if version != SCHEMA_VERSION {
+            bail!(
+                "{} is at schema {version} and this build uses schema {SCHEMA_VERSION}. Use a build that matches the installed cc-rotate.",
+                path.display()
+            );
+        }
+        Ok(Store {
+            conn,
+            key_path: Some(secret::key_path(dir)),
+            key: OnceCell::new(),
+        })
+    }
+
     pub fn open_in_memory() -> Result<Store> {
         Self::init(
             Connection::open_in_memory()?,
@@ -1726,6 +1754,31 @@ pub fn sanitize_label(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_read_only_open_never_changes_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        Store::open(&path).unwrap();
+
+        let store = Store::open_read_only(&path).unwrap();
+        assert!(store.accounts().unwrap().is_empty());
+        assert!(store.set_setting("usage_checks", Some("false")).is_err());
+        drop(store);
+
+        // An older store is refused, not migrated.
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION - 1)
+            .unwrap();
+        drop(conn);
+        let err = Store::open_read_only(&path).err().unwrap().to_string();
+        assert!(err.contains("this build uses schema"), "{err}");
+        let conn = Connection::open(&path).unwrap();
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION - 1);
+    }
     use serde_json::json;
 
     fn ident(uuid: &str) -> AccountIdentity {
