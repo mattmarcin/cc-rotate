@@ -369,7 +369,7 @@ pub fn run(store: &Store, paths: &Paths) -> Vec<Check> {
         ),
     });
     checks.push(usage_checks_check(store, &accounts));
-    if let Some(c) = warm_ups_check(store, &accounts) {
+    if let Some(c) = warm_ups_check(store, paths, &accounts) {
         checks.push(c);
     }
     if crate::swap::pending_swap(store).ok().flatten().is_some()
@@ -433,7 +433,7 @@ fn usage_checks_check(store: &Store, accounts: &[Account]) -> Check {
 
 /// Whether warm-ups keep the 5-hour windows running of the accounts the user chose (section
 /// 22); nothing when no account has it on.
-fn warm_ups_check(store: &Store, accounts: &[Account]) -> Option<Check> {
+fn warm_ups_check(store: &Store, paths: &Paths, accounts: &[Account]) -> Option<Check> {
     let name = "Keeping 5-hour windows running";
     let kept: Vec<&Account> = accounts.iter().filter(|a| a.keep_running).collect();
     if kept.is_empty() {
@@ -444,20 +444,20 @@ fn warm_ups_check(store: &Store, accounts: &[Account]) -> Option<Check> {
         .map(|a| a.label.as_str())
         .collect::<Vec<_>>()
         .join(", ");
-    if !store.settings().is_ok_and(|s| s.usage_checks) {
-        return Some(check(
-            name,
-            Status::Warn,
-            format!("On for {labels}, but it needs usage checks, which are off."),
-        ));
-    }
     if let Ok(Some(reason)) = usage_check::warm_ups_blocked(store) {
         return Some(check(
             name,
             Status::Warn,
             format!(
-                "Stopped: {reason}. Turn it on again for an account in its More dialog, or with `cc-rotate-ctl keep-running <label> yes`."
+                "Stopped: {reason}. Save an account's More dialog with it ticked, or run `cc-rotate-ctl keep-running <label> yes`, to start it again."
             ),
+        ));
+    }
+    if let Ok(Some(why)) = usage_check::warm_ups_paused(store, paths) {
+        return Some(check(
+            name,
+            Status::Warn,
+            format!("On for {labels}, but not running: {why}."),
         ));
     }
     let mut failing = Vec::new();

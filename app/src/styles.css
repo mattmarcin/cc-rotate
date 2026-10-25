@@ -1039,6 +1039,10 @@ dialog.drawer {
   justify-items: start;
 }
 
+.check-field small.warn {
+  color: var(--amber);
+}
+
 input[type="text"],
 input[type="email"],
 input[type="number"],

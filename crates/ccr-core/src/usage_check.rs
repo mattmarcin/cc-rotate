@@ -51,6 +51,9 @@ use crate::{credfile, credstore, login, profile_usage, scheduler, swap, time, us
 
 /// How long Claude Code may take: it starts up, fetches its settings, then the usage.
 pub const RUN_TIMEOUT: Duration = Duration::from_secs(60);
+/// The longest a check or warm-up holds an account's lock while Claude Code runs: a warm-up's
+/// prompt, then its check.
+pub const JOB_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 /// Before a swap, a check may not hold the swap up for long.
 const BEFORE_SWAP_TIMEOUT: Duration = Duration::from_secs(30);
 /// The wait after a 429 when Claude Code did not log one.
@@ -202,9 +205,10 @@ pub enum WarmOutcome {
     Sent { cost_usd: f64, check: CheckOutcome },
     /// Nothing was sent.
     Skipped { why: String },
-    /// The prompt did not go through, or did something other than asked (which stops
-    /// warm-ups); `check` is the reading after it.
+    /// The prompt did not go through; `check` is the reading after it.
     Failed { why: String, check: CheckOutcome },
+    /// The prompt went through but did more than asked, which stopped warm-ups.
+    Unexpected { why: String, check: CheckOutcome },
 }
 
 /// What a warm-up's prompt run did.
@@ -311,9 +315,15 @@ pub fn due_before_swap(store: &Store, account: &Account, now_ms: i64) -> Result<
 /// whose latest reading and last check are both older than `usage_check_interval_s` and whose
 /// back-off is over.
 pub fn next_due(store: &Store, paths: &Paths, now_ms: i64) -> Result<Option<i64>> {
-    if let Some(id) = next_held_back(store, paths, now_ms)? {
-        return Ok(Some(id));
+    match next_held_back(store, paths, now_ms)? {
+        Some(id) => Ok(Some(id)),
+        None => next_routine(store, paths, now_ms),
     }
+}
+
+/// The first parked account in pick order whose reading and last check are both older than
+/// `usage_check_interval_s`, and whose back-off is over.
+fn next_routine(store: &Store, paths: &Paths, now_ms: i64) -> Result<Option<i64>> {
     if !checks_on(store, paths)? {
         return Ok(None);
     }
@@ -349,7 +359,7 @@ pub fn next_job(store: &Store, paths: &Paths, now_ms: i64) -> Result<Option<Due>
     if let Some(id) = next_warm_up(store, paths, now_ms)? {
         return Ok(Some(Due::WarmUp(id)));
     }
-    Ok(next_due(store, paths, now_ms)?.map(Due::Check))
+    Ok(next_routine(store, paths, now_ms)?.map(Due::Check))
 }
 
 /// Whether automatic checks (and so warm-ups) run at all.
@@ -414,8 +424,18 @@ pub fn next_warm_up(store: &Store, paths: &Paths, now_ms: i64) -> Result<Option<
             continue;
         }
         let st = state(store, c.account.id)?;
-        // A window a warm-up started runs whether or not the reading after it came through.
-        let started = st.warmed_at.is_some_and(|t| window_end_ms(t) > now_ms);
+        // A window a warm-up started runs whether or not the reading after it came through; a
+        // reading since says when it really ends (the prompt may have landed in a window that
+        // was already running).
+        let read_since = |t: i64| {
+            store
+                .last_sample(c.account.id)
+                .map(|s| s.is_some_and(|s| s.ts > t))
+        };
+        let started = match st.warmed_at {
+            Some(t) => window_end_ms(t) > now_ms && !read_since(t)?,
+            None => false,
+        };
         let tried = st
             .warm_attempt_at
             .is_some_and(|t| now_ms - t < WARM_RETRY_MS);
@@ -429,6 +449,18 @@ pub fn next_warm_up(store: &Store, paths: &Paths, now_ms: i64) -> Result<Option<
 /// Why warm-ups are stopped until the user turns them on again, if they are.
 pub fn warm_ups_blocked(store: &Store) -> Result<Option<String>> {
     store.meta(META_WARM_BLOCKED)
+}
+
+/// Why warm-ups do not run now, if they don't: they were stopped, or usage checks are off or
+/// stopped.
+pub fn warm_ups_paused(store: &Store, paths: &Paths) -> Result<Option<String>> {
+    if let Some(why) = warm_ups_blocked(store)? {
+        return Ok(Some(format!("they stopped because {why}")));
+    }
+    if !store.settings()?.usage_checks {
+        return Ok(Some("they need usage checks, which are off".into()));
+    }
+    checks_possible(store, paths)
 }
 
 /// Start the account's next 5-hour window (spec section 22): Claude Code sends a short prompt to
@@ -466,7 +498,7 @@ fn warm_up_with(
     prompt: &dyn Fn(&Path) -> Result<Run>,
     run: &dyn Fn(&Path) -> Result<Run>,
 ) -> Result<WarmOutcome> {
-    let mut prompted = None;
+    let mut verdict = None;
     let check = job(
         store,
         paths,
@@ -474,13 +506,21 @@ fn warm_up_with(
         trigger,
         Some(prompt),
         run,
-        &mut prompted,
-    )?;
-    Ok(match prompted {
+        &mut verdict,
+    );
+    if verdict.is_none() {
+        // Nothing was sent (the account was busy, its login unreadable, a swap unfinished...):
+        // count it as a try, so the background goes on to other work instead of retrying this
+        // every minute.
+        let mut st = state(store, account_id)?;
+        st.warm_attempt_at = Some(time::now_ms());
+        save_state(store, account_id, &st)?;
+    }
+    let check = check?;
+    Ok(match verdict {
         Some(Prompted::Sent { cost_usd }) => WarmOutcome::Sent { cost_usd, check },
-        Some(Prompted::Failed { why } | Prompted::Unexpected { why }) => {
-            WarmOutcome::Failed { why, check }
-        }
+        Some(Prompted::Failed { why }) => WarmOutcome::Failed { why, check },
+        Some(Prompted::Unexpected { why }) => WarmOutcome::Unexpected { why, check },
         None => WarmOutcome::Skipped {
             why: match check {
                 CheckOutcome::Skipped { why } => why,
@@ -516,9 +556,9 @@ fn check_with(
     job(store, paths, account_id, trigger, None, run, &mut None)
 }
 
-/// A check, after a warm-up's prompt when `prompt` is given (its verdict goes to `prompted`):
-/// both run under the account's lock in one scratch profile, so a renewal by either is handled
-/// as a check's is.
+/// A check, after a warm-up's prompt when `prompt` is given (its verdict goes to
+/// `verdict_out`): both run under the account's lock in one scratch profile, so a renewal by
+/// either is handled as a check's is.
 fn job(
     store: &Store,
     paths: &Paths,
@@ -526,7 +566,7 @@ fn job(
     trigger: Trigger,
     prompt: Option<Runner>,
     run: Runner,
-    prompted: &mut Option<Prompted>,
+    verdict_out: &mut Option<Prompted>,
 ) -> Result<CheckOutcome> {
     let skipped = |why: &str| {
         Ok(CheckOutcome::Skipped {
@@ -542,12 +582,16 @@ fn job(
     }
     let mut st = state(store, account_id)?;
     let now = time::now_ms();
-    // A warm-up's prompt does not ask the usage endpoint, so its wait does not hold it up.
     if matches!(trigger, Trigger::Background | Trigger::BeforeSwap)
         && st.not_before.is_some_and(|t| t > now)
     {
         return skipped("Anthropic asked to wait before the next check");
     }
+    // A warm-up's prompt does not ask the usage endpoint, so its wait only holds up the
+    // reading after it, which is left out.
+    let usage_wait = st
+        .not_before
+        .filter(|&t| prompt.is_some() && trigger != Trigger::Manual && t > now);
     // A skip below is about this account: count it as an attempt, so the background moves on
     // to the next account instead of picking this one every minute.
     let attempted = |store: &Store, why: &str| -> Result<CheckOutcome> {
@@ -642,9 +686,14 @@ fn job(
     // is stored.
     scratch.keep = true;
     let warm = prompt.map(|p| p(&scratch.dir));
-    let ran = run(&scratch.dir);
     let verdict = warm.as_ref().map(judge_warm_up);
-    prompted.clone_from(&verdict);
+    verdict_out.clone_from(&verdict);
+    // Only a reading `/usage` fetched counts, not one the prompt run may have cached.
+    let usage_started = time::now_ms();
+    let ran = match usage_wait {
+        Some(_) => Ok(Run::default()),
+        None => run(&scratch.dir),
+    };
 
     let left = match Credentials::for_profile(&scratch.dir).read_oauth() {
         Ok(left) => left,
@@ -656,6 +705,7 @@ fn job(
             );
             st.held_back = true;
             st.problem = Some(why.clone());
+            note_verdict(store, &mut st, verdict.as_ref(), account_id, started)?;
             save_state(store, account_id, &st)?;
             return Ok(CheckOutcome::Failed { why });
         }
@@ -666,7 +716,7 @@ fn job(
     let report = config
         .as_ref()
         .and_then(usage_report::from_config)
-        .filter(|r| r.fetched_at_ms >= started - 1000);
+        .filter(|r| r.fetched_at_ms >= usage_started - 1000);
     // Kept with the reading when the check reads the account's usage.
     let extra_usage = report
         .as_ref()
@@ -692,6 +742,8 @@ fn job(
         CheckOutcome::Failed { why: why.clone() }
     } else if dead {
         CheckOutcome::LoginRejected
+    } else if let Some(until) = usage_wait {
+        CheckOutcome::RateLimited { until }
     } else if let Some(report) = report {
         match (&account.account_uuid, &report.account_uuid) {
             (Some(expected), Some(got)) if expected != got => {
@@ -776,27 +828,7 @@ fn job(
                 "Claude Code started keeping logins in Windows Credential Manager, which usage checks don't support",
             )?;
         }
-        match &verdict {
-            Some(Prompted::Sent { cost_usd }) => {
-                st.warmed_at = Some(started);
-                st.warm_problem = None;
-                s.log_event(
-                    kind::WARM_UP,
-                    Some(account_id),
-                    None,
-                    Some("keep_running"),
-                    Some(json!({ "cost_usd": cost_usd })),
-                )?;
-            }
-            Some(Prompted::Failed { why }) => st.warm_problem = Some(why.clone()),
-            Some(Prompted::Unexpected { why }) => {
-                // It sent something, so a window runs all the same.
-                st.warmed_at = Some(started);
-                st.warm_problem = Some(why.clone());
-                block_warm_ups(s, why)?;
-            }
-            None => {}
-        }
+        note_verdict(s, &mut st, verdict.as_ref(), account_id, started)?;
         match &outcome {
             CheckOutcome::Read { windows } => {
                 let last = s.last_sample(account_id)?;
@@ -858,6 +890,39 @@ fn block(store: &Store, reason: &str) -> Result<()> {
         Some("usage_check"),
         Some(json!({ "message": format!("Usage checks stopped because {reason}. After updating Claude Code, turn usage checks off and on again in Settings, or run `cc-rotate-ctl config usage_checks true`.") })),
     )?;
+    Ok(())
+}
+
+/// Record what a warm-up's prompt did: that it went through (`warmed_at`, a `warm_up` event),
+/// why it did not, or, when it did more than asked, stop warm-ups.
+fn note_verdict(
+    store: &Store,
+    st: &mut CheckState,
+    verdict: Option<&Prompted>,
+    account_id: i64,
+    started: i64,
+) -> Result<()> {
+    match verdict {
+        Some(Prompted::Sent { cost_usd }) => {
+            st.warmed_at = Some(started);
+            st.warm_problem = None;
+            store.log_event(
+                kind::WARM_UP,
+                Some(account_id),
+                None,
+                Some("keep_running"),
+                Some(json!({ "cost_usd": cost_usd })),
+            )?;
+        }
+        Some(Prompted::Failed { why }) => st.warm_problem = Some(why.clone()),
+        Some(Prompted::Unexpected { why }) => {
+            // It sent something, so a window runs all the same; the stop says why.
+            st.warmed_at = Some(started);
+            st.warm_problem = None;
+            block_warm_ups(store, why)?;
+        }
+        None => {}
+    }
     Ok(())
 }
 
@@ -1121,7 +1186,7 @@ pub fn sweep(store: &Store, paths: &Paths) -> Result<()> {
 /// Remove an account, its check state and anything its checks left behind, under its lock so no
 /// check is using its login meanwhile.
 pub fn remove_account(store: &Store, paths: &Paths, account_id: i64) -> Result<()> {
-    let wait = Duration::from_millis(store.settings()?.lock_timeout_ms) + RUN_TIMEOUT;
+    let wait = Duration::from_millis(store.settings()?.lock_timeout_ms) + JOB_TIMEOUT;
     let _lock = DirLock::acquire(&paths.account_lock(account_id), LockOptions::claude(wait))
         .context("waiting for a usage check of the account to finish")?;
     let dirs = scratch_dirs(paths, &format!("{SCRATCH_PREFIX}{account_id}-"));
@@ -1555,12 +1620,16 @@ pub fn describe(outcome: &CheckOutcome) -> String {
 pub fn describe_warm_up(outcome: &WarmOutcome) -> String {
     match outcome {
         WarmOutcome::Sent { cost_usd, check } => format!(
-            "started its 5-hour window (${cost_usd:.4} at API prices). Now: {}",
+            "sent its request (${cost_usd:.4} at API prices), so its 5-hour window is running. Now: {}",
             describe(check)
         ),
         WarmOutcome::Skipped { why } => format!("skipped: {why}"),
         WarmOutcome::Failed { why, check } => format!(
             "the request didn't go through: {why}. Now: {}",
+            describe(check)
+        ),
+        WarmOutcome::Unexpected { why, check } => format!(
+            "the request went through, but {why}, so cc-rotate stopped keeping windows running. Now: {}",
             describe(check)
         ),
     }
@@ -2283,7 +2352,7 @@ mod tests {
             None,
             "its window runs now"
         );
-        assert!(describe_warm_up(&out).starts_with("started its 5-hour window"));
+        assert!(describe_warm_up(&out).starts_with("sent its request"));
     }
 
     #[test]
@@ -2305,10 +2374,11 @@ mod tests {
             &usage,
         )
         .unwrap();
-        let WarmOutcome::Failed { why, .. } = &out else {
+        let WarmOutcome::Unexpected { why, .. } = &out else {
             panic!("{out:?}")
         };
         assert!(why.contains("claude-opus-5-5"), "{why}");
+        assert!(describe_warm_up(&out).contains("went through"));
         let reason = warm_ups_blocked(&e.store).unwrap().expect("stopped");
         assert!(e.store.last_event_of(kind::ERROR).unwrap().is_some());
         assert!(e.store.last_event_of(kind::WARM_UP).unwrap().is_none());
@@ -2505,6 +2575,128 @@ mod tests {
             window_end_ms(start + 10 * 60_000),
             start + 10 * 60_000 + FIVE_HOURS_MS
         );
+    }
+
+    /// A warm-up that cannot run (here: its login is the one the cc-rotate profile uses) counts
+    /// as a try, so the background goes on to other work instead of retrying it every minute.
+    #[test]
+    fn a_warm_up_that_cannot_run_lets_other_work_go_first() {
+        let e = env();
+        let a = account(&e, "a", "ua", AccountState::Parked);
+        let b = account(&e, "b", "ub", AccountState::Parked);
+        e.store.set_keep_running(a, true).unwrap();
+        let login = e.store.credential(a).unwrap().unwrap().oauth;
+        credfile::write_oauth(&e.paths.profile_dir.join(".credentials.json"), &login).unwrap();
+        let now = time::now_ms();
+        assert_eq!(
+            next_job(&e.store, &e.paths, now).unwrap(),
+            Some(Due::WarmUp(a))
+        );
+        let never = |_: &Path| -> Result<Run> { panic!("nothing may run") };
+        let out = warm_up_with(&e.store, &e.paths, a, Trigger::WarmUp, &never, &never).unwrap();
+        assert!(matches!(out, WarmOutcome::Skipped { .. }), "{out:?}");
+        assert_eq!(
+            next_job(&e.store, &e.paths, time::now_ms()).unwrap(),
+            Some(Due::Check(b))
+        );
+    }
+
+    /// A warm-up that did more than asked stops warm-ups even when the login it left cannot be
+    /// read (the account is held back for that as usual).
+    #[test]
+    fn an_unexpected_warm_up_stops_warm_ups_even_with_an_unreadable_login() {
+        let e = env();
+        let a = account(&e, "a", "ua", AccountState::Parked);
+        e.store.set_keep_running(a, true).unwrap();
+        let opus = HAIKU_RESULT.replace("claude-haiku-5-5", "claude-opus-5-5");
+        let prompt = move |dir: &Path| {
+            std::fs::write(dir.join(".credentials.json"), "{\"claudeAi").unwrap();
+            Ok(Run {
+                exit_code: Some(0),
+                stdout: opus.clone(),
+                ..Default::default()
+            })
+        };
+        let out = warm_up_with(
+            &e.store,
+            &e.paths,
+            a,
+            Trigger::WarmUp,
+            &prompt,
+            &fake(Fake::default()),
+        )
+        .unwrap();
+        assert!(matches!(out, WarmOutcome::Unexpected { .. }), "{out:?}");
+        assert!(warm_ups_blocked(&e.store).unwrap().is_some());
+        let st = state(&e.store, a).unwrap();
+        assert!(st.held_back && st.warmed_at.is_some());
+    }
+
+    /// While the usage endpoint asked to wait, a warm-up sends its prompt but leaves out the
+    /// reading after it; the window it started still counts.
+    #[test]
+    fn a_warm_up_leaves_out_the_reading_while_the_endpoint_asks_to_wait() {
+        let e = env();
+        let a = account(&e, "a", "ua", AccountState::Parked);
+        e.store.set_keep_running(a, true).unwrap();
+        let until = time::now_ms() + 600_000;
+        save_state(
+            &e.store,
+            a,
+            &CheckState {
+                not_before: Some(until),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let never = |_: &Path| -> Result<Run> { panic!("no /usage while asked to wait") };
+        let out = warm_up_with(
+            &e.store,
+            &e.paths,
+            a,
+            Trigger::WarmUp,
+            &prompt_fake(HAIKU_RESULT, None, false),
+            &never,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            WarmOutcome::Sent {
+                cost_usd: 0.0009,
+                check: CheckOutcome::RateLimited { until }
+            }
+        );
+        assert_eq!(state(&e.store, a).unwrap().not_before, Some(until));
+        assert_eq!(
+            next_warm_up(&e.store, &e.paths, time::now_ms()).unwrap(),
+            None
+        );
+    }
+
+    /// A reading newer than a warm-up says when the window really ends: the prompt may have
+    /// landed in a window that was already running.
+    #[test]
+    fn a_reading_after_a_warm_up_says_when_its_window_ends() {
+        let e = env();
+        let now = time::now_ms();
+        let a = account(&e, "a", "ua", AccountState::Parked);
+        e.store.set_keep_running(a, true).unwrap();
+        save_state(
+            &e.store,
+            a,
+            &CheckState {
+                warmed_at: Some(now - 60_000),
+                warm_attempt_at: Some(now - 60_000),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        e.store
+            .record_sample(&reading(a, now, &[("five_hour", 30.0, now / 1000 + 3600)]))
+            .unwrap();
+        let due = |at: i64| next_warm_up(&e.store, &e.paths, at).unwrap();
+        assert_eq!(due(now), None);
+        assert_eq!(due(now + 3_600_000 + 60_000), Some(a));
     }
 
     #[cfg(unix)]

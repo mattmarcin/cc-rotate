@@ -161,7 +161,8 @@ pub fn forecast(
         for c in &mut pool {
             // An account the user keeps running gets its next window as soon as one ends, while
             // it is not in use (section 22).
-            let kept = c.account.keep_running && c.account.state == AccountState::Parked;
+            let kept =
+                c.account.keep_running && c.account.state == AccountState::Parked && !c.held_back;
             for w in &mut c.windows {
                 if let Some(r) = w.resets_at.filter(|&r| r <= t) {
                     w.pct = 0.0;

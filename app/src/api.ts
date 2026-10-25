@@ -225,6 +225,8 @@ export interface Snapshot {
   last_event_id: number;
   /** How long the pool lasts at the account in use's current pace, while it is being used. */
   forecast: { pace: number; runs_out_at: number | null; free_again_at: number | null } | null;
+  /** Why warm-ups stopped until an account's "Keep its 5-hour window running" is saved on again. */
+  warm_ups_blocked: string | null;
 }
 
 export interface EventRow {

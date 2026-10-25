@@ -1198,17 +1198,19 @@ impl Store {
     /// Whether cc-rotate keeps the account's 5-hour window running. Turning it on for any
     /// account lets warm-ups run again after they were stopped (`usage_check::META_WARM_BLOCKED`).
     pub fn set_keep_running(&self, id: i64, on: bool) -> Result<()> {
-        let n = self.conn.execute(
-            "UPDATE accounts SET keep_running = ?2 WHERE id = ?1",
-            params![id, on],
-        )?;
-        if n == 0 {
-            bail!("account {id} does not exist");
-        }
-        if on {
-            self.delete_meta(crate::usage_check::META_WARM_BLOCKED)?;
-        }
-        Ok(())
+        self.immediate(|s| {
+            let n = s.conn.execute(
+                "UPDATE accounts SET keep_running = ?2 WHERE id = ?1",
+                params![id, on],
+            )?;
+            if n == 0 {
+                bail!("account {id} does not exist");
+            }
+            if on {
+                s.delete_meta(crate::usage_check::META_WARM_BLOCKED)?;
+            }
+            Ok(())
+        })
     }
 
     /// Whether the account moves ahead when its weekly budget would reset unused.

@@ -218,7 +218,7 @@ Check that requests like this are fine under your plan's terms before you do.
 - `cc-rotate-ctl warm-up <label>` starts an account's window once, now.
 - The desktop app sends the requests, so it has to be running, with usage checks on.
 - It skips an account that is in use, paused, on hold, or at a weekly limit.
-- If a request ever uses another model, takes more than one turn or costs more than 2 cents, cc-rotate stops sending them and says so in the activity log, until you turn it on again for an account.
+- If a request ever uses another model, takes more than one turn or costs more than 2 cents, cc-rotate stops sending them and says so in the activity log and in the account's **More** dialog, until you save that dialog with the box ticked (or run `cc-rotate-ctl keep-running <label> yes`).
 
 ### How long your accounts last
 

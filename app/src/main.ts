@@ -1291,6 +1291,7 @@ function openManage(a: AccountView) {
   const useExpiring = h("input", { type: "checkbox", checked: a.use_expiring });
   const keepRunning = h("input", { type: "checkbox", checked: a.keep_running });
   const checksOff = state.snap?.settings.usage_checks === false;
+  const warmStopped = state.snap?.warm_ups_blocked ?? null;
   const details = h(
     "dl",
     { class: "facts info" },
@@ -1357,6 +1358,7 @@ function openManage(a: AccountView) {
           "While it's not in use, starts its next window with a short Haiku request as soon as one ends, so a window is already counting down when it's needed.",
           checksOff ? " Needs usage checks, which are off in Settings." : "",
         ),
+        warmStopped && h("small", { class: "warn" }, `Stopped because ${warmStopped}. Save with this ticked to start again.`),
       ),
       h("label", null, h("span", null, "Label"), label),
     ),
@@ -1381,7 +1383,8 @@ function openManage(a: AccountView) {
         await api.setUseExpiring(a.id, useExpiring.checked);
         a.use_expiring = useExpiring.checked;
       }
-      if (keepRunning.checked !== a.keep_running) {
+      // Saving it ticked also starts warm-ups again after they stopped.
+      if (keepRunning.checked !== a.keep_running || (keepRunning.checked && warmStopped)) {
         await api.setKeepRunning(a.id, keepRunning.checked);
         a.keep_running = keepRunning.checked;
       }

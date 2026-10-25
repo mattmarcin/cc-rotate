@@ -488,7 +488,7 @@ fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> 
             ranking::use_before_reset(store, &account, value.as_deref())?
         }
         Command::KeepRunning { account, value } => {
-            ranking::keep_running(store, &account, value.as_deref())?
+            ranking::keep_running(store, paths, &account, value.as_deref())?
         }
         Command::WarmUp { account, json } => {
             usage_check::sweep(store, paths)?;

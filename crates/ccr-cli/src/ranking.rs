@@ -114,7 +114,7 @@ pub fn weekly_cap(store: &Store, label: &str, value: Option<&str>) -> Result<()>
 }
 
 /// `keep-running <account> [yes|no]`.
-pub fn keep_running(store: &Store, label: &str, value: Option<&str>) -> Result<()> {
+pub fn keep_running(store: &Store, paths: &Paths, label: &str, value: Option<&str>) -> Result<()> {
     let account = store.find_account(label)?;
     if let Some(value) = value {
         let on = value == "yes";
@@ -139,12 +139,8 @@ pub fn keep_running(store: &Store, label: &str, value: Option<&str>) -> Result<(
         "{}: on. While it's not in use, cc-rotate starts its next 5-hour window with a short request as soon as one ends.",
         account.label
     );
-    if !store.settings()?.usage_checks {
-        println!(
-            "It needs usage checks, which are off: turn them on in Settings or with `cc-rotate-ctl config usage_checks true`."
-        );
-    } else if let Some(why) = usage_check::blocked(store)? {
-        println!("It's stopped while usage checks are: {why}.");
+    if let Some(why) = usage_check::warm_ups_paused(store, paths)? {
+        println!("Not running now: {why}.");
     }
     Ok(())
 }
