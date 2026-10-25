@@ -321,6 +321,20 @@ pub fn same_windows(a: &[SampleWindow], b: &[SampleWindow]) -> bool {
         })
 }
 
+/// The highest reading recorded for one usage window (one reset time) of an account.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WindowPeak {
+    /// Epoch seconds.
+    pub resets_at: i64,
+    pub peak_pct: f64,
+    /// Readings that reported this window.
+    pub samples: usize,
+    /// Epoch ms.
+    pub first_sample_at: i64,
+    /// Epoch ms.
+    pub last_sample_at: i64,
+}
+
 const SAMPLE_COLS: &str = "id, ts, account_id, profile, session_id, model";
 
 fn sample_from_row(row: &Row) -> rusqlite::Result<(i64, Sample)> {
@@ -1176,6 +1190,49 @@ impl Store {
         )?;
         let rows = stmt.query_map(params![account_id, name, since_s], |r| r.get(0))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The highest reading of each of an account's windows named `name` whose reset time is in
+    /// `resets_from_s..=resets_to_s`, from samples taken at or after `since_ms`: one row per
+    /// distinct reset time, in ascending order. Read-only.
+    pub fn window_peaks(
+        &self,
+        account_id: i64,
+        name: &str,
+        resets_from_s: i64,
+        resets_to_s: i64,
+        since_ms: i64,
+    ) -> Result<Vec<WindowPeak>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT w.resets_at, MAX(w.pct), COUNT(*), MIN(s.ts), MAX(s.ts)
+             FROM sample_windows w JOIN samples s ON s.id = w.sample_id
+             WHERE w.account_id = ?1 AND w.name = ?2 AND w.resets_at BETWEEN ?3 AND ?4
+               AND s.ts >= ?5
+             GROUP BY w.resets_at ORDER BY w.resets_at",
+        )?;
+        let rows = stmt.query_map(
+            params![account_id, name, resets_from_s, resets_to_s, since_ms],
+            |r| {
+                Ok(WindowPeak {
+                    resets_at: r.get(0)?,
+                    peak_pct: r.get(1)?,
+                    samples: r.get::<_, i64>(2)? as usize,
+                    first_sample_at: r.get(3)?,
+                    last_sample_at: r.get(4)?,
+                })
+            },
+        )?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// How many readings of an account were taken in `from_ms..to_ms`. Read-only.
+    pub fn sample_count(&self, account_id: i64, from_ms: i64, to_ms: i64) -> Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM samples WHERE account_id = ?1 AND ts >= ?2 AND ts < ?3",
+            params![account_id, from_ms, to_ms],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
     }
 
     /// Drop samples and events older than the retention window, at most once an hour.

@@ -9,6 +9,7 @@ pub mod credstore;
 pub mod doctor;
 pub mod forecast;
 pub mod herdr;
+pub mod history;
 pub mod lock;
 pub mod login;
 pub mod paths;
