@@ -244,8 +244,11 @@ fn settle_due(store: &Store, now_ms: i64) -> Result<bool> {
 /// changed without cc-rotate writing it) and it is time to try again (`swap::settle_profile`
 /// with the swap lock, which callers run off the hot path).
 pub fn needs_settling(store: &Store, paths: &Paths, now_ms: i64) -> Result<bool> {
+    // The store only, no credentials: the app asks every few seconds, and reading the macOS
+    // Keychain starts a process. The write-back leaves the mark of a changed login.
     if crate::lock::is_held(&paths.swap_lock(), crate::lock::CLAUDE_STALE)
-        || (swap::pending_swap(store)?.is_none() && swap::changed_login(store, paths)?.is_none())
+        || (swap::pending_swap(store)?.is_none()
+            && store.meta(swap::META_LOGIN_TO_IDENTIFY)?.is_none())
     {
         return Ok(false);
     }
@@ -474,6 +477,9 @@ fn sync_profile_login(
         // whose it is, unless logins are not identified.
         if crate::usage_check::identifies_logins(store, paths)? {
             *unidentified = true;
+            if store.meta(swap::META_LOGIN_TO_IDENTIFY)?.as_deref() != Some(marker.as_str()) {
+                store.set_meta(swap::META_LOGIN_TO_IDENTIFY, &marker)?;
+            }
             return Ok(true);
         }
         store.save_credential(active.id, &oauth, "sync")?;

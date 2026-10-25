@@ -19,7 +19,8 @@ struct Env {
 
 /// A stand-in `claude` that writes `seen.txt` (its config dir and arguments), copies the login
 /// it was given to `received.json`, then puts `config.json` and `credentials.json` from its own
-/// directory into the scratch profile when they exist.
+/// directory into the scratch profile when they exist, and runs `during.sh` (`during.cmd` on
+/// Windows) from there if there is one: what happens elsewhere while Claude Code runs.
 fn env() -> Env {
     let root = tempfile::tempdir().unwrap();
     let paths = Paths::new(root.path().join("data"), root.path().join("profile"))
@@ -39,6 +40,7 @@ dir=$(dirname "$0")
 cp "$CLAUDE_CONFIG_DIR/.credentials.json" "$dir/received.json"
 [ -f "$dir/config.json" ] && cp "$dir/config.json" "$CLAUDE_CONFIG_DIR/.claude.json"
 [ -f "$dir/credentials.json" ] && cp "$dir/credentials.json" "$CLAUDE_CONFIG_DIR/.credentials.json"
+[ -f "$dir/during.sh" ] && sh "$dir/during.sh"
 echo '{"type":"result","num_turns":0,"local_command":"usage"}'
 exit 0
 "#,
@@ -61,6 +63,7 @@ exit 0
                 "copy /y \"%CLAUDE_CONFIG_DIR%\\.credentials.json\" \"%dir%received.json\" >nul",
                 "if exist \"%dir%config.json\" copy /y \"%dir%config.json\" \"%CLAUDE_CONFIG_DIR%\\.claude.json\" >nul",
                 "if exist \"%dir%credentials.json\" copy /y \"%dir%credentials.json\" \"%CLAUDE_CONFIG_DIR%\\.credentials.json\" >nul",
+                "if exist \"%dir%during.cmd\" call \"%dir%during.cmd\"",
                 "echo {\"type\":\"result\",\"num_turns\":0,\"local_command\":\"usage\"}",
                 "exit /b 0",
                 "",
@@ -690,4 +693,95 @@ fn with_checks_off_a_changed_login_is_stored_at_once() {
     statusline::sync(&store, &e.paths).unwrap();
     assert_eq!(stored_refresh(&store, a), "refresh-a2");
     assert!(e.seen().is_empty(), "Claude Code ran: {}", e.seen());
+}
+
+/// A `/login` with x, which `.claude.json` already names, lands while a swap checks the account it
+/// is about to use: the swap does not store x's login as the outgoing account's, and leaves it
+/// to be identified first.
+#[test]
+fn a_login_during_a_swaps_checks_is_not_stored_as_the_outgoing_accounts() {
+    let e = env();
+    let (store, a, _) = identified_pool(&e, "ux");
+    // While Claude Code checks b, the profile gets x's login.
+    let x_login = e.bin.join("x-login.json");
+    std::fs::write(&x_login, json!({"claudeAiOauth": oauth("x1")}).to_string()).unwrap();
+    let profile = e.paths.credentials_file();
+    #[cfg(unix)]
+    std::fs::write(
+        e.bin.join("during.sh"),
+        format!("cp '{}' '{}'\n", x_login.display(), profile.display()),
+    )
+    .unwrap();
+    #[cfg(windows)]
+    std::fs::write(
+        e.bin.join("during.cmd"),
+        format!(
+            "@copy /y \"{}\" \"{}\" >nul\r\n",
+            x_login.display(),
+            profile.display()
+        ),
+    )
+    .unwrap();
+    e.answer("ub", 10.0);
+
+    let out = swap::run(
+        &store,
+        &e.paths,
+        &SwapRequest {
+            from: Some(a),
+            to: None,
+            reason: Reason::FiveHour,
+            wait: false,
+        },
+    )
+    .unwrap();
+    assert!(e.seen().contains("arg=/usage"), "b was checked before the swap");
+    assert!(matches!(out, SwapOutcome::Skipped { .. }), "{out:?}");
+    assert_eq!(
+        stored_refresh(&store, a),
+        "refresh-a1",
+        "x's login was stored as a's"
+    );
+    assert_eq!(store.active_account().unwrap().unwrap().id, a);
+}
+
+/// The app asks whether there is anything to identify every few seconds: the write-back's mark
+/// answers that from the store, and settling clears it.
+#[test]
+fn the_write_back_marks_a_changed_login_for_settling() {
+    let e = env();
+    let (store, _, _) = identified_pool(&e, "ua");
+    let now = time::now_ms();
+    assert!(!statusline::needs_settling(&store, &e.paths, now).unwrap());
+
+    profile_login(&e, "a2");
+    statusline::sync(&store, &e.paths).unwrap();
+    assert!(statusline::needs_settling(&store, &e.paths, now).unwrap());
+
+    e.answer("ua", 10.0);
+    assert_eq!(settle(&store, &e), swap::Settle::Settled);
+    assert!(!statusline::needs_settling(&store, &e.paths, now + 61_000).unwrap());
+}
+
+/// When the active account has nothing to compare (no account id, no email), a login Claude
+/// Code identifies as another pool account's still makes that account active.
+#[test]
+fn an_active_account_without_an_identity_does_not_take_another_accounts_login() {
+    let e = env();
+    let store = e.store();
+    let a = store
+        .insert_account("a", &AccountIdentity::default(), AccountState::Active)
+        .unwrap();
+    store.save_credential(a, &oauth("a1"), "login").unwrap();
+    let b = add(&store, "b", AccountState::Parked);
+    profile_login(&e, "a1");
+    profile_config(&e, "ub", 1);
+    statusline::sync(&store, &e.paths).unwrap();
+
+    profile_login(&e, "b2");
+    statusline::sync(&store, &e.paths).unwrap();
+    e.answer("ub", 10.0);
+    assert_eq!(settle(&store, &e), swap::Settle::Settled);
+    assert_eq!(store.active_account().unwrap().unwrap().id, b);
+    assert_eq!(stored_refresh(&store, a), "refresh-a1");
 }

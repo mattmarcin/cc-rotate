@@ -194,9 +194,13 @@ pub fn blocked(store: &Store) -> Result<Option<String>> {
 
 /// Whether a login that changed in the profile is identified with Claude Code before it is
 /// stored (`swap::identify_changed_login`): a routine run of Claude Code like a check, so only
-/// while checks are on and possible.
+/// while checks are on and possible, and while the profile's login can be read in full (on
+/// macOS, not while the Keychain cannot be used). Otherwise it is stored at once, as before
+/// logins were identified.
 pub fn identifies_logins(store: &Store, paths: &Paths) -> Result<bool> {
-    Ok(store.settings()?.usage_checks && checks_possible(store, paths)?.is_none())
+    Ok(store.settings()?.usage_checks
+        && checks_possible(store, paths)?.is_none()
+        && paths.credentials().complete().unwrap_or(false))
 }
 
 /// Whether nothing at all keeps automatic checks from running.
