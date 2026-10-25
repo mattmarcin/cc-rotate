@@ -146,7 +146,7 @@ Accounts in the same place never swap just to even out usage.
 
 cc-rotate knows how much of each limit an account has used from three places: the status line of sessions in the rotation profile, the status line of your other profiles if you turn on observe mode for them (see **Tracking your other profiles too**), and the last `/usage` reading Claude Code saved in each of your other profiles.
 An account used up elsewhere since its last reading can still be picked.
-When the first readings after a swap show that, cc-rotate swaps again on the next reading, without waiting for `swap_cooldown_s`.
+When the first readings after a swap show that, cc-rotate swaps again without waiting for `swap_cooldown_s` (it still waits 30 seconds between swap requests, so many sessions reporting at once start one swap).
 
 Some limits only apply to one model, such as a weekly limit for one model family.
 When Claude Code reports one, cc-rotate records it too and only counts it while your sessions use that model.

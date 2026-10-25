@@ -53,7 +53,8 @@ pub fn parse_rfc3339(s: &str) -> Option<i64> {
         "" | "Z" | "z" => 0,
         o if o.len() == 6 && (o.starts_with('+') || o.starts_with('-')) => {
             let sign = if o.starts_with('-') { -1 } else { 1 };
-            sign * (o[1..3].parse::<i64>().ok()? * 3600 + o[4..6].parse::<i64>().ok()? * 60)
+            let part = |r: std::ops::Range<usize>| o.get(r)?.parse::<i64>().ok();
+            sign * (part(1..3)? * 3600 + part(4..6)? * 60)
         }
         _ => return None,
     };
@@ -91,5 +92,10 @@ mod tests {
             parse_rfc3339("2026-10-25T05:00:00Z")
         );
         assert_eq!(parse_rfc3339("garbage"), None);
+        assert_eq!(
+            parse_rfc3339("2026-10-25T05:00:00+\u{e9}9:0"),
+            None,
+            "no panic"
+        );
     }
 }

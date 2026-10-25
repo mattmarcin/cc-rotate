@@ -64,6 +64,7 @@ fn pool(env: &Env) -> (Store, i64, i64, i64) {
     let ident = |u: &str| AccountIdentity {
         account_uuid: Some(u.into()),
         email: Some(format!("{u}@x.test")),
+        org_uuid: Some("org-x".into()),
         ..Default::default()
     };
     let a = store
@@ -915,7 +916,7 @@ fn a_swap_skips_an_account_its_own_profile_used_up() {
     std::fs::write(
         profile.join(".claude.json"),
         json!({
-            "oauthAccount": {"accountUuid": "ub", "emailAddress": "ub@x.test"},
+            "oauthAccount": {"accountUuid": "ub", "emailAddress": "ub@x.test", "organizationUuid": "org-x"},
             "cachedUsageUtilization": {
                 "fetchedAtMs": fetched_at,
                 "accountUuid": "ub",
@@ -940,4 +941,92 @@ fn a_swap_skips_an_account_its_own_profile_used_up() {
     assert_eq!(reading.profile, ".claude-b");
     assert_eq!(reading.ts, fetched_at);
     assert_eq!(reading.windows[0].pct, 100.0);
+}
+
+/// Two swaps in quick succession (a used up, then b found used up on arrival) while another
+/// session has been idle since it last used a: its status line keeps reporting a's usage. That
+/// reading is neither recorded for c nor taken as proof that c arrived used up.
+#[test]
+fn an_idle_session_does_not_push_the_rotation_through_the_pool() {
+    let env = Env::new();
+    let (store, a, b, c) = pool(&env);
+    let a_resets = time::now_s() + 1800;
+    store
+        .record_sample(&five_only(a, 99.0, a_resets, time::now_ms()))
+        .unwrap();
+    let from = |id| SwapRequest {
+        from: Some(id),
+        to: None,
+        reason: Reason::FiveHour,
+        wait: false,
+    };
+    swap::run(&store, &env.paths, &from(a)).unwrap();
+    let now = time::now_ms();
+    let req = statusline::tick(
+        &store,
+        &env.paths,
+        &five_hour_input(100.0, time::now_s() + 7200),
+        now,
+    )
+    .unwrap()
+    .swap
+    .unwrap();
+    assert_eq!(
+        swap::run(&store, &env.paths, &req).unwrap(),
+        SwapOutcome::Swapped {
+            from: Some(b),
+            to: c
+        }
+    );
+
+    // The idle session, 40 s later: a's reading, still at 99%.
+    let tick = statusline::tick(
+        &store,
+        &env.paths,
+        &five_hour_input(99.0, a_resets),
+        now + 40_000,
+    )
+    .unwrap();
+    assert!(tick.swap.is_none(), "{:?}", tick.swap);
+    assert!(
+        store.last_sample(c).unwrap().is_none(),
+        "a's reading is not recorded for c"
+    );
+
+    // Past the stale-reading guard (a longer cooldown), the same reading is recorded for c, but
+    // it shares a's reset time, so it does not prove c arrived used up: the cooldown applies.
+    store.set_setting("swap_cooldown_s", Some("600")).unwrap();
+    let tick = statusline::tick(
+        &store,
+        &env.paths,
+        &five_hour_input(99.0, a_resets),
+        now + 200_000,
+    )
+    .unwrap();
+    assert!(tick.swap.is_none(), "{:?}", tick.swap);
+    assert!(!swap::arrived_over_limit(&store, c, now + 200_000).unwrap());
+}
+
+/// Observe mode in the default profile, which keeps its `.claude.json` in the home directory.
+#[test]
+fn observe_mode_works_in_the_default_profile() {
+    let env = Env::new();
+    let (store, _, b, _) = pool(&env);
+    let default = env.paths.home.join(".claude");
+    std::fs::create_dir_all(&default).unwrap();
+    std::fs::write(
+        env.paths.home.join(".claude.json"),
+        json!({"oauthAccount": {"accountUuid": "ub"}}).to_string(),
+    )
+    .unwrap();
+    let account = statusline::observe(
+        &store,
+        &default,
+        &env.paths.home,
+        &five_hour_input(55.0, time::now_s() + 3600),
+        time::now_ms(),
+    )
+    .unwrap();
+    assert_eq!(account.map(|a| a.id), Some(b));
+    assert_eq!(store.last_sample(b).unwrap().unwrap().windows[0].pct, 55.0);
 }
