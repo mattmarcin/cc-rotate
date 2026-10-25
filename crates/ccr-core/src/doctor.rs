@@ -146,7 +146,7 @@ pub fn run(store: &Store, paths: &Paths) -> Vec<Check> {
         (_, 0) if usable == 0 => check(
             "Accounts",
             Status::Warn,
-            "No account in use: every account is paused or signed out.",
+            "No account in use: every account is paused or signed out",
         ),
         (_, 0) => check(
             "Accounts",
@@ -156,7 +156,7 @@ pub fn run(store: &Store, paths: &Paths) -> Vec<Check> {
         _ => check(
             "Accounts",
             Status::Fail,
-            "More than one account is marked in use.",
+            "More than one account is marked in use",
         ),
     });
 
@@ -269,7 +269,7 @@ pub fn run(store: &Store, paths: &Paths) -> Vec<Check> {
                     ),
                 ),
             },
-            (None, _) => check("Profile login", Status::Fail, "The profile has no usable login."),
+            (None, _) => check("Profile login", Status::Fail, "The profile has no usable login"),
             (_, None) => check(
                 "Profile login",
                 Status::Fail,
@@ -296,7 +296,7 @@ pub fn run(store: &Store, paths: &Paths) -> Vec<Check> {
                     "Locks",
                     Status::Warn,
                     format!(
-                        "{} is {age}s old and will be ignored as stale.",
+                        "{} is {age}s old and will be ignored as stale",
                         lock.display()
                     ),
                 ));

@@ -208,7 +208,7 @@ When Claude Code reports one, cc-rotate records it too and only counts it while 
 | `claude_path` | found on `PATH` | The `claude` executable to use for logins, usage checks and `cc-rotate`. |
 | `usage_checks` | true | Check the usage of accounts not in use with Claude Code's `/usage`, and ask Claude Code whose a changed login in the cc-rotate profile is. |
 | `usage_check_interval_s` | 3600 | How often the app checks each account that is not in use (at least 300). |
-| `usage_check_max_age_s` | 900 | A swap checks the account it picked first when its usage data is older than this. 0 checks every time. |
+| `usage_check_max_age_s` | 900 | A swap checks the account it picked first when its usage data is older than this. 0 always checks first. |
 
 ### Tracking your other profiles too
 
