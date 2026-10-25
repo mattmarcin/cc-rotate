@@ -13,13 +13,13 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::lock::{DirLock, LockError, LockOptions};
 use crate::paths::Paths;
 use crate::scheduler::{self, Candidate, Policy, Reason, WeeklyEvidence, WeeklyLimit, WindowKind};
-use crate::store::{Account, AccountState, Store, kind};
+use crate::store::{Account, AccountState, Sample, SampleWindow, Store, kind};
 use crate::{credfile, secret, time};
 
 pub const META_LAST_SWAP_AT: &str = "last_swap_at";
@@ -28,6 +28,10 @@ pub const META_LAST_SWAP_AT: &str = "last_swap_at";
 /// of each other add to it, so a session that has not made a request since two swaps ago is
 /// recognized too.
 pub const META_LAST_SWAP_FROM_RESETS: &str = "last_swap_from_resets";
+/// The reset times known to belong to the active account's own windows (JSON `KnownResets`):
+/// those of its latest reading when it became active, and of every reading since that was
+/// clearly its own. See `attribute`.
+pub const META_KNOWN_RESETS: &str = "active_known_resets";
 /// Window after a swap during which readings carrying the reset times of an account just left
 /// are treated as stale readings of that account (sessions that have not made a request yet).
 pub const STALE_SAMPLE_GUARD_MS: i64 = 120_000;
@@ -120,6 +124,122 @@ pub fn detect_weekly_limit(store: &Store, account_id: i64, now_s: i64) -> Result
 pub fn next_target(store: &Store, exclude: Option<i64>) -> Result<Option<Account>> {
     let (pool, policy) = load_pool(store, time::now_s())?;
     Ok(scheduler::pick(&pool, policy, exclude).map(|c| c.account.clone()))
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct KnownResets {
+    account: i64,
+    resets: Vec<i64>,
+}
+
+/// Where a status line reading of the active account belongs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attribution {
+    /// Clearly the active account's: it shares no reset time with another account's latest
+    /// reading, or it has one of the active account's own.
+    Own,
+    /// It shares a reset time with another account and the active account's own reset times
+    /// are not known: it may be either. Counted, since hiding a genuine reading of a used-up
+    /// account would leave its sessions waiting at the limit; a swap it triggers confirms the
+    /// account's usage first where it can (section 20).
+    Ambiguous,
+    /// Another account's: it has another account's reset times, and the active account's are
+    /// known and different. A session only notices a new login when it next starts a request
+    /// (F1), so one idle since before a swap, or one whose request started before it, still
+    /// shows the account it used then.
+    Elsewhere,
+}
+
+/// The active account's own reset times that have not passed yet.
+pub fn known_resets(store: &Store, account_id: i64, now_s: i64) -> Result<Vec<i64>> {
+    let known: KnownResets = store
+        .meta(META_KNOWN_RESETS)?
+        .and_then(|v| serde_json::from_str(&v).ok())
+        .unwrap_or_default();
+    Ok(if known.account == account_id {
+        known.resets.into_iter().filter(|&r| r > now_s).collect()
+    } else {
+        Vec::new()
+    })
+}
+
+/// Add reset times that are clearly the active account's own.
+pub fn note_known_resets(
+    store: &Store,
+    account_id: i64,
+    windows: &[SampleWindow],
+    now_s: i64,
+) -> Result<()> {
+    let mut resets = known_resets(store, account_id, now_s)?;
+    let before = resets.len();
+    for r in windows.iter().filter_map(|w| w.resets_at) {
+        if r > now_s && !resets.contains(&r) {
+            resets.push(r);
+        }
+    }
+    if resets.len() == before && store.meta(META_KNOWN_RESETS)?.is_some() {
+        return Ok(());
+    }
+    resets.sort_unstable();
+    store.set_meta(
+        META_KNOWN_RESETS,
+        serde_json::to_string(&KnownResets {
+            account: account_id,
+            resets,
+        })?,
+    )
+}
+
+/// Start the known reset times of an account that just became active from its latest reading.
+pub fn reset_known_resets(store: &Store, account_id: i64, now_s: i64) -> Result<()> {
+    let resets: Vec<i64> = store
+        .last_sample(account_id)?
+        .iter()
+        .flat_map(|s| &s.windows)
+        .filter_map(|w| w.resets_at)
+        .filter(|&r| r > now_s)
+        .collect();
+    store.set_meta(
+        META_KNOWN_RESETS,
+        serde_json::to_string(&KnownResets {
+            account: account_id,
+            resets,
+        })?,
+    )
+}
+
+/// Where a status line reading of the active account belongs (`Attribution`).
+pub fn attribute(
+    store: &Store,
+    sample: &Sample,
+    active_id: i64,
+    now_s: i64,
+) -> Result<Attribution> {
+    let mut others: Vec<i64> = Vec::new();
+    for account in store.accounts()? {
+        if account.id != active_id {
+            if let Some(last) = store.last_sample(account.id)? {
+                others.extend(
+                    last.windows
+                        .iter()
+                        .filter_map(|w| w.resets_at)
+                        .filter(|&r| r > now_s),
+                );
+            }
+        }
+    }
+    let resets: Vec<i64> = sample.windows.iter().filter_map(|w| w.resets_at).collect();
+    if !resets.iter().any(|r| others.contains(r)) {
+        return Ok(Attribution::Own);
+    }
+    let own = known_resets(store, active_id, now_s)?;
+    Ok(if resets.iter().any(|r| own.contains(r)) {
+        Attribution::Own
+    } else if own.is_empty() {
+        Attribution::Ambiguous
+    } else {
+        Attribution::Elsewhere
+    })
 }
 
 /// The reset times the stale-reading guard currently knows (`META_LAST_SWAP_FROM_RESETS`).
@@ -352,6 +472,7 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
         s.set_meta(META_LAST_SWAP_AT, now)?;
         s.set_meta(META_PROFILE_FOREIGN, "0")?;
         s.set_meta(META_ACTIVE_SINCE, now)?;
+        reset_known_resets(s, target.id, now / 1000)?;
         let mut resets: Vec<i64> = match previous_swap {
             Some(last) if now - last <= STALE_SAMPLE_GUARD_MS => left_resets(s)?,
             _ => Vec::new(),

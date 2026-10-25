@@ -309,11 +309,6 @@ fn same_windows(a: &[SampleWindow], b: &[SampleWindow]) -> bool {
         })
 }
 
-/// Prefix of the meta keys holding each session's last reading (`statusline`).
-pub const META_SESSION_PREFIX: &str = "session_reading:";
-/// A session's last reading is forgotten after this long without a tick.
-const SESSION_READING_KEPT_MS: i64 = 2 * 86_400_000;
-
 const SAMPLE_COLS: &str = "id, ts, account_id, profile, session_id, model";
 
 fn sample_from_row(row: &Row) -> rusqlite::Result<(i64, Sample)> {
@@ -1131,31 +1126,7 @@ impl Store {
             .execute("DELETE FROM samples WHERE ts < ?1", [cutoff])?;
         self.conn
             .execute("DELETE FROM events WHERE ts < ?1", [cutoff])?;
-        self.prune_session_readings(now_ms)?;
         self.set_meta("last_prune_at", now_ms)
-    }
-
-    /// Forget the readings of sessions that stopped ticking (`META_SESSION_PREFIX`).
-    fn prune_session_readings(&self, now_ms: i64) -> Result<()> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT key, value FROM meta WHERE key LIKE ?1")?;
-        let rows: Vec<(String, String)> = stmt
-            .query_map([format!("{META_SESSION_PREFIX}%")], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })?
-            .collect::<rusqlite::Result<_>>()?;
-        for (key, value) in rows {
-            let at = serde_json::from_str::<Value>(&value)
-                .ok()
-                .and_then(|v| v.get("at").and_then(Value::as_i64))
-                .unwrap_or(0);
-            if now_ms - at > SESSION_READING_KEPT_MS {
-                self.conn
-                    .execute("DELETE FROM meta WHERE key = ?1", [key])?;
-            }
-        }
-        Ok(())
     }
 
     // ---- events ------------------------------------------------------------------------
@@ -1795,20 +1766,6 @@ mod tests {
         assert_eq!(s.settings().unwrap().swap_threshold_5h, 90.0);
         assert!(s.set_setting("swap_threshold_5h", Some("150")).is_err());
         assert!(s.set_setting("nope", Some("1")).is_err());
-    }
-
-    #[test]
-    fn prune_forgets_sessions_that_stopped() {
-        let s = Store::open_in_memory().unwrap();
-        let now = 10 * 86_400_000;
-        let key = |id: &str| format!("{META_SESSION_PREFIX}{id}");
-        s.set_meta(&key("old"), json!({"at": now - 3 * 86_400_000}).to_string())
-            .unwrap();
-        s.set_meta(&key("live"), json!({"at": now - 60_000}).to_string())
-            .unwrap();
-        s.prune(now).unwrap();
-        assert!(s.meta(&key("old")).unwrap().is_none());
-        assert!(s.meta(&key("live")).unwrap().is_some());
     }
 
     #[test]
