@@ -2,6 +2,7 @@ mod format;
 mod herdr;
 mod process;
 mod ranking;
+mod stop_failure;
 mod watch;
 
 use std::io::{IsTerminal, Read, Write};
@@ -175,8 +176,8 @@ enum Command {
         /// --force, this is all setup does.
         #[arg(long)]
         remove_alias: bool,
-        /// Leave an existing cc-rotate profile as it is instead of failing (the installer runs
-        /// setup on every upgrade).
+        /// Keep an existing cc-rotate profile instead of failing, only bringing cc-rotate's own
+        /// hooks in it up to date (the installer runs setup on every upgrade).
         #[arg(long, conflicts_with = "force")]
         keep_existing: bool,
     },
@@ -230,6 +231,8 @@ enum Command {
 
 #[derive(Subcommand)]
 enum HookCommand {
+    /// A turn stopped at a usage limit: swap, then wake the session once the profile holds an
+    /// account with room.
     StopFailure,
     /// Report `cc-rotate --resume <id>` to herdr when the session runs in a herdr pane.
     SessionStart,
@@ -254,12 +257,14 @@ fn run(cli: Cli) -> Result<ExitCode> {
         }
         Command::Hook {
             hook: HookCommand::StopFailure,
-        } => {
-            if let Err(e) = stop_failure(cli.profile) {
+        } => Ok(match stop_failure::run(cli.profile, &read_stdin()) {
+            Ok(code) => code,
+            Err(e) => {
+                // Never fails the session: errors only go to the log.
                 process::log_error("hook stop-failure", &e);
+                ExitCode::SUCCESS
             }
-            Ok(ExitCode::SUCCESS)
-        }
+        }),
         Command::Hook {
             hook: HookCommand::SessionStart,
         } => {
@@ -481,9 +486,23 @@ fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> 
         } => {
             if (remove_alias || keep_existing) && !force && paths.settings_file().exists() {
                 if keep_existing {
+                    // An upgrade: cc-rotate's own hooks follow the new release, the rest stays.
+                    // A settings.json it cannot update must not fail the upgrade: doctor says
+                    // the hook is outdated until it is fixed.
+                    let note = match setup::update_hooks(&paths.profile_dir, &dunce_exe()?) {
+                        Ok(true) => {
+                            "Updated cc-rotate's hooks in it and left everything else as it is."
+                                .to_string()
+                        }
+                        Ok(false) => "Leaving it as it is.".to_string(),
+                        Err(e) => {
+                            eprintln!("warning: couldn't update cc-rotate's hooks in it: {e:#}");
+                            "Leaving it as it is.".to_string()
+                        }
+                    };
                     println!(
-                        "The cc-rotate profile at {} is already set up. Leaving it as it is.",
-                        paths.profile_dir.display()
+                        "The cc-rotate profile at {} is already set up. {note}",
+                        paths.profile_dir.display(),
                     );
                     println!(
                         "To rebuild it from your template profile, run: cc-rotate-ctl setup --force"
@@ -848,26 +867,4 @@ fn statusline_entry(profile: Option<PathBuf>, observe: bool, then: Option<String
     for line in lines {
         let _ = writeln!(out, "{line}");
     }
-}
-
-fn stop_failure(profile: Option<PathBuf>) -> Result<()> {
-    let payload: serde_json::Value = serde_json::from_str(&read_stdin()).unwrap_or_default();
-    if payload.get("error").and_then(|e| e.as_str()) != Some("rate_limit") {
-        return Ok(());
-    }
-    let (store, _) = ccr_core::open(profile.clone())?;
-    let Some(active) = store.active_account()? else {
-        return Ok(());
-    };
-    // In the background, like the statusline's: a swap may check accounts first, which can take
-    // longer than Claude Code gives a hook.
-    process::spawn_swap(
-        &SwapRequest {
-            from: Some(active.id),
-            to: None,
-            reason: Reason::StopFailure,
-            wait: false,
-        },
-        profile.as_deref(),
-    )
 }

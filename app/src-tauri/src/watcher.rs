@@ -100,6 +100,11 @@ fn run(app: &AppHandle, store: &Store, paths: &Paths, watch: &mut Watch) {
         if tick % CHECK_EVERY_S == 0 {
             start_due_check(store, paths, &watch.checking);
         }
+        // Sign-ins about to end and sessions that did not continue after a usage limit: each
+        // becomes an event once, which the refresh below turns into a notification.
+        if tick % STATUS_EVERY_S == 0 {
+            let _ = ccr_core::health::scan(store, time::now_ms());
+        }
         let Ok(version) = store.data_version() else {
             return;
         };
@@ -278,10 +283,43 @@ fn describe(store: &Store, event: &Event) -> Option<(String, String)> {
             "No account left to swap to".into(),
             "Every other account is near a limit, paused or signed out.".into(),
         )),
+        kind::DEAD_LOGIN if event.reason.as_deref() == Some("sign_in_ended") => Some((
+            format!("{} is signed out", label(event.account_from)),
+            "Its sign-in ended. Open cc-rotate and choose Sign in again.".into(),
+        )),
         kind::DEAD_LOGIN => Some((
             format!("{} is signed out", label(event.account_from)),
             "Its login stopped working. Open cc-rotate and choose Sign in again.".into(),
         )),
+        kind::LOGIN_EXPIRING => {
+            let name = label(event.account_from);
+            let left = event
+                .detail
+                .as_ref()
+                .and_then(|d| d.get("expires_at"))
+                .and_then(|v| v.as_i64())
+                .map(|t| format!("in {}", time::span(t / 1000 - time::now_s())))
+                .unwrap_or_else(|| "soon".into());
+            Some((
+                format!("{name}'s sign-in ends {left}"),
+                format!("Sign in to {name} again before then to keep it in rotation."),
+            ))
+        }
+        kind::SESSION_STUCK => {
+            let detail = event.detail.as_ref();
+            let version = detail
+                .and_then(|d| d.get("claude_version"))
+                .and_then(|v| v.as_str())
+                .filter(|v| !ccr_core::health::is_tested(v));
+            let mut body = format!(
+                "cc-rotate woke a session that stopped at a usage limit, now on {}, but it hasn't continued. Check it, and type continue if it's still waiting.",
+                label(event.account_to)
+            );
+            if let Some(v) = version {
+                body.push_str(&format!(" Claude Code {v} isn't tested with cc-rotate yet."));
+            }
+            Some(("A session didn't continue".into(), body))
+        }
         kind::FOREIGN_LOGIN => Some((
             "cc-rotate profile signed in to another account".into(),
             "A /login in the cc-rotate profile signed in to an account that isn't in cc-rotate. Add that account, or use Swap now to go back to one of yours.".into(),

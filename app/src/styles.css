@@ -570,6 +570,10 @@ td .updated {
   white-space: nowrap;
 }
 
+td .sign-in-ends {
+  color: var(--amber);
+}
+
 .badge {
   display: inline-block;
   padding: 2px 9px;

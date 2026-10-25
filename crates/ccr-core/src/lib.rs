@@ -8,6 +8,7 @@ pub mod credfile;
 pub mod credstore;
 pub mod doctor;
 pub mod forecast;
+pub mod health;
 pub mod herdr;
 pub mod history;
 pub mod lock;
@@ -28,6 +29,7 @@ pub mod swap;
 pub mod time;
 pub mod usage_check;
 pub mod usage_report;
+pub mod waiting;
 
 use std::path::PathBuf;
 
