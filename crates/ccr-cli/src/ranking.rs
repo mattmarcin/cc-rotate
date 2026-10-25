@@ -128,11 +128,20 @@ pub fn use_before_reset(store: &Store, label: &str, value: Option<&str>) -> Resu
         )?;
     }
     let account = store.find_account(label)?;
+    let detected = swap::detect_weekly_limit(store, account.id, ccr_core::time::now_s())?;
+    if scheduler::weekly_limit(account.weekly_limit, detected) == scheduler::WeeklyLimit::None {
+        let state = if account.use_expiring { "yes" } else { "no" };
+        println!(
+            "{}: has no weekly limit, so this doesn't apply (set to {state})",
+            account.label
+        );
+        return Ok(());
+    }
     let global = store.settings()?.use_expiring_weekly;
     let text = match (account.use_expiring, global) {
         (true, true) => "moves ahead when its weekly budget would reset unused",
         (true, false) => {
-            "would move ahead when its weekly budget would reset unused, but that's off in Settings"
+            "moves ahead when its weekly budget would reset unused, once that's turned on in Settings"
         }
         (false, _) => "never moves ahead for its weekly budget; it's used in your order",
     };

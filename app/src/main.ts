@@ -1223,8 +1223,16 @@ function openManage(a: AccountView) {
       if (cap.validity.badInput || (capValue !== null && !(Number.isFinite(capValue) && capValue >= 1 && capValue <= 100))) {
         throw new Error("Use a number from 1 to 100, or leave it empty.");
       }
-      if (capValue !== a.weekly_cap) await api.setWeeklyCap(a.id, capValue);
-      if (useExpiring.checked !== a.use_expiring) await api.setUseExpiring(a.id, useExpiring.checked);
+      // Each saved change becomes the new baseline, so a retry after a failed rename does not
+      // save (and log) the others again.
+      if (capValue !== a.weekly_cap) {
+        await api.setWeeklyCap(a.id, capValue);
+        a.weekly_cap = capValue;
+      }
+      if (useExpiring.checked !== a.use_expiring) {
+        await api.setUseExpiring(a.id, useExpiring.checked);
+        a.use_expiring = useExpiring.checked;
+      }
       if (label.value.trim() !== a.label) await api.renameAccount(a.id, label.value.trim());
       d.close();
       await refresh();
