@@ -87,6 +87,7 @@ fn main() -> Result<()> {
     }
     let ids: Vec<i64> = sims.iter().map(|s| s.id).collect();
     store.set_order(&ids)?;
+    earlier_weeks(&store, &sims, week_start)?;
 
     // The order the scheduler uses them in: accounts without a weekly limit first, then the
     // user's order. The paused account is never picked.
@@ -202,6 +203,112 @@ fn main() -> Result<()> {
         Ok(())
     })?;
     println!("Demo store written to {}", data.display());
+    Ok(())
+}
+
+/// Highest weekly usage of the accounts with a weekly limit in each of the four weekly windows
+/// before the current one, newest first. The paused Pro account barely gets used.
+const WEEKLY_PEAKS: &[(usize, [f64; 4])] = &[
+    (0, [34.0, 12.0, 50.0, 41.0]),
+    (5, [62.0, 88.0, 71.0, 55.0]),
+    (6, [1.0, 1.0, 2.0, 1.0]),
+];
+
+/// 5-hour windows a day of the accounts without a weekly limit, and how high each gets, per
+/// week before the current one (newest first). `None` is a week with no readings at all.
+const DAILY_WINDOWS: &[(usize, [Option<&[f64]>; 4])] = &[
+    (
+        1,
+        [
+            Some(&[99.0, 99.0]),
+            Some(&[99.0, 60.0]),
+            Some(&[99.0, 99.0]),
+            Some(&[80.0]),
+        ],
+    ),
+    (
+        2,
+        [
+            Some(&[99.0, 45.0]),
+            Some(&[70.0]),
+            Some(&[99.0]),
+            Some(&[50.0]),
+        ],
+    ),
+    (
+        3,
+        [Some(&[40.0]), Some(&[99.0]), Some(&[30.0]), Some(&[20.0])],
+    ),
+    (4, [Some(&[15.0]), None, Some(&[10.0]), Some(&[12.0])]),
+];
+
+/// Readings from the four weeks before the simulated one, for the usage history (`report` and
+/// "Recent weeks"): weekly windows that closed, and 5-hour windows on weekdays.
+fn earlier_weeks(store: &Store, sims: &[Sim], week_start: i64) -> Result<()> {
+    let hour = 3_600_000;
+    let day = 24 * hour;
+    let record = |s: &Sim, ts: i64, windows: Vec<SampleWindow>| {
+        store.record_sample(&Sample {
+            ts,
+            account_id: s.id,
+            profile: "rotate".into(),
+            session_id: Some("demo".into()),
+            model: Some("claude-opus-4-1".into()),
+            windows,
+        })
+    };
+    for &(i, peaks) in WEEKLY_PEAKS {
+        let s = &sims[i];
+        // Oldest first, so every reading is newer than the one before it.
+        for (k, peak) in peaks.iter().enumerate().rev() {
+            let resets = s.week_resets * 1000 - (k as i64 + 1) * 7 * day;
+            let opens = resets - 7 * day;
+            // A reading every 6 hours while the window is open, up to the simulated week.
+            let mut t = opens + hour;
+            while t < resets.min(week_start) {
+                let pct = peak * ((t - opens) as f64 / (7 * day) as f64).min(1.0);
+                record(
+                    s,
+                    t,
+                    vec![SampleWindow {
+                        name: "seven_day".into(),
+                        pct: (pct * 10.0).round() / 10.0,
+                        resets_at: Some(resets / 1000),
+                    }],
+                )?;
+                t += 6 * hour;
+            }
+        }
+    }
+    for &(i, weeks) in DAILY_WINDOWS {
+        let s = &sims[i];
+        for (k, windows) in weeks.iter().enumerate().rev() {
+            let Some(windows) = windows else { continue };
+            for d in 0..7 {
+                // Weekdays only, counting back from the simulated week.
+                let day_start = week_start - (k as i64 + 1) * 7 * day + d * day;
+                if d >= 5 {
+                    continue;
+                }
+                for (w, peak) in windows.iter().enumerate() {
+                    let opens = day_start + (9 + 6 * w as i64) * hour;
+                    let resets = (opens + 5 * hour) / 1000;
+                    for step in 1..=10 {
+                        let pct = (peak * step as f64 / 10.0).min(*peak);
+                        record(
+                            s,
+                            opens + step * 30 * 60_000 - 60_000,
+                            vec![SampleWindow {
+                                name: "five_hour".into(),
+                                pct,
+                                resets_at: Some(resets),
+                            }],
+                        )?;
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }
 

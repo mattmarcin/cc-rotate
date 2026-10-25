@@ -26,6 +26,16 @@ pub fn span(secs: i64) -> String {
     }
 }
 
+/// An epoch-seconds time in the local time zone, formatted with `strftime` syntax
+/// ("%H:%M:%S", "%a %b %-d").
+pub fn local(ts_s: i64, format: &str) -> String {
+    use chrono::TimeZone;
+    match chrono::Local.timestamp_opt(ts_s, 0).single() {
+        Some(t) => t.format(format).to_string(),
+        None => "-".into(),
+    }
+}
+
 /// Epoch seconds from an RFC 3339 timestamp (`2026-10-24T18:00:00Z`, with an optional fraction
 /// and offset), the form Claude Code's status line and usage readings use.
 pub fn parse_rfc3339(s: &str) -> Option<i64> {
