@@ -15,6 +15,7 @@
   --crimson-soft: #f8e1e6;
   --focus: #2b6fd6;
   --shadow: 0 12px 40px rgba(20, 30, 45, 0.18);
+  --lift: 0 6px 20px rgba(20, 30, 45, 0.16), 0 1px 3px rgba(20, 30, 45, 0.12);
   color-scheme: light;
 }
 
@@ -36,6 +37,7 @@
     --crimson-soft: #3d1c24;
     --focus: #6aa5ff;
     --shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
+    --lift: 0 8px 24px rgba(0, 0, 0, 0.5), 0 1px 3px rgba(0, 0, 0, 0.4);
     color-scheme: dark;
   }
 }
@@ -375,6 +377,11 @@ button {
   color: var(--crimson);
 }
 
+/* Without a weekly limit the tank already shows the 5-hour budget. */
+.cell.no-weekly .five {
+  visibility: hidden;
+}
+
 .onboard {
   max-width: 520px;
   padding: 6px 0 4px;
@@ -526,6 +533,19 @@ tr.is-active td:first-child {
   white-space: nowrap;
 }
 
+.plan {
+  display: inline-block;
+  margin-left: 7px;
+  padding: 0 6px;
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+  font-size: 11.5px;
+  font-weight: 560;
+  line-height: 17px;
+  color: var(--muted);
+  vertical-align: 1px;
+}
+
 .who-email {
   font-size: 12.5px;
   white-space: nowrap;
@@ -620,6 +640,104 @@ td .updated {
 
 .meter-text .muted {
   font-size: 12px;
+}
+
+.meter-text.none strong {
+  font-weight: 560;
+}
+
+.scoped {
+  list-style: none;
+  margin: 5px 0 0;
+  padding: 0;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.scoped li.over {
+  color: var(--crimson);
+}
+
+/* ---- account order ---- */
+
+th.order,
+td.order {
+  width: 34px;
+  padding-left: 8px;
+  padding-right: 0;
+}
+
+.grip {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 30px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--line-strong);
+  cursor: grab;
+  touch-action: none;
+}
+
+.grip svg {
+  fill: currentColor;
+}
+
+tbody tr:hover .grip,
+.grip:focus-visible {
+  color: var(--muted);
+}
+
+.grip:hover {
+  background: var(--tank);
+  color: var(--ink);
+}
+
+body.grabbing,
+body.grabbing * {
+  cursor: grabbing !important;
+  user-select: none;
+}
+
+tbody.sorting tr:not(.dragging) {
+  transition: transform 0.16s ease;
+}
+
+tr.dragging {
+  position: relative;
+  z-index: 2;
+  box-shadow: var(--lift);
+}
+
+tr.dragging td {
+  background: var(--panel);
+  border-bottom-color: transparent;
+}
+
+tr.dragging .grip {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.table-note {
+  margin: 8px 2px 0;
+  font-size: 12.5px;
+}
+
+.order-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: -4px 0 16px;
+  font-size: 13px;
+}
+
+.order-buttons {
+  display: flex;
+  gap: 8px;
 }
 
 .actions {
@@ -818,6 +936,13 @@ td .updated {
   border: 0;
 }
 
+.activity .why {
+  display: block;
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
 .activity time {
   color: var(--muted);
   font-size: 12.5px;
@@ -887,9 +1012,15 @@ dialog.drawer {
   font-size: 12px;
 }
 
+.fields label.check {
+  display: inline-flex;
+  font-weight: 400;
+}
+
 input[type="text"],
 input[type="email"],
-input[type="number"] {
+input[type="number"],
+select {
   font: inherit;
   color: var(--ink);
   background: var(--bg);
@@ -1064,6 +1195,17 @@ input[type="checkbox"] {
   .rail {
     border-left: 0;
     border-top: 1px solid var(--line);
+  }
+  th,
+  td {
+    padding-left: 9px;
+    padding-right: 9px;
+  }
+  th.order,
+  td.order {
+    width: 28px;
+    padding-left: 5px;
+    padding-right: 0;
   }
 }
 
