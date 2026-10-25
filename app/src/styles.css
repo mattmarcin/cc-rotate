@@ -1135,6 +1135,12 @@ input[type="checkbox"] {
   font-weight: 600;
 }
 
+/* Details may hold long paths: wrap them instead of widening the drawer. */
+.checks li > * {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .facts.info dd {
   font-weight: 450;
 }

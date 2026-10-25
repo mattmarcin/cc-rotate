@@ -889,7 +889,7 @@ function openLogin(account: AccountView | null) {
     "div",
     { class: "fields" },
     h("label", null, h("span", null, "Email"), email, h("small", { class: "muted" }, "Optional. Pre-fills the sign-in page.")),
-    h("label", null, h("span", null, "Label"), label, h("small", { class: "muted" }, "Optional. A short name, like work or team-3.")),
+    h("label", null, h("span", null, "Label"), label, h("small", { class: "muted" }, "Optional. A short name, like main or account2.")),
     h("p", { class: "muted" }, "Sign-in uses the claude.ai account your browser is signed in to. Switch accounts there first if you need to."),
   );
   const form = account
@@ -1149,9 +1149,11 @@ async function openSettings() {
   const autostart = h("input", { type: "checkbox", id: "autostart" });
   const d = dialog(
     "Settings",
+    h("h3", null, "Health"),
     checks,
-    h("h3", null, "Settings"),
+    h("h3", null, "Rotation"),
     settingsForm,
+    h("h3", null, "General"),
     h("label", { class: "check", for: "autostart" }, autostart, "Start cc-rotate when I sign in"),
     h("h3", null, "About"),
     info,
@@ -1209,7 +1211,7 @@ async function openSettings() {
         "usage_check_max_age_s",
         "Check before swapping if usage is older than (seconds)",
         snap.settings.usage_check_max_age_s,
-        "0 checks every time.",
+        "Set to 0 to always check first.",
         0,
         86400,
       ),
