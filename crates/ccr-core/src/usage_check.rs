@@ -192,6 +192,13 @@ pub fn blocked(store: &Store) -> Result<Option<String>> {
     store.meta(META_BLOCKED)
 }
 
+/// Whether a login that changed in the profile is identified with Claude Code before it is
+/// stored (`swap::identify_changed_login`): a routine run of Claude Code like a check, so only
+/// while checks are on and possible.
+pub fn identifies_logins(store: &Store, paths: &Paths) -> Result<bool> {
+    Ok(store.settings()?.usage_checks && checks_possible(store, paths)?.is_none())
+}
+
 /// Whether nothing at all keeps automatic checks from running.
 fn checks_possible(store: &Store, paths: &Paths) -> Result<Option<String>> {
     if let Some(reason) = blocked(store)? {
@@ -867,6 +874,29 @@ pub struct Who {
     pub uuid: Option<String>,
     pub email: Option<String>,
     pub org_uuid: Option<String>,
+}
+
+impl Who {
+    /// Whether this is `account`: by account id, or else by email. The same person can be a
+    /// member of several organizations with one account id and email, so the organization must
+    /// match too where both are known. `None` when neither the id nor the email can be compared.
+    pub fn is(&self, account: &Account) -> Option<bool> {
+        let person = match (
+            &account.account_uuid,
+            &self.uuid,
+            &account.email,
+            &self.email,
+        ) {
+            (Some(x), Some(y), _, _) => x == y,
+            (_, _, Some(x), Some(y)) => x.eq_ignore_ascii_case(y),
+            _ => return None,
+        };
+        let org = match (&account.org_uuid, &self.org_uuid) {
+            (Some(x), Some(y)) => x == y,
+            _ => true,
+        };
+        Some(person && org)
+    }
 }
 
 /// Which account the rotation profile's login belongs to, as Claude Code reports it: run with a

@@ -1493,11 +1493,11 @@ fn an_unidentified_login_after_a_dead_swap_stops_everything_until_settled() {
     };
     let now = time::now_ms();
     assert!(
-        tick(now).finish_swap,
+        tick(now).settle_login,
         "settling is started in the background"
     );
-    assert!(!tick(now + 5_000).finish_swap, "at most once a minute");
-    assert!(tick(now + 61_000).finish_swap);
+    assert!(!tick(now + 5_000).settle_login, "at most once a minute");
+    assert!(tick(now + 61_000).settle_login);
     statusline::sync(&store, &env.paths).unwrap();
     assert_eq!(
         store.credential(a).unwrap().unwrap().oauth["refreshToken"],
@@ -1612,7 +1612,7 @@ fn a_dead_swap_whose_login_was_then_rejected_puts_the_outgoing_login_back() {
 
     assert_eq!(
         swap::finish_dead_swap(&store, &env.paths, swap::Settler::Locked).unwrap(),
-        swap::DeadSwap::Settled
+        swap::Settle::Settled
     );
     assert_eq!(refresh_of(&env.file_doc()), "refresh-a1");
     assert_eq!(store.active_account().unwrap().unwrap().id, a);

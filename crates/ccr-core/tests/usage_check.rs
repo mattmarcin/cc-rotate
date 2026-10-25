@@ -8,7 +8,7 @@ use ccr_core::scheduler::Reason;
 use ccr_core::store::{AccountIdentity, AccountState, Sample, SampleWindow, kind};
 use ccr_core::swap::{self, SwapOutcome, SwapRequest};
 use ccr_core::usage_check::{self, CheckOutcome, Trigger};
-use ccr_core::{Paths, Store, time};
+use ccr_core::{Paths, Store, statusline, time};
 use serde_json::{Value, json};
 
 struct Env {
@@ -411,7 +411,7 @@ fn a_dead_swap_is_settled_by_asking_claude_code_whose_login_it_is() {
 
         assert_eq!(
             swap::finish_dead_swap(&store, &e.paths, swap::Settler::Locked).unwrap(),
-            swap::DeadSwap::Settled
+            swap::Settle::Settled
         );
         assert_eq!(
             store.active_account().unwrap().unwrap().label,
@@ -471,4 +471,223 @@ fn no_check_runs_while_a_swap_is_pending() {
     let out = usage_check::check(&store, &e.paths, c, Trigger::Manual).unwrap();
     assert!(matches!(out, CheckOutcome::Skipped { .. }), "{out:?}");
     assert!(e.seen().is_empty());
+}
+
+/// Put a login into the profile, the way Claude Code writes it.
+fn profile_login(e: &Env, tag: &str) {
+    std::fs::write(
+        e.paths.credentials_file(),
+        json!({"claudeAiOauth": oauth(tag)}).to_string(),
+    )
+    .unwrap();
+}
+
+/// Write the profile's `.claude.json` naming `uuid`, as `/login` does, with a modification time
+/// `step` seconds ahead so every write is told apart.
+fn profile_config(e: &Env, uuid: &str, step: u64) {
+    let path = e.paths.profile_config();
+    std::fs::write(
+        &path,
+        json!({"oauthAccount": {"accountUuid": uuid}}).to_string(),
+    )
+    .unwrap();
+    let file = std::fs::File::options().write(true).open(&path).unwrap();
+    file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(step))
+        .unwrap();
+}
+
+/// Pool a (active, its login in the profile, which the write-back has seen) and b (parked),
+/// with the profile's `.claude.json` naming `named`, as it still does after swaps (F14).
+fn identified_pool(e: &Env, named: &str) -> (Store, i64, i64) {
+    let store = e.store();
+    let a = add(&store, "a", AccountState::Active);
+    let b = add(&store, "b", AccountState::Parked);
+    profile_login(e, "a1");
+    profile_config(e, named, 1);
+    statusline::sync(&store, &e.paths).unwrap();
+    (store, a, b)
+}
+
+fn stored_refresh(store: &Store, id: i64) -> Value {
+    store.credential(id).unwrap().unwrap().oauth["refreshToken"].clone()
+}
+
+fn settle(store: &Store, e: &Env) -> swap::Settle {
+    swap::settle_profile(store, &e.paths).unwrap()
+}
+
+/// The profile's `.claude.json` still names x, an account outside the pool, from an earlier
+/// `/login` (a swap does not update it, F14), and a is active with its own login. A second
+/// `/login` with x changes the login but not the account the config names. The write-back does
+/// not store x's login as a's; Claude Code identifies it, and the profile is marked foreign.
+#[test]
+fn a_second_login_of_the_account_the_config_names_is_not_stored_as_the_active_accounts() {
+    let e = env();
+    let (store, a, _) = identified_pool(&e, "ux");
+
+    profile_login(&e, "x1");
+    profile_config(&e, "ux", 2);
+    e.answer("ux", 10.0);
+    let tick = statusline::tick(
+        &store,
+        &e.paths,
+        &statusline::StatusInput::default(),
+        time::now_ms(),
+    )
+    .unwrap();
+    assert!(
+        tick.settle_login,
+        "identifying the login is started in the background"
+    );
+    assert_eq!(
+        stored_refresh(&store, a),
+        "refresh-a1",
+        "x's login was stored as a's"
+    );
+
+    assert_eq!(settle(&store, &e), swap::Settle::Settled);
+    assert_eq!(stored_refresh(&store, a), "refresh-a1");
+    assert_eq!(
+        store.meta(swap::META_PROFILE_FOREIGN).unwrap().as_deref(),
+        Some("1")
+    );
+    let event = store.last_event_of(kind::FOREIGN_LOGIN).unwrap().unwrap();
+    assert_eq!(event.detail.unwrap()["account_uuid"], "ux");
+    assert_eq!(settle(&store, &e), swap::Settle::Nothing, "settled once");
+}
+
+/// Claude Code renewed the active account's login: once Claude Code says it is a's, it is stored.
+#[test]
+fn a_renewal_is_stored_once_identified() {
+    let e = env();
+    let (store, a, _) = identified_pool(&e, "ua");
+
+    profile_login(&e, "a2");
+    statusline::sync(&store, &e.paths).unwrap();
+    assert_eq!(
+        stored_refresh(&store, a),
+        "refresh-a1",
+        "not before it is identified"
+    );
+
+    e.answer("ua", 10.0);
+    assert_eq!(settle(&store, &e), swap::Settle::Settled);
+    assert_eq!(stored_refresh(&store, a), "refresh-a2");
+    assert!(e.seen().contains("arg=/usage"), "{}", e.seen());
+    let received: Value =
+        serde_json::from_str(&std::fs::read_to_string(e.bin.join("received.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        received["claudeAiOauth"]["refreshToken"], "",
+        "never renewable"
+    );
+    assert_eq!(store.active_account().unwrap().unwrap().id, a);
+}
+
+/// The config still names b, which was active before a swap to a. A `/login` with b changes the
+/// login but not the account the config names: once Claude Code says it is b's, b becomes active
+/// with that login, and a keeps its own.
+#[test]
+fn a_login_of_another_pool_account_makes_it_active() {
+    let e = env();
+    let (store, a, b) = identified_pool(&e, "ub");
+
+    profile_login(&e, "b2");
+    profile_config(&e, "ub", 2);
+    statusline::sync(&store, &e.paths).unwrap();
+    e.answer("ub", 10.0);
+    assert_eq!(settle(&store, &e), swap::Settle::Settled);
+    assert_eq!(store.active_account().unwrap().unwrap().id, b);
+    assert_eq!(stored_refresh(&store, b), "refresh-b2");
+    assert_eq!(stored_refresh(&store, a), "refresh-a1");
+    assert!(store.last_event_of(kind::ADOPTED_LOGIN).unwrap().is_some());
+}
+
+/// A swap identifies a changed login before it stores the profile's login as the outgoing
+/// account's.
+#[test]
+fn a_swap_identifies_a_changed_login_first() {
+    let e = env();
+    let (store, a, b) = identified_pool(&e, "ux");
+    profile_login(&e, "x1");
+    e.answer("ux", 10.0);
+
+    let out = swap::run(
+        &store,
+        &e.paths,
+        &SwapRequest {
+            from: Some(a),
+            to: Some(b),
+            reason: Reason::Manual,
+            wait: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        SwapOutcome::Swapped {
+            from: Some(a),
+            to: b
+        }
+    );
+    assert_eq!(
+        stored_refresh(&store, a),
+        "refresh-a1",
+        "x's login was stored as a's"
+    );
+}
+
+/// While Claude Code cannot say whose a changed login is, it is not stored and no swap runs.
+/// After `UNIDENTIFIED_FOR_AT_MOST_MS` it is stored as the active account's, as before logins
+/// were identified, so a Claude Code that cannot identify logins never stops the rotation.
+#[test]
+fn a_login_that_cannot_be_identified_is_stored_as_before_after_a_while() {
+    let e = env();
+    let (store, a, b) = identified_pool(&e, "ua");
+    profile_login(&e, "a2");
+    statusline::sync(&store, &e.paths).unwrap();
+
+    // The stand-in reports nobody.
+    assert_eq!(settle(&store, &e), swap::Settle::Unsure);
+    assert_eq!(stored_refresh(&store, a), "refresh-a1");
+    let out = swap::run(
+        &store,
+        &e.paths,
+        &SwapRequest {
+            from: Some(a),
+            to: Some(b),
+            reason: Reason::Manual,
+            wait: false,
+        },
+    )
+    .unwrap();
+    assert!(matches!(out, SwapOutcome::Skipped { .. }), "{out:?}");
+
+    let mut since: swap::Unidentified =
+        serde_json::from_str(&store.meta(swap::META_LOGIN_UNIDENTIFIED).unwrap().unwrap()).unwrap();
+    since.at -= swap::UNIDENTIFIED_FOR_AT_MOST_MS;
+    store
+        .set_meta(
+            swap::META_LOGIN_UNIDENTIFIED,
+            serde_json::to_string(&since).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(settle(&store, &e), swap::Settle::Settled);
+    assert_eq!(stored_refresh(&store, a), "refresh-a2");
+    let error = store.last_event_of(kind::ERROR).unwrap().unwrap();
+    assert_eq!(error.reason.as_deref(), Some("login"));
+    assert!(store.meta(swap::META_LOGIN_UNIDENTIFIED).unwrap().is_none());
+}
+
+/// With usage checks off, cc-rotate runs no Claude Code of its own: a changed login is stored as
+/// the active account's at once, as before logins were identified.
+#[test]
+fn with_checks_off_a_changed_login_is_stored_at_once() {
+    let e = env();
+    let (store, a, _) = identified_pool(&e, "ua");
+    store.set_setting("usage_checks", Some("false")).unwrap();
+    profile_login(&e, "a2");
+    statusline::sync(&store, &e.paths).unwrap();
+    assert_eq!(stored_refresh(&store, a), "refresh-a2");
+    assert!(e.seen().is_empty(), "Claude Code ran: {}", e.seen());
 }

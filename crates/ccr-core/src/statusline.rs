@@ -14,10 +14,10 @@ use serde_json::{Value, json};
 use crate::paths::Paths;
 use crate::profile_account;
 use crate::scheduler::{self, Reason, Timing};
-use crate::store::{Account, AccountState, Sample, SampleWindow, Store, kind};
+use crate::store::{Account, Sample, SampleWindow, Store, kind};
 use crate::swap::{
-    self, META_ACTIVE_SINCE, META_CRED_SEEN, META_LAST_SWAP_AT, META_PROFILE_FOREIGN,
-    META_PROFILE_MODEL, STALE_SAMPLE_GUARD_MS, SwapRequest,
+    self, META_CRED_SEEN, META_LAST_SWAP_AT, META_PROFILE_FOREIGN, META_PROFILE_MODEL,
+    STALE_SAMPLE_GUARD_MS, SwapRequest,
 };
 use crate::{credfile, time};
 
@@ -138,15 +138,17 @@ pub struct TickResult {
     /// background: readings at its limit keep coming that look like another account's, while
     /// none of its own arrived for a while.
     pub confirm: bool,
-    /// Start `cc-rotate-ctl finish-swap` in the background: a swap stopped half way and the
-    /// profile's login has to be identified (`swap::finish_dead_swap`).
-    pub finish_swap: bool,
+    /// Start `cc-rotate-ctl settle-login` in the background: the profile's login has to be
+    /// identified, after a swap stopped half way or because it changed without cc-rotate
+    /// writing it (`swap::settle_profile`).
+    pub settle_login: bool,
 }
 
 /// One statusline tick in the rotation profile.
 pub fn tick(store: &Store, paths: &Paths, input: &StatusInput, now_ms: i64) -> Result<TickResult> {
     let mut result = TickResult::default();
     let mut dead_login = false;
+    let mut unidentified = false;
 
     // Recorded for `doctor`: proves the statusline runs, and whether Claude Code sent usage.
     store.set_meta(META_LAST_TICK_AT, now_ms)?;
@@ -159,11 +161,14 @@ pub fn tick(store: &Store, paths: &Paths, input: &StatusInput, now_ms: i64) -> R
         },
     )?;
 
-    if !sync_profile_login(store, paths, &mut dead_login)? {
+    if !sync_profile_login(store, paths, &mut dead_login, &mut unidentified)? {
         // Nothing can be trusted about the profile's login until the swap is settled.
-        result.finish_swap = settle_due(store, now_ms)?;
+        result.settle_login = settle_due(store, now_ms)?;
         result.active = store.active_account()?;
         return Ok(result);
+    }
+    if unidentified && !crate::lock::is_held(&paths.swap_lock(), crate::lock::CLAUDE_STALE) {
+        result.settle_login = settle_due(store, now_ms)?;
     }
 
     let Some(active) = store.active_account()? else {
@@ -235,11 +240,12 @@ fn settle_due(store: &Store, now_ms: i64) -> Result<bool> {
     })
 }
 
-/// Whether a swap stopped half way and it is time to try settling it again
-/// (`swap::finish_dead_swap` with the swap lock, which callers run off the hot path).
+/// Whether the profile's login has to be identified (a swap stopped half way, or the login
+/// changed without cc-rotate writing it) and it is time to try again (`swap::settle_profile`
+/// with the swap lock, which callers run off the hot path).
 pub fn needs_settling(store: &Store, paths: &Paths, now_ms: i64) -> Result<bool> {
-    if swap::pending_swap(store)?.is_none()
-        || crate::lock::is_held(&paths.swap_lock(), crate::lock::CLAUDE_STALE)
+    if crate::lock::is_held(&paths.swap_lock(), crate::lock::CLAUDE_STALE)
+        || (swap::pending_swap(store)?.is_none() && swap::changed_login(store, paths)?.is_none())
     {
         return Ok(false);
     }
@@ -375,7 +381,7 @@ pub fn sync(store: &Store, paths: &Paths) -> Result<Option<SwapRequest>> {
 
 pub fn sync_at(store: &Store, paths: &Paths, now_ms: i64) -> Result<Option<SwapRequest>> {
     let mut dead_login = false;
-    if !sync_profile_login(store, paths, &mut dead_login)? {
+    if !sync_profile_login(store, paths, &mut dead_login, &mut false)? {
         // Settled where it can take its time (`needs_settling`).
         return Ok(None);
     }
@@ -401,9 +407,15 @@ pub fn sync_at(store: &Store, paths: &Paths, now_ms: i64) -> Result<Option<SwapR
 /// Keep the store's copy of the active login current, and notice when the login in the
 /// profile changed for reasons other than our own swaps.
 /// Returns false when nothing could be synced because a swap stopped half way and the profile's
-/// login is not identified yet.
-fn sync_profile_login(store: &Store, paths: &Paths, dead_login: &mut bool) -> Result<bool> {
-    if swap::finish_dead_swap(store, paths, swap::Settler::Tick)? == swap::DeadSwap::Unsure {
+/// login is not identified yet. Sets `unidentified` when the login changed without cc-rotate
+/// writing it and waits for Claude Code to say whose it is (`swap::identify_changed_login`).
+fn sync_profile_login(
+    store: &Store,
+    paths: &Paths,
+    dead_login: &mut bool,
+    unidentified: &mut bool,
+) -> Result<bool> {
+    if swap::finish_dead_swap(store, paths, swap::Settler::Tick)? == swap::Settle::Unsure {
         return Ok(false);
     }
     if adopt_manual_login(store, paths)? {
@@ -457,6 +469,13 @@ fn sync_profile_login(store: &Store, paths: &Paths, dead_login: &mut bool) -> Re
     }
     let stored_fp = store.credential_meta(active.id)?.map(|m| m.refresh_fp);
     if file_fp.is_some() && file_fp != stored_fp {
+        // A login cc-rotate did not write: a renewal of the active account's, or a `/login` that
+        // `.claude.json` does not reveal after a swap (F14). Left unseen until Claude Code says
+        // whose it is, unless logins are not identified.
+        if crate::usage_check::identifies_logins(store, paths)? {
+            *unidentified = true;
+            return Ok(true);
+        }
         store.save_credential(active.id, &oauth, "sync")?;
         store.log_event(kind::SYNC, Some(active.id), None, Some("refreshed"), None)?;
     }
@@ -502,24 +521,7 @@ fn adopt_manual_login(store: &Store, paths: &Paths) -> Result<bool> {
         Some(account) => {
             let creds = paths.credentials();
             let oauth = creds.read_oauth()?;
-            store.immediate(|s| {
-                if let Some(a) = &active {
-                    s.set_state(a.id, AccountState::Parked)?;
-                }
-                s.set_state(account.id, AccountState::Active)?;
-                s.set_meta(META_ACTIVE_SINCE, crate::time::now_ms())?;
-                if let Some(o) = oauth.as_ref().filter(|o| !credfile::is_dead(o)) {
-                    s.save_credential(account.id, o, "sync")?;
-                }
-                s.log_event(
-                    kind::ADOPTED_LOGIN,
-                    active.as_ref().map(|a| a.id),
-                    Some(account.id),
-                    Some("login_in_profile"),
-                    None,
-                )?;
-                Ok(())
-            })?;
+            store.immediate(|s| swap::adopt_login(s, active.as_ref(), &account, oauth.as_ref()))?;
             if let Some(marker) = creds.change_marker()? {
                 store.set_meta(META_CRED_SEEN, &marker)?;
             }
