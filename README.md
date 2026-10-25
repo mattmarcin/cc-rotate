@@ -149,22 +149,6 @@ cc-rotate also swaps back by itself: when an account higher in your order than t
 That includes an account you picked by hand, so pause an account if you want it left alone.
 Accounts in the same place never swap just to even out usage.
 
-### Weekly budget that would go unused
-
-Whatever an account with a weekly limit hasn't used by its weekly reset is lost.
-It can only be used as fast as its 5-hour limit allows, and only while you're working, so leaving it for last can mean there isn't time to use it.
-cc-rotate works out how many hours of use the rest of each weekly budget takes and how many working hours are left before the reset.
-When the account would otherwise run out of time, it moves to the front, early enough to use its budget.
-Until then its budget stays in reserve for when every other account is at a limit.
-The accounts are taken in the order their weeks reset, since only one is in use at a time.
-
-It learns from your usage how much of the weekly budget a 5-hour window costs on each account, how fast you use an account, and when you usually work.
-Until it has seen enough, it assumes a full 5-hour window costs a tenth of the week and that you work 10 hours a day, which errs on the side of starting early.
-Turn it off with `cc-rotate-ctl config use_expiring_weekly false`, or in **Settings**.
-
-To keep part of an account's week for yourself, set where rotation stops using it, in its **More** dialog or with `cc-rotate-ctl weekly-cap <label> 70` (`off` goes back to the setting).
-cc-rotate then treats 70% as that account's weekly limit, and only plans to use its budget up to there.
-
 `cc-rotate-ctl next --explain` lists every account in the order it would be used, with the reason for each.
 
 cc-rotate knows how much of each limit an account has used from four places: the status line of sessions in the cc-rotate profile, the status line of your other profiles if you turn on observe mode for them (see **Tracking your other profiles too**), the last `/usage` reading Claude Code saved in each of your other profiles, and usage checks.
@@ -185,6 +169,22 @@ When the first readings after a swap show that, cc-rotate swaps again without wa
 
 Some limits only apply to one model, such as a weekly limit for one model family.
 When Claude Code reports one, cc-rotate records it too and only counts it while your sessions use that model.
+
+### Weekly budget that would go unused
+
+Whatever an account with a weekly limit hasn't used by its weekly reset is lost.
+It can only be used as fast as its 5-hour limit allows, and only while you're working, so leaving it for last can mean there isn't time to use it.
+cc-rotate works out how many hours of use the rest of each weekly budget takes and how many working hours are left before the reset.
+When the account would otherwise run out of time, it moves to the front, early enough to use its budget.
+Until then its budget stays in reserve for when every other account is at a limit.
+The accounts are taken in the order their weeks reset, since only one is in use at a time.
+
+It learns from your usage how much of the weekly budget a 5-hour window costs on each account, how fast you use an account, and when you usually work.
+Until it has seen enough, it assumes a full 5-hour window costs a tenth of the week and that you work 10 hours a day, which errs on the side of starting early.
+Turn it off with `cc-rotate-ctl config use_expiring_weekly false`, or in **Settings**.
+
+To keep part of an account's week for yourself, set where rotation stops using it, in its **More** dialog or with `cc-rotate-ctl weekly-cap <label> 70` (`off` goes back to the setting).
+cc-rotate then treats 70% as that account's weekly limit, and only plans to use its budget up to there.
 
 ### Commands
 
