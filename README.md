@@ -191,12 +191,33 @@ cc-rotate then treats 70% as that account's weekly limit, and only plans to use 
 While you work, the dashboard shows how long your accounts last at your current pace ("all at a limit by 3:10 PM, one frees up at 4:30 PM"), and `cc-rotate-ctl status` shows the same.
 The app sends a notification once when they would all be at a limit within the hour.
 
+### Which accounts earn their keep
+
+`cc-rotate-ctl report` shows how much use each account got, so you can tell which subscriptions you still need:
+
+- For an account with a weekly limit: the highest usage of each weekly window that ended in the period, and the average.
+- For an account without one: how many 5-hour windows it used each calendar week (Monday to Monday), and how many of them reached the limit.
+
+It only reports what cc-rotate recorded, and usage history is kept for `sample_retention_days` (90 days by default).
+A week with no readings shows no numbers.
+A week with few readings is marked, since the account may have used more than cc-rotate saw.
+The app shows the same numbers for the last 4 weeks as **Recent weeks** in the account's **More** dialog.
+
+### Watching from a terminal
+
+Over SSH, or in a terminal pane without the app, `cc-rotate-ctl watch` keeps `status` and the latest events on screen and redraws them in place.
+It only reads: unlike `status`, it never swaps, syncs logins or starts Claude Code.
+Press q, Esc or Ctrl-C to quit.
+When its output isn't a terminal, it prints the status once and exits.
+
 ### Commands
 
 | Command | What it does |
 |---|---|
 | `cc-rotate [claude arguments]` | Start Claude Code on the pool. |
 | `cc-rotate-ctl status` | Every account with its plan, usage and reset times, and the next pick. |
+| `cc-rotate-ctl watch` | `status` and the latest events, redrawn every 2 seconds until you press q. `--interval <seconds>` changes the pace. |
+| `cc-rotate-ctl report` | How much of its limits each account used, week by week, over the last 4 weeks. `--weeks <n>` looks further back, `--json` prints the numbers. |
 | `cc-rotate-ctl next` | The account the next swap would pick, and why. `--explain` lists every account in order with a reason. |
 | `cc-rotate-ctl swap` | Swap now to the next pick. `--to <label>` picks one. |
 | `cc-rotate-ctl check [<label>...]` | Read the usage of accounts not in use now with Claude Code's `/usage`, all of them when none are listed. |
