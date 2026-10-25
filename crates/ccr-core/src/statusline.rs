@@ -48,6 +48,10 @@ pub struct StatusInput {
     pub rate_limits: Option<BTreeMap<String, Window>>,
 }
 
+/// A session whose process has run this long or less started then, unless it was resumed or
+/// forked, which restores the run time it had (`Store::note_session_cost`).
+const NEW_SESSION_MS: f64 = 60_000.0;
+
 #[derive(Debug, Default, Deserialize)]
 pub struct CostInfo {
     pub total_cost_usd: Option<f64>,
@@ -265,10 +269,9 @@ pub fn tick(store: &Store, paths: &Paths, input: &StatusInput, now_ms: i64) -> R
     // Paid extra usage judged by an old report: read the account in use again, in place of a
     // swap that has nowhere to go (a sync runs one thing at a time: a swap, a settling, or a
     // reading). A swap away from paying goes first.
-    let futile = result
-        .swap
-        .as_ref()
-        .is_some_and(|s| result.pool_exhausted && s.reason != Reason::AvoidExtraUsage);
+    let futile = result.swap.as_ref().is_some_and(|s| {
+        result.pool_exhausted && !matches!(s.reason, Reason::AvoidExtraUsage | Reason::DeadLogin)
+    });
     if !result.confirm
         && !result.settle_login
         && (result.swap.is_none() || futile)
@@ -472,12 +475,12 @@ fn note_cost(store: &Store, input: &StatusInput, account_id: i64, now_ms: i64) -
         return Ok(());
     }
     // Two processes can run one session (resumed twice, each restoring the same total): each
-    // keeps its own count, told apart by when it started.
-    let started = cost
+    // keeps its own count. A process that cannot be told shares one with the session.
+    let process = crate::process::Ancestors::launcher().unwrap_or_default();
+    let new_session = cost
         .total_duration_ms
-        .filter(|d| d.is_finite() && *d >= 0.0)
-        .map(|d| now_ms - d as i64);
-    store.note_session_cost(session, started, total, account_id, now_ms)?;
+        .is_some_and(|d| d.is_finite() && (0.0..NEW_SESSION_MS).contains(&d));
+    store.note_session_cost(session, &process, total, new_session, account_id, now_ms)?;
     Ok(())
 }
 

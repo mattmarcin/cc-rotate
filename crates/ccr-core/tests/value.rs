@@ -108,35 +108,39 @@ fn a_session_counts_only_what_it_adds() {
     let e = env();
     let hour = 1_000_000 * 3_600_000;
     let s = &e.store;
-    // A process that started at `hour`; its ticks work out its start a little late each time.
-    let s1 = |total: f64, account: i64, at: i64| {
-        s.note_session_cost("s1", Some(hour + (at - hour) % 7_000), total, account, at)
+    let s1 = |total: f64, new: bool, account: i64, at: i64| {
+        s.note_session_cost("s1", "100:1", total, new, account, at)
             .unwrap()
     };
     // The status line runs as a session starts, at $0: counting starts there.
-    assert_eq!(s1(0.0, e.a, hour), 0.0);
-    assert_eq!(s1(0.50, e.a, hour + 30_000), 0.50);
-    assert_eq!(s1(0.75, e.a, hour + 60_000), 0.25);
-    assert_eq!(s1(0.75, e.a, hour + 120_000), 0.0);
+    assert_eq!(s1(0.0, true, e.a, hour), 0.0);
+    assert_eq!(s1(0.50, false, e.a, hour + 30_000), 0.50);
+    assert_eq!(s1(0.75, false, e.a, hour + 60_000), 0.25);
+    assert_eq!(s1(0.75, false, e.a, hour + 120_000), 0.0);
     // A drop (a /login resets the total) is only where counting goes on from.
-    assert_eq!(s1(0.60, e.a, hour + 180_000), 0.0);
-    let added = s1(0.70, e.b, hour + 3_600_000);
+    assert_eq!(s1(0.60, false, e.a, hour + 180_000), 0.0);
+    let added = s1(0.70, false, e.b, hour + 3_600_000);
     assert!((added - 0.10).abs() < 1e-9, "{added}");
-    assert_eq!(s1(f64::NAN, e.a, hour), 0.0);
-    assert_eq!(s1(-1.0, e.a, hour), 0.0);
-    // A process first seen moments after it started counts its first total whole.
+    assert_eq!(s1(f64::NAN, true, e.a, hour), 0.0);
+    assert_eq!(s1(-1.0, true, e.a, hour), 0.0);
+    // A new session first seen moments after it started counts its first total whole.
     let fresh = s
-        .note_session_cost("fresh", Some(hour + 3_600_000), 0.30, e.c, hour + 3_620_000)
+        .note_session_cost("fresh", "200:1", 0.30, true, e.c, hour + 3_620_000)
         .unwrap();
     assert_eq!(fresh, 0.30);
-    // A session first seen with a total long after its process started (resumed, forked, or
-    // running before cc-rotate counted) carries what it spent before: only a starting point.
+    // A session that ran a while before it was first seen (running before cc-rotate counted,
+    // resumed or forked with the run time it had) carries what it spent before.
     let old = |total: f64, at: i64| {
-        s.note_session_cost("old", Some(hour - 3_600_000), total, e.a, at)
+        s.note_session_cost("old", "300:1", total, false, e.a, at)
             .unwrap()
     };
     assert_eq!(old(80.0, hour), 0.0);
     assert_eq!(old(80.5, hour + 60_000), 0.5);
+    // A second process of a session already seen is a resume, however short: a starting point.
+    let resumed = s
+        .note_session_cost("s1", "400:1", 0.70, true, e.a, hour + 3_700_000)
+        .unwrap();
+    assert_eq!(resumed, 0.0);
 
     let from = hour / 1000;
     let a = s
@@ -219,25 +223,22 @@ fn the_status_line_counts_cost_for_the_account_that_served_it() {
 fn two_processes_on_one_session_each_keep_their_own_count() {
     let e = env();
     let now = time::now_ms();
-    let resets = now / 1000 + 3_600;
-    // Resumed twice: both start from the $5 the session had, two minutes apart.
-    let first = |cost: f64, at: i64| tick_input("s1", cost, at - (now - 600_000), 20.0, resets);
-    let second = |cost: f64, at: i64| tick_input("s1", cost, at - (now - 480_000), 20.0, resets);
-    for (input, at) in [
-        (first(5.0, now), now),
-        (second(5.0, now + 1_000), now + 1_000),
-        (first(5.5, now + 30_000), now + 30_000),
-        (second(5.2, now + 31_000), now + 31_000),
-        (first(5.6, now + 60_000), now + 60_000),
+    // Resumed twice, seconds apart: both start from the $5 the session had.
+    let mut counted = 0.0;
+    for (process, total, at) in [
+        ("first", 5.0, now),
+        ("second", 5.0, now + 1_000),
+        ("first", 5.5, now + 30_000),
+        ("second", 5.2, now + 31_000),
+        ("first", 5.6, now + 60_000),
+        ("second", 5.3, now + 61_000),
     ] {
-        statusline::tick(&e.store, &e.paths, &input, at).unwrap();
+        counted += e
+            .store
+            .note_session_cost("s1", process, total, false, e.a, at)
+            .unwrap();
     }
-    let a = e
-        .store
-        .account_cost_between(e.a, now / 1000 - 3_600, now / 1000 + 3_600)
-        .unwrap()
-        .unwrap();
-    assert!((a - 0.80).abs() < 1e-9, "{a}");
+    assert!((counted - 0.90).abs() < 1e-9, "{counted}");
 }
 
 #[test]
