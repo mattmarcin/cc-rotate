@@ -17,26 +17,37 @@ mod flags {
 }
 
 /// Start `cc-rotate-ctl swap` in the background so the statusline returns immediately.
-/// It must outlive the statusline process, so it leaves Claude Code's job object if allowed
-/// (Windows) or its process group (Unix), and a signal sent to the statusline's group when
-/// Claude Code times it out does not reach the swap.
 pub fn spawn_swap(req: &SwapRequest, profile: Option<&Path>) -> Result<()> {
+    spawn_ctl(
+        |cmd| {
+            if let Some(p) = profile {
+                cmd.arg("--profile").arg(p);
+            }
+            cmd.args([
+                "swap",
+                "--no-wait",
+                "--quiet",
+                "--reason",
+                req.reason.as_str(),
+            ]);
+            if let Some(from) = req.from {
+                cmd.args(["--from-id", &from.to_string()]);
+            }
+        },
+        "starting the background swap",
+    )
+}
+
+/// Start this executable in the background with the arguments `args` adds.
+/// It must outlive the statusline process that starts it, so it leaves Claude Code's job object
+/// if allowed (Windows) or its process group (Unix), and a signal sent to that process's group
+/// when Claude Code times it out does not reach it. It must not hold Claude Code's pipes either:
+/// Claude Code sees the end of a statusline's output only once every copy of the pipe is closed.
+fn spawn_ctl(args: impl Fn(&mut Command), what: &str) -> Result<()> {
     let exe = std::env::current_exe()?;
     let build = || {
         let mut cmd = Command::new(&exe);
-        if let Some(p) = profile {
-            cmd.arg("--profile").arg(p);
-        }
-        cmd.args([
-            "swap",
-            "--no-wait",
-            "--quiet",
-            "--reason",
-            req.reason.as_str(),
-        ]);
-        if let Some(from) = req.from {
-            cmd.args(["--from-id", &from.to_string()]);
-        }
+        args(&mut cmd);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -45,6 +56,7 @@ pub fn spawn_swap(req: &SwapRequest, profile: Option<&Path>) -> Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
+        let _private = StdHandlesNotInherited::new();
         let base = flags::CREATE_NO_WINDOW | flags::CREATE_NEW_PROCESS_GROUP;
         if build()
             .creation_flags(base | flags::CREATE_BREAKAWAY_FROM_JOB)
@@ -56,17 +68,66 @@ pub fn spawn_swap(req: &SwapRequest, profile: Option<&Path>) -> Result<()> {
         build()
             .creation_flags(base)
             .spawn()
-            .context("starting the background swap")?;
+            .context(what.to_string())?;
     }
     #[cfg(unix)]
     {
+        // The child's stdio is /dev/null and every other descriptor Rust opens is close-on-exec,
+        // so nothing of the caller's pipes reaches it.
         use std::os::unix::process::CommandExt;
-        build()
-            .process_group(0)
-            .spawn()
-            .context("starting the background swap")?;
+        build().process_group(0).spawn().context(what.to_string())?;
     }
     Ok(())
+}
+
+/// Windows starts children with every inheritable handle of the parent, whatever their stdio is
+/// set to, and the standard handles this process got from Claude Code are inheritable. While one
+/// of these exists, this process's standard handles are kept out of the children it starts.
+#[cfg(windows)]
+struct StdHandlesNotInherited {
+    saved: Vec<(windows_sys::Win32::Foundation::HANDLE, u32)>,
+}
+
+#[cfg(windows)]
+impl StdHandlesNotInherited {
+    fn new() -> Self {
+        use windows_sys::Win32::Foundation::{
+            GetHandleInformation, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+        };
+        use windows_sys::Win32::System::Console::{
+            GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+        };
+        let mut saved = Vec::new();
+        for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            // SAFETY: plain Win32 calls on this process's own standard handles, which stay open.
+            unsafe {
+                let handle = GetStdHandle(id);
+                if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+                    continue;
+                }
+                let mut flags = 0u32;
+                if GetHandleInformation(handle, &mut flags) == 0 || flags & HANDLE_FLAG_INHERIT == 0
+                {
+                    continue;
+                }
+                if SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) != 0 {
+                    saved.push((handle, flags & HANDLE_FLAG_INHERIT));
+                }
+            }
+        }
+        Self { saved }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for StdHandlesNotInherited {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+        for &(handle, flags) in &self.saved {
+            // SAFETY: restores the flag cleared in `new` on the same, still open handle.
+            unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, flags) };
+        }
+    }
 }
 
 /// Run the user's original statusline command with the same stdin and return its stdout.
