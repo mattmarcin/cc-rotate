@@ -22,6 +22,9 @@ pub struct AccountView {
     pub weekly: WeeklyLimitView,
     /// When the latest reading was taken (epoch ms).
     pub last_sample_at: Option<i64>,
+    /// Where it came from: `rotate` (the rotation profile's status line), or the folder name of
+    /// another profile (`.claude-work`) whose status line or cached usage reported it.
+    pub last_sample_source: Option<String>,
     pub login_expires_at: Option<i64>,
     pub login_updated_at: Option<i64>,
     pub refresh_expires_at: Option<i64>,
@@ -114,6 +117,7 @@ pub fn snapshot_at(store: &Store, paths: &Paths, now_ms: i64) -> Result<Snapshot
     let mut accounts = Vec::new();
     for c in &pool {
         let meta = store.credential_meta(c.account.id)?;
+        let last = store.last_sample(c.account.id)?;
         let ranked = ranking.iter().find(|r| r.account_id == c.account.id);
         accounts.push(AccountView {
             plan: plan::label(
@@ -126,7 +130,8 @@ pub fn snapshot_at(store: &Store, paths: &Paths, now_ms: i64) -> Result<Snapshot
                 detected: c.weekly_detected,
                 effective: c.weekly_limit,
             },
-            last_sample_at: store.last_sample(c.account.id)?.map(|s| s.ts),
+            last_sample_at: last.as_ref().map(|s| s.ts),
+            last_sample_source: last.map(|s| s.profile),
             login_expires_at: meta.as_ref().and_then(|m| m.expires_at),
             refresh_expires_at: meta.as_ref().and_then(|m| m.refresh_expires_at),
             login_updated_at: meta.as_ref().map(|m| m.updated_at),

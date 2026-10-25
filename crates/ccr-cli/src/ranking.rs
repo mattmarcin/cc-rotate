@@ -75,6 +75,8 @@ pub fn weekly_limit(store: &Store, label: &str, value: Option<&str>) -> Result<(
 
 /// `next [--explain] [--json]`.
 pub fn next(store: &Store, paths: &Paths, explain: bool, json: bool) -> Result<()> {
+    // Count what the other profiles read since, as the next swap will.
+    ccr_core::profile_usage::import(store, paths, ccr_core::time::now_ms())?;
     let snap = snapshot::snapshot(store, paths)?;
     if json {
         println!(

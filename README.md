@@ -23,6 +23,8 @@ Because every session lives in one profile, sessions can see and message each ot
 - A swap takes the same lock Claude Code uses when it renews a login, saves the outgoing account's latest login, and writes the next account's login into the profile.
   Claude Code notices the change and uses the new account on its next request.
 - If a request already hit the limit, Claude Code waits and retries on its own, and the retry goes out on the new account.
+- Before picking an account, cc-rotate also reads the last usage Claude Code saw in each of your other Claude Code profiles, so an account an agent used up in its own profile is not picked.
+  If an account still turns out to be used up right after a swap, cc-rotate moves on at once instead of waiting out the 2-minute minimum between swaps.
 
 cc-rotate never talks to Anthropic itself.
 All traffic is the unmodified Claude Code talking to Anthropic, exactly as it does today.
@@ -142,6 +144,10 @@ Accounts in the same place never swap just to even out usage.
 
 `cc-rotate-ctl next --explain` lists every account in the order it would be used, with the reason for each.
 
+cc-rotate knows how much of each limit an account has used from three places: the status line of sessions in the rotation profile, the status line of your other profiles if you turn on observe mode for them (see **Tracking your other profiles too**), and the last `/usage` reading Claude Code saved in each of your other profiles.
+An account used up elsewhere since its last reading can still be picked.
+When the first readings after a swap show that, cc-rotate swaps again on the next reading, without waiting for `swap_cooldown_s`.
+
 Some limits only apply to one model, such as a weekly limit for one model family.
 When Claude Code reports one, cc-rotate records it too and only counts it while your sessions use that model.
 
@@ -184,8 +190,12 @@ When Claude Code reports one, cc-rotate records it too and only counts it while 
 
 ### Tracking your other profiles too
 
-If you keep using separate profiles for some accounts, cc-rotate can record their usage so the dashboard and the swap logic see it.
-In that profile's `settings.json`, set the status line to:
+cc-rotate already reads the usage Claude Code last saw in each of your other `~/.claude*` profiles that is signed in to an account in the pool.
+Claude Code saves a reading there each time a session in that profile checks the account's usage, for example for `/usage` and when the account reaches a limit.
+cc-rotate only reads those files, and only uses a reading that Claude Code marked as belonging to the account the profile is signed in to.
+
+For a reading after every reply instead, turn on observe mode in that profile.
+In its `settings.json`, set the status line to:
 
 ```json
 "statusLine": { "type": "command", "command": "cc-rotate-ctl statusline --observe", "refreshInterval": 30 }

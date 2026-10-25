@@ -63,6 +63,8 @@ export interface AccountView extends Account {
   windows: WindowUsage[];
   weekly: { setting: WeeklyLimitSetting; detected: WeeklyLimit; effective: WeeklyLimit };
   last_sample_at: number | null;
+  /** `rotate`, or the folder of another profile (`.claude-work`) that reported the reading. */
+  last_sample_source: string | null;
   login_expires_at: number | null;
   login_updated_at: number | null;
   refresh_expires_at: number | null;

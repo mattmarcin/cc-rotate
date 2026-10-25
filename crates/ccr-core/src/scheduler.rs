@@ -29,6 +29,13 @@ pub const SEVEN_DAY: &str = "seven_day";
 /// session's model id, which contains the family name (`claude-opus-4-1`).
 const MODEL_FAMILIES: &[&str] = &["opus", "sonnet", "haiku", "fable"];
 
+/// The model family a model's display name or id belongs to ("Opus 4.5" and `claude-opus-4-5`
+/// are `opus`), when it is one cc-rotate knows.
+pub fn model_family(model: &str) -> Option<&'static str> {
+    let model = model.to_ascii_lowercase();
+    MODEL_FAMILIES.iter().copied().find(|f| model.contains(f))
+}
+
 /// A better ranked account is only switched back to while every window that applies is at
 /// least this many points below its threshold, so it is not left again a moment later.
 pub const SWITCH_BACK_MARGIN: f64 = 5.0;
@@ -327,10 +334,12 @@ impl Reason {
 
     /// Usage-driven triggers respect the cooldown; the others are urgent or explicit.
     pub fn respects_cooldown(self) -> bool {
-        matches!(
-            self,
-            Self::FiveHour | Self::Weekly | Self::OtherLimit | Self::PreferredAvailable
-        )
+        self.is_threshold() || self == Self::PreferredAvailable
+    }
+
+    /// A window of the active account reached its threshold.
+    pub fn is_threshold(self) -> bool {
+        matches!(self, Self::FiveHour | Self::Weekly | Self::OtherLimit)
     }
 }
 
@@ -502,12 +511,26 @@ pub struct Timing {
     pub last_request_ms: i64,
     pub cooldown_ms: i64,
     pub dwell_ms: i64,
+    /// Every reading of the active account since it became active had it over a threshold: it
+    /// was already used up when it was picked (`swap::arrived_over_limit`).
+    pub arrived_over_limit: bool,
 }
 
 impl Timing {
     fn throttled(&self, reason: Reason) -> bool {
         self.now_ms - self.last_request_ms < REQUEST_INTERVAL_MS
-            || (reason.respects_cooldown() && self.now_ms - self.last_swap_ms < self.cooldown_ms)
+            || (reason.respects_cooldown() && self.cooling_down() && !self.leaves_at_once(reason))
+    }
+
+    pub fn cooling_down(&self) -> bool {
+        self.now_ms - self.last_swap_ms < self.cooldown_ms
+    }
+
+    /// An account that was already over a threshold when it was swapped to is left without
+    /// waiting out the cooldown. The cooldown is there to stop accounts trading places, and this
+    /// cannot: the account swapped away from was itself over a threshold, or ranked lower.
+    pub fn leaves_at_once(&self, reason: Reason) -> bool {
+        self.arrived_over_limit && reason.is_threshold()
     }
 
     pub fn dwell_done(&self) -> bool {
@@ -1000,6 +1023,61 @@ mod tests {
             d(&[max_active, other(9, 0.0)], timing),
             Some(Reason::PreferredAvailable)
         );
+    }
+
+    #[test]
+    fn an_account_found_over_its_limit_on_arrival_is_left_at_once() {
+        let now_ms = NOW * 1000;
+        let timing = Timing {
+            now_ms,
+            last_swap_ms: now_ms - 20_000,
+            active_since_ms: now_ms - 20_000,
+            cooldown_ms: 120_000,
+            dwell_ms: 600_000,
+            ..Default::default()
+        };
+        let full = cand(
+            acct(1, "full", AccountState::Active, 1),
+            WeeklyLimit::None,
+            &[("five_hour", 100.0, NOW + 3600)],
+        );
+        let ready = cand(
+            acct(2, "ready", AccountState::Parked, 2),
+            WeeklyLimit::None,
+            &[("five_hour", 10.0, NOW + 3600)],
+        );
+        let pool = [full, ready];
+        let d = |t: Timing| decide(&pool, POLICY, t, false, true);
+
+        assert_eq!(
+            d(timing),
+            None,
+            "an account that reached its limit in use cools down"
+        );
+        let arrived = Timing {
+            arrived_over_limit: true,
+            ..timing
+        };
+        assert_eq!(d(arrived), Some(Reason::FiveHour));
+        assert!(arrived.leaves_at_once(Reason::FiveHour));
+        assert!(!arrived.leaves_at_once(Reason::PreferredAvailable));
+        assert!(!arrived.leaves_at_once(Reason::Manual));
+        assert_eq!(
+            d(Timing {
+                last_request_ms: now_ms - 5_000,
+                ..arrived
+            }),
+            None,
+            "requests from many sessions are still spaced out"
+        );
+    }
+
+    #[test]
+    fn model_families() {
+        assert_eq!(model_family("Fable"), Some("fable"));
+        assert_eq!(model_family("Opus 4.5"), Some("opus"));
+        assert_eq!(model_family("claude-sonnet-5-5"), Some("sonnet"));
+        assert_eq!(model_family("Mystery"), None);
     }
 
     /// A day of status line ticks on a pool of two Team seats (no weekly limit) and one Max
