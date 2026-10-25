@@ -6,7 +6,10 @@ Running sessions keep going on their next request, with no restart and no proxy.
 
 Because every session lives in one profile, sessions can see and message each other, and their history lives in one place.
 
-![The cc-rotate dashboard](docs/screenshot.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshot-dark.png">
+  <img alt="The cc-rotate dashboard" src="docs/screenshot.png">
+</picture>
 
 > **Unofficial.** cc-rotate is a community project and is not affiliated with or endorsed by Anthropic.
 > It is meant for people who personally hold more than one Claude subscription.
@@ -37,7 +40,7 @@ The design, with the Claude Code behavior it relies on, is in [docs/specs/2026-1
 
 | | Windows 10 and 11 | Linux | macOS |
 |---|---|---|---|
-| Rotation | Supported, verified with real accounts | Supported; Claude Code keeps its login in the same file as on Windows | Experimental, not yet verified on a Mac |
+| Rotation | Supported, verified with real accounts | Supported, verified with real accounts (in WSL); Claude Code keeps its login in the same file as on Windows | Supported, verified with real accounts, with the login in the Keychain and in the file |
 | Desktop app | Supported | Builds; needs a desktop with a system tray | Builds; runs as a plain executable, not an app bundle |
 | Data folder | `%LOCALAPPDATA%\cc-rotate` | `~/.local/share/cc-rotate` | `~/Library/Application Support/cc-rotate` |
 
@@ -46,7 +49,8 @@ The design, with the Claude Code behavior it relies on, is in [docs/specs/2026-1
 On macOS, Claude Code keeps its login in the Keychain rather than in a file, and cc-rotate swaps the Keychain item.
 Claude Code rereads that item at most every 30 seconds, so a swap reaches running sessions within about 30 seconds instead of on their next request.
 Start Claude Code with `cc-rotate` there: the Keychain item is named after the exact profile path, which `cc-rotate` sets for you.
-If you try it on a Mac, `cc-rotate-ctl doctor` shows where the login lives, and reports of what works and what does not are very welcome.
+Over SSH, where the Keychain cannot be used, Claude Code keeps the login in the file instead, and cc-rotate follows it there.
+`cc-rotate-ctl doctor` shows where the login lives.
 
 ## Requirements
 
@@ -89,7 +93,7 @@ Add each account once.
 Either open the app (`cc-rotate-ctl dashboard`) and choose **Add account**, or use the terminal:
 
 ```sh
-cc-rotate-ctl login --email you@example.com --label work
+cc-rotate-ctl login --email account1@example.com --label account1
 ```
 
 A browser window opens on Claude's sign-in page.
@@ -100,8 +104,8 @@ The first account you add becomes the active one.
 
 These are fresh logins, separate from any other Claude Code profiles you already use, so adding an account here never logs you out anywhere else.
 
-If you already have a Claude Code profile per account (for example `~/.claude-work`), `cc-rotate-ctl profiles` lists them with the account each one belongs to.
-`cc-rotate-ctl login --from-profile work` then signs that account in fresh, with its email and label filled in, and refuses the login if a different account signs in.
+If you already have a Claude Code profile per account (for example `~/.claude-account1`), `cc-rotate-ctl profiles` lists them with the account each one belongs to.
+`cc-rotate-ctl login --from-profile account1` then signs that account in fresh, with its email and label filled in, and refuses the login if a different account signs in.
 cc-rotate only reads those profiles to find out which account they belong to; it never copies or changes their logins.
 
 ## Daily use
