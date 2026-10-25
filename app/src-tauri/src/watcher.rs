@@ -60,7 +60,7 @@ fn run(app: &AppHandle, store: &Store, paths: &Paths, watch: &mut Watch) {
             && !watch.swapping.load(Ordering::Acquire)
             && statusline::needs_settling(store, paths, time::now_ms()).unwrap_or(false)
         {
-            // A swap stopped half way: settling it may run Claude Code, so off this thread.
+            // The profile's login has to be identified: that runs Claude Code, so off this thread.
             watch.swapping.store(true, Ordering::Release);
             let swapping = watch.swapping.clone();
             std::thread::spawn(move || {
@@ -69,7 +69,7 @@ fn run(app: &AppHandle, store: &Store, paths: &Paths, watch: &mut Watch) {
                         &paths.swap_lock(),
                         ccr_core::lock::LockOptions::claude(Duration::ZERO),
                     ) {
-                        let _ = swap::finish_dead_swap(&store, &paths, swap::Settler::Locked);
+                        let _ = swap::settle_profile(&store, &paths);
                     }
                 }
                 swapping.store(false, Ordering::Release);

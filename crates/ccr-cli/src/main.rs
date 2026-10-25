@@ -176,9 +176,10 @@ enum Command {
     /// background by the statusline).
     #[command(hide = true)]
     ConfirmActive,
-    /// Settle a swap that stopped half way (started in the background by the statusline).
+    /// Identify the profile's login after a swap stopped half way, or when it changed without
+    /// cc-rotate writing it (started in the background by the statusline).
     #[command(hide = true)]
-    FinishSwap,
+    SettleLogin,
     /// Tell herdr how to resume a session (started in the background by `hook session-start`).
     #[command(hide = true)]
     HerdrReport {
@@ -264,7 +265,7 @@ fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> 
                     &paths.swap_lock(),
                     ccr_core::lock::LockOptions::claude(Duration::ZERO),
                 ) {
-                    swap::finish_dead_swap(store, paths, swap::Settler::Locked)?;
+                    swap::settle_profile(store, paths)?;
                 }
             }
             let snap = snapshot::snapshot(store, paths)?;
@@ -362,19 +363,20 @@ fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> 
             }
         }
         Command::Check { accounts, json } => check_cmd(store, paths, &accounts, json)?,
-        Command::FinishSwap => {
+        Command::SettleLogin => {
             let timeout = Duration::from_millis(store.settings()?.lock_timeout_ms);
             let _lock = ccr_core::lock::DirLock::acquire(
                 &paths.swap_lock(),
                 ccr_core::lock::LockOptions::claude(timeout),
             )?;
-            let outcome = swap::finish_dead_swap(store, paths, swap::Settler::Locked)?;
+            let outcome = swap::settle_profile(store, paths)?;
             println!(
                 "{}",
                 match outcome {
-                    swap::DeadSwap::Nothing => "No swap stopped half way.",
-                    swap::DeadSwap::Settled => "Settled the swap that stopped half way.",
-                    swap::DeadSwap::Unsure =>
+                    swap::Settle::Nothing => "Nothing to settle: the profile's login is known.",
+                    swap::Settle::Settled =>
+                        "Settled which account the profile's login belongs to.",
+                    swap::Settle::Unsure =>
                         "Cannot tell which account the profile is signed in to yet; cc-rotate tries again in a minute.",
                 }
             );
@@ -724,8 +726,8 @@ fn statusline_entry(profile: Option<PathBuf>, observe: bool, then: Option<String
         let result = statusline::tick(&store, &paths, &input, time::now_ms())?;
         if let Some(req) = &result.swap {
             process::spawn_swap(req, profile.as_deref())?;
-        } else if result.finish_swap {
-            process::spawn_finish_swap(profile.as_deref())?;
+        } else if result.settle_login {
+            process::spawn_settle_login(profile.as_deref())?;
         } else if result.confirm {
             process::spawn_confirm(profile.as_deref())?;
         }

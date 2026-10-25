@@ -9,7 +9,7 @@ use serde_json::Value;
 use crate::credstore::{self, Location};
 use crate::paths::{self, Paths};
 use crate::store::{Account, AccountState, Store};
-use crate::{credfile, herdr, login, statusline, time, usage_check};
+use crate::{credfile, herdr, login, statusline, swap, time, usage_check};
 
 /// Claude Code versions whose internals (credential reload, refresh locks, statusline and hook
 /// payloads) this release was verified against end to end.
@@ -193,13 +193,49 @@ pub fn run(store: &Store, paths: &Paths) -> Vec<Check> {
             .ok()
             .flatten()
             .map(|m| m.refresh_fp);
+        let foreign = store
+            .meta(swap::META_PROFILE_FOREIGN)
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some("1");
+        let identifies = usage_check::identifies_logins(store, paths).unwrap_or(false);
+        // How long Claude Code has not been able to say whose the profile's login is.
+        let unidentified_ms = store
+            .meta(swap::META_LOGIN_UNIDENTIFIED)
+            .ok()
+            .flatten()
+            .and_then(|v| serde_json::from_str::<swap::Unidentified>(&v).ok())
+            .map(|u| time::now_ms() - u.at);
         checks.push(match (file_fp, stored_fp) {
             (Some(f), Some(s)) if f == s => check("Profile login", Status::Ok, format!("matches {}", account.label)),
-            (Some(_), Some(_)) => check(
+            (Some(_), Some(_)) if foreign => check(
+                "Profile login",
+                Status::Warn,
+                "the profile is signed in to an account outside the pool (a /login in it); cc-rotate stores nothing from it until the next swap or a re-login",
+            ),
+            (Some(_), Some(_)) if !identifies => check(
                 "Profile login",
                 Status::Warn,
                 "the profile holds a newer login than the store; the next statusline tick will sync it",
             ),
+            (Some(_), Some(_)) => match unidentified_ms.filter(|ms| *ms >= 2 * 60_000) {
+                None => check(
+                    "Profile login",
+                    Status::Ok,
+                    format!("a newer login than the store; stored once Claude Code confirms it is {}'s", account.label),
+                ),
+                Some(ms) => check(
+                    "Profile login",
+                    Status::Warn,
+                    format!(
+                        "Claude Code has not said for {} min which account the profile's login belongs to, so cc-rotate does not swap; after {} min it stores the login as {}'s",
+                        ms / 60_000,
+                        swap::UNIDENTIFIED_FOR_AT_MOST_MS / 60_000,
+                        account.label
+                    ),
+                ),
+            },
             (None, _) => check("Profile login", Status::Fail, "the profile has no usable login"),
             (_, None) => check("Profile login", Status::Fail, "the active account has no stored login"),
         });

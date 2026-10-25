@@ -157,6 +157,7 @@ Usage checks read the accounts that are not in use:
 - Paused accounts are only checked when you ask, and `cc-rotate-ctl config usage_checks false` turns the automatic checks off.
 - If a check is interrupted while Claude Code may have been renewing a login, that account is not used until its next check confirms the login still works.
 - When the status line reports the account in use at a limit but cannot be sure the reading is that account's (a session that has not made a request since the last swap still shows the account it used before), the swap first checks the account in use. That check uses a copy of its login that Claude Code cannot renew.
+- When the login in the rotation profile changes without cc-rotate writing it (Claude Code renewed it, or someone ran `/login` there), cc-rotate asks Claude Code whose it is the same way before it stores it, so another account's login is never stored as the account in use's. Until Claude Code answers, for at most 10 minutes, cc-rotate does not swap. With usage checks off, it stores the new login as the account in use's right away.
 
 An account used up elsewhere since its last reading can still be picked.
 When the first readings after a swap show that, cc-rotate swaps again without waiting for `swap_cooldown_s` (it still waits 30 seconds between swap requests, so many sessions reporting at once start one swap).
@@ -201,7 +202,7 @@ When Claude Code reports one, cc-rotate records it too and only counts it while 
 | `statusline_downstream` | your old status line | The status line command shown after cc-rotate's label. |
 | `profile_dir` | `~/.claude-rotate` | The rotation profile, recorded by `setup`. |
 | `claude_path` | found on `PATH` | The `claude` executable to use for logins, usage checks and `cc-rotate`. |
-| `usage_checks` | true | Check the usage of accounts not in use with Claude Code's `/usage`. |
+| `usage_checks` | true | Check the usage of accounts not in use with Claude Code's `/usage`, and ask Claude Code whose a changed login in the rotation profile is. |
 | `usage_check_interval_s` | 3600 | How often the app checks each account that is not in use (at least 300). |
 | `usage_check_max_age_s` | 900 | A swap checks the account it picked first when its last reading is older than this. |
 

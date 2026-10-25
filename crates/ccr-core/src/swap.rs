@@ -49,21 +49,22 @@ pub fn pending_swap(store: &Store) -> Result<Option<PendingSwap>> {
         .and_then(|v| serde_json::from_str(&v).ok()))
 }
 
-/// Who settles a swap that died half way, which decides what it may do.
+/// Who settles the profile's login, which decides what it may do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Settler {
     /// A status line tick: does not hold the swap lock, must stay fast, so it only acts when the
     /// profile's login says for certain what happened.
     Tick,
-    /// Holds the swap lock (a swap, `cc-rotate-ctl finish-swap`, the app): may ask Claude Code
+    /// Holds the swap lock (a swap, `cc-rotate-ctl settle-login`, the app): may ask Claude Code
     /// which account the profile's login belongs to.
     Locked,
 }
 
-/// What became of a swap that died half way.
+/// What became of settling the profile's login: a swap that died half way, or a login that
+/// changed without cc-rotate writing it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeadSwap {
-    /// None was pending (or one is still running).
+pub enum Settle {
+    /// Nothing to settle (or a swap is still running).
     Nothing,
     Settled,
     /// The profile's login could not be identified yet: until it is, nothing may be stored from
@@ -86,26 +87,26 @@ pub enum DeadSwap {
 /// `Unsure` otherwise: then nothing is stored from the profile and no swap runs, so no login
 /// that cannot be identified is ever overwritten or filed under an account; the sessions go on
 /// with whatever login the profile has.
-pub fn finish_dead_swap(store: &Store, paths: &Paths, settler: Settler) -> Result<DeadSwap> {
+pub fn finish_dead_swap(store: &Store, paths: &Paths, settler: Settler) -> Result<Settle> {
     let Some(raw) = store.meta(META_SWAP_PENDING)? else {
-        return Ok(DeadSwap::Nothing);
+        return Ok(Settle::Nothing);
     };
     let Ok(pending) = serde_json::from_str::<PendingSwap>(&raw) else {
         store.delete_meta(META_SWAP_PENDING)?;
-        return Ok(DeadSwap::Settled);
+        return Ok(Settle::Settled);
     };
     if settler == Settler::Tick
         && crate::lock::is_held(&paths.swap_lock(), crate::lock::CLAUDE_STALE)
     {
-        return Ok(DeadSwap::Nothing);
+        return Ok(Settle::Nothing);
     }
     let creds = paths.credentials();
     // A Keychain that cannot be read now may hold the live login while the file is stale.
     if !creds.complete().unwrap_or(false) {
-        return Ok(DeadSwap::Unsure);
+        return Ok(Settle::Unsure);
     }
     let Ok(oauth) = creds.read_oauth() else {
-        return Ok(DeadSwap::Unsure);
+        return Ok(Settle::Unsure);
     };
     let file_fp = oauth.as_ref().and_then(credfile::oauth_fingerprint);
     let outgoing_fp = match pending.from {
@@ -123,7 +124,7 @@ pub fn finish_dead_swap(store: &Store, paths: &Paths, settler: Settler) -> Resul
     } else if file_fp.as_deref() == Some(pending.fp.as_str()) {
         Verdict::Written
     } else if settler == Settler::Tick {
-        return Ok(DeadSwap::Unsure);
+        return Ok(Settle::Unsure);
     } else if oauth.as_ref().is_none_or(credfile::is_dead) {
         Verdict::NoLogin
     } else {
@@ -134,20 +135,8 @@ pub fn finish_dead_swap(store: &Store, paths: &Paths, settler: Settler) -> Resul
             })
         };
         let (to, from) = (account(Some(pending.to))?, account(pending.from)?);
-        // The same person can be a member of several organizations with one account id and
-        // email: the organization must match too where both are known.
         let is = |who: &crate::usage_check::Who, a: &Option<Account>| -> Option<bool> {
-            let a = a.as_ref()?;
-            let person = match (&a.account_uuid, &who.uuid, &a.email, &who.email) {
-                (Some(x), Some(y), _, _) => x == y,
-                (_, _, Some(x), Some(y)) => x.eq_ignore_ascii_case(y),
-                _ => return None,
-            };
-            let org = match (&a.org_uuid, &who.org_uuid) {
-                (Some(x), Some(y)) => x == y,
-                _ => true,
-            };
-            Some(person && org)
+            who.is(a.as_ref()?)
         };
         match crate::usage_check::identify_profile_login(store, paths)? {
             Some(who) => match (is(&who, &to), is(&who, &from)) {
@@ -240,11 +229,11 @@ pub fn finish_dead_swap(store: &Store, paths: &Paths, settler: Settler) -> Resul
         }
         s.delete_meta(META_SWAP_PENDING)
     })?;
-    Ok(DeadSwap::Settled)
+    Ok(Settle::Settled)
 }
 
 /// Still unsure: tell the user once it has lasted a while, with what to do.
-fn unsure(store: &Store, pending: &PendingSwap, raw: &str) -> Result<DeadSwap> {
+fn unsure(store: &Store, pending: &PendingSwap, raw: &str) -> Result<Settle> {
     const REPORT_AFTER_MS: i64 = 10 * 60_000;
     const META_REPORTED: &str = "dead_swap_reported";
     if time::now_ms() - pending.at > REPORT_AFTER_MS
@@ -259,7 +248,235 @@ fn unsure(store: &Store, pending: &PendingSwap, raw: &str) -> Result<DeadSwap> {
             Some(json!({ "message": "A swap stopped half way and cc-rotate cannot tell yet which account the profile is signed in to, so it stores nothing from the profile and does not swap. It asks Claude Code once a minute, which needs the `claude` command to run and the network; your sessions keep working meanwhile." })),
         )?;
     }
-    Ok(DeadSwap::Unsure)
+    Ok(Settle::Unsure)
+}
+
+/// A login in the profile that could not be identified yet (JSON `Unidentified`).
+pub const META_LOGIN_UNIDENTIFIED: &str = "login_unidentified";
+/// How long a changed login may stay unidentified (no swap runs meanwhile) before it is stored
+/// as the active account's without Claude Code's word, as before logins were identified.
+pub const UNIDENTIFIED_FOR_AT_MOST_MS: i64 = 10 * 60_000;
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct Unidentified {
+    /// The credentials' change marker of the login.
+    pub marker: String,
+    /// When it first could not be identified (epoch ms).
+    pub at: i64,
+}
+
+/// A login in the profile that cc-rotate did not write and has not identified.
+pub(crate) struct ChangedLogin {
+    active: Account,
+    oauth: serde_json::Value,
+    fp: String,
+    marker: String,
+}
+
+/// The login in the profile when it is neither one stored for the active account nor
+/// identified yet: a renewal of the active account's login, or a `/login` in the profile, which
+/// `.claude.json` cannot tell apart after a swap (F14). `None` when there is nothing to identify,
+/// or logins are not identified (`usage_check::identifies_logins`).
+pub(crate) fn changed_login(store: &Store, paths: &Paths) -> Result<Option<ChangedLogin>> {
+    if !usage_check::identifies_logins(store, paths)?
+        || pending_swap(store)?.is_some()
+        || store.meta(META_PROFILE_FOREIGN)?.as_deref() == Some("1")
+    {
+        return Ok(None);
+    }
+    let Some(active) = store.active_account()? else {
+        return Ok(None);
+    };
+    // The change marker first: it is all the app's frequent calls read while nothing changed.
+    let creds = paths.credentials();
+    let Some(marker) = creds.change_marker()? else {
+        return Ok(None);
+    };
+    if store.meta(META_CRED_SEEN)?.as_deref() == Some(marker.as_str())
+        || !creds.complete().unwrap_or(false)
+    {
+        return Ok(None);
+    }
+    let Some(oauth) = creds
+        .read_oauth()
+        .ok()
+        .flatten()
+        .filter(|o| !credfile::is_dead(o))
+    else {
+        return Ok(None);
+    };
+    let Some(fp) = credfile::oauth_fingerprint(&oauth) else {
+        return Ok(None);
+    };
+    if store.credential_meta(active.id)?.map(|m| m.refresh_fp) == Some(fp.clone()) {
+        return Ok(None);
+    }
+    Ok(Some(ChangedLogin {
+        active,
+        oauth,
+        fp,
+        marker,
+    }))
+}
+
+/// Identify a login that changed in the profile without cc-rotate writing it (`changed_login`),
+/// with the swap lock held, by asking Claude Code whose it is with a copy it cannot renew:
+/// - the active account's (a renewal) is stored as its login;
+/// - another pool account's (a `/login` in the profile) makes that account active;
+/// - any other account's (a `/login` with an account outside the pool) marks the profile
+///   foreign, so its login is never stored.
+///
+/// `Unsure` while Claude Code cannot tell: the login is not stored and no swap runs, for at most
+/// `UNIDENTIFIED_FOR_AT_MOST_MS`. After that it is stored as the active account's, as it was
+/// before logins were identified, so a Claude Code that cannot identify logins never stops the
+/// rotation.
+pub fn identify_changed_login(store: &Store, paths: &Paths) -> Result<Settle> {
+    let Some(changed) = changed_login(store, paths)? else {
+        store.delete_meta(META_LOGIN_UNIDENTIFIED)?;
+        return Ok(Settle::Nothing);
+    };
+    let who = usage_check::identify_profile_login(store, paths)?;
+    // Claude Code may have renewed the login meanwhile: act only on the one identified.
+    let now_fp = paths
+        .credentials()
+        .read_oauth()
+        .ok()
+        .flatten()
+        .as_ref()
+        .and_then(credfile::oauth_fingerprint);
+    if now_fp.as_deref() != Some(changed.fp.as_str()) {
+        return Ok(Settle::Unsure);
+    }
+    enum Verdict {
+        Own,
+        Adopt(Account),
+        Foreign(Option<String>),
+    }
+    let verdict = match who {
+        Some(who) => match who.is(&changed.active) {
+            Some(true) => Verdict::Own,
+            // Nothing to compare the active account with: stored as before.
+            None => Verdict::Own,
+            Some(false) => match store
+                .accounts()?
+                .into_iter()
+                .find(|a| who.is(a) == Some(true))
+            {
+                Some(account) => Verdict::Adopt(account),
+                None => Verdict::Foreign(who.uuid),
+            },
+        },
+        None => {
+            if !unidentified_for_long(store, &changed)? {
+                return Ok(Settle::Unsure);
+            }
+            Verdict::Own
+        }
+    };
+    let active = &changed.active;
+    store.immediate(|s| {
+        // Only the login identified: the write-back, a swap or a `/login` may have dealt with
+        // it meanwhile.
+        if s.meta(META_CRED_SEEN)?.as_deref() == Some(changed.marker.as_str())
+            || s.active_account()?.map(|a| a.id) != Some(active.id)
+        {
+            return Ok(());
+        }
+        match &verdict {
+            Verdict::Own => {
+                s.save_credential(active.id, &changed.oauth, "sync")?;
+                s.log_event(kind::SYNC, Some(active.id), None, Some("refreshed"), None)?;
+            }
+            Verdict::Adopt(account) => {
+                adopt_login(s, Some(active), account, Some(&changed.oauth))?;
+            }
+            Verdict::Foreign(uuid) => {
+                s.set_meta(META_PROFILE_FOREIGN, "1")?;
+                s.log_event(
+                    kind::FOREIGN_LOGIN,
+                    Some(active.id),
+                    None,
+                    Some("login_in_profile"),
+                    Some(json!({ "account_uuid": uuid })),
+                )?;
+            }
+        }
+        s.set_meta(META_CRED_SEEN, &changed.marker)?;
+        s.delete_meta(META_LOGIN_UNIDENTIFIED)
+    })?;
+    Ok(Settle::Settled)
+}
+
+/// Whether the changed login has gone unidentified for `UNIDENTIFIED_FOR_AT_MOST_MS`; if so, the
+/// user is told it is stored without Claude Code's word.
+fn unidentified_for_long(store: &Store, changed: &ChangedLogin) -> Result<bool> {
+    let now = time::now_ms();
+    let since = match store
+        .meta(META_LOGIN_UNIDENTIFIED)?
+        .and_then(|v| serde_json::from_str::<Unidentified>(&v).ok())
+    {
+        Some(u) if u.marker == changed.marker => u.at,
+        _ => {
+            let first = Unidentified {
+                marker: changed.marker.clone(),
+                at: now,
+            };
+            store.set_meta(META_LOGIN_UNIDENTIFIED, serde_json::to_string(&first)?)?;
+            now
+        }
+    };
+    if now - since < UNIDENTIFIED_FOR_AT_MOST_MS {
+        return Ok(false);
+    }
+    store.log_event(
+        kind::ERROR,
+        Some(changed.active.id),
+        None,
+        Some("login"),
+        Some(json!({ "message": format!("The login in the profile changed and Claude Code could not say for 10 minutes which account it belongs to, so cc-rotate stored it as {}'s, as it did before it could tell. Claude Code is asked with the `claude` command, which needs to run and reach the network.", changed.active.label) })),
+    )?;
+    Ok(true)
+}
+
+/// Make `account` active because the profile holds its login (a `/login` in the profile), and
+/// store that login as its own. Call inside a transaction.
+pub(crate) fn adopt_login(
+    s: &Store,
+    active: Option<&Account>,
+    account: &Account,
+    oauth: Option<&serde_json::Value>,
+) -> Result<()> {
+    if let Some(a) = active {
+        s.set_state(a.id, AccountState::Parked)?;
+    }
+    s.set_state(account.id, AccountState::Active)?;
+    s.set_meta(META_ACTIVE_SINCE, time::now_ms())?;
+    if let Some(o) = oauth.filter(|o| !credfile::is_dead(o)) {
+        s.save_credential(account.id, o, "sync")?;
+    }
+    s.log_event(
+        kind::ADOPTED_LOGIN,
+        active.map(|a| a.id),
+        Some(account.id),
+        Some("login_in_profile"),
+        None,
+    )?;
+    Ok(())
+}
+
+/// Settle what the profile's login is, with the swap lock held: a swap that stopped half way
+/// (`finish_dead_swap`), then a login that changed without cc-rotate writing it
+/// (`identify_changed_login`).
+pub fn settle_profile(store: &Store, paths: &Paths) -> Result<Settle> {
+    let dead = finish_dead_swap(store, paths, Settler::Locked)?;
+    if dead == Settle::Unsure {
+        return Ok(Settle::Unsure);
+    }
+    Ok(match (dead, identify_changed_login(store, paths)?) {
+        (_, Settle::Unsure) => Settle::Unsure,
+        (Settle::Settled, _) | (_, Settle::Settled) => Settle::Settled,
+        _ => Settle::Nothing,
+    })
 }
 
 /// Write a pool account's login into the profile under Claude Code's refresh and credentials
@@ -659,11 +876,20 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
     };
     // An earlier swap that stopped half way. While the profile's login is unidentified, no swap
     // runs: it would overwrite the only copy of that login, or file it under the wrong account.
-    if finish_dead_swap(store, paths, Settler::Locked)? == DeadSwap::Unsure {
+    if finish_dead_swap(store, paths, Settler::Locked)? == Settle::Unsure {
         return skip(
             store,
             req,
             "an earlier swap stopped half way, and the login in the profile cannot be identified yet",
+        );
+    }
+    // A login that changed in the profile is identified first, so the swap below never stores
+    // another account's login as the outgoing account's.
+    if identify_changed_login(store, paths)? == Settle::Unsure {
+        return skip(
+            store,
+            req,
+            "the login in the profile changed, and Claude Code cannot say yet which account it belongs to",
         );
     }
 
@@ -1045,7 +1271,7 @@ pub fn install_active_login(
 ) -> Result<ActiveLogin> {
     let timeout = Duration::from_millis(store.settings()?.lock_timeout_ms);
     let _swap_lock = DirLock::acquire(&paths.swap_lock(), LockOptions::claude(timeout))?;
-    if finish_dead_swap(store, paths, Settler::Locked)? == DeadSwap::Unsure {
+    if finish_dead_swap(store, paths, Settler::Locked)? == Settle::Unsure {
         return Ok(ActiveLogin::Unidentified);
     }
     if store.active_account()?.map(|a| a.id) != Some(account_id) {
