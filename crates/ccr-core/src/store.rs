@@ -23,7 +23,8 @@ use crate::{credfile, time};
 ///    `priority`) and the per-account weekly limit override.
 /// 4: the per-account weekly cap (`weekly_cap`).
 /// 5: whether an account's weekly budget is used before it resets (`use_expiring`).
-const SCHEMA_VERSION: i64 = 5;
+/// 6: sessions stopped at a usage limit (`waiting_sessions`).
+const SCHEMA_VERSION: i64 = 6;
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE accounts (
@@ -138,6 +139,24 @@ ALTER TABLE accounts ADD COLUMN weekly_cap REAL
 const SCHEMA_V5: &str = r#"
 ALTER TABLE accounts ADD COLUMN use_expiring INTEGER NOT NULL DEFAULT 1
     CHECK (use_expiring IN (0, 1));
+"#;
+
+/// Schema 6: one row per session whose turn stopped at a usage limit, kept while the
+/// `StopFailure` hook waits to wake it and until it is seen working again (`waiting`).
+const SCHEMA_V6: &str = r#"
+CREATE TABLE waiting_sessions (
+    session_id       TEXT PRIMARY KEY,
+    since_ms         INTEGER NOT NULL,
+    account_id       INTEGER REFERENCES accounts (id) ON DELETE SET NULL,
+    hook_pid         INTEGER,
+    hook_started     TEXT,
+    state            TEXT NOT NULL
+        CHECK (state IN ('waiting', 'woken', 'resumed', 'stuck', 'ended')),
+    woken_at         INTEGER,
+    woken_account_id INTEGER REFERENCES accounts (id) ON DELETE SET NULL,
+    woken_accounts   TEXT NOT NULL DEFAULT '[]',
+    updated_at       INTEGER NOT NULL
+);
 "#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -363,6 +382,96 @@ fn sample_from_row(row: &Row) -> rusqlite::Result<(i64, Sample)> {
     ))
 }
 
+/// Where a session stopped at a usage limit stands (`waiting`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitingState {
+    /// Its `StopFailure` hook waits for an account with room to wake it.
+    Waiting,
+    /// The hook woke it on `woken_account_id`; not seen working since.
+    Woken,
+    /// Its status line reported the account it was woken on.
+    Resumed,
+    /// Woken, but not seen working since (`waiting::STUCK_AFTER_MS`); the user was told.
+    Stuck,
+    /// The hook stopped without waking it: it gave up, was replaced, or its process is gone.
+    Ended,
+}
+
+impl WaitingState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Waiting => "waiting",
+            Self::Woken => "woken",
+            Self::Resumed => "resumed",
+            Self::Stuck => "stuck",
+            Self::Ended => "ended",
+        }
+    }
+}
+
+impl FromStr for WaitingState {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        Ok(match s {
+            "waiting" => Self::Waiting,
+            "woken" => Self::Woken,
+            "resumed" => Self::Resumed,
+            "stuck" => Self::Stuck,
+            "ended" => Self::Ended,
+            other => bail!("unknown waiting state {other:?}"),
+        })
+    }
+}
+
+/// A session whose turn stopped at a usage limit (`waiting_sessions`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WaitingSession {
+    pub session_id: String,
+    /// When the turn stopped (epoch ms). A later stop of the same session replaces the row,
+    /// and the hook that recorded the earlier one gives up.
+    pub since_ms: i64,
+    /// The account in the profile when it stopped.
+    pub account_id: Option<i64>,
+    /// The hook process waiting to wake it, with its start time (`process::start_time`), so a
+    /// reused process id does not count as the hook.
+    pub hook_pid: Option<u32>,
+    pub hook_started: Option<String>,
+    pub state: WaitingState,
+    /// The last time the session was woken, and on which account.
+    pub woken_at: Option<i64>,
+    pub woken_account_id: Option<i64>,
+    /// Every account the session was woken on since it first stopped. Kept across a new stop
+    /// soon after a wake (`WAKE_MEMORY_MS`), so a session is never woken twice on one account,
+    /// even while readings wrongly show room on several.
+    pub woken_accounts: Vec<i64>,
+    pub updated_at: i64,
+}
+
+/// A new stop of a session woken this recently remembers the account it was woken on.
+pub const WAKE_MEMORY_MS: i64 = 30 * 60_000;
+
+/// Waiting-session rows are dropped this long after their last change.
+const WAITING_RETENTION_MS: i64 = 7 * 86_400_000;
+
+const WAITING_COLS: &str = "session_id, since_ms, account_id, hook_pid, hook_started, state, \
+    woken_at, woken_account_id, woken_accounts, updated_at";
+
+fn waiting_from_row(row: &Row) -> rusqlite::Result<WaitingSession> {
+    Ok(WaitingSession {
+        session_id: row.get(0)?,
+        since_ms: row.get(1)?,
+        account_id: row.get(2)?,
+        hook_pid: row.get(3)?,
+        hook_started: row.get(4)?,
+        state: parse_col(row, 5)?,
+        woken_at: row.get(6)?,
+        woken_account_id: row.get(7)?,
+        woken_accounts: serde_json::from_str(&row.get::<_, String>(8)?).unwrap_or_default(),
+        updated_at: row.get(9)?,
+    })
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Event {
     pub id: i64,
@@ -386,6 +495,16 @@ pub mod kind {
     pub const ADOPTED_LOGIN: &str = "adopted_login";
     pub const STATE: &str = "state";
     pub const ERROR: &str = "error";
+    /// A session stopped at a usage limit (`waiting`), was woken on another account
+    /// (`woken`), or was seen working again (`resumed`); `detail.session` names it.
+    pub const SESSION: &str = "session";
+    /// A session cc-rotate woke did not continue (`waiting::scan`).
+    pub const SESSION_STUCK: &str = "session_stuck";
+    /// An account's sign-in ends soon (`health::scan`); `detail.expires_at` says when.
+    pub const LOGIN_EXPIRING: &str = "login_expiring";
+    /// The rotation profile's sessions run a Claude Code version not seen before;
+    /// `detail` has `version`, `previous` and `tested`.
+    pub const CLAUDE_VERSION: &str = "claude_version";
 }
 
 /// Typed view of the `settings` table with defaults applied.
@@ -415,6 +534,8 @@ pub struct Settings {
     /// Move an account with a weekly limit ahead while its weekly budget would otherwise reset
     /// unused (`budget`).
     pub use_expiring_weekly: bool,
+    /// Warn this many days before an account's sign-in ends; 0 turns the warning off.
+    pub login_warning_days: i64,
 }
 
 pub const SETTING_KEYS: &[&str] = &[
@@ -432,6 +553,7 @@ pub const SETTING_KEYS: &[&str] = &[
     "usage_check_interval_s",
     "usage_check_max_age_s",
     "use_expiring_weekly",
+    "login_warning_days",
 ];
 
 pub struct Store {
@@ -549,6 +671,10 @@ impl Store {
             if version < 5 {
                 s.conn.execute_batch(SCHEMA_V5)?;
                 s.conn.pragma_update(None, "user_version", 5)?;
+            }
+            if version < 6 {
+                s.conn.execute_batch(SCHEMA_V6)?;
+                s.conn.pragma_update(None, "user_version", 6)?;
             }
             Ok(())
         })
@@ -691,6 +817,7 @@ impl Store {
             use_expiring_weekly: get("use_expiring_weekly")?
                 .and_then(|v| parse_bool(&v))
                 .unwrap_or(true),
+            login_warning_days: int("login_warning_days", 5)?,
         })
     }
 
@@ -1275,7 +1402,102 @@ impl Store {
             .execute("DELETE FROM samples WHERE ts < ?1", [cutoff])?;
         self.conn
             .execute("DELETE FROM events WHERE ts < ?1", [cutoff])?;
+        self.conn.execute(
+            "DELETE FROM waiting_sessions WHERE updated_at < ?1",
+            [now_ms - WAITING_RETENTION_MS],
+        )?;
         self.set_meta("last_prune_at", now_ms)
+    }
+
+    // ---- sessions stopped at a usage limit ------------------------------------------------
+
+    /// Record that `session_id` stopped at a usage limit at `since_ms`, replacing an earlier
+    /// stop of the same session. The last wake is kept when it was recent (`WAKE_MEMORY_MS`).
+    pub fn start_waiting(
+        &self,
+        session_id: &str,
+        since_ms: i64,
+        account_id: Option<i64>,
+        hook: Option<(u32, Option<String>)>,
+    ) -> Result<WaitingSession> {
+        let (pid, started) = hook.unzip();
+        self.conn.execute(
+            "INSERT INTO waiting_sessions (session_id, since_ms, account_id, hook_pid, hook_started,
+                                           state, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'waiting', ?2)
+             ON CONFLICT (session_id) DO UPDATE SET
+                since_ms = excluded.since_ms,
+                account_id = excluded.account_id,
+                hook_pid = excluded.hook_pid,
+                hook_started = excluded.hook_started,
+                state = 'waiting',
+                woken_at = CASE WHEN woken_at >= ?6 THEN woken_at END,
+                woken_account_id = CASE WHEN woken_at >= ?6 THEN woken_account_id END,
+                woken_accounts = CASE WHEN woken_at >= ?6 THEN woken_accounts ELSE '[]' END,
+                updated_at = excluded.updated_at",
+            params![
+                session_id,
+                since_ms,
+                account_id,
+                pid,
+                started.flatten(),
+                since_ms - WAKE_MEMORY_MS
+            ],
+        )?;
+        self.waiting_session(session_id)?
+            .context("the waiting session was not recorded")
+    }
+
+    pub fn waiting_session(&self, session_id: &str) -> Result<Option<WaitingSession>> {
+        Ok(self
+            .conn
+            .query_row(
+                &format!("SELECT {WAITING_COLS} FROM waiting_sessions WHERE session_id = ?1"),
+                [session_id],
+                waiting_from_row,
+            )
+            .optional()?)
+    }
+
+    /// Sessions still waiting to be woken, or woken and not seen working since, oldest first.
+    pub fn open_waiting_sessions(&self) -> Result<Vec<WaitingSession>> {
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT {WAITING_COLS} FROM waiting_sessions
+             WHERE state IN ('waiting', 'woken') ORDER BY since_ms"
+        ))?;
+        let rows = stmt.query_map([], waiting_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Move the stop recorded at `since_ms` to `state` (and record a wake), unless a later stop
+    /// replaced it. Returns whether it did.
+    pub fn set_waiting_state(
+        &self,
+        session_id: &str,
+        since_ms: i64,
+        state: WaitingState,
+        woken: Option<(i64, i64)>,
+        now_ms: i64,
+    ) -> Result<bool> {
+        let (woken_at, woken_account) = woken.unzip();
+        let n = self.conn.execute(
+            "UPDATE waiting_sessions SET state = ?3,
+                woken_at = COALESCE(?4, woken_at),
+                woken_account_id = COALESCE(?5, woken_account_id),
+                woken_accounts = CASE WHEN ?5 IS NULL THEN woken_accounts
+                                      ELSE json_insert(woken_accounts, '$[#]', ?5) END,
+                updated_at = ?6
+             WHERE session_id = ?1 AND since_ms = ?2",
+            params![
+                session_id,
+                since_ms,
+                state.as_str(),
+                woken_at,
+                woken_account,
+                now_ms
+            ],
+        )?;
+        Ok(n > 0)
     }
 
     // ---- events ------------------------------------------------------------------------
@@ -1420,6 +1642,14 @@ fn validate_setting(key: &str, value: &str) -> Result<Option<String>> {
             let v: i64 = value.parse().map_err(|_| anyhow!("Use a whole number."))?;
             if v < 0 {
                 bail!("Use 0 or more.");
+            }
+        }
+        "login_warning_days" => {
+            let v: i64 = value
+                .parse()
+                .map_err(|_| anyhow!("Use a whole number of days from 0 to 30."))?;
+            if !(0..=30).contains(&v) {
+                bail!("Use a whole number of days from 0 to 30.");
             }
         }
         "prefer_no_weekly_limit" | "usage_checks" | "use_expiring_weekly" => {

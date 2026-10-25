@@ -42,7 +42,7 @@ const state: UiState = {
   focusGrip: null,
 };
 
-const ROUTINE = new Set(["sync", "swap_skipped"]);
+const ROUTINE = new Set(["sync", "swap_skipped", "claude_version"]);
 
 // ---- layout ----------------------------------------------------------------------------
 
@@ -332,6 +332,22 @@ function renderTop() {
         next ? `The next one frees up in ${until(next)}.` : "",
       ),
     );
+  } else if (snap && snap.pool.sign_ins_ending.length > 0) {
+    const ending = snap.accounts.filter((a) => a.sign_in_ends_soon);
+    const first = ending[0];
+    banner.hidden = false;
+    banner.className = "banner warn";
+    replace(
+      banner,
+      h(
+        "span",
+        null,
+        ending.length === 1 && first.refresh_expires_at
+          ? `${first.label}'s sign-in ends in ${until(first.refresh_expires_at / 1000)}. Sign in again to keep it in rotation.`
+          : `${ending.map((a) => a.label).join(", ")} need a new sign-in soon. Sign in again to keep them in rotation.`,
+      ),
+      h("button", { class: "btn small", onclick: () => openLogin(first) }, `Sign in to ${first.label}`),
+    );
   } else {
     banner.hidden = true;
   }
@@ -441,6 +457,9 @@ function renderOverview() {
         ),
       p.weekly_limited > 0 && p.no_weekly_limit > 0 && h("dt", null, "No weekly limit"),
       p.weekly_limited > 0 && p.no_weekly_limit > 0 && h("dd", null, plural(p.no_weekly_limit, "account")),
+      p.sessions_waiting > 0 && h("dt", null, "At a limit"),
+      p.sessions_waiting > 0 &&
+        h("dd", { class: "warn" }, plural(p.sessions_waiting, "session"), h("span", { class: "muted" }, " waiting for an account with room")),
       unavailable > 0 && h("dt", null, "Unavailable"),
       unavailable > 0 && h("dd", null, `${unavailable}`, h("span", { class: "muted" }, " paused or signed out")),
       h("dt", null, "Swaps"),
@@ -674,7 +693,8 @@ function renderAccounts() {
       actions.push(h("button", { class: "link", onclick: () => act(() => api.swapNow(a.id), () => `Swapped to ${a.label}`) }, "Use now"));
     if (a.state === "paused")
       actions.push(h("button", { class: "link", onclick: () => act(() => api.setPaused(a.id, false), () => `Resumed ${a.label}`) }, "Resume"));
-    if (a.state === "needs_login") actions.push(h("button", { class: "link", onclick: () => openLogin(a) }, "Sign in again"));
+    if (a.state === "needs_login" || a.sign_in_ends_soon)
+      actions.push(h("button", { class: "link", onclick: () => openLogin(a) }, "Sign in again"));
     actions.push(h("button", { class: "link quiet-link", onclick: () => openManage(a), "aria-label": `More options for ${a.label}` }, "More"));
 
     const grip = h(
@@ -719,6 +739,13 @@ function renderAccounts() {
           { class: "muted updated", title: readTitle(a) },
           readText(a),
         ),
+        a.sign_in_ends_soon &&
+          a.refresh_expires_at &&
+          h(
+            "div",
+            { class: "updated sign-in-ends", title: new Date(a.refresh_expires_at).toLocaleString() },
+            `sign-in ends in ${until(a.refresh_expires_at / 1000)}`,
+          ),
       ),
       h("td", null, meter(fiveOf(a), !!a.last_sample_at)),
       h("td", null, weeklyCell(a)),
@@ -860,7 +887,26 @@ function describe(e: EventRow): { parts: Child[]; tone?: "warn" | "danger" } {
         ? { parts: ["Saved ", from, "'s renewed login after a usage check"] }
         : { parts: ["Saved ", from, "'s renewed login"] };
     case "dead_login":
-      return { parts: [from, "'s login stopped working"], tone: "danger" };
+      return e.reason === "sign_in_ended"
+        ? { parts: [from, "'s sign-in ended"], tone: "danger" }
+        : { parts: [from, "'s login stopped working"], tone: "danger" };
+    case "login_expiring": {
+      const at = e.detail?.expires_at as number | undefined;
+      return { parts: [from, "'s sign-in ends", at ? ` on ${new Date(at).toLocaleDateString([], { weekday: "long", month: "short", day: "numeric" })}` : " soon"], tone: "warn" };
+    }
+    case "session":
+      if (e.reason === "waiting") return { parts: e.account_from ? ["A session stopped at ", from, "'s usage limit"] : ["A session stopped at a usage limit"] };
+      if (e.reason === "woken") return { parts: ["Woke a session that was stopped at a limit, now on ", to] };
+      if (e.reason === "resumed") return { parts: ["A woken session continued on ", to] };
+      return { parts: ["A session ", e.reason ?? "changed"] };
+    case "session_stuck":
+      return { parts: ["A session woken on ", to, " hasn't continued"], tone: "warn" };
+    case "claude_version": {
+      const version = detail("version");
+      return e.detail?.tested === false
+        ? { parts: [`Claude Code ${version} is in use, not yet tested with cc-rotate`] }
+        : { parts: [`Claude Code ${version} is in use`] };
+    }
     case "pool_exhausted":
       return { parts: ["No other account was ready to take over"], tone: "warn" };
     case "adopted_login":
@@ -1188,6 +1234,14 @@ function openManage(a: AccountView) {
     h("dd", null, a.rank ? `${ordinal(a.rank)} - ${a.reason}` : `not available${a.reason ? ` - ${a.reason}` : ""}`),
     h("dt", null, "Login updated"),
     h("dd", null, a.login_updated_at ? ago(a.login_updated_at) : "never"),
+    a.refresh_expires_at && a.state !== "needs_login" && h("dt", null, "Sign-in ends"),
+    a.refresh_expires_at &&
+      a.state !== "needs_login" &&
+      h(
+        "dd",
+        { class: a.sign_in_ends_soon ? "warn" : null, title: new Date(a.refresh_expires_at).toLocaleString() },
+        a.refresh_expires_at > Date.now() ? `in ${until(a.refresh_expires_at / 1000)}` : "ended",
+      ),
     h("dt", null, "Usage check"),
     h("dd", null, checkText(a)),
   );
@@ -1325,6 +1379,14 @@ async function openSettings() {
       h("label", { class: "check", for: "prefer-no-weekly" }, prefer, "Use accounts without a weekly limit first"),
       h("label", { class: "check", for: "use-expiring" }, expiringBox, "Use weekly budget before it resets"),
       h("label", { class: "check", for: "usage-checks" }, checks, "Check usage of accounts not in use"),
+      field(
+        "login_warning_days",
+        "Warn before a sign-in ends (days)",
+        snap.settings.login_warning_days,
+        "Each sign-in lasts about a month. Set to 0 to turn the warning off.",
+        0,
+        30,
+      ),
       field(
         "usage_check_interval_s",
         "Check every (seconds)",

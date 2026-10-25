@@ -10,6 +10,7 @@ use crate::credfile;
 use crate::herdr;
 use crate::paths;
 use crate::store::Store;
+use crate::waiting;
 
 const COPIED_DIRS: &[&str] = &[
     "agents",
@@ -255,15 +256,31 @@ fn build_settings(
     status.insert("refreshInterval".into(), json!(30));
     obj.insert("statusLine".into(), Value::Object(status));
 
-    let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
+    set_ctl_hooks(obj, &ctl)?;
+    Ok((settings, downstream))
+}
+
+/// cc-rotate's hooks in the profile's settings, replacing earlier versions of them and keeping
+/// every other hook. `ctl` is the command as `command_path` writes it.
+fn set_ctl_hooks(settings: &mut Map<String, Value>, ctl: &str) -> Result<()> {
+    let hooks = settings.entry("hooks").or_insert_with(|| json!({}));
     let hooks = hooks
         .as_object_mut()
         .context("settings.hooks is not an object")?;
+    // At a usage limit: ask for a swap, then wait in the background until the profile holds an
+    // account with room and wake the session (exit code 2), whose next turn reads the new login
+    // (spec section 21).
     set_ctl_hook(
         hooks,
         "StopFailure",
         json!({
-            "hooks": [{ "type": "command", "command": format!("{ctl} hook stop-failure"), "timeout": 60 }]
+            "matcher": "rate_limit",
+            "hooks": [{
+                "type": "command",
+                "command": format!("{ctl} hook stop-failure"),
+                "asyncRewake": true,
+                "timeout": waiting::HOOK_TIMEOUT_S
+            }]
         }),
     )?;
     // Reports `cc-rotate --resume <id>` to herdr when the session runs in a herdr pane (spec
@@ -279,8 +296,54 @@ fn build_settings(
                 "timeout": 10
             }]
         }),
+    )
+}
+
+/// Bring cc-rotate's hooks in an existing profile up to date (after an upgrade), leaving the
+/// rest of its settings as they are. Returns whether anything changed.
+pub fn update_hooks(profile: &Path, ctl: &Path) -> Result<bool> {
+    let path = profile.join("settings.json");
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let mut settings: Value =
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    let before = settings.clone();
+    let obj = settings
+        .as_object_mut()
+        .context("settings.json is not an object")?;
+    set_ctl_hooks(obj, &command_path(ctl))?;
+    if settings == before {
+        return Ok(false);
+    }
+    credfile::atomic_write(
+        &path,
+        (serde_json::to_string_pretty(&settings)?
+            + "
+")
+        .as_bytes(),
     )?;
-    Ok((settings, downstream))
+    Ok(true)
+}
+
+/// Whether the profile's `StopFailure` hook is this release's: it wakes a session stopped at a
+/// usage limit once a swap lands (`asyncRewake`).
+pub fn stop_failure_hook_current(settings: &Value) -> bool {
+    settings
+        .pointer("/hooks/StopFailure")
+        .and_then(Value::as_array)
+        .is_some_and(|groups| {
+            groups.iter().any(|g| {
+                g.get("hooks")
+                    .and_then(Value::as_array)
+                    .is_some_and(|hooks| {
+                        hooks.iter().any(|h| {
+                            h.get("command").and_then(Value::as_str).is_some_and(|c| {
+                                c.contains("cc-rotate-ctl") && c.contains("stop-failure")
+                            }) && h.get("asyncRewake").and_then(Value::as_bool) == Some(true)
+                        })
+                    })
+            })
+        })
 }
 
 /// Make `group` the only hook group for `event` that runs `cc-rotate-ctl`, keeping every other
@@ -673,6 +736,12 @@ mod tests {
         );
         assert!(herdr::session_start_hook_installed(&first));
         assert_eq!(first["hooks"]["StopFailure"].as_array().unwrap().len(), 1);
+        assert!(stop_failure_hook_current(&first));
+        // The StopFailure hook as releases before section 21 wrote it.
+        let old = json!({"hooks": {"StopFailure": [{"hooks": [
+            {"type": "command", "command": format!("{ctl_cmd} hook stop-failure"), "timeout": 60}
+        ]}]}});
+        assert!(!stop_failure_hook_current(&old));
 
         // Rebuilding from settings that already carry cc-rotate's hooks changes nothing.
         std::fs::write(template.join("settings.json"), first.to_string()).unwrap();

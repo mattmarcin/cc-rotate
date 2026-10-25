@@ -98,6 +98,7 @@ pub fn run(store: &Store, paths: &Paths) -> Vec<Check> {
     }
 
     checks.push(profile_settings_check(paths));
+    checks.push(environment_check(paths, |k| std::env::var(k).ok()));
     checks.push(herdr_check(paths, herdr::detect()));
 
     let legacy = crate::setup::legacy_alias_files();
@@ -552,6 +553,7 @@ fn profile_settings_check(paths: &Paths) -> Check {
     let hook_ok = settings
         .pointer("/hooks/StopFailure")
         .is_some_and(|h| h.to_string().contains("cc-rotate-ctl"));
+    let hook_current = crate::setup::stop_failure_hook_current(&settings);
     // Older setups quoted the path, which PowerShell cannot run, so no usage was ever recorded.
     if status_ok && command.trim_start().starts_with('"') {
         return check(
@@ -561,6 +563,11 @@ fn profile_settings_check(paths: &Paths) -> Check {
         );
     }
     match (status_ok, hook_ok) {
+        (true, true) if !hook_current => check(
+            "Profile",
+            Status::Warn,
+            "The StopFailure hook is from an older cc-rotate, so a session stopped at a usage limit doesn't continue after a swap. Run `cc-rotate-ctl setup --keep-existing`.",
+        ),
         (true, true) => check(
             "Profile",
             Status::Ok,
@@ -576,6 +583,76 @@ fn profile_settings_check(paths: &Paths) -> Check {
             Status::Warn,
             "The StopFailure hook isn't installed. Run `cc-rotate-ctl setup --force`.",
         ),
+    }
+}
+
+/// Variables that make Claude Code ignore the profile's login, so a swap reaches no session.
+const LOGIN_OVERRIDES: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+];
+
+/// With it, a request at a usage limit waits inside Claude Code holding the login it was built
+/// with, so it never moves to the account cc-rotate swapped to (spec section 21).
+const RETRY_WATCHDOG: &str = "CLAUDE_CODE_RETRY_WATCHDOG";
+
+/// What in this environment or the profile's settings works against swaps: a login override, or
+/// Claude Code's retry watchdog. `var` reads this process's environment (the shell `doctor` runs
+/// in, which sessions started from it share).
+fn environment_check(paths: &Paths, var: impl Fn(&str) -> Option<String>) -> Check {
+    let settings: Value = std::fs::read_to_string(paths.settings_file())
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or(Value::Null);
+    // Where a variable is set, and to what: the environment wins over the settings, as in
+    // Claude Code.
+    let lookup = |name: &str| -> Option<(String, &'static str)> {
+        var(name)
+            .filter(|v| !v.trim().is_empty())
+            .map(|v| (v, "your environment"))
+            .or_else(|| {
+                settings
+                    .pointer(&format!("/env/{name}"))
+                    .and_then(Value::as_str)
+                    .filter(|v| !v.trim().is_empty())
+                    .map(|v| (v.to_string(), "the profile's settings.json"))
+            })
+    };
+    let mut problems = Vec::new();
+    for name in LOGIN_OVERRIDES {
+        if let Some((_, place)) = lookup(name) {
+            problems.push(format!(
+                "{name} is set in {place}, so Claude Code uses it instead of the account cc-rotate swaps in."
+            ));
+        }
+    }
+    if settings
+        .get("apiKeyHelper")
+        .and_then(Value::as_str)
+        .is_some_and(|v| !v.trim().is_empty())
+    {
+        problems.push(
+            "The profile's settings.json has an apiKeyHelper, so Claude Code uses its key instead of the account cc-rotate swaps in."
+                .to_string(),
+        );
+    }
+    let overrides = !problems.is_empty();
+    if let Some((_, place)) = lookup(RETRY_WATCHDOG)
+        .filter(|(v, _)| v.trim() != "0" && !v.trim().eq_ignore_ascii_case("false"))
+    {
+        problems.push(format!(
+            "{RETRY_WATCHDOG} is set in {place}: a session that reaches a usage limit waits on its old login and doesn't move to the account cc-rotate swaps to. Unset it for cc-rotate sessions."
+        ));
+    }
+    match (problems.is_empty(), overrides) {
+        (true, _) => check(
+            "Claude Code environment",
+            Status::Ok,
+            "Nothing overrides the profile's login",
+        ),
+        (false, true) => check("Claude Code environment", Status::Fail, problems.join(" ")),
+        (false, false) => check("Claude Code environment", Status::Warn, problems.join(" ")),
     }
 }
 
@@ -636,6 +713,39 @@ fn herdr_check(paths: &Paths, detected: Option<herdr::Detected>) -> Check {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn environment_check_finds_overrides_and_the_retry_watchdog() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path().join("data"), dir.path().join("profile"));
+        std::fs::create_dir_all(&paths.profile_dir).unwrap();
+        let none = |_: &str| None;
+        assert_eq!(environment_check(&paths, none).status, Status::Ok);
+
+        let token = |k: &str| (k == "CLAUDE_CODE_OAUTH_TOKEN").then(|| "x".to_string());
+        let c = environment_check(&paths, token);
+        assert_eq!(c.status, Status::Fail);
+        assert!(
+            c.detail
+                .contains("CLAUDE_CODE_OAUTH_TOKEN is set in your environment")
+        );
+
+        std::fs::write(
+            paths.settings_file(),
+            r#"{"env":{"CLAUDE_CODE_RETRY_WATCHDOG":"1"}}"#,
+        )
+        .unwrap();
+        let c = environment_check(&paths, none);
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.detail.contains("profile's settings.json"), "{}", c.detail);
+
+        let off = |k: &str| (k == RETRY_WATCHDOG).then(|| "0".to_string());
+        std::fs::write(paths.settings_file(), r#"{"apiKeyHelper":"get-key"}"#).unwrap();
+        let c = environment_check(&paths, off);
+        assert_eq!(c.status, Status::Fail);
+        assert!(c.detail.contains("apiKeyHelper"));
+        assert!(!c.detail.contains(RETRY_WATCHDOG));
+    }
 
     #[test]
     fn herdr_check_is_soft() {

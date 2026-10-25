@@ -91,7 +91,10 @@ export interface AccountView extends Account {
   usage_check: CheckState;
   login_expires_at: number | null;
   login_updated_at: number | null;
+  /** When the account's sign-in ends: after it, the account needs a new sign-in. */
   refresh_expires_at: number | null;
+  /** The sign-in ends within the warning period in Settings. */
+  sign_in_ends_soon: boolean;
   eligible: boolean;
   available_at: number | null;
   /** Place in the pick order among the accounts usable now. */
@@ -152,6 +155,8 @@ export interface Settings {
   swap_cooldown_s: number;
   prefer_no_weekly_limit: boolean;
   use_expiring_weekly: boolean;
+  /** Warn this many days before an account's sign-in ends; 0 turns the warning off. */
+  login_warning_days: number;
   switch_back_dwell_s: number;
   lock_timeout_ms: number;
   sample_retention_days: number;
@@ -181,6 +186,10 @@ export interface Snapshot {
     next_available_at: number | null;
     swaps_24h: number;
     needs_login: string[];
+    /** Accounts whose sign-in ends within the warning period. */
+    sign_ins_ending: string[];
+    /** Sessions stopped at a usage limit, waiting for an account with room. */
+    sessions_waiting: number;
     /** A swap stopped half way and is not settled yet. */
     swap_unsettled: boolean;
   };

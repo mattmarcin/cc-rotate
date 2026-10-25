@@ -190,6 +190,33 @@ pub fn status(snap: &Snapshot) -> String {
             "{YELLOW}No other account is ready. The next one frees up in {next}.{RESET}"
         );
     }
+    if p.sessions_waiting > 0 {
+        let _ = writeln!(
+            out,
+            "{} at a usage limit, waiting for an account with room.",
+            if p.sessions_waiting == 1 {
+                "1 session is".to_string()
+            } else {
+                format!("{} sessions are", p.sessions_waiting)
+            }
+        );
+    }
+    let ending: Vec<String> = snap
+        .accounts
+        .iter()
+        .filter(|a| a.sign_in_ends_soon)
+        .filter_map(|a| {
+            a.refresh_expires_at
+                .map(|t| format!("{} in {}", a.account.label, until(t / 1000)))
+        })
+        .collect();
+    if !ending.is_empty() {
+        let _ = writeln!(
+            out,
+            "{YELLOW}Sign-ins ending: {}. Sign in again with `cc-rotate-ctl login --relogin <label>`.{RESET}",
+            ending.join(", ")
+        );
+    }
     if !p.needs_login.is_empty() {
         let _ = writeln!(
             out,
@@ -274,8 +301,22 @@ pub fn events(store: &Store, events: &[Event]) -> String {
         let detail = e
             .detail
             .as_ref()
-            .and_then(|d| d.get("why").or_else(|| d.get("message")))
-            .and_then(|v| v.as_str())
+            .and_then(|d| {
+                d.get("why")
+                    .or_else(|| d.get("message"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .or_else(|| {
+                        d.get("session")
+                            .and_then(|v| v.as_str())
+                            .map(|s| format!("session {}", s.chars().take(8).collect::<String>()))
+                    })
+                    .or_else(|| {
+                        d.get("version")
+                            .and_then(|v| v.as_str())
+                            .map(|v| format!("Claude Code {v}"))
+                    })
+            })
             .map(|s| format!("  {DIM}{s}{RESET}"))
             .unwrap_or_default();
         let _ = writeln!(

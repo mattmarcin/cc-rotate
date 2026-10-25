@@ -81,6 +81,98 @@ pub fn start_time(pid: u32) -> Option<String> {
     (out.status.success() && !text.is_empty()).then_some(text)
 }
 
+/// The parent of the process `pid`, while both run.
+#[cfg(windows)]
+pub fn parent(pid: u32) -> Option<u32> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    // SAFETY: a snapshot handle opened and closed here, and an entry sized as the API asks.
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut found = None;
+        let mut more = Process32FirstW(snapshot, &mut entry);
+        while more != 0 {
+            if entry.th32ProcessID == pid {
+                found = Some(entry.th32ParentProcessID);
+                break;
+            }
+            more = Process32NextW(snapshot, &mut entry);
+        }
+        CloseHandle(snapshot);
+        found
+    }
+}
+
+/// The parent of the process `pid`: from `/proc` on Linux, else what `ps` reports.
+#[cfg(unix)]
+pub fn parent(pid: u32) -> Option<u32> {
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        // Field 4, counted after the command name, which may itself contain spaces.
+        return stat
+            .rsplit_once(')')?
+            .1
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok();
+    }
+    let out = Command::new("ps")
+        .args(["-o", "ppid=", "-p", &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// This process's nearest ancestors as they were when it started, to tell when the program that
+/// started it is gone: a hook outlives a Claude Code session that was killed, since the shell
+/// between them waits for it.
+#[derive(Debug, Clone)]
+pub struct Ancestors(Vec<(u32, Option<String>)>);
+
+impl Ancestors {
+    /// Up to `depth` ancestors: for a hook, the shell Claude Code runs it in and Claude Code.
+    pub fn of_this_process(depth: usize) -> Ancestors {
+        let mut chain = Vec::new();
+        let mut pid = std::process::id();
+        for _ in 0..depth {
+            match parent(pid) {
+                // 0 and 1 (and 4, Windows' System) are the system's, not a program's.
+                Some(p) if p > 4 && p != pid => {
+                    chain.push((p, start_time(p)));
+                    pid = p;
+                }
+                _ => break,
+            }
+        }
+        Ancestors(chain)
+    }
+
+    /// Every ancestor recorded still runs (the same process, not a reused id).
+    pub fn all_alive(&self) -> bool {
+        self.0.iter().all(|(pid, started)| {
+            alive(*pid)
+                && match started {
+                    Some(s) => start_time(*pid).as_ref() == Some(s),
+                    None => true,
+                }
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 /// Whether any process of the process group `pgid` is running (Unix; never on Windows, where a
 /// check's tree dies with its job).
 #[cfg(unix)]

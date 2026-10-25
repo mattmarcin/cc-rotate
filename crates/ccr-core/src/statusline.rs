@@ -36,6 +36,8 @@ const META_DEAD_LOGIN_SEEN: &str = "dead_login_seen";
 #[derive(Debug, Default, Deserialize)]
 pub struct StatusInput {
     pub session_id: Option<String>,
+    /// The Claude Code version the session runs (`health::note_claude_version`).
+    pub version: Option<String>,
     pub model: Option<ModelInfo>,
     /// Every usage window Claude Code reports, by name (`five_hour`, `seven_day`, ...). Kept
     /// generic so a window Claude Code adds later is recorded without a code change; a window
@@ -180,16 +182,21 @@ pub fn tick(store: &Store, paths: &Paths, input: &StatusInput, now_ms: i64) -> R
             store.set_meta(META_PROFILE_MODEL, model)?;
         }
     }
+    if let Some(version) = input.version.as_deref() {
+        crate::health::note_claude_version(store, version)?;
+    }
     if let Some(sample) = input.sample_for(active.id, "rotate", now_ms) {
         if !is_stale_reading(store, &sample, now_ms)? {
             match swap::attribute(store, &sample, active.id, now_ms / 1000)? {
                 swap::Attribution::Own => {
                     store.record_sample(&sample)?;
                     swap::note_known_resets(store, active.id, &sample.windows, now_ms / 1000)?;
+                    note_session_working(store, input, active.id, now_ms)?;
                 }
                 // Recorded, but it does not vouch for the account's reset times.
                 swap::Attribution::Ambiguous => {
                     store.record_sample(&sample)?;
+                    note_session_working(store, input, active.id, now_ms)?;
                 }
                 swap::Attribution::Elsewhere => {
                     result.confirm = confirm_due(store, &sample, active.id, now_ms)?;
@@ -220,8 +227,25 @@ pub fn tick(store: &Store, paths: &Paths, input: &StatusInput, now_ms: i64) -> R
     }
 
     store.prune(now_ms)?;
+    crate::health::scan_from_tick(store, now_ms)?;
     result.active = store.active_account()?;
     Ok(result)
+}
+
+/// A fresh reading of the account in use from a session cc-rotate woke after a usage limit
+/// means it is working again (`waiting::note_reading`).
+fn note_session_working(
+    store: &Store,
+    input: &StatusInput,
+    account_id: i64,
+    now_ms: i64,
+) -> Result<()> {
+    match input.session_id.as_deref() {
+        Some(session) if !session.is_empty() => {
+            crate::waiting::note_reading(store, session, account_id, now_ms)
+        }
+        _ => Ok(()),
+    }
 }
 
 /// When a swap stopped half way, settling it runs Claude Code: ask at most once a minute (one of

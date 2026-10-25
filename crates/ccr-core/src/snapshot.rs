@@ -31,7 +31,10 @@ pub struct AccountView {
     pub usage_check: CheckState,
     pub login_expires_at: Option<i64>,
     pub login_updated_at: Option<i64>,
+    /// When the account's sign-in ends: after it, the account needs a new sign-in.
     pub refresh_expires_at: Option<i64>,
+    /// The sign-in ends within `login_warning_days`.
+    pub sign_in_ends_soon: bool,
     /// Parked and below every threshold that applies: the scheduler may pick it.
     pub eligible: bool,
     /// When this account is usable again, if a window keeps it from being used now.
@@ -76,6 +79,10 @@ pub struct PoolSummary {
     pub next_available_at: Option<i64>,
     pub swaps_24h: usize,
     pub needs_login: Vec<String>,
+    /// Accounts whose sign-in ends within `login_warning_days`.
+    pub sign_ins_ending: Vec<String>,
+    /// Sessions stopped at a usage limit, waiting for an account with room (`waiting`).
+    pub sessions_waiting: usize,
     /// A swap stopped half way and is not settled yet (`swap::finish_dead_swap`).
     pub swap_unsettled: bool,
 }
@@ -145,6 +152,13 @@ pub fn snapshot_at(store: &Store, paths: &Paths, now_ms: i64) -> Result<Snapshot
             usage_check: usage_check::state(store, c.account.id)?,
             login_expires_at: meta.as_ref().and_then(|m| m.expires_at),
             refresh_expires_at: meta.as_ref().and_then(|m| m.refresh_expires_at),
+            sign_in_ends_soon: c.account.state != AccountState::NeedsLogin
+                && meta
+                    .as_ref()
+                    .and_then(|m| m.refresh_expires_at)
+                    .is_some_and(|t| {
+                        crate::health::sign_in_ends_soon(t, settings.login_warning_days, now_ms)
+                    }),
             login_updated_at: meta.as_ref().map(|m| m.updated_at),
             eligible: c.eligible(),
             available_at: c.blocked_until(),
@@ -209,6 +223,16 @@ pub fn snapshot_at(store: &Store, paths: &Paths, now_ms: i64) -> Result<Snapshot
                 .filter(|c| c.account.state == AccountState::NeedsLogin)
                 .map(|c| c.account.label.clone())
                 .collect(),
+            sign_ins_ending: accounts
+                .iter()
+                .filter(|a| a.sign_in_ends_soon)
+                .map(|a| a.account.label.clone())
+                .collect(),
+            sessions_waiting: store
+                .open_waiting_sessions()?
+                .iter()
+                .filter(|w| w.state == crate::store::WaitingState::Waiting)
+                .count(),
             swap_unsettled: swap::pending_swap(store)?.is_some()
                 && !crate::lock::is_held(&paths.swap_lock(), crate::lock::CLAUDE_STALE),
         },
