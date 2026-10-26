@@ -335,7 +335,8 @@ export const api = {
   appInfo: () => invoke<AppInfo>("app_info"),
   autostartEnabled: () => invoke<boolean>("autostart_enabled"),
   setAutostart: (enabled: boolean) => invoke<void>("set_autostart", { enabled }),
-  openUrl: (url: string) => invoke<void>("open_url", { url }),
+  /** Open a running sign-in's page again. */
+  openLoginPage: (id: string) => invoke<void>("open_login_page", { id }),
   startLogin: (email: string | null, label: string | null, relogin: number | null, expectEmail: string | null = null) =>
     invoke<string>("start_login", { email, label, relogin, expectEmail }),
   otherProfiles: () => invoke<FoundProfile[]>("other_profiles"),

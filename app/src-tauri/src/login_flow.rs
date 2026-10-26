@@ -22,7 +22,12 @@ struct Running {
     child: Arc<Mutex<Child>>,
     stdin: Option<ChildStdin>,
     cancelled: Arc<AtomicBool>,
+    /// The sign-in page Claude Code announced, the only page `open_login_page` opens.
+    url: Arc<Mutex<Option<String>>>,
 }
+
+/// The longest code a sign-in page shows; anything longer is not one.
+const MAX_CODE_LEN: usize = 512;
 
 #[derive(Default)]
 pub struct Logins(Mutex<HashMap<String, Running>>);
@@ -109,6 +114,7 @@ pub fn start_login(
     let stdin = child.stdin.take();
     let child = Arc::new(Mutex::new(child));
     let cancelled = Arc::new(AtomicBool::new(false));
+    let url = Arc::new(Mutex::new(None));
 
     let id = format!("login-{}", ccr_core::time::now_ms());
     logins.0.lock().unwrap().insert(
@@ -117,6 +123,7 @@ pub fn start_login(
             child: child.clone(),
             stdin,
             cancelled: cancelled.clone(),
+            url: url.clone(),
         },
     );
     emit(&app, Progress::new(&id, Stage::Starting));
@@ -132,7 +139,8 @@ pub fn start_login(
         let output = output.clone();
         let app = app.clone();
         let id = id.clone();
-        std::thread::spawn(move || read_pipe(pipe, &output, &app, &id));
+        let url = url.clone();
+        std::thread::spawn(move || read_pipe(pipe, &output, &url, &app, &id));
     }
 
     let request = LoginRequest {
@@ -156,7 +164,13 @@ pub fn start_login(
     Ok(id)
 }
 
-fn read_pipe(mut pipe: Box<dyn Read + Send>, output: &Mutex<String>, app: &AppHandle, id: &str) {
+fn read_pipe(
+    mut pipe: Box<dyn Read + Send>,
+    output: &Mutex<String>,
+    url: &Mutex<Option<String>>,
+    app: &AppHandle,
+    id: &str,
+) {
     let mut buf = [0u8; 4096];
     let mut announced = false;
     while let Ok(n) = pipe.read(&mut buf) {
@@ -169,10 +183,11 @@ fn read_pipe(mut pipe: Box<dyn Read + Send>, output: &Mutex<String>, app: &AppHa
             strip_ansi(&out)
         };
         if !announced {
-            if let Some(url) = login::find_sign_in_url(&text) {
+            if let Some(found) = login::find_sign_in_url(&text) {
                 announced = true;
+                *url.lock().unwrap() = Some(found.clone());
                 let mut p = Progress::new(id, Stage::Browser);
-                p.url = Some(url);
+                p.url = Some(found);
                 emit(app, p);
             }
         }
@@ -251,8 +266,46 @@ pub fn submit_login_code(logins: State<'_, Logins>, id: String, code: String) ->
         .stdin
         .as_mut()
         .ok_or("This sign-in isn't waiting for a code.")?;
-    writeln!(stdin, "{}", code.trim()).map_err(|e| e.to_string())?;
+    let code = code.trim();
+    // One line of printable text: a newline inside would answer more than this prompt.
+    if code.is_empty()
+        || code.len() > MAX_CODE_LEN
+        || code.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        return Err(
+            "That doesn't look like a sign-in code. Copy it again from the browser.".into(),
+        );
+    }
+    writeln!(stdin, "{code}").map_err(|e| e.to_string())?;
     stdin.flush().map_err(|e| e.to_string())
+}
+
+/// Open a running sign-in's page again: only the one Claude Code announced for it.
+#[tauri::command]
+pub fn open_login_page(app: AppHandle, logins: State<'_, Logins>, id: String) -> CmdResult<()> {
+    let url = logins
+        .0
+        .lock()
+        .unwrap()
+        .get(&id)
+        .and_then(|r| r.url.lock().unwrap().clone())
+        .ok_or("That sign-in has already finished.")?;
+    tauri_plugin_opener::OpenerExt::opener(&app)
+        .open_url(url, None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
+/// End every running sign-in as the app exits, so none can still finish in the browser and
+/// leave a login behind with no one to import or delete it. Their staging folders are swept
+/// on the next start (`usage_check::sweep_logins`).
+pub fn stop_all(app: &AppHandle) {
+    let Some(logins) = tauri::Manager::try_state::<Logins>(app) else {
+        return;
+    };
+    for running in logins.0.lock().unwrap().values() {
+        running.cancelled.store(true, Ordering::Release);
+        let _ = running.child.lock().unwrap().kill();
+    }
 }
 
 /// Stop a running sign-in. The waiting thread reports `cancelled` once the process exits.

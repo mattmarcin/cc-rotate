@@ -13,7 +13,6 @@ use ccr_core::{Paths, Store};
 use serde::Serialize;
 use tauri::AppHandle;
 use tauri_plugin_autostart::ManagerExt;
-use tauri_plugin_opener::OpenerExt;
 
 pub type CmdResult<T> = Result<T, String>;
 
@@ -264,8 +263,28 @@ pub async fn doctor() -> CmdResult<Vec<Check>> {
     blocking(|s, p| Ok(doctor::run(s, p))).await
 }
 
+/// The settings the app's Settings page changes. The others name programs to run or where the
+/// login is written (`claude_path`, `statusline_downstream`, `profile_dir`), or tune internals,
+/// and are set with `cc-rotate-ctl config` only: nothing running in the window may change them.
+const APP_SETTINGS: &[&str] = &[
+    "swap_threshold_5h",
+    "swap_threshold_7d",
+    "swap_cooldown_s",
+    "prefer_no_weekly_limit",
+    "strict_order",
+    "use_expiring_weekly",
+    "avoid_extra_usage",
+    "usage_checks",
+    "usage_check_interval_s",
+    "usage_check_max_age_s",
+    "login_warning_days",
+];
+
 #[tauri::command]
 pub async fn set_setting(key: String, value: Option<String>) -> CmdResult<()> {
+    if !APP_SETTINGS.contains(&key.as_str()) {
+        return Err(format!("{key} can only be set with cc-rotate-ctl config."));
+    }
     blocking(move |s, _| s.set_setting(&key, value.as_deref().filter(|v| !v.is_empty()))).await
 }
 
@@ -306,12 +325,4 @@ pub fn set_autostart(app: AppHandle, enabled: bool) -> CmdResult<()> {
         launcher.disable()
     }
     .map_err(err)
-}
-
-#[tauri::command]
-pub fn open_url(app: AppHandle, url: String) -> CmdResult<()> {
-    if !url.starts_with("https://") {
-        return Err("only https links can be opened".into());
-    }
-    app.opener().open_url(url, None::<&str>).map_err(err)
 }

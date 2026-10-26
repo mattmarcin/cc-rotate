@@ -1322,7 +1322,7 @@ function openLogin(account: AccountView | null) {
         break;
       case "browser": {
         setSteps(1);
-        status.replaceChildren("Finish in your browser. ", h("button", { class: "link", onclick: () => p.url && api.openUrl(p.url) }, "Open the page again"));
+        status.replaceChildren("Finish in your browser. ", h("button", { class: "link", onclick: () => api.openLoginPage(p.id).catch((e) => say(String(e), "error")) }, "Open the page again"));
         const code = h("input", { type: "text", placeholder: "Code", autocomplete: "off" });
         replace(
           codeRow,

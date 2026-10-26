@@ -1,7 +1,12 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "The dashboard window: app commands and events only.",
-  "windows": ["main"],
-  "permissions": ["core:default"]
+  "description": "The dashboard window: the app's own commands, and listening for its events. Nothing else of Tauri's.",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
+  ]
 }
