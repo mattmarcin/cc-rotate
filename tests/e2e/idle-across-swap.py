@@ -85,7 +85,8 @@ def cleanup():
     error = None
     for _ in range(240):
         try:
-            shutil.rmtree(scratch, onerror=writable)
+            # `onexc` from Python 3.12, `onerror` before it; the handler takes either.
+            shutil.rmtree(scratch, **({"onexc": writable} if sys.version_info >= (3, 12) else {"onerror": writable}))
             return
         except FileNotFoundError:
             return
@@ -100,8 +101,9 @@ atexit.register(cleanup)
 exe = ".exe" if os.name == "nt" else ""
 subprocess.run(["cargo", "build", "-q", "-p", "ccr-cli"], cwd=repo, check=True)
 subprocess.run(["cargo", "build", "-q", "-p", "ccr-core", "--example", "e2e_stage"], cwd=repo, check=True)
-ctl_exe = os.path.join(repo, "target", "debug", f"cc-rotate-ctl{exe}")
-stager = os.path.join(repo, "target", "debug", "examples", f"e2e_stage{exe}")
+target = os.environ.get("CARGO_TARGET_DIR") or os.path.join(repo, "target")
+ctl_exe = os.path.join(target, "debug", f"cc-rotate-ctl{exe}")
+stager = os.path.join(target, "debug", "examples", f"e2e_stage{exe}")
 
 data, profile, template, work = (os.path.join(scratch, d) for d in ("data", "profile", "template", "work"))
 token_map = os.path.join(scratch, "tokens.json")
@@ -279,16 +281,16 @@ if not own:
     failures.append(f"no reading of {label_b} was recorded, not even the busy session's own")
 if any(pct != 5 for _, _, pct in own):
     failures.append(f"{label_b} got another account's numbers: {sorted({pct for _, _, pct in own})}")
-# The idle session kept reporting after the swap; those reports were seen and dropped.
-late = query(
-    "SELECT session_id, since_ms, seen_ms FROM session_readings WHERE seen_ms > ? AND since_ms < ?",
-    swapped_ms + IDLE_S * 1000,
-    swapped_ms,
-)
-if not late:
+# The idle session's status line kept running after the swap (it shows the account in use, which
+# cc-rotate prints first), while its numbers stayed the ones from before it; none were recorded.
+idle_screen = "\n".join(idle.screen.display)
+unchanged = query("SELECT session_id FROM session_readings WHERE since_ms < ?", swapped_ms)
+if f"[{label_b}]" not in idle_screen:
+    failures.append(f"the idle session's status line did not show {label_b} after the swap")
+elif not unchanged:
     failures.append("no session still reported its numbers from before the swap (F24 not reproduced)")
 else:
-    log(f"{len(late)} session(s) still showed {label_a}'s numbers {IDLE_S}s and more after the swap; none recorded")
+    log(f"the idle session still showed {label_a}'s numbers {IDLE_S}s and more after the swap; none recorded")
 # Each session ran in one Claude Code process the whole time, and every tick told it the same.
 processes = query("SELECT session_id, count(*) FROM session_processes GROUP BY session_id")
 if len(processes) != 2 or any(n != 1 for _, n in processes):

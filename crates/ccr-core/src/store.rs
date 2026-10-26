@@ -209,9 +209,10 @@ ALTER TABLE accounts ADD COLUMN keep_running INTEGER NOT NULL DEFAULT 0
 const SCHEMA_V9: &str = r#"
 CREATE TABLE session_processes (
     session_id TEXT NOT NULL,
+    key        TEXT NOT NULL,
     started_ms INTEGER NOT NULL,
     seen_ms    INTEGER NOT NULL,
-    PRIMARY KEY (session_id, started_ms)
+    PRIMARY KEY (session_id, key)
 ) WITHOUT ROWID;
 CREATE TABLE session_readings (
     session_id TEXT NOT NULL,
@@ -539,10 +540,16 @@ pub const WAKE_MEMORY_MS: i64 = 30 * 60_000;
 /// Waiting-session rows are dropped this long after their last change.
 const WAITING_RETENTION_MS: i64 = 7 * 86_400_000;
 
-/// How far apart two ticks' reckonings of when a Claude Code process started can be and still be
-/// the same process (`Store::session_process`): the status line takes a moment to start, longer
-/// on a busy machine.
-const PROCESS_START_SLACK_MS: i64 = 5_000;
+/// How much later and how much earlier than the earliest reckoning of when a Claude Code process
+/// started another can be and still be the same process (`Store::session_process`). A
+/// reckoning is the start plus however long the status line took to start, which a busy machine
+/// can stretch to several seconds: never earlier than the start, and the earliest one is the
+/// nearest to it.
+const PROCESS_START_LATER_MS: i64 = 20_000;
+const PROCESS_START_EARLIER_MS: i64 = 2_000;
+/// How often an unchanged session row has its `seen_ms` refreshed, which only keeps it from
+/// being pruned: so most ticks only read.
+const SESSION_SEEN_REFRESH_MS: i64 = 10 * 60_000;
 
 const WAITING_COLS: &str = "session_id, since_ms, account_id, hook_pid, hook_started, state, \
     woken_at, woken_account_id, woken_accounts, updated_at";
@@ -1643,33 +1650,57 @@ impl Store {
 
     /// The key of the session's Claude Code process that started at about `started_ms` (from its
     /// status line: the time less how long the process has run), for `note_session_reading` and
-    /// `note_session_cost`. Every tick of one process gives the same start, give or take how
-    /// long the status line took to start, so a process known to have started within
-    /// `PROCESS_START_SLACK_MS` of it is that one; anything else is a new one.
+    /// `note_session_cost`. Every tick of one process reckons its start plus however long the
+    /// status line took to start, so the earliest reckoning is the nearest. A known process
+    /// whose earliest reckoning is at most `PROCESS_START_LATER_MS` before this one or
+    /// `PROCESS_START_EARLIER_MS` after it is that one (the nearest, if several), and an earlier
+    /// reckoning becomes its earliest; anything else is a new process, keyed by its first
+    /// reckoning for good.
     pub fn session_process(
         &self,
         session_id: &str,
         started_ms: i64,
         now_ms: i64,
     ) -> Result<String> {
-        self.immediate(|s| {
-            let known: Option<i64> = s
-                .conn
+        let find = |s: &Store| -> Result<Option<(String, i64, i64)>> {
+            Ok(s.conn
                 .query_row(
-                    "SELECT started_ms FROM session_processes
-                     WHERE session_id = ?1 AND abs(started_ms - ?2) <= ?3
+                    "SELECT key, started_ms, seen_ms FROM session_processes
+                     WHERE session_id = ?1 AND started_ms BETWEEN ?2 - ?3 AND ?2 + ?4
                      ORDER BY abs(started_ms - ?2) LIMIT 1",
-                    params![session_id, started_ms, PROCESS_START_SLACK_MS],
-                    |r| r.get(0),
+                    params![
+                        session_id,
+                        started_ms,
+                        PROCESS_START_LATER_MS,
+                        PROCESS_START_EARLIER_MS
+                    ],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
-                .optional()?;
-            let key = known.unwrap_or(started_ms);
-            s.conn.execute(
-                "INSERT INTO session_processes (session_id, started_ms, seen_ms) VALUES (?1, ?2, ?3)
-                 ON CONFLICT (session_id, started_ms) DO UPDATE SET seen_ms = excluded.seen_ms",
-                params![session_id, key, now_ms],
-            )?;
-            Ok(key.to_string())
+                .optional()?)
+        };
+        if let Some((key, earliest, seen)) = find(self)? {
+            if earliest <= started_ms && now_ms - seen < SESSION_SEEN_REFRESH_MS {
+                return Ok(key);
+            }
+        }
+        self.immediate(|s| match find(s)? {
+            Some((key, earliest, _)) => {
+                s.conn.execute(
+                    "UPDATE session_processes SET started_ms = ?3, seen_ms = ?4
+                     WHERE session_id = ?1 AND key = ?2",
+                    params![session_id, key, earliest.min(started_ms), now_ms],
+                )?;
+                Ok(key)
+            }
+            None => {
+                let key = started_ms.to_string();
+                s.conn.execute(
+                    "INSERT OR REPLACE INTO session_processes (session_id, key, started_ms, seen_ms)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![session_id, key, started_ms, now_ms],
+                )?;
+                Ok(key)
+            }
         })
     }
 
@@ -1688,18 +1719,26 @@ impl Store {
         windows: &[SampleWindow],
         now_ms: i64,
     ) -> Result<i64> {
-        self.immediate(|s| {
-            let last: Option<(String, i64)> = s
-                .conn
+        let text = serde_json::to_string(windows)?;
+        let last = |s: &Store| -> Result<Option<(String, i64, i64)>> {
+            Ok(s.conn
                 .query_row(
-                    "SELECT windows, since_ms FROM session_readings
+                    "SELECT windows, since_ms, seen_ms FROM session_readings
                      WHERE session_id = ?1 AND process = ?2",
                     params![session_id, process],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
-                .optional()?;
-            let unchanged_since = last.and_then(|(text, since)| {
-                let last: Vec<SampleWindow> = serde_json::from_str(&text).ok()?;
+                .optional()?)
+        };
+        // The same numbers again, recently: nothing to write.
+        if let Some((last_text, since, seen)) = last(self)? {
+            if last_text == text && now_ms - seen < SESSION_SEEN_REFRESH_MS {
+                return Ok(since);
+            }
+        }
+        self.immediate(|s| {
+            let unchanged_since = last(s)?.and_then(|(last_text, since, _)| {
+                let last: Vec<SampleWindow> = serde_json::from_str(&last_text).ok()?;
                 let unchanged = !windows.is_empty() && windows.iter().all(|w| last.contains(w));
                 unchanged.then_some(since)
             });
@@ -1710,13 +1749,7 @@ impl Store {
                  ON CONFLICT (session_id, process) DO UPDATE SET
                     windows = excluded.windows, since_ms = excluded.since_ms,
                     seen_ms = excluded.seen_ms",
-                params![
-                    session_id,
-                    process,
-                    serde_json::to_string(windows)?,
-                    since,
-                    now_ms
-                ],
+                params![session_id, process, text, since, now_ms],
             )?;
             Ok(since)
         })
@@ -1725,7 +1758,7 @@ impl Store {
     // ---- what use would cost at API prices ---------------------------------------------------
 
     /// A session's `cost.total_cost_usd` from the status line of its Claude Code `process`
-    /// (`process::Ancestors::launcher`; two processes can run one session, resumed twice, each
+    /// (`Store::session_process`; two processes can run one session, resumed twice, each
     /// restoring the same total). What it added since that process's last total counts for
     /// `account_id`, in the hour of `now_ms`; returns that.
     ///
@@ -2163,9 +2196,14 @@ mod tests {
         let store = Store::open(&dir.path().join("store.db")).unwrap();
         let first = store.session_process("s", 10_000, 20_000).unwrap();
         assert_eq!(first, "10000");
-        // Later ticks of the same process reckon its start a little differently.
+        // Later ticks of the same process reckon its start later, by however long their status
+        // line took to start; an earlier reckoning becomes the one later ones are held to.
         assert_eq!(store.session_process("s", 10_400, 50_000).unwrap(), first);
+        assert_eq!(store.session_process("s", 26_000, 60_000).unwrap(), first);
         assert_eq!(store.session_process("s", 9_100, 80_000).unwrap(), first);
+        assert_eq!(store.session_process("s", 28_000, 90_000).unwrap(), first);
+        // Started 30 s later: another process (resumed, restoring the run time it had).
+        assert_eq!(store.session_process("s", 40_000, 95_000).unwrap(), "40000");
         // Another process of the session, resumed later, and another session.
         assert_eq!(
             store.session_process("s", 400_000, 410_000).unwrap(),

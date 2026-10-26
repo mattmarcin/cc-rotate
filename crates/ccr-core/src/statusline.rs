@@ -498,7 +498,13 @@ fn idle_since_swap(
         return Ok(false);
     };
     let since = store.note_session_reading(session, process, &sample.windows, now_ms)?;
-    Ok(since < swap::active_since(store)?)
+    if since >= swap::active_since(store)? {
+        return Ok(false);
+    }
+    // The numbers the active account was last read at: a session swapped back to an account
+    // whose numbers did not change while it was parked gets them again from its first response.
+    let active_latest = store.last_sample(sample.account_id)?;
+    Ok(!active_latest.is_some_and(|l| crate::store::same_windows(&l.windows, &sample.windows)))
 }
 
 /// Count what the session's use cost since its last reading, at API prices, for `account_id`
@@ -702,6 +708,7 @@ fn sync_profile_login(
             *unidentified = true;
             if store.meta(swap::META_LOGIN_TO_IDENTIFY)?.as_deref() != Some(marker.as_str()) {
                 store.set_meta(swap::META_LOGIN_TO_IDENTIFY, &marker)?;
+                store.set_meta(swap::META_LOGIN_CHANGED_AT, crate::time::now_ms())?;
             }
             return Ok(true);
         }
@@ -750,7 +757,11 @@ fn adopt_manual_login(store: &Store, paths: &Paths) -> Result<bool> {
         Some(account) => {
             let creds = paths.credentials();
             let oauth = creds.read_oauth()?;
-            store.immediate(|s| swap::adopt_login(s, active.as_ref(), &account, oauth.as_ref()))?;
+            // `/login` wrote `.claude.json` when it changed the login.
+            let changed_at = mtime.min(crate::time::now_ms());
+            store.immediate(|s| {
+                swap::adopt_login(s, active.as_ref(), &account, oauth.as_ref(), changed_at)
+            })?;
             if let Some(marker) = creds.change_marker()? {
                 store.set_meta(META_CRED_SEEN, &marker)?;
             }

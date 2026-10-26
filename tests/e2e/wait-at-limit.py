@@ -76,7 +76,8 @@ def cleanup():
     error = None
     for _ in range(240):
         try:
-            shutil.rmtree(scratch, onerror=writable)
+            # `onexc` from Python 3.12, `onerror` before it; the handler takes either.
+            shutil.rmtree(scratch, **({"onexc": writable} if sys.version_info >= (3, 12) else {"onerror": writable}))
             return
         except FileNotFoundError:
             return
@@ -91,8 +92,9 @@ atexit.register(cleanup)
 exe = ".exe" if os.name == "nt" else ""
 subprocess.run(["cargo", "build", "-q", "-p", "ccr-cli"], cwd=repo, check=True)
 subprocess.run(["cargo", "build", "-q", "-p", "ccr-core", "--example", "e2e_stage"], cwd=repo, check=True)
-ctl_exe = os.path.join(repo, "target", "debug", f"cc-rotate-ctl{exe}")
-stager = os.path.join(repo, "target", "debug", "examples", f"e2e_stage{exe}")
+target = os.environ.get("CARGO_TARGET_DIR") or os.path.join(repo, "target")
+ctl_exe = os.path.join(target, "debug", f"cc-rotate-ctl{exe}")
+stager = os.path.join(target, "debug", "examples", f"e2e_stage{exe}")
 
 data, profile, template, work = (os.path.join(scratch, d) for d in ("data", "profile", "template", "work"))
 token_map = os.path.join(scratch, "tokens.json")
