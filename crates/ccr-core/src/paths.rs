@@ -278,7 +278,7 @@ mod tests {
         let relative = PathBuf::from("bin");
         let path = std::env::join_paths([&relative]).unwrap();
         assert_eq!(
-            find_program_in("claude", Some(path), &[relative.clone()], None),
+            find_program_in("claude", Some(path), std::slice::from_ref(&relative), None),
             None
         );
     }
