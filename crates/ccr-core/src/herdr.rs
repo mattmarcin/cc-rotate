@@ -229,11 +229,11 @@ pub fn detect() -> Option<Detected> {
         let bin = if bin.components().count() > 1 {
             bin
         } else {
-            which::which(&bin).unwrap_or(bin)
+            crate::paths::find_program(&bin.to_string_lossy()).unwrap_or(bin)
         };
         return Some(Detected::InPane(bin));
     }
-    which::which("herdr").ok().map(Detected::OnPath)
+    crate::paths::find_program("herdr").map(Detected::OnPath)
 }
 
 /// `herdr --version`, for example `0.9.4-preview.2026-10-14-fbd2ae23927f`.

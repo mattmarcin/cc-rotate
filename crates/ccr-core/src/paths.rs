@@ -134,3 +134,15 @@ pub fn default_template_dir() -> Result<PathBuf> {
 pub fn forward_slashes(path: &Path) -> String {
     path.display().to_string().replace('\\', "/")
 }
+
+/// `name` on PATH, searching only absolute directories: a relative entry (`.`, an empty one,
+/// `node_modules/.bin`) would resolve against wherever cc-rotate runs, such as a project folder,
+/// and run a program from it with a login in reach.
+pub fn find_program(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    let dirs: Vec<PathBuf> = std::env::split_paths(&path)
+        .filter(|d| d.is_absolute())
+        .collect();
+    let joined = std::env::join_paths(dirs).ok()?;
+    which::which_in(name, Some(joined), std::env::temp_dir()).ok()
+}

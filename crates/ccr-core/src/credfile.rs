@@ -83,8 +83,13 @@ pub fn mtime_ms(path: &Path) -> Option<i64> {
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let dir = path.parent().context("target has no parent directory")?;
     std::fs::create_dir_all(dir)?;
+    remove_stale_temps(path);
     let tmp = temp_sibling(path);
-    write_new_private(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
+    if let Err(e) = write_new_private(&tmp, bytes) {
+        // A half-written copy of a login must not stay behind.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("writing {}", tmp.display()));
+    }
     let mut last = None;
     for attempt in 0..40 {
         match std::fs::rename(&tmp, path) {
@@ -119,6 +124,33 @@ pub(crate) fn write_new_private(path: &Path, bytes: &[u8]) -> std::io::Result<()
     file.sync_all()
 }
 
+/// Temp files of earlier writes to `path` that a crash or power loss left behind, possibly
+/// holding a login: removed once they are older than any write could take.
+fn remove_stale_temps(path: &Path) {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return;
+    };
+    let prefix = format!(".{}.cc-rotate-", name.to_string_lossy());
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let file = entry.file_name().to_string_lossy().into_owned();
+        if !file.starts_with(&prefix) || !file.ends_with(".tmp") {
+            continue;
+        }
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > Duration::from_secs(600));
+        if old {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 fn temp_sibling(path: &Path) -> PathBuf {
     let name = path
         .file_name()
@@ -134,6 +166,32 @@ fn temp_sibling(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A temp copy a crash left behind is removed by the next write, once it is old.
+    #[test]
+    fn stale_temp_files_of_a_target_are_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(".credentials.json");
+        let old = dir.path().join(".credentials.json.cc-rotate-old.tmp");
+        let recent = dir.path().join(".credentials.json.cc-rotate-new.tmp");
+        let other = dir.path().join(".other.json.cc-rotate-old.tmp");
+        for path in [&old, &recent, &other] {
+            std::fs::write(path, "{}").unwrap();
+        }
+        let long_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
+        for path in [&old, &other] {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(long_ago)
+                .unwrap();
+        }
+        atomic_write(&target, b"{}").unwrap();
+        assert!(!old.exists());
+        assert!(recent.exists(), "may belong to a write in progress");
+        assert!(other.exists(), "another file's");
+    }
 
     #[test]
     fn write_preserves_other_keys_and_order() {

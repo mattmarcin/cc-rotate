@@ -56,7 +56,7 @@ pub fn from_config(doc: &Map<String, Value>) -> Option<CachedReport> {
 pub fn from_cache(cached: &Value) -> Option<CachedReport> {
     let cached = cached.as_object()?;
     Some(CachedReport {
-        fetched_at_ms: cached.get("fetchedAtMs")?.as_f64()? as i64,
+        fetched_at_ms: time::epoch_ms(cached.get("fetchedAtMs")?.as_f64()?)?,
         account_uuid: cached
             .get("accountUuid")
             .and_then(Value::as_str)
@@ -179,7 +179,7 @@ fn merge(out: &mut Vec<SampleWindow>, w: SampleWindow) {
 fn resets_at(v: Option<&Value>) -> Option<i64> {
     match v? {
         Value::String(s) => time::parse_rfc3339(s),
-        Value::Number(n) => n.as_f64().map(|n| n as i64),
+        Value::Number(n) => n.as_f64().and_then(time::epoch_s),
         _ => None,
     }
 }

@@ -9,6 +9,20 @@ pub fn now_ms() -> i64 {
 }
 
 /// Seconds since the Unix epoch.
+/// The latest epoch second a reading may name (the year 3000): anything later, negative, or not a
+/// number is not a time, and arithmetic on it in milliseconds could overflow.
+const MAX_EPOCH_S: f64 = 32_503_680_000.0;
+
+/// Epoch seconds from a number Claude Code or the API reported, if it is a plausible time.
+pub fn epoch_s(v: f64) -> Option<i64> {
+    (v.is_finite() && (0.0..=MAX_EPOCH_S).contains(&v)).then_some(v as i64)
+}
+
+/// Epoch milliseconds the same way.
+pub fn epoch_ms(v: f64) -> Option<i64> {
+    (v.is_finite() && (0.0..=MAX_EPOCH_S * 1000.0).contains(&v)).then_some(v as i64)
+}
+
 pub fn now_s() -> i64 {
     now_ms() / 1000
 }
@@ -82,6 +96,16 @@ pub fn parse_rfc3339(s: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_plausible_epoch_times_are_read() {
+        assert_eq!(epoch_s(1_800_000_000.7), Some(1_800_000_000));
+        for v in [f64::NAN, f64::INFINITY, -1.0, 1e30] {
+            assert_eq!(epoch_s(v), None, "{v}");
+            assert_eq!(epoch_ms(v), None, "{v}");
+        }
+        assert_eq!(epoch_ms(1_800_000_000_000.0), Some(1_800_000_000_000));
+    }
 
     #[test]
     fn spans() {

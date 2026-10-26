@@ -681,6 +681,13 @@ pub struct Store {
     key: OnceCell<Key>,
 }
 
+/// `path` with `suffix` added to its file name (`store.db-wal`).
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(suffix);
+    path.with_file_name(name)
+}
+
 impl Store {
     /// Open (or create) the store. Its encryption key is `master.key` next to it.
     pub fn open(path: &Path) -> Result<Store> {
@@ -688,8 +695,17 @@ impl Store {
             .parent()
             .context("the store path has no parent directory")?;
         secret::create_private_dir(dir)?;
+        secret::restrict_to_owner(dir, 0o700);
         let conn =
             Connection::open(path).with_context(|| format!("opening store {}", path.display()))?;
+        // SQLite creates the database and its journal files with the default mode.
+        for file in [
+            path.to_path_buf(),
+            with_suffix(path, "-wal"),
+            with_suffix(path, "-shm"),
+        ] {
+            secret::restrict_to_owner(&file, 0o600);
+        }
         Self::init(conn, Some(secret::key_path(dir)), OnceCell::new())
     }
 
@@ -2152,12 +2168,10 @@ fn validate_setting(key: &str, value: &str) -> Result<Option<String>> {
                 bail!("Use a number from 1 to 100.");
             }
         }
-        "swap_cooldown_s" | "lock_timeout_ms" | "sample_retention_days" => {
-            let v: i64 = value.parse().map_err(|_| anyhow!("Use a whole number."))?;
-            if v < 0 {
-                bail!("Use 0 or more.");
-            }
-        }
+        // Bounded above too, so time arithmetic on them cannot overflow.
+        "swap_cooldown_s" => whole_in(value, 0, DAY_S)?,
+        "lock_timeout_ms" => whole_in(value, 0, 10 * 60_000)?,
+        "sample_retention_days" => whole_in(value, 0, 3650)?,
         "usage_check_interval_s" => {
             let v: i64 = value.parse().map_err(|_| anyhow!("Use a whole number."))?;
             if v < MIN_CHECK_INTERVAL_S {
@@ -2165,11 +2179,13 @@ fn validate_setting(key: &str, value: &str) -> Result<Option<String>> {
                     "Use {MIN_CHECK_INTERVAL_S} or more. Anthropic refuses more frequent usage checks."
                 );
             }
+            whole_in(value, MIN_CHECK_INTERVAL_S, 7 * DAY_S)?;
         }
-        "usage_check_max_age_s" => {
-            let v: i64 = value.parse().map_err(|_| anyhow!("Use a whole number."))?;
-            if v < 0 {
-                bail!("Use 0 or more.");
+        "usage_check_max_age_s" => whole_in(value, 0, 7 * DAY_S)?,
+        // A relative path would be looked up from wherever cc-rotate runs, such as a project.
+        "claude_path" | "profile_dir" => {
+            if !std::path::Path::new(value).is_absolute() {
+                bail!("Use a full path, starting from the root of the drive.");
             }
         }
         "login_warning_days" => {
@@ -2191,6 +2207,19 @@ fn validate_setting(key: &str, value: &str) -> Result<Option<String>> {
         _ => {}
     }
     Ok(None)
+}
+
+const DAY_S: i64 = 86_400;
+
+/// A whole number from `min` to `max`.
+fn whole_in(value: &str, min: i64, max: i64) -> Result<()> {
+    let v: i64 = value
+        .parse()
+        .map_err(|_| anyhow!("Use a whole number from {min} to {max}."))?;
+    if !(min..=max).contains(&v) {
+        bail!("Use a whole number from {min} to {max}.");
+    }
+    Ok(())
 }
 
 pub fn validate_label(label: &str) -> Result<()> {
@@ -2231,6 +2260,32 @@ pub fn sanitize_label(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_are_bounded_and_paths_are_full() {
+        let store = Store::open_in_memory().unwrap();
+        for (key, value) in [
+            ("lock_timeout_ms", "9999999999"),
+            ("swap_cooldown_s", "-1"),
+            ("swap_cooldown_s", "100000000"),
+            ("usage_check_interval_s", "100000000"),
+            ("claude_path", "claude"),
+            ("claude_path", "node_modules/.bin/claude"),
+            ("profile_dir", "rotate"),
+        ] {
+            assert!(
+                store.set_setting(key, Some(value)).is_err(),
+                "{key} = {value}"
+            );
+        }
+        let full = if cfg!(windows) {
+            r"C:\Tools\claude.exe"
+        } else {
+            "/usr/local/bin/claude"
+        };
+        store.set_setting("claude_path", Some(full)).unwrap();
+        store.set_setting("lock_timeout_ms", Some("60000")).unwrap();
+    }
 
     #[test]
     fn a_session_process_is_told_by_when_it_started() {

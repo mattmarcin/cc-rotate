@@ -96,12 +96,11 @@ fn epoch_seconds<'de, D: Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Erro
         Text(String),
     }
     Ok(match Option::<Raw>::deserialize(d)? {
-        Some(Raw::Num(n)) => Some(n as i64),
-        Some(Raw::Text(s)) => s
-            .parse::<f64>()
-            .ok()
-            .map(|n| n as i64)
-            .or_else(|| time::parse_rfc3339(&s)),
+        Some(Raw::Num(n)) => time::epoch_s(n),
+        Some(Raw::Text(s)) => match s.parse::<f64>() {
+            Ok(n) => time::epoch_s(n),
+            Err(_) => time::parse_rfc3339(&s),
+        },
         None => None,
     })
 }

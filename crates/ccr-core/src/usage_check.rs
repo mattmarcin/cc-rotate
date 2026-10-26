@@ -122,6 +122,18 @@ pub const SOURCE: &str = "check";
 /// backend than the scratch profile's, or tie it to a session or tool it was started from.
 const SCRUBBED_PREFIXES: &[&str] = &["ANTHROPIC_", "CLAUDE_CODE_", "CLAUDECODE", "HERDR_"];
 
+/// Leave out of `cmd`'s environment what would make Claude Code use another login, account or
+/// backend than its `CLAUDE_CONFIG_DIR`'s (`SCRUBBED_PREFIXES`), keeping what it needs to run
+/// (`KEPT_ENV`).
+pub(crate) fn scrub_env(cmd: &mut Command) {
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if SCRUBBED_PREFIXES.iter().any(|p| name.starts_with(p)) && !KEPT_ENV.contains(&&*name) {
+            cmd.env_remove(&key);
+        }
+    }
+}
+
 /// Who asked for a check, which decides what may stop it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Trigger {
@@ -1184,8 +1196,10 @@ pub(crate) fn hold_back(store: &Store, account_id: i64) -> Result<()> {
 }
 
 /// Settle every scratch profile left behind (at app start): the ones of accounts whose lock is
-/// free are recovered, those of removed accounts and of `confirm_active` are deleted.
+/// free are recovered, those of removed accounts and of `confirm_active` are deleted, and so are
+/// abandoned sign-ins (`sweep_logins`).
 pub fn sweep(store: &Store, paths: &Paths) -> Result<()> {
+    sweep_logins(paths);
     for dir in scratch_dirs(paths, CONFIRM_PREFIX) {
         if !running(&dir) {
             remove_scratch(&dir);
@@ -1419,6 +1433,70 @@ fn identify_with(
         }))
 }
 
+/// Delete the staging folders of sign-ins that were abandoned: their process (the app or
+/// `cc-rotate-ctl login`) ended without cleaning up, after a crash, a quit or Ctrl+C. A folder
+/// that records no process is deleted once it is older than a sign-in may take, which covers the
+/// bare-id folders of older versions too. They can hold a plaintext login, or on macOS a Keychain
+/// item named after them.
+pub fn sweep_logins(paths: &Paths) {
+    let Ok(entries) = std::fs::read_dir(paths.staging_root()) else {
+        return;
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let legacy = name.len() == 32 && name.bytes().all(|b| b.is_ascii_hexdigit());
+        if !legacy && !name.starts_with(crate::login::STAGING_PREFIX) {
+            continue;
+        }
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let abandoned = if dir.join(PID_FILE).exists() {
+            !running(&dir)
+        } else {
+            entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > crate::login::SIGN_IN_TIMEOUT)
+        };
+        if abandoned {
+            remove_scratch(&dir);
+        }
+    }
+}
+
+/// Record this process as the one using `dir`, so a sweep leaves it alone while it runs.
+pub(crate) fn record_owner(dir: &Path) -> Result<()> {
+    let pid = std::process::id();
+    let started = process::start_time(pid).unwrap_or_default();
+    write_private(&dir.join(PID_FILE), format!("{pid} {started}").as_bytes())
+}
+
+/// Write a small file only its owner can read (on Unix), replacing any that was there.
+fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
+    let _ = std::fs::remove_file(path);
+    let mut file = private_file(path)?;
+    std::io::Write::write_all(&mut file, contents)
+        .with_context(|| format!("writing {}", path.display()))
+}
+
+/// A new file only its owner can read (mode 0600 on Unix), for output that may mention a login.
+fn private_file(path: &Path) -> Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+        .open(path)
+        .with_context(|| format!("creating {}", path.display()))
+}
+
 /// Whether the Claude Code a scratch profile records as started is still running: a process
 /// with that id and the same start time (ids are reused).
 fn running(dir: &Path) -> bool {
@@ -1467,7 +1545,7 @@ impl Scratch {
             None => format!("{prefix}{unique}"),
         };
         let dir = paths.staging_root().join(name);
-        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        crate::secret::create_private_dir(&dir)?;
         Ok(Scratch { dir, keep: false })
     }
 }
@@ -1531,8 +1609,10 @@ fn run_in_scratch(
     files: [&str; 3],
 ) -> Result<Run> {
     let [out_file, err_file, debug_file] = files;
-    let out = std::fs::File::create(scratch.join(out_file))?;
-    let err = std::fs::File::create(scratch.join(err_file))?;
+    let out = private_file(&scratch.join(out_file))?;
+    let err = private_file(&scratch.join(err_file))?;
+    // Claude Code's debug log, made private before Claude Code appends to it.
+    drop(private_file(&scratch.join(debug_file))?);
     let mut cmd = Command::new(claude);
     cmd.args(args)
         .arg("--debug-file")
@@ -1541,12 +1621,7 @@ fn run_in_scratch(
         .stdin(Stdio::null())
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err));
-    for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if SCRUBBED_PREFIXES.iter().any(|p| name.starts_with(p)) && !KEPT_ENV.contains(&&*name) {
-            cmd.env_remove(&key);
-        }
-    }
+    scrub_env(&mut cmd);
     cmd.env("CLAUDE_CONFIG_DIR", scratch)
         .env("DISABLE_AUTOUPDATER", "1");
     #[cfg(windows)]
@@ -1561,7 +1636,10 @@ fn run_in_scratch(
     // From here on no error returns early: Claude Code may be renewing the login, and an error
     // that stops it counts as an interruption (`timed_out`), which holds the account back.
     let started = process::start_time(tree.id()).unwrap_or_default();
-    let _ = std::fs::write(scratch.join(PID_FILE), format!("{} {started}", tree.id()));
+    let _ = write_private(
+        &scratch.join(PID_FILE),
+        format!("{} {started}", tree.id()).as_bytes(),
+    );
     let deadline = Instant::now() + timeout;
     let mut run = Run::default();
     loop {
@@ -1690,6 +1768,35 @@ pub fn summary(store: &Store, account_id: i64, outcome: &CheckOutcome) -> Value 
 mod tests {
     use super::*;
     use crate::store::AccountIdentity;
+
+    /// A sign-in's staging folder outlives a crash, a quit or Ctrl+C with a login in it: the
+    /// sweep deletes the ones whose process is gone, and leaves those still in use.
+    #[test]
+    fn abandoned_sign_ins_are_swept() {
+        let e = env();
+        let live = crate::login::Staging::create(&e.paths).unwrap();
+        let root = e.paths.staging_root();
+        // Its process ended: a recorded id that no process has.
+        let dead = root.join(format!("{}dead", crate::login::STAGING_PREFIX));
+        std::fs::create_dir_all(&dead).unwrap();
+        std::fs::write(dead.join(PID_FILE), format!("{} 0", u32::MAX - 7)).unwrap();
+        std::fs::write(dead.join(".credentials.json"), "{}").unwrap();
+        // No record, but recent: an older version's sign-in that may still be running.
+        let fresh = root.join("0123456789abcdef0123456789abcdef");
+        std::fs::create_dir_all(&fresh).unwrap();
+        // A check's scratch profile is settled by `recover`, not here.
+        let check = root.join(format!("{SCRATCH_PREFIX}1-0-x"));
+        std::fs::create_dir_all(&check).unwrap();
+
+        sweep_logins(&e.paths);
+        assert!(live.dir().exists(), "in use by this process");
+        assert!(!dead.exists());
+        assert!(fresh.exists() && check.exists());
+
+        let dir = live.dir().to_path_buf();
+        drop(live);
+        assert!(!dir.exists());
+    }
 
     struct Env {
         _root: tempfile::TempDir,

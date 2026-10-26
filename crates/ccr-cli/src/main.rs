@@ -1,5 +1,6 @@
 mod format;
 mod herdr;
+mod interrupts;
 mod process;
 mod ranking;
 mod stop_failure;
@@ -798,9 +799,15 @@ fn login_cmd(
         "Your browser signs in with the claude.ai account it's signed in to. Switch accounts there first if needed.\n"
     );
 
-    let status = login::login_command(&claude, staging.dir(), email.as_deref())
-        .status()
+    let mut child = login::login_command(&claude, staging.dir(), email.as_deref())
+        .spawn()
         .context("running `claude auth login`")?;
+    // Ctrl+C reaches Claude Code too, which ends the sign-in; this process waits for it so the
+    // staging folder, which may already hold the new login, is removed on the way out.
+    let status = {
+        let _held = interrupts::Held::new();
+        child.wait().context("running `claude auth login`")?
+    };
     if !status.success() {
         bail!("`claude auth login` exited with {status}");
     }
