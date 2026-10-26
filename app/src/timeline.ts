@@ -136,7 +136,8 @@ export const at = (ms: number, view: View) => (Math.max(view.start, Math.min(vie
 export function axis(snap: Snapshot, view: View): HTMLElement {
   const marks: HTMLElement[] = [];
   // Wide enough gaps are named in the axis, over the hour labels where the name goes.
-  const named = gaps(snap, view).filter((g) => at(g.to, view) - at(g.from, view) > 9);
+  // Not right beside the tag for now, and not so near the end that the name is cut off.
+  const named = gaps(snap, view).filter((g) => at(g.to, view) - at(g.from, view) > 9 && at(g.from, view) - at(view.now, view) > 7 && at(g.from, view) < 86);
   for (let t = view.start + HOUR_MS; t < view.end; t += HOUR_MS) {
     const d = new Date(t);
     const midnight = d.getHours() === 0;
@@ -222,7 +223,7 @@ export function summary(snap: Snapshot, labelOf: (id: number) => string): { titl
     const next = snap.pool.next_available_at;
     return {
       title: "Every account is at a limit",
-      story: [next ? ["The first one frees up at ", b(when(next * 1000, now)), ". "] : "", "Sessions stopped at a limit pick up again then."],
+      story: next ? ["The first one frees up at ", b(when(next * 1000, now)), ". Sessions stopped at a limit pick up again then."] : ["None says when it resets."],
       tone: "warn",
     };
   }
@@ -255,7 +256,7 @@ export function summary(snap: Snapshot, labelOf: (id: number) => string): { titl
       : ["At your pace, ", b(active.label), first.at_limit ? " reaches its swap point around " : " gives way around ", b(when(first.to * 1000, now)), "."]
     : [
         b(active.label),
-        active.available_at && active.available_at * 1000 > now ? " is at its swap point, so " : " gives way to an account without a weekly limit: ",
+        active.windows.some((w) => w.applies && w.pct >= w.threshold) ? " is at its swap point, so " : " gives way to an account without a weekly limit: ",
         b(labelOf(first.account_id)),
         " takes over now.",
       ];
@@ -268,8 +269,7 @@ export function summary(snap: Snapshot, labelOf: (id: number) => string): { titl
       story: [
         handover,
         " Every account reaches a limit then",
-        f.free_again_at ? [", and the first one frees up at ", b(when(f.free_again_at * 1000, now))] : "",
-        ". Sessions stopped at a limit pick up again then.",
+        f.free_again_at ? [", and the first one frees up at ", b(when(f.free_again_at * 1000, now)), ". Sessions stopped at a limit pick up again then."] : ".",
       ],
       tone: "warn",
     };

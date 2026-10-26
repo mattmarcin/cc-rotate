@@ -392,6 +392,8 @@ function saveOrder(ids: number[], moved: AccountView) {
     .catch((e) => say(String(e), "error"))
     .finally(() => {
       pendingOrderSaves -= 1;
+      // A read that ran while this save was being written may hold the order before it.
+      orderVersion += 1;
       // Refresh once the last save landed, so an earlier one never shows a stale order.
       if (pendingOrderSaves === 0) refresh();
     });
@@ -566,12 +568,13 @@ function renderHead() {
             class: "btn",
             disabled: !snap.pool.eligible,
             title: snap.pool.eligible ? "Swap to the next account in line" : "No other account is ready",
+            "data-focus": "head-swap",
             onclick: swapNow,
           },
           "Swap now",
         )
       : null;
-  const add = h("button", { class: "btn primary", onclick: () => openLogin(null) }, "Add account");
+  const add = h("button", { class: "btn primary", "data-focus": "head-add", onclick: () => openLogin(null) }, "Add account");
   if (r.page === "overview") {
     const active = snap?.accounts.find((a) => a.id === snap.active_id);
     const since = activeSince();
@@ -684,7 +687,7 @@ function onboarding(): Child {
       null,
       "Sign in to each of your Claude accounts once. cc-rotate keeps the logins encrypted on this computer and swaps the cc-rotate profile to another account when one nears its limits.",
     ),
-    h("button", { class: "btn primary", onclick: () => openLogin(null) }, "Add account"),
+    h("button", { class: "btn primary", "data-focus": "onboard-add", onclick: () => openLogin(null) }, "Add account"),
   );
 }
 
@@ -724,7 +727,7 @@ function planSection(snap: Snapshot): Child {
   const p = snap.pool;
   return h(
     "section",
-    { class: "card plan-card", "aria-label": "Plan for the next 12 hours" },
+    { class: "card plan-card", "aria-label": "Plan" },
     h("div", { class: "plan-top" }, h("div", { class: "plan-corner" }, "Your order"), axis(snap, view)),
     h("div", { class: "plan-rows" }, overlay(snap, view), h("ol", { class: "plan-list" }, rows)),
     h(
@@ -904,7 +907,7 @@ function accountSettings(a: AccountView): HTMLElement {
   const label = h("input", { type: "text", value: a.label, maxlength: 40 });
   const error = h("p", { class: "login-status error", hidden: true });
   const save = h("button", { class: "btn primary" }, "Save changes");
-  const remove = h("button", { class: "btn danger-outline", disabled: a.state === "active", title: a.state === "active" ? "Swap to another account first" : null }, "Remove account");
+  const remove = h("button", { class: "btn danger-outline" }, "Remove account");
   const weekly = h(
     "select",
     {
