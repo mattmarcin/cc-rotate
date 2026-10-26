@@ -76,13 +76,37 @@ impl Drop for Held {
 mod tests {
     use super::*;
 
+    const CHILD: &str = "CCR_INTERRUPTS_TEST_CHILD";
+    const NAME: &str =
+        "interrupts::tests::a_termination_signal_is_held_then_ends_the_process_again";
+
     /// While held, a termination signal sent to this process leaves it running and is reported,
-    /// so the sign-in can be stopped and its staging folder removed.
+    /// so the sign-in can be stopped and its staging folder removed; once released, the signal
+    /// ends the process as it would have. Run in a copy of the test binary, since the handlers
+    /// stay registered for the whole process, where other tests raise signals too.
     #[test]
-    fn a_termination_signal_while_held_is_reported_not_fatal() {
-        let held = Held::new();
-        assert!(!held.ended());
-        signal_hook::low_level::raise(signal_hook::consts::SIGTERM).unwrap();
-        assert!(held.ended(), "still running, and told");
+    fn a_termination_signal_is_held_then_ends_the_process_again() {
+        use signal_hook::consts::SIGTERM;
+        use std::os::unix::process::ExitStatusExt;
+        if std::env::var_os(CHILD).is_some() {
+            let held = Held::new();
+            signal_hook::low_level::raise(SIGTERM).unwrap();
+            assert!(held.ended(), "still running, and told");
+            drop(held);
+            signal_hook::low_level::raise(SIGTERM).unwrap();
+            // Not reached: the default action ended the process.
+            std::process::exit(0);
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--test-threads=1", "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.signal(),
+            Some(SIGTERM),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
     }
 }

@@ -70,7 +70,7 @@ To use cc-rotate on a Mac you reach over SSH:
 ## Requirements
 
 - Claude Code, native install (`claude --version`). Tested with 2.1.310.
-- To build from source: [Rust](https://rustup.rs) 1.88 or newer, and [Node.js](https://nodejs.org) 20 or newer for the desktop app.
+- To build from source: [Rust](https://rustup.rs) 1.89 or newer, and [Node.js](https://nodejs.org) 20 or newer for the desktop app.
 - On Linux, the desktop app also needs the WebKitGTK and tray libraries, for example on Debian and Ubuntu: `sudo apt install libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev`.
 
 ## Install

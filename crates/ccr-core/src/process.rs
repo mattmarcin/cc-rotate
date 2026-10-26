@@ -297,6 +297,11 @@ pub struct Tree {
     job: Option<windows_sys::Win32::Foundation::HANDLE>,
 }
 
+// SAFETY: the job handle is a kernel handle, usable from any thread; `Tree` owns it and closes
+// it once, on drop.
+#[cfg(windows)]
+unsafe impl Send for Tree {}
+
 impl Tree {
     pub fn spawn(cmd: &mut Command) -> std::io::Result<Tree> {
         #[cfg(unix)]
