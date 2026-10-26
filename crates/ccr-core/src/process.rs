@@ -201,17 +201,6 @@ impl Ancestors {
         Ancestors::of_this_process(if shell_parent { 2 } else { 1 })
     }
 
-    /// The process that started this one, past the shell Claude Code runs a command in, as
-    /// "<pid>:<start time>": for a status line or hook, the Claude Code process, which no other
-    /// process shares even under a reused id.
-    pub fn launcher() -> Option<String> {
-        let mut pid = parent(std::process::id())?;
-        if name(pid).is_some_and(|n| is_shell(&n)) {
-            pid = parent(pid)?;
-        }
-        (pid > 4).then(|| format!("{pid}:{}", start_time(pid).unwrap_or_default()))
-    }
-
     /// Up to `depth` ancestors.
     pub fn of_this_process(depth: usize) -> Ancestors {
         let mut chain = Vec::new();
@@ -258,8 +247,6 @@ mod ancestry_tests {
         let ancestors = Ancestors::of_this_process(2);
         assert!(!ancestors.is_empty());
         assert!(ancestors.all_alive());
-        let launcher = Ancestors::launcher().expect("a launcher");
-        assert_eq!(Ancestors::launcher().as_deref(), Some(launcher.as_str()));
     }
 
     #[test]

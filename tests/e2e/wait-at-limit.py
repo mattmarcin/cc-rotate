@@ -26,6 +26,7 @@ import json
 import os
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -67,15 +68,23 @@ def cleanup():
             pass
     # The scratch store holds copies of access tokens: never leave it behind. Windows can hold the
     # folders a little longer after Claude Code is stopped.
-    for _ in range(60):
+    def writable(func, path, _):
+        # A read-only file stops rmtree on Windows.
+        os.chmod(path, stat.S_IWRITE)
+        func(path)
+
+    error = None
+    for _ in range(240):
         try:
-            shutil.rmtree(scratch)
+            # `onexc` from Python 3.12, `onerror` before it; the handler takes either.
+            shutil.rmtree(scratch, **({"onexc": writable} if sys.version_info >= (3, 12) else {"onerror": writable}))
             return
         except FileNotFoundError:
             return
-        except OSError:
+        except OSError as e:
+            error = e
             time.sleep(0.5)
-    print(f"Could not delete {scratch}; delete it by hand.", flush=True)
+    print(f"Could not delete {scratch} ({error}); delete it by hand.", flush=True)
 
 
 atexit.register(cleanup)
@@ -83,8 +92,9 @@ atexit.register(cleanup)
 exe = ".exe" if os.name == "nt" else ""
 subprocess.run(["cargo", "build", "-q", "-p", "ccr-cli"], cwd=repo, check=True)
 subprocess.run(["cargo", "build", "-q", "-p", "ccr-core", "--example", "e2e_stage"], cwd=repo, check=True)
-ctl_exe = os.path.join(repo, "target", "debug", f"cc-rotate-ctl{exe}")
-stager = os.path.join(repo, "target", "debug", "examples", f"e2e_stage{exe}")
+target = os.environ.get("CARGO_TARGET_DIR") or os.path.join(repo, "target")
+ctl_exe = os.path.join(target, "debug", f"cc-rotate-ctl{exe}")
+stager = os.path.join(target, "debug", "examples", f"e2e_stage{exe}")
 
 data, profile, template, work = (os.path.join(scratch, d) for d in ("data", "profile", "template", "work"))
 token_map = os.path.join(scratch, "tokens.json")

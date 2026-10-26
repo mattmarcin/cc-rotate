@@ -27,7 +27,9 @@ use crate::{credfile, time};
 /// 7: what each account's use would cost at API prices (`session_costs`, `account_costs`) and
 ///    its extra usage (`extra_usage`).
 /// 8: whether cc-rotate keeps an account's 5-hour window running (`keep_running`).
-const SCHEMA_VERSION: i64 = 8;
+/// 9: each session's Claude Code processes (`session_processes`), and the usage each last
+///    reported and since when (`session_readings`).
+const SCHEMA_VERSION: i64 = 9;
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE accounts (
@@ -197,6 +199,29 @@ CREATE TABLE extra_usage (
 const SCHEMA_V8: &str = r#"
 ALTER TABLE accounts ADD COLUMN keep_running INTEGER NOT NULL DEFAULT 0
     CHECK (keep_running IN (0, 1));
+"#;
+
+/// Schema 9: the Claude Code processes of each session, told apart by when each started
+/// (`session_process`); the usage windows each session's Claude Code process last reported on
+/// the status line (`windows`, JSON), since when it has reported them unchanged (`since_ms`), and when it
+/// last reported (`seen_ms`). A session repeats its last numbers until it gets a response, so
+/// numbers unchanged since before a swap are the account it used before (`note_session_reading`).
+const SCHEMA_V9: &str = r#"
+CREATE TABLE session_processes (
+    session_id TEXT NOT NULL,
+    key        TEXT NOT NULL,
+    started_ms INTEGER NOT NULL,
+    seen_ms    INTEGER NOT NULL,
+    PRIMARY KEY (session_id, key)
+) WITHOUT ROWID;
+CREATE TABLE session_readings (
+    session_id TEXT NOT NULL,
+    process    TEXT NOT NULL,
+    windows    TEXT NOT NULL,
+    since_ms   INTEGER NOT NULL,
+    seen_ms    INTEGER NOT NULL,
+    PRIMARY KEY (session_id, process)
+) WITHOUT ROWID;
 "#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -515,6 +540,19 @@ pub const WAKE_MEMORY_MS: i64 = 30 * 60_000;
 /// Waiting-session rows are dropped this long after their last change.
 const WAITING_RETENTION_MS: i64 = 7 * 86_400_000;
 
+/// How much later and how much earlier than the earliest reckoning of when a Claude Code process
+/// started another can be and still be the same process (`Store::session_process`). A
+/// reckoning is the start plus however long the status line took to start, which a busy machine
+/// can stretch to several seconds: never earlier than the start, and the earliest one is the
+/// nearest to it. The first one may be the slow one, so later ones can be earlier by as much; a
+/// resumed process restores the run time it had, so it never reckons earlier than the one it
+/// was resumed from.
+const PROCESS_START_LATER_MS: i64 = 20_000;
+const PROCESS_START_EARLIER_MS: i64 = 20_000;
+/// How often an unchanged session row has its `seen_ms` refreshed, which only keeps it from
+/// being pruned: so most ticks only read.
+const SESSION_SEEN_REFRESH_MS: i64 = 10 * 60_000;
+
 const WAITING_COLS: &str = "session_id, since_ms, account_id, hook_pid, hook_started, state, \
     woken_at, woken_account_id, woken_accounts, updated_at";
 
@@ -674,6 +712,43 @@ impl Store {
         })
     }
 
+    /// A copy of the store at `source`, made at `copy` (a consistent snapshot read through a
+    /// read-only connection), then opened and brought up to this build's schema, with the key
+    /// next to `source`. For tools that read an installed cc-rotate's store whatever its schema,
+    /// such as `examples/e2e_stage.rs`: the store at `source` is never migrated or written
+    /// (SQLite may create its `-wal` and `-shm` files). The copy holds the sealed logins, so
+    /// delete it after use. A store newer than this build is refused.
+    pub fn open_copy(source: &Path, copy: &Path) -> Result<Store> {
+        let dir = source
+            .parent()
+            .context("the store path has no parent directory")?;
+        let key_path = secret::key_path(dir);
+        if !key_path.exists() {
+            bail!("{} has no key file next to it", source.display());
+        }
+        if copy.exists() {
+            bail!("{} exists already", copy.display());
+        }
+        let conn = Connection::open_with_flags(
+            source,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("opening store {} read-only", source.display()))?;
+        conn.busy_timeout(Duration::from_millis(5000))?;
+        let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if version > SCHEMA_VERSION {
+            bail!(
+                "{} is at schema {version}, newer than this build's {SCHEMA_VERSION}",
+                source.display()
+            );
+        }
+        conn.execute("VACUUM INTO ?1", [copy.to_string_lossy().as_ref()])?;
+        drop(conn);
+        let conn =
+            Connection::open(copy).with_context(|| format!("opening store {}", copy.display()))?;
+        Self::init(conn, Some(key_path), OnceCell::new())
+    }
+
     pub fn open_in_memory() -> Result<Store> {
         Self::init(
             Connection::open_in_memory()?,
@@ -781,6 +856,10 @@ impl Store {
             if version < 8 {
                 s.conn.execute_batch(SCHEMA_V8)?;
                 s.conn.pragma_update(None, "user_version", 8)?;
+            }
+            if version < 9 {
+                s.conn.execute_batch(SCHEMA_V9)?;
+                s.conn.pragma_update(None, "user_version", 9)?;
             }
             Ok(())
         })
@@ -1558,6 +1637,10 @@ impl Store {
         )?;
         self.conn
             .execute("DELETE FROM session_costs WHERE updated_at < ?1", [cutoff])?;
+        self.conn
+            .execute("DELETE FROM session_readings WHERE seen_ms < ?1", [cutoff])?;
+        self.conn
+            .execute("DELETE FROM session_processes WHERE seen_ms < ?1", [cutoff])?;
         self.conn.execute(
             "DELETE FROM account_costs WHERE hour < ?1",
             [cutoff.div_euclid(3_600_000)],
@@ -1565,10 +1648,123 @@ impl Store {
         self.set_meta("last_prune_at", now_ms)
     }
 
+    // ---- what each session reports ------------------------------------------------------------
+
+    /// The key of the session's Claude Code process that started at about `started_ms` (from its
+    /// status line: the time less how long the process has run), for `note_session_reading` and
+    /// `note_session_cost`. Every tick of one process reckons its start plus however long the
+    /// status line took to start, so the earliest reckoning is the nearest. A known process
+    /// whose earliest reckoning is at most `PROCESS_START_LATER_MS` before this one or
+    /// `PROCESS_START_EARLIER_MS` after it is that one (the nearest, if several), and an earlier
+    /// reckoning becomes its earliest; anything else is a new process, keyed by its first
+    /// reckoning for good.
+    pub fn session_process(
+        &self,
+        session_id: &str,
+        started_ms: i64,
+        now_ms: i64,
+    ) -> Result<String> {
+        let find = |s: &Store| -> Result<Option<(String, i64, i64)>> {
+            Ok(s.conn
+                .query_row(
+                    "SELECT key, started_ms, seen_ms FROM session_processes
+                     WHERE session_id = ?1 AND started_ms BETWEEN ?2 - ?3 AND ?2 + ?4
+                     ORDER BY abs(started_ms - ?2) LIMIT 1",
+                    params![
+                        session_id,
+                        started_ms,
+                        PROCESS_START_LATER_MS,
+                        PROCESS_START_EARLIER_MS
+                    ],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?)
+        };
+        if let Some((key, earliest, seen)) = find(self)? {
+            if earliest <= started_ms && now_ms - seen < SESSION_SEEN_REFRESH_MS {
+                return Ok(key);
+            }
+        }
+        self.immediate(|s| match find(s)? {
+            Some((key, earliest, _)) => {
+                s.conn.execute(
+                    "UPDATE session_processes SET started_ms = ?3, seen_ms = ?4
+                     WHERE session_id = ?1 AND key = ?2",
+                    params![session_id, key, earliest.min(started_ms), now_ms],
+                )?;
+                Ok(key)
+            }
+            None => {
+                let key = started_ms.to_string();
+                // A key is a first reckoning, so one already taken is the same process.
+                s.conn.execute(
+                    "INSERT INTO session_processes (session_id, key, started_ms, seen_ms)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT (session_id, key) DO UPDATE SET
+                        started_ms = min(started_ms, excluded.started_ms),
+                        seen_ms = excluded.seen_ms",
+                    params![session_id, key, started_ms, now_ms],
+                )?;
+                Ok(key)
+            }
+        })
+    }
+
+    /// Record the usage windows a session's Claude Code `process` reported on the status line,
+    /// and return since when it has reported them unchanged (epoch ms).
+    ///
+    /// The numbers come from the process's own record of its last API responses, so they change
+    /// only with a response (any response, a refusal at a usage limit too) and otherwise repeat,
+    /// however long the session idles. A window also drops out once its reset time passes, so a
+    /// reading whose every window is one the last reading had, exactly, is unchanged. Anything
+    /// else (a new window, other numbers, a first reading) starts at `now_ms`.
+    pub fn note_session_reading(
+        &self,
+        session_id: &str,
+        process: &str,
+        windows: &[SampleWindow],
+        now_ms: i64,
+    ) -> Result<i64> {
+        let text = serde_json::to_string(windows)?;
+        let last = |s: &Store| -> Result<Option<(String, i64, i64)>> {
+            Ok(s.conn
+                .query_row(
+                    "SELECT windows, since_ms, seen_ms FROM session_readings
+                     WHERE session_id = ?1 AND process = ?2",
+                    params![session_id, process],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?)
+        };
+        // The same numbers again, recently: nothing to write.
+        if let Some((last_text, since, seen)) = last(self)? {
+            if last_text == text && now_ms - seen < SESSION_SEEN_REFRESH_MS {
+                return Ok(since);
+            }
+        }
+        self.immediate(|s| {
+            let unchanged_since = last(s)?.and_then(|(last_text, since, _)| {
+                let last: Vec<SampleWindow> = serde_json::from_str(&last_text).ok()?;
+                let unchanged = !windows.is_empty() && windows.iter().all(|w| last.contains(w));
+                unchanged.then_some(since)
+            });
+            let since = unchanged_since.unwrap_or(now_ms);
+            s.conn.execute(
+                "INSERT INTO session_readings (session_id, process, windows, since_ms, seen_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (session_id, process) DO UPDATE SET
+                    windows = excluded.windows, since_ms = excluded.since_ms,
+                    seen_ms = excluded.seen_ms",
+                params![session_id, process, text, since, now_ms],
+            )?;
+            Ok(since)
+        })
+    }
+
     // ---- what use would cost at API prices ---------------------------------------------------
 
     /// A session's `cost.total_cost_usd` from the status line of its Claude Code `process`
-    /// (`process::Ancestors::launcher`; two processes can run one session, resumed twice, each
+    /// (`Store::session_process`; two processes can run one session, resumed twice, each
     /// restoring the same total). What it added since that process's last total counts for
     /// `account_id`, in the hour of `now_ms`; returns that.
     ///
@@ -1999,6 +2195,118 @@ pub fn sanitize_label(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_session_process_is_told_by_when_it_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("store.db")).unwrap();
+        let first = store.session_process("s", 10_000, 20_000).unwrap();
+        assert_eq!(first, "10000");
+        // Later ticks of the same process reckon its start later, by however long their status
+        // line took to start; an earlier reckoning becomes the one later ones are held to.
+        assert_eq!(store.session_process("s", 10_400, 50_000).unwrap(), first);
+        assert_eq!(store.session_process("s", 26_000, 60_000).unwrap(), first);
+        assert_eq!(store.session_process("s", 9_100, 80_000).unwrap(), first);
+        assert_eq!(store.session_process("s", 28_000, 90_000).unwrap(), first);
+        // Started 30 s later: another process (resumed, restoring the run time it had).
+        assert_eq!(store.session_process("s", 40_000, 95_000).unwrap(), "40000");
+        // A first reckoning that came late, then the true one: the same process.
+        let slow = store.session_process("u", 106_000, 110_000).unwrap();
+        assert_eq!(store.session_process("u", 100_000, 140_000).unwrap(), slow);
+        // Another process of the session, resumed later, and another session.
+        assert_eq!(
+            store.session_process("s", 400_000, 410_000).unwrap(),
+            "400000"
+        );
+        assert_eq!(store.session_process("s", 10_100, 420_000).unwrap(), first);
+        assert_eq!(
+            store.session_process("t", 10_000, 430_000).unwrap(),
+            "10000"
+        );
+    }
+
+    #[test]
+    fn a_session_reading_is_unchanged_until_its_numbers_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("store.db")).unwrap();
+        let w = |name: &str, pct: f64, resets_at: i64| SampleWindow {
+            name: name.into(),
+            pct,
+            resets_at: Some(resets_at),
+        };
+        let both = [w("five_hour", 40.0, 1000), w("seven_day", 10.0, 9000)];
+        let note = |windows: &[SampleWindow], at: i64| {
+            store.note_session_reading("s", "p", windows, at).unwrap()
+        };
+        assert_eq!(note(&both, 100), 100, "a first reading");
+        assert_eq!(note(&both, 200), 100, "the same numbers again");
+        assert_eq!(
+            note(&both[1..], 300),
+            100,
+            "a window whose reset passed dropped out"
+        );
+        // Another process of the session keeps its own.
+        assert_eq!(
+            store.note_session_reading("s", "q", &both, 350).unwrap(),
+            350
+        );
+        assert_eq!(note(&[w("seven_day", 11.0, 9000)], 400), 400, "a response");
+        assert_eq!(
+            note(
+                &[w("seven_day", 11.0, 9000), w("five_hour", 1.0, 2000)],
+                500
+            ),
+            500
+        );
+        assert_eq!(note(&[], 600), 600, "nothing to compare");
+    }
+
+    #[test]
+    fn a_copy_is_migrated_and_the_store_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        let store = Store::open(&path).unwrap();
+        let id = store
+            .insert_account("a", &ident("ua"), AccountState::Active)
+            .unwrap();
+        store
+            .save_credential(
+                id,
+                &json!({"refreshToken": "r", "accessToken": "t"}),
+                "login",
+            )
+            .unwrap();
+        drop(store);
+        // As the store an older build left (schema 8).
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("DROP TABLE session_readings; DROP TABLE session_processes;")
+            .unwrap();
+        conn.pragma_update(None, "user_version", 8).unwrap();
+        drop(conn);
+
+        let copy_dir = tempfile::tempdir().unwrap();
+        let copy = copy_dir.path().join("copy.db");
+        let copied = Store::open_copy(&path, &copy).unwrap();
+        assert_eq!(copied.accounts().unwrap().len(), 1);
+        assert_eq!(
+            copied.credential(id).unwrap().unwrap().oauth["accessToken"],
+            "t",
+            "opened with the original's key"
+        );
+        let version = |p: &Path| -> i64 {
+            Connection::open(p)
+                .unwrap()
+                .pragma_query_value(None, "user_version", |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(version(&copy), SCHEMA_VERSION);
+        assert_eq!(version(&path), 8, "the original is not migrated");
+        drop(copied);
+        assert!(
+            Store::open_copy(&path, &copy).is_err(),
+            "never overwrites a file"
+        );
+    }
 
     #[test]
     fn a_read_only_open_never_changes_the_store() {

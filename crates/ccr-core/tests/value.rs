@@ -219,6 +219,40 @@ fn the_status_line_counts_cost_for_the_account_that_served_it() {
     assert!((b - 0.60).abs() < 1e-9, "b {b}");
 }
 
+/// The status line runs under a process of its own each time, so a session's Claude Code process
+/// is told by when it started (`now - total_duration_ms`), which each tick reckons a little
+/// differently; two processes of one session (resumed twice) each keep their own count.
+#[test]
+fn the_status_line_tells_a_sessions_processes_by_when_they_started() {
+    let e = env();
+    let start = time::now_ms();
+    let resets = start / 1000 + 3_600;
+    let tick = |cost: f64, at: i64, ran_ms: i64| {
+        statusline::tick(
+            &e.store,
+            &e.paths,
+            &tick_input("s1", cost, ran_ms, 20.0, resets),
+            at,
+        )
+        .unwrap();
+    };
+    // The first process started 120 s before `start`; it ran before cc-rotate counted.
+    tick(1.0, start, 120_000);
+    tick(1.5, start + 30_000, 150_300);
+    // A second one, resumed with the run time the session had, started 90 s before `start`.
+    tick(1.5, start + 60_000, 150_000);
+    tick(1.8, start + 90_000, 180_200);
+    tick(1.7, start + 95_000, 214_800);
+    // Hours on both sides, whenever in the hour this runs: the ticks above span up to 95 s.
+    let counted = e
+        .store
+        .account_cost_between(e.a, start / 1000 - 3_600, start / 1000 + 7_200)
+        .unwrap()
+        .unwrap();
+    // 0.5 and 0.2 from the first, 0.3 from the second.
+    assert!((counted - 1.0).abs() < 1e-9, "{counted}");
+}
+
 #[test]
 fn two_processes_on_one_session_each_keep_their_own_count() {
     let e = env();

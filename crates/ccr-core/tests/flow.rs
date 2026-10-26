@@ -764,6 +764,64 @@ fn tick_switches_back_to_a_preferred_account() {
     assert!(r.swap.is_none());
 }
 
+/// A session idle since before a swap keeps reporting the numbers of the account it used, long
+/// after the swap and whatever reset times the accounts have: they are never taken for the
+/// account in use. Seen live: an account's usage jumped between its own 5% and the 40%, 88% and
+/// 96% that idle sessions still showed of two accounts used earlier.
+#[test]
+fn a_session_idle_since_a_swap_is_not_taken_for_the_account_in_use() {
+    let env = Env::new();
+    let (store, a, b, _) = pool(&env);
+    let now_s = time::now_s();
+    let input = |session: &str, windows: &str| {
+        StatusInput::parse(&format!(
+            r#"{{"session_id":"{session}","rate_limits":{{{windows}}}}}"#
+        ))
+    };
+    let a_numbers = format!(
+        r#""five_hour":{{"used_percentage":40,"resets_at":{}}},"seven_day":{{"used_percentage":20,"resets_at":{}}}"#,
+        now_s + 3600,
+        now_s + 86_400 * 3
+    );
+    let before = time::now_ms() - 60_000;
+    statusline::tick(&store, &env.paths, &input("idle", &a_numbers), before).unwrap();
+    assert_eq!(store.last_sample(a).unwrap().unwrap().windows[0].pct, 40.0);
+
+    swap::run(&store, &env.paths, &manual(Some(b))).unwrap();
+    // Well past the 120 s right after a swap, when the old account's reset times are dropped
+    // anyway.
+    let later = time::now_ms() + 10 * 60_000;
+    statusline::tick(&store, &env.paths, &input("idle", &a_numbers), later).unwrap();
+    assert!(
+        store.last_sample(b).unwrap().is_none(),
+        "the idle session still shows a"
+    );
+    // Once the 5-hour window has reset, the session shows only a's weekly window: still a's.
+    let weekly_only = format!(
+        r#""seven_day":{{"used_percentage":20,"resets_at":{}}}"#,
+        now_s + 86_400 * 3
+    );
+    statusline::tick(
+        &store,
+        &env.paths,
+        &input("idle", &weekly_only),
+        later + 1000,
+    )
+    .unwrap();
+    assert!(store.last_sample(b).unwrap().is_none());
+
+    // Its next request goes out on b, and the numbers it gets are b's.
+    let b_numbers = format!(
+        r#""five_hour":{{"used_percentage":3,"resets_at":{}}},"seven_day":{{"used_percentage":50,"resets_at":{}}}"#,
+        now_s + 4 * 3600,
+        now_s + 86_400 * 5
+    );
+    statusline::tick(&store, &env.paths, &input("idle", &b_numbers), later + 2000).unwrap();
+    let last = store.last_sample(b).unwrap().expect("b's own reading");
+    assert_eq!(last.windows[0].pct, 3.0);
+    assert_eq!(store.last_sample(a).unwrap().unwrap().windows[0].pct, 40.0);
+}
+
 /// A switch back that is no longer warranted when the detached swap runs is skipped, not
 /// turned into another kind of swap.
 #[test]

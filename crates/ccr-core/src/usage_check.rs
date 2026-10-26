@@ -756,6 +756,8 @@ fn job(
         .filter(|o| !credfile::is_dead(o))
         .filter(|o| credfile::oauth_fingerprint(o).as_deref() != Some(stored.refresh_fp.as_str()));
     let mut wrong_account = None;
+    // The report was checked against the account's identity, so its reset times are its own.
+    let mut vouched = false;
 
     let outcome = if let Some(why) = &prompted {
         CheckOutcome::Failed { why: why.clone() }
@@ -780,9 +782,12 @@ fn job(
             (Some(_), None) => CheckOutcome::Failed {
                 why: "Claude Code didn't say which account the usage is for".into(),
             },
-            _ => CheckOutcome::Read {
-                windows: report.windows,
-            },
+            _ => {
+                vouched = account.account_uuid.is_some();
+                CheckOutcome::Read {
+                    windows: report.windows,
+                }
+            }
         }
     } else if let Some(wait) = rate_limited(&debug_log) {
         CheckOutcome::RateLimited {
@@ -902,7 +907,13 @@ fn job(
         }
         save_state(s, account_id, &st)
     })?;
+    // The check is done: its scratch profile goes whatever follows.
     scratch.keep = false;
+    if let (true, CheckOutcome::Read { windows }) = (vouched, &outcome) {
+        // So that once the account is in use, a session still showing the account it used
+        // before is told apart by its reset times (`swap::attribute`).
+        swap::note_known_resets(store, account_id, windows, now / 1000)?;
+    }
     Ok(outcome)
 }
 
@@ -1814,6 +1825,93 @@ mod tests {
         assert!(st.last_read_at.is_some() && st.problem.is_none() && !st.held_back);
         assert_eq!(scratch_dirs_left(&e), 0, "the scratch profile is gone");
         assert!(!e.paths.account_lock(a).exists(), "the lock is released");
+    }
+
+    /// A check reads the account's usage with the account's own login, so the reset times it
+    /// reads are the account's own. Without them, once the account is in use, a session still
+    /// showing the account it used before (idle since that swap) could not be told apart: its
+    /// reading shares a reset time with that account, and the active account's own were not
+    /// known, so it counted as the active account's and its usage jumped about.
+    #[test]
+    fn a_check_vouches_for_the_reset_times_it_read() {
+        let e = env();
+        let a = account(&e, "a", "ua", AccountState::Parked);
+        let b = account(&e, "b", "ub", AccountState::Active);
+        let run = fake(Fake {
+            stamp: Some("ua".into()),
+            pct: 5.0,
+            ..Default::default()
+        });
+        check_with(&e.store, &e.paths, a, Trigger::Background, &run).unwrap();
+        let now_s = time::now_s();
+        // The fake's window resets on 2099-01-01.
+        let own = swap::known_resets(&e.store, a, now_s).unwrap();
+        assert!(
+            own.iter().any(|&r| swap::same_reset(r, 4_070_908_800)),
+            "{own:?}"
+        );
+
+        // b was in use until now, its window resetting in an hour; then a session idle since
+        // shows b's numbers while a is in use.
+        let window = |pct: f64, resets: i64| SampleWindow {
+            name: "five_hour".into(),
+            pct,
+            resets_at: Some(resets),
+        };
+        let reading = |account: i64, pct: f64, resets: i64| Sample {
+            ts: time::now_ms(),
+            account_id: account,
+            profile: "rotate".into(),
+            session_id: Some("idle".into()),
+            model: None,
+            windows: vec![window(pct, resets)],
+        };
+        e.store
+            .record_sample(&reading(b, 96.0, now_s + 3600))
+            .unwrap();
+        let stale = reading(a, 40.0, now_s + 3600);
+        assert_eq!(
+            swap::attribute(&e.store, &stale, a, now_s).unwrap(),
+            swap::Attribution::Elsewhere
+        );
+        // A genuine reading of a whose window resets when b's latest does too stays a's.
+        let mut genuine = reading(a, 7.0, 4_070_908_800);
+        e.store
+            .record_sample(&reading(b, 96.0, 4_070_908_800))
+            .unwrap();
+        genuine.ts += 1;
+        assert_eq!(
+            swap::attribute(&e.store, &genuine, a, now_s).unwrap(),
+            swap::Attribution::Own
+        );
+    }
+
+    /// An account with no identity to compare the report with is read, but its reset times are
+    /// not taken as its own.
+    #[test]
+    fn a_check_of_an_account_without_an_identity_vouches_for_nothing() {
+        let e = env();
+        let ident = AccountIdentity {
+            email: Some("n@x.test".into()),
+            ..Default::default()
+        };
+        let n = e
+            .store
+            .insert_account("n", &ident, AccountState::Parked)
+            .unwrap();
+        e.store.save_credential(n, &oauth("n"), "login").unwrap();
+        let run = fake(Fake {
+            stamp: Some("un".into()),
+            pct: 5.0,
+            ..Default::default()
+        });
+        let out = check_with(&e.store, &e.paths, n, Trigger::Background, &run).unwrap();
+        assert!(matches!(out, CheckOutcome::Read { .. }), "{out:?}");
+        assert!(
+            swap::known_resets(&e.store, n, time::now_s())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

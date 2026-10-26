@@ -1,9 +1,12 @@
-// Fake Messages API for tests/e2e/wait-at-limit.py. The account whose access token hashes to the
-// entry labelled <limited> in <map file> (or every account, for `*`) reaches its 5-hour limit
-// with the session's first turn:
+// Fake Messages API for tests/e2e/wait-at-limit.py and idle-across-swap.py. The account whose
+// access token hashes to the entry labelled <limited> in <map file> (or every account, for `*`;
+// none, for `-`) reaches its 5-hour limit with the session's first turn:
 // Claude Code's own checks before it pass (at 50%), and from that turn on it gets the usage-limit
 // 429 Anthropic answers at a limit. Any other account gets a one-word answer. Model requests never reach Anthropic, so the test uses
 // no quota. Prints its port, then one JSON line per request (never a token).
+//
+// With `-`, each account has its own 5-hour numbers, in the order of the labels sorted: the first
+// 40% resetting at <reset>, the next 5% resetting half an hour later, and so on.
 //
 // usage: node fake-api.mjs <map file> <limited label> [<seconds until the limit resets>]
 import http from "node:http";
@@ -94,7 +97,10 @@ const server = http.createServer((req, res) => {
       return;
     }
     emit({ ...info, status: 200 });
-    if (isLimited) answer(res, parsed.model, !!parsed.stream, 0.5, resetAt);
+    if (limited === "-") {
+      const place = [...new Set(Object.values(tokenMap))].sort().indexOf(who);
+      answer(res, parsed.model, !!parsed.stream, place === 0 ? 0.4 : 0.05, resetAt + 1800 * Math.max(place, 0));
+    } else if (isLimited) answer(res, parsed.model, !!parsed.stream, 0.5, resetAt);
     else answer(res, parsed.model, !!parsed.stream, 0.1, resetAt + 900);
   });
 });
