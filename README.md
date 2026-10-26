@@ -57,8 +57,8 @@ Start Claude Code with `cc-rotate` there: the Keychain item is named after the e
 
 macOS gives your login Keychain only to programs started from the Mac's desktop session.
 A Claude Code started over SSH, or by a program that was started over SSH (a herdr or tmux server, for example), cannot read it, so it starts signed out even though the login is there and works everywhere else.
-Signing in again inside such a session does not help: Claude Code cannot save the new login while the Keychain is locked to it.
-`cc-rotate` refuses to start in such a session and says why, and `cc-rotate-ctl doctor` run there reports it.
+It cannot save a login either: one it signs in to or renews there is lost, and with it the account's sign-in, since a renewal replaces the old refresh token.
+So `cc-rotate` refuses to start in such a session and says why, swaps started there are skipped, and `cc-rotate-ctl doctor` run there reports it.
 
 To use cc-rotate on a Mac you reach over SSH:
 
@@ -385,18 +385,19 @@ When you quit Claude Code in a pane, herdr forgets the command, just as it forge
 
 ### herdr on macOS
 
-When you reach a Mac's herdr from another computer, herdr's remote side starts `herdr server` over SSH if none is running, for example right after the Mac restarts.
-Its sessions then cannot read the login Keychain (see **macOS over SSH**), and Claude Code in them starts signed out.
-Start the server from your desktop session at login instead, with a launch agent; herdr then connects to it.
-Run this on the Mac (it works over SSH too, since `launchctl` starts the server in the desktop session), with your own paths:
+When you reach a Mac's herdr from another computer through a tool that starts `herdr server` over SSH when none is running (Ovis's remote setup does, for example right after the Mac restarts), that server's sessions cannot use the login Keychain (see **macOS over SSH**), and Claude Code in them starts signed out.
+Start the server from your desktop session instead, with a launch agent; the remote side then finds it running and connects to it.
+A launch agent runs while you are logged in at the Mac, so turn on automatic login, or log in once after a restart, before connecting.
+The Ovis Mac app installs such an agent itself (`sh.ovis.herdr-server`); with it, you need nothing more.
+Otherwise, run this on the Mac (it works over SSH too, since `launchctl` starts the server in the desktop session), with your own paths:
 
 ```sh
-cat > ~/Library/LaunchAgents/dev.herdr.server.plist <<'EOF'
+cat > ~/Library/LaunchAgents/local.herdr-server.plist <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>dev.herdr.server</string>
+  <key>Label</key><string>local.herdr-server</string>
   <key>ProgramArguments</key>
   <array><string>/Users/you/.local/bin/herdr</string><string>server</string></array>
   <key>EnvironmentVariables</key>
@@ -409,10 +410,10 @@ cat > ~/Library/LaunchAgents/dev.herdr.server.plist <<'EOF'
 </plist>
 EOF
 pkill -f 'herdr server'   # ends the herdr sessions of a server started over SSH
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.herdr.server.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.herdr-server.plist
 ```
 
-To undo it: `launchctl bootout gui/$(id -u)/dev.herdr.server`, then delete the file.
+To undo it: `launchctl bootout gui/$(id -u)/local.herdr-server`, then delete the file.
 
 ## What it does not cover
 

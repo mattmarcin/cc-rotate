@@ -1004,6 +1004,16 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
         Err(LockError::Busy(_)) => return skip(store, req, "another swap is running"),
         Err(e) => return Err(e.into()),
     };
+    // A session the macOS Keychain is locked to (started over SSH) cannot write the profile's
+    // login where Claude Code reads it: the file instead would leave the desktop session's
+    // sessions on the old account.
+    if !paths.credentials().complete().unwrap_or(true) {
+        return skip(
+            store,
+            req,
+            "this session can't use the macOS Keychain, which holds the profile's login (it was started over SSH). Swap from the Mac's desktop session.",
+        );
+    }
     // An earlier swap that stopped half way. While the profile's login is unidentified, no swap
     // runs: it would overwrite the only copy of that login, or file it under the wrong account.
     if finish_dead_swap(store, paths, Settler::Locked)? == Settle::Unsure {
