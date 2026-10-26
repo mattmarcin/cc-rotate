@@ -202,7 +202,7 @@ fn status(app: &AppHandle, store: &Store, paths: &Paths, watch: &mut Watch) {
 
     // Once, when at the current pace every account would be at a limit within the hour.
     let now_s = snap.now_ms / 1000;
-    let soon = snap.forecast.and_then(|f| {
+    let soon = snap.forecast.as_ref().and_then(|f| {
         f.runs_out_at
             .filter(|&t| t - now_s <= RUNNING_OUT_WARNING_S)
             .map(|t| (t, f.free_again_at))
@@ -226,7 +226,7 @@ fn status(app: &AppHandle, store: &Store, paths: &Paths, watch: &mut Watch) {
         // wavers around the hour does not warn again.
         // No forecast while the pool is out is no sign of room; no forecast otherwise is a break
         // from work, after which a new run-out is worth a new warning.
-        None if match snap.forecast {
+        None if match &snap.forecast {
             Some(f) => f
                 .runs_out_at
                 .is_none_or(|t| t - now_s > 2 * RUNNING_OUT_WARNING_S),

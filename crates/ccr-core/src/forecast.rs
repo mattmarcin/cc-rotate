@@ -7,7 +7,8 @@
 //! without that is ready (`scheduler::switch_back_target`), and windows reset when they reset.
 //! The first moment
 //! no account is left is when the pool runs out, and the earliest reset after it is when an
-//! account frees up again.
+//! account frees up again. Play goes on after that, the way sessions woken at a limit carry on
+//! (section 21), and every stretch an account is in use is kept as the plan the app draws.
 
 use anyhow::Result;
 use serde::Serialize;
@@ -29,7 +30,21 @@ const MIN_PACE_SPAN_MS: i64 = 15 * 60_000;
 const FIVE_HOUR_S: i64 = 5 * 3600;
 const WEEK_S: i64 = 7 * 86_400;
 
+/// One stretch of the plan: an account in use from `from` to `to` (epoch seconds).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct Turn {
+    pub account_id: i64,
+    pub from: i64,
+    pub to: i64,
+    /// The turn ended at a limit, rather than giving way to an account without a weekly limit
+    /// or being cut off by the horizon.
+    pub at_limit: bool,
+    /// When the account is usable again after a turn that ended at a limit (epoch seconds), if
+    /// the limit's reading says when it resets.
+    pub rests_until: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Forecast {
     /// How hard the pool was used in the last hour, as a multiple of each account's usual pace
     /// (`budget::AccountRates::five_per_hour`): 1 is the usual pace.
@@ -38,6 +53,9 @@ pub struct Forecast {
     pub runs_out_at: Option<i64>,
     /// When the first account frees up again after that (epoch seconds).
     pub free_again_at: Option<i64>,
+    /// Which account is in use when, from now to the horizon, oldest first. Gaps are times no
+    /// account is left.
+    pub plan: Vec<Turn>,
 }
 
 /// How hard the pool was used in the last hour, as a multiple of each account's usual pace:
@@ -156,7 +174,10 @@ pub fn forecast(
         pace,
         runs_out_at: None,
         free_again_at: None,
+        plan: Vec::new(),
     };
+    // When the turn of the account in use started.
+    let mut since = now_s;
 
     let mut t = now_s;
     while t < now_s + HORIZON_S {
@@ -195,19 +216,36 @@ pub fn forecast(
         if blocked || next.is_some() {
             if let Some(i) = current {
                 pool[i].account.state = AccountState::Parked;
+                // An account in use that hands over at once has no turn: the plan starts with
+                // the next one, and the dashboard reads the wait from the account's own
+                // `available_at`.
+                if t > since {
+                    out.plan.push(Turn {
+                        account_id: pool[i].account.id,
+                        from: since,
+                        to: t,
+                        at_limit: blocked,
+                        rests_until: pool[i].blocked_until(),
+                    });
+                }
             }
             current = next.and_then(|id| pool.iter().position(|c| c.account.id == id));
+            since = t;
             match current {
                 Some(i) => pool[i].account.state = AccountState::Active,
                 None => {
-                    out.runs_out_at = Some(t);
-                    out.free_again_at = pool
-                        .iter()
-                        .filter(|c| c.usable() && !c.held_back)
-                        .filter_map(|c| c.blocked_until())
-                        .filter(|&r| r > t)
-                        .min();
-                    return out;
+                    if out.runs_out_at.is_none() {
+                        out.runs_out_at = Some(t);
+                        out.free_again_at = pool
+                            .iter()
+                            .filter(|c| c.usable() && !c.held_back)
+                            .filter_map(|c| c.blocked_until())
+                            .filter(|&r| r > t)
+                            .min();
+                    }
+                    // Sessions wait for an account to free up.
+                    t += STEP_S;
+                    continue;
                 }
             }
         }
@@ -231,6 +269,15 @@ pub fn forecast(
             start_window(&mut pool[i], t, five_used, policy);
         }
         t += STEP_S;
+    }
+    if let Some(i) = current.filter(|_| t > since) {
+        out.plan.push(Turn {
+            account_id: pool[i].account.id,
+            from: since,
+            to: t,
+            at_limit: false,
+            rests_until: None,
+        });
     }
     out
 }
@@ -297,6 +344,47 @@ mod tests {
         }
     }
 
+    /// Plays the pool forward like `forecast`, and checks what the plans of these pools must
+    /// hold. (A pool already out at `NOW` would start with a gap; the snapshot shows no forecast
+    /// then.)
+    fn play(pool: &[Candidate], pace: f64) -> Forecast {
+        let f = forecast(pool, POLICY, &same_pace(), pace, NOW);
+        let plan = &f.plan;
+        if let Some(first) = plan.first() {
+            assert_eq!(first.from, NOW, "the plan starts now: {plan:?}");
+        }
+        for pair in plan.windows(2) {
+            if pair[0].to == pair[1].from {
+                assert_ne!(pair[0].account_id, pair[1].account_id, "{plan:?}");
+            } else {
+                // Only a run-out leaves a gap.
+                assert!(
+                    f.runs_out_at.is_some_and(|out| pair[0].to >= out),
+                    "{plan:?}"
+                );
+            }
+        }
+        if f.runs_out_at.is_none() {
+            assert_eq!(plan.last().map(|t| t.to), Some(NOW + HORIZON_S), "{plan:?}");
+        }
+        for t in plan {
+            assert!(t.from < t.to, "{t:?}");
+            assert!(t.to <= NOW + HORIZON_S, "{t:?}");
+            assert!(t.rests_until.is_none_or(|r| r > t.to), "{t:?}");
+            assert!(t.at_limit || t.rests_until.is_none(), "{t:?}");
+        }
+        for pair in plan.windows(2) {
+            assert!(pair[0].to <= pair[1].from, "turns don't overlap: {plan:?}");
+        }
+        // An account at a limit takes no turn before it is usable again.
+        for (i, t) in plan.iter().enumerate() {
+            if let Some(next) = plan[i + 1..].iter().find(|n| n.account_id == t.account_id) {
+                assert!(next.from >= t.rests_until.unwrap_or(t.to), "{plan:?}");
+            }
+        }
+        f
+    }
+
     fn same_pace() -> Rates {
         let mut rates = Rates::default();
         for id in 1..=3 {
@@ -318,7 +406,7 @@ mod tests {
             seat(1, AccountState::Active, 0.0, None),
             seat(2, AccountState::Parked, 0.0, None),
         ];
-        let f = forecast(&pool, POLICY, &same_pace(), 0.5, NOW);
+        let f = play(&pool, 0.5);
         assert_eq!(f.runs_out_at, None);
     }
 
@@ -331,7 +419,7 @@ mod tests {
             seat(2, AccountState::Parked, 0.0, None),
             seat(3, AccountState::Parked, 0.0, None),
         ];
-        let f = forecast(&pool, POLICY, &same_pace(), 49.0 / 20.0, NOW);
+        let f = play(&pool, 49.0 / 20.0);
         assert_eq!(f.runs_out_at, None, "{:?}", f);
     }
 
@@ -345,8 +433,8 @@ mod tests {
             [seat(1, AccountState::Active, 95.0, Some(6 * 3600)), s2]
         };
         let pace = 98.0 / 20.0;
-        let used = forecast(&pool(false), POLICY, &same_pace(), pace, NOW);
-        let kept = forecast(&pool(true), POLICY, &same_pace(), pace, NOW);
+        let used = play(&pool(false), pace);
+        let kept = play(&pool(true), pace);
         assert!(used.runs_out_at.is_some() && kept.runs_out_at.is_some());
         // Kept running, s2's window started at once instead of when s2 was first used.
         assert_eq!(kept.free_again_at, Some(NOW + 5 * 3600));
@@ -373,11 +461,133 @@ mod tests {
         };
         s1.windows = window_usage(Some(&weekly), NOW, T, None);
         let pool = [s1, seat(2, AccountState::Parked, 0.0, None)];
-        let f = forecast(&pool, POLICY, &same_pace(), 98.0 / 20.0, NOW);
+        let f = play(&pool, 98.0 / 20.0);
         assert!(f.runs_out_at.is_some(), "{f:?}");
         // s2 took over at once, so its window resets 5 hours from now, not 5 hours from when s1
         // reached its weekly limit.
         assert_eq!(f.free_again_at, Some(NOW + 5 * 3600), "{f:?}");
+        // s1 handed over before its first step, so the plan starts with s2.
+        assert_eq!(f.plan[0].account_id, 2, "{:?}", f.plan);
+    }
+
+    #[test]
+    fn an_account_with_a_weekly_limit_gives_way_mid_plan() {
+        // s1 has a weekly limit and room; s2, a seat without one, is at its 5-hour limit until
+        // an hour from now. 20 points an hour fills nothing in that hour.
+        let mut s1 = seat(1, AccountState::Active, 0.0, None);
+        s1.weekly_limit = WeeklyLimit::Has;
+        let weekly = Sample {
+            ts: NOW * 1000,
+            account_id: 1,
+            profile: "rotate".into(),
+            session_id: None,
+            model: None,
+            windows: vec![SampleWindow {
+                name: "seven_day".into(),
+                pct: 10.0,
+                resets_at: Some(NOW + 3 * 86_400),
+            }],
+        };
+        s1.windows = window_usage(Some(&weekly), NOW, T, None);
+        let pool = [s1, seat(2, AccountState::Parked, 99.0, Some(3600))];
+        let f = play(&pool, 1.0);
+        let plan = &f.plan;
+        assert_eq!(plan[0].account_id, 1, "{plan:?}");
+        // It gave way with room left, so it isn't resting.
+        assert!(!plan[0].at_limit, "{plan:?}");
+        assert_eq!(plan[0].rests_until, None);
+        assert_eq!(plan[1].account_id, 2, "{plan:?}");
+        assert!(
+            (NOW + 3600..=NOW + 3600 + STEP_S).contains(&plan[1].from),
+            "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn an_account_in_use_at_its_limit_hands_over_at_once() {
+        // s1 is past its swap point, as during a swap's cooldown, and resets in 2 hours.
+        let pool = [
+            seat(1, AccountState::Active, 99.0, Some(2 * 3600)),
+            seat(2, AccountState::Parked, 0.0, None),
+        ];
+        let f = play(&pool, 20.0 / 20.0);
+        // No turn for s1: the plan starts with s2, now, and s1 is back once it has reset.
+        assert_eq!(f.plan[0].account_id, 2, "{:?}", f.plan);
+        let back = f
+            .plan
+            .iter()
+            .find(|t| t.account_id == 1)
+            .expect("s1 is used again");
+        assert!(back.from >= NOW + 2 * 3600, "{:?}", f.plan);
+    }
+
+    #[test]
+    fn the_plan_hands_over_at_each_limit_until_the_horizon() {
+        // The same three seats as above: each fills its window in about two hours and rests
+        // until it resets, while the next one takes over.
+        let pool = [
+            seat(1, AccountState::Active, 49.0, Some(3 * 3600)),
+            seat(2, AccountState::Parked, 0.0, None),
+            seat(3, AccountState::Parked, 0.0, None),
+        ];
+        let f = play(&pool, 49.0 / 20.0);
+        let plan = &f.plan;
+        assert_eq!(plan[0].account_id, 1);
+        // s1's window started 2 hours ago and resets in 3.
+        assert_eq!(plan[0].rests_until, Some(NOW + 3 * 3600), "{plan:?}");
+        assert_eq!(plan.last().unwrap().to, NOW + HORIZON_S, "{plan:?}");
+        for pair in plan.windows(2) {
+            assert_eq!(
+                pair[0].to, pair[1].from,
+                "no gap while seats have room: {plan:?}"
+            );
+            assert_ne!(pair[0].account_id, pair[1].account_id);
+            assert!(pair[0].at_limit, "{plan:?}");
+        }
+        // A fresh seat's window starts with its turn, and it rests until 5 hours after that.
+        for t in &plan[1..plan.len() - 1] {
+            if t.from > NOW + 6 * 3600 {
+                continue;
+            }
+            assert_eq!(t.rests_until, Some(t.from + 5 * 3600), "{plan:?}");
+        }
+        assert!(plan.iter().any(|t| t.account_id == 3), "{plan:?}");
+        // The turn the horizon ends is not at a limit.
+        assert!(!plan.last().unwrap().at_limit);
+    }
+
+    #[test]
+    fn the_plan_waits_out_a_run_out_and_carries_on() {
+        let pool = [
+            seat(1, AccountState::Active, 0.0, None),
+            seat(2, AccountState::Parked, 0.0, None),
+        ];
+        let f = play(&pool, 98.0 / 20.0);
+        let out = f.runs_out_at.expect("runs out");
+        let free = f.free_again_at.expect("frees up");
+        // Nothing is planned while every account is at a limit, and the first account to free
+        // up takes over then.
+        let gap = f
+            .plan
+            .windows(2)
+            .find(|p| p[0].to < p[1].from)
+            .expect("a gap in the plan");
+        assert_eq!(gap[0].to, out);
+        assert!(gap[0].at_limit, "{:?}", f.plan);
+        assert!(
+            (free..=free + STEP_S).contains(&gap[1].from),
+            "{:?}",
+            f.plan
+        );
+        assert!(f.plan.iter().all(|t| t.to <= out || t.from >= free));
+        // The account that takes over is the one that freed up first.
+        let earlier = f
+            .plan
+            .iter()
+            .rev()
+            .find(|t| t.account_id == gap[1].account_id && t.to <= out)
+            .expect("it had a turn before");
+        assert_eq!(earlier.rests_until, Some(free), "{:?}", f.plan);
     }
 
     #[test]
@@ -388,7 +598,7 @@ mod tests {
             seat(1, AccountState::Active, 0.0, None),
             seat(2, AccountState::Parked, 0.0, None),
         ];
-        let f = forecast(&pool, POLICY, &same_pace(), 98.0 / 20.0, NOW);
+        let f = play(&pool, 98.0 / 20.0);
         let out = f.runs_out_at.expect("runs out");
         assert!(
             (NOW + 3600..=NOW + 2 * 3600 + STEP_S).contains(&out),

@@ -1,6 +1,7 @@
 import "@fontsource-variable/schibsted-grotesk";
 import "./styles.css";
 
+import { activityItems, routine } from "./activity";
 import {
   api,
   onLoginProgress,
@@ -16,120 +17,47 @@ import {
   type WeeklyLimitSetting,
   type WindowUsage,
 } from "./api";
-import {
-  Chart,
-  colorFor,
-  costBuckets,
-  drawCost,
-  drawUsage,
-  usageLines,
-  usd,
-  type Metric,
-  type RangeDays,
-} from "./chart";
+import { colorFor, usd } from "./chart";
 import { h, replace, type Child } from "./dom";
-import { ago, clock, ordinal, pct, plural, until } from "./format";
+import { ago, clock, ordinal, pct, until } from "./format";
+import { ChartPanel } from "./panel";
+import { dragRow, keyMove } from "./sortable";
+import { axis, fitLabels, laneEl, lanes, nextUp, overlay, planView, stateLine, summary } from "./timeline";
+
+type Page = "overview" | "activity" | "cost" | "settings";
+type Route = { page: Page } | { page: "account"; id: number };
 
 interface UiState {
   snap: Snapshot | null;
   events: EventRow[];
+  route: Route;
   showRoutine: boolean;
-  /** Which view the chart panel shows. */
-  view: "usage" | "cost";
-  metric: Metric;
-  rangeDays: RangeDays;
   busy: boolean;
   /** A row is being dragged; renders wait until it is dropped. */
   dragging: boolean;
-  /** The account whose order handle should have focus after the next render. */
-  focusGrip: number | null;
+  /** The `data-focus` key of the element that should have focus after the next render. */
+  focus: string | null;
 }
 
 const state: UiState = {
   snap: null,
   events: [],
+  route: { page: "overview" },
   showRoutine: false,
-  view: "usage",
-  metric: "weekly",
-  rangeDays: 7,
   busy: false,
   dragging: false,
-  focusGrip: null,
+  focus: null,
 };
-
-const ROUTINE = new Set(["sync", "swap_skipped", "claude_version", "warm_up"]);
 
 // ---- layout ----------------------------------------------------------------------------
 
 const root = document.getElementById("app")!;
-const topActions = h("div", { class: "top-actions" });
+const nav = h("nav", { class: "side", "aria-label": "cc-rotate" });
+const head = h("header", { class: "page-head" });
 const banner = h("div", { class: "banner", hidden: true });
-const bank = h("div", { class: "bank", role: "list", "aria-label": "Accounts" });
-const summary = h("div", { class: "summary" });
-const accountsBody = h("div", { class: "accounts" });
-const chartTabs = h("div", { class: "tabs", role: "tablist", "aria-label": "Charts" });
-const chartControls = h("div", { class: "chart-controls" });
-const chartSummary = h("div", { class: "chart-summary" });
-const chartLegend = h("div", { class: "legend" });
-const chartHost = h("div", { class: "chart" });
-const chartEmpty = h("div", { class: "chart-empty", hidden: true });
-const chartView = h(
-  "div",
-  { id: "chart-view", role: "tabpanel" },
-  chartSummary,
-  chartLegend,
-  h("div", { class: "chart-wrap" }, chartHost, chartEmpty),
-);
-const activity = h("ol", { class: "activity" });
-const routineToggle = h("input", {
-  type: "checkbox",
-  id: "routine",
-  onchange: (e: Event) => {
-    state.showRoutine = (e.target as HTMLInputElement).checked;
-    renderActivity();
-  },
-});
+const body = h("div", { class: "page-body" });
 const toast = h("div", { class: "toast", role: "status", "aria-live": "polite" });
-
-root.append(
-  h(
-    "header",
-    { class: "top" },
-    h("div", { class: "brand" }, h("img", { src: "/icon.svg", alt: "", width: 22, height: 22 }), "cc-rotate"),
-    topActions,
-  ),
-  banner,
-  h("section", { class: "overview" }, bank, summary),
-  h(
-    "main",
-    { class: "content" },
-    h(
-      "div",
-      { class: "main-col" },
-      h("section", { class: "panel" }, h("h2", null, "Accounts"), accountsBody),
-      h(
-        "section",
-        { class: "panel chart-panel" },
-        h("div", { class: "panel-head" }, chartTabs, chartControls),
-        chartView,
-      ),
-    ),
-    h(
-      "aside",
-      { class: "rail" },
-      h(
-        "div",
-        { class: "panel-head" },
-        h("h2", null, "Activity"),
-        h("label", { class: "check", for: "routine" }, routineToggle, "Show all"),
-      ),
-      activity,
-    ),
-  ),
-  toast,
-);
-
-const chart = new Chart(chartHost);
+root.append(nav, h("main", { class: "page" }, head, banner, body), toast);
 
 // ---- helpers ---------------------------------------------------------------------------
 
@@ -168,9 +96,69 @@ const fiveOf = (a: AccountView) => a.windows.find((w) => w.kind === "session" &&
 const weekOf = (a: AccountView) => a.windows.find((w) => w.kind === "weekly" && w.model === null);
 /** Windows limited to one model, or of a kind cc-rotate does not know. */
 const otherWindows = (a: AccountView) => a.windows.filter((w) => w.model !== null || w.kind === "other");
-const blocking = (a: AccountView) => a.windows.some((w) => w.applies && w.pct >= w.threshold);
 /** No weekly limit: the 5-hour window is what runs out. */
 const noWeekly = (a: AccountView) => a.weekly.effective === "none";
+
+/** Replace `el`'s children, keeping keyboard focus on the element with the same `data-focus` key. */
+function rerender(el: HTMLElement, ...children: Child[]) {
+  const active = document.activeElement as HTMLElement | null;
+  const had = active && el.contains(active) ? active.dataset.focus : undefined;
+  replace(el, ...children);
+  const want = state.focus ?? had;
+  if (!want) return;
+  const target = el.querySelector<HTMLElement>(`[data-focus="${CSS.escape(want)}"]`);
+  if (!target) return;
+  state.focus = null;
+  // A button that turned off (Move up at the top) hands focus to its alternative.
+  const alt = target.matches(":disabled") && target.dataset.focusAlt ? el.querySelector<HTMLElement>(`[data-focus="${CSS.escape(target.dataset.focusAlt)}"]`) : null;
+  (alt ?? target).focus();
+}
+
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+/** A 16px stroke icon from path data. */
+function icon(...paths: string[]): SVGSVGElement {
+  const svg = document.createElementNS(SVG_NS, "svg");
+  for (const [k, v] of Object.entries({ viewBox: "0 0 16 16", width: "16", height: "16", fill: "none", stroke: "currentColor", "stroke-width": "1.6", "stroke-linecap": "round", "stroke-linejoin": "round", "aria-hidden": "true" })) {
+    svg.setAttribute(k, v);
+  }
+  for (const d of paths) {
+    const p = document.createElementNS(SVG_NS, "path");
+    p.setAttribute("d", d);
+    svg.append(p);
+  }
+  return svg;
+}
+
+const ICONS: Record<Page, () => SVGSVGElement> = {
+  overview: () => icon("M2 4h12", "M2 8h7", "M2 12h10", "M11.5 6.5v3"),
+  activity: () => icon("M2 8h3l2-5 2 10 2-5h3"),
+  cost: () => icon("M3 13V9", "M8 13V3", "M13 13V6"),
+  settings: () => icon("M8 5.8a2.2 2.2 0 1 0 0 4.4 2.2 2.2 0 0 0 0-4.4Z", "M8 1.8v2", "M8 12.2v2", "M1.8 8h2", "M12.2 8h2", "M3.6 3.6 5 5", "M11 11l1.4 1.4", "M3.6 12.4 5 11", "M11 5l1.4-1.4"),
+};
+
+const GRIP = () => {
+  const svg = document.createElementNS(SVG_NS, "svg");
+  svg.setAttribute("viewBox", "0 0 10 16");
+  svg.setAttribute("width", "10");
+  svg.setAttribute("height", "16");
+  svg.setAttribute("aria-hidden", "true");
+  for (const [cx, cy] of [
+    [2.5, 3],
+    [7.5, 3],
+    [2.5, 8],
+    [7.5, 8],
+    [2.5, 13],
+    [7.5, 13],
+  ]) {
+    const dot = document.createElementNS(SVG_NS, "circle");
+    dot.setAttribute("cx", String(cx));
+    dot.setAttribute("cy", String(cy));
+    dot.setAttribute("r", "1.4");
+    svg.append(dot);
+  }
+  return svg;
+};
 
 /** The other profile a reading came from, by its short name ("work" for `.claude-work`). */
 function readIn(source: string | null): string | null {
@@ -211,7 +199,7 @@ function checkMessage(label: string, r: CheckOutcome): string {
   }
 }
 
-/** The usage check facts in the account dialog. */
+/** The usage check facts on the account page. */
 function checkText(a: AccountView): string {
   const c = a.usage_check;
   if (a.state === "active") return "not needed while in use";
@@ -258,7 +246,7 @@ function extraText(e: ExtraUsage): string {
   return "on";
 }
 
-/** "API value" in the account dialog: what the last weeks' use would have cost at API prices. */
+/** "API value" on the account page: what the last weeks' use would have cost at API prices. */
 function valueText(hist: AccountHistory): string {
   const counted = hist.weeks.filter((w) => w.api_value_usd !== null);
   if (counted.length === 0) return "nothing counted yet";
@@ -267,11 +255,11 @@ function valueText(hist: AccountHistory): string {
   return `${dollars(total)} in the last ${weeks === 1 ? "week" : `${weeks} weeks`}`;
 }
 
-/** Weeks "Recent weeks" shows in the account dialog. */
+/** Weeks "Recent weeks" shows on the account page. */
 const RECENT_WEEKS = 4;
 
 /**
- * "Recent weeks" in the account dialog, newest first: the highest usage of each weekly window
+ * "Recent weeks" on the account page, newest first: the highest usage of each weekly window
  * that closed, or for an account without a weekly limit, how many of each week's 5-hour windows
  * reached the limit. A week cc-rotate saw little of is dimmed, and its tooltip says why.
  */
@@ -329,301 +317,64 @@ function stateText(a: AccountView): string {
   }
 }
 
-// ---- top bar and banner ----------------------------------------------------------------
-
-function renderTop() {
-  const snap = state.snap;
-  const hasAccounts = !!snap && snap.accounts.length > 0;
-  replace(
-    topActions,
-    h("button", { class: "btn quiet", onclick: openSettings }, "Settings"),
-    hasAccounts &&
-      h(
-        "button",
-        {
-          class: "btn",
-          disabled: !snap!.pool.eligible,
-          title: snap!.pool.eligible ? "Swap to the next account in line" : "No other account is ready",
-          onclick: () =>
-            act(
-              () => api.swapNow(null),
-              (r) =>
-                r.outcome === "swapped"
-                  ? `Swapped to ${labelOf(r.to)}`
-                  : r.outcome === "pool_exhausted"
-                    ? "No other account is ready"
-                    : `No swap: ${r.why}`,
-            ),
-        },
-        "Swap now",
-      ),
-    h("button", { class: "btn primary", onclick: () => openLogin(null) }, "Add account"),
-  );
-
-  const needs = snap?.accounts.filter((a) => a.state === "needs_login") ?? [];
-  if (snap?.pool.swap_unsettled) {
-    banner.hidden = false;
-    banner.className = "banner warn";
-    replace(
-      banner,
-      h(
-        "span",
-        null,
-        "A swap was interrupted. Swaps are on hold until cc-rotate confirms which account the profile is signed in to. Your sessions keep working.",
-      ),
-    );
-  } else if (needs.length > 0) {
-    banner.hidden = false;
-    banner.className = "banner danger";
-    replace(
-      banner,
-      h(
-        "span",
-        null,
-        needs.length === 1
-          ? `${needs[0].label} is signed out. Sign in again to use it.`
-          : `${needs.map((a) => a.label).join(", ")} are signed out. Sign in again to use them.`,
-      ),
-      h("button", { class: "btn small", onclick: () => openLogin(needs[0]) }, `Sign in to ${needs[0].label}`),
-    );
-  } else if (snap?.pool.exhausted && snap.accounts.length > 0) {
-    banner.hidden = false;
-    banner.className = "banner warn";
-    const next = snap.pool.next_available_at;
-    replace(
-      banner,
-      h(
-        "span",
-        null,
-        "No account is ready to take over. ",
-        next ? `The next one frees up in ${until(next)}.` : "",
-      ),
-    );
-  } else if (snap && snap.pool.sign_ins_ending.length > 0) {
-    // The sign-in that ends first, first.
-    const ending = snap.accounts
-      .filter((a) => a.sign_in_ends_soon)
-      .sort((x, y) => (x.refresh_expires_at ?? 0) - (y.refresh_expires_at ?? 0));
-    const first = ending[0];
-    banner.hidden = false;
-    banner.className = "banner warn";
-    replace(
-      banner,
-      h(
-        "span",
-        null,
-        ending.length === 1 && first.refresh_expires_at
-          ? `${first.label}'s sign-in ends in ${until(first.refresh_expires_at / 1000)}. Sign in again to keep it in rotation.`
-          : `${ending.map((a) => a.label).join(", ")} need a new sign-in soon. Sign in again to keep them in rotation.`,
-      ),
-      h("button", { class: "btn small", onclick: () => openLogin(first) }, `Sign in to ${first.label}`),
-    );
-  } else {
-    banner.hidden = true;
-  }
+/** When the account in use was swapped in, from the activity log. */
+function activeSince(): number | null {
+  const id = state.snap?.active_id;
+  if (id === null || id === undefined) return null;
+  return state.events.find((e) => (e.kind === "swap" || e.kind === "adopted_login") && e.account_to === id)?.ts ?? null;
 }
 
-// ---- overview: the bank and the pool summary --------------------------------------------
+const swapNow = () =>
+  act(
+    () => api.swapNow(null),
+    (r) => (r.outcome === "swapped" ? `Swapped to ${labelOf(r.to)}` : r.outcome === "pool_exhausted" ? "No other account is ready" : `No swap: ${r.why}`),
+  );
+const useNow = (a: AccountView) => act(() => api.swapNow(a.id), () => `Swapped to ${a.label}`);
+const resume = (a: AccountView) => act(() => api.setPaused(a.id, false), () => `Resumed ${a.label}`);
 
-function renderOverview() {
-  const snap = state.snap;
-  if (!snap || snap.accounts.length === 0) {
-    replace(
-      bank,
-      h(
-        "div",
-        { class: "onboard" },
-        h("h1", null, "Add your first account"),
-        h(
-          "p",
-          null,
-          "Sign in to each of your Claude accounts once. cc-rotate keeps the logins encrypted on this computer and swaps the cc-rotate profile to another account when one nears its limits.",
-        ),
-        h("button", { class: "btn primary", onclick: () => openLogin(null) }, "Add account"),
-      ),
-    );
-    replace(summary);
+// ---- navigation ------------------------------------------------------------------------
+
+const isPage = (page: Route["page"]) => state.route.page === page;
+const isAccount = (id: number) => state.route.page === "account" && state.route.id === id;
+
+/** Pages that hold a form are built when opened, so a refresh never undoes what's being typed. */
+let settingsPage: HTMLElement | null = null;
+let accountForm: { id: number; el: HTMLElement } | null = null;
+let accountHistory: { id: number; hist: AccountHistory | null; failed: boolean } | null = null;
+
+function go(route: Route) {
+  const same = route.page === state.route.page && (route.page !== "account" || (state.route.page === "account" && state.route.id === route.id));
+  if (same) {
+    body.scrollTop = 0;
     return;
   }
-  replace(
-    bank,
-    snap.accounts.map((a) => {
-      const five = fiveOf(a);
-      const week = weekOf(a);
-      // The tall tank is the budget that runs out first: the weekly one, or the 5-hour one for
-      // an account without a weekly limit.
-      const tankWindow = noWeekly(a) ? five : week;
-      const tankLeft = Math.max(0, 100 - (tankWindow?.pct ?? 0));
-      const fiveLeft = Math.max(0, 100 - (five?.pct ?? 0));
-      const tone =
-        a.state === "needs_login"
-          ? "dead"
-          : a.state === "paused"
-            ? "paused"
-            : blocking(a)
-              ? "over"
-              : a.state === "active"
-                ? "active"
-                : level(tankWindow?.pct ?? 0, tankWindow?.threshold ?? 100);
-      const title = [
-        `${a.label}${a.email ? ` (${a.email})` : ""}`,
-        [stateText(a), a.plan].filter(Boolean).join(", "),
-        noWeekly(a) ? "No weekly limit" : `Weekly: ${week ? `${pct(week.pct)} used` : "no data"}`,
-        `5-hour: ${five ? `${pct(five.pct)} used` : "no data"}`,
-        ...otherWindows(a).map((w) => `${w.label}: ${pct(w.pct)} used`),
-      ].join("\n");
-      const sub =
-        a.state === "needs_login"
-          ? "Signed out"
-          : a.state === "paused"
-            ? "Paused"
-            : !a.last_sample_at
-              ? "No data"
-              : noWeekly(a)
-                ? `5h ${pct(tankLeft)} left`
-                : `${pct(tankLeft)} left`;
-      return h(
-        "div",
-        { class: `cell ${tone}${noWeekly(a) ? " no-weekly" : ""}`, role: "listitem", title },
-        h("div", { class: "tank" }, h("div", { class: "fill", style: { height: `${a.state === "needs_login" ? 0 : tankLeft}%` } })),
-        h("div", { class: "five", "aria-hidden": "true" }, h("span", { style: { width: `${a.state === "needs_login" ? 0 : fiveLeft}%` } })),
-        h("div", { class: "cell-label" }, a.label),
-        h("div", { class: "cell-sub tnum" }, sub),
-      );
-    }),
-  );
-
-  const active = snap.accounts.find((a) => a.id === snap.active_id);
-  const p = snap.pool;
-  const unavailable = snap.accounts.length - p.usable;
-  const swapEvent = state.events.find((e) => e.kind === "swap" && e.account_to === snap.active_id);
-  const headline =
-    p.weekly_limited > 0
-      ? `Weekly usage left: ${p.weekly_accounts_left.toFixed(1)} of ${p.weekly_limited} accounts`
-      : `${plural(p.usable, "account")}, none with a weekly limit`;
-  replace(
-    summary,
-    h("p", { class: "headline" }, headline),
-    h(
-      "dl",
-      { class: "facts" },
-      h("dt", null, "Using"),
-      h("dd", null, active ? active.label : "None", active && swapEvent ? h("span", { class: "muted" }, ` since ${clock(swapEvent.ts)}`) : null),
-      h("dt", null, "Next"),
-      h("dd", null, snap.next ? [snap.next.label, h("span", { class: "muted" }, ` - ${snap.next.reason}`)] : "None ready"),
-      snap.forecast && h("dt", null, "At this pace"),
-      snap.forecast &&
-        h(
-          "dd",
-          { class: snap.forecast.runs_out_at ? "warn" : null },
-          snap.forecast.runs_out_at
-            ? [
-                `all at a limit by ${clock(snap.forecast.runs_out_at * 1000)}`,
-                snap.forecast.free_again_at
-                  ? h("span", { class: "muted" }, `, one frees up at ${clock(snap.forecast.free_again_at * 1000)}`)
-                  : null,
-              ]
-            : "room for the next 24 hours",
-        ),
-      p.weekly_limited > 0 && p.no_weekly_limit > 0 && h("dt", null, "No weekly limit"),
-      p.weekly_limited > 0 && p.no_weekly_limit > 0 && h("dd", null, plural(p.no_weekly_limit, "account")),
-      p.sessions_waiting > 0 && h("dt", null, "At a limit"),
-      p.sessions_waiting > 0 &&
-        h("dd", { class: "warn" }, plural(p.sessions_waiting, "session"), h("span", { class: "muted" }, " waiting for an account with room")),
-      unavailable > 0 && h("dt", null, "Unavailable"),
-      unavailable > 0 && h("dd", null, `${unavailable}`, h("span", { class: "muted" }, " paused or signed out")),
-      h("dt", null, "Swaps"),
-      h("dd", null, String(p.swaps_24h), h("span", { class: "muted" }, " in the last 24 hours")),
-    ),
-  );
-}
-
-// ---- accounts table --------------------------------------------------------------------
-
-function meter(w: WindowUsage | undefined, live: boolean) {
-  const used = w?.pct ?? 0;
-  const lvl = level(used, w?.threshold ?? 100);
-  // A usage report names no reset time for a window that has not started (nothing used yet).
-  // No window at all is not 0% used: nothing was reported for it, so no number is shown.
-  const reset = !w
-    ? live
-      ? "not reported yet"
-      : "no data yet"
-    : w.resets_at && w.resets_at * 1000 > Date.now()
-      ? `resets in ${until(w.resets_at)}`
-      : w.resets_at === null
-        ? "not started"
-        : live
-          ? "has reset"
-          : "no data yet";
-  return h(
-    "div",
-    { class: `meter ${lvl}` },
-    h(
-      "div",
-      { class: "bar", role: "img", "aria-label": w ? `${pct(used)} used` : reset },
-      h("span", { style: { width: `${Math.min(100, used)}%` } }),
-    ),
-    h("div", { class: "meter-text" }, h("strong", { class: "tnum" }, w ? pct(used) : "-"), h("span", { class: "muted" }, reset)),
-  );
-}
-
-function weeklyCell(a: AccountView) {
-  const week = weekOf(a);
-  const main =
-    week || !noWeekly(a)
-      ? meter(week, !!a.last_sample_at)
-      : h(
-          "div",
-          { class: "meter-text none" },
-          h("strong", null, "No weekly limit"),
-          h("span", { class: "muted" }, a.weekly.setting === "no" ? "set by you" : "detected"),
-        );
-  const others = otherWindows(a);
-  return [
-    main,
-    others.length > 0 &&
-      h(
-        "ul",
-        { class: "scoped" },
-        others.map((w) =>
-          h(
-            "li",
-            { class: `${w.applies ? "" : "muted"} ${w.applies && w.pct >= w.threshold ? "over" : ""}`.trim() || null },
-            `${w.label[0].toUpperCase()}${w.label.slice(1)} ${pct(w.pct)}`,
-            !w.applies && h("span", null, ", not for the model in use"),
-          ),
-        ),
-      ),
-  ];
-}
-
-const GRIP = () => {
-  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-  svg.setAttribute("viewBox", "0 0 10 16");
-  svg.setAttribute("width", "10");
-  svg.setAttribute("height", "16");
-  svg.setAttribute("aria-hidden", "true");
-  for (const [cx, cy] of [
-    [2.5, 3],
-    [7.5, 3],
-    [2.5, 8],
-    [7.5, 8],
-    [2.5, 13],
-    [7.5, 13],
-  ]) {
-    const dot = document.createElementNS("http://www.w3.org/2000/svg", "circle");
-    dot.setAttribute("cx", String(cx));
-    dot.setAttribute("cy", String(cy));
-    dot.setAttribute("r", "1.4");
-    svg.append(dot);
+  state.route = route;
+  settingsPage = null;
+  accountForm = null;
+  if (route.page === "account") {
+    const id = route.id;
+    accountHistory = { id, hist: null, failed: false };
+    api
+      .usageHistory(id)
+      .then((hist) => accountHistory?.id === id && ((accountHistory.hist = hist), render()))
+      .catch(() => accountHistory?.id === id && ((accountHistory.failed = true), render()));
   }
-  return svg;
-};
+  body.scrollTop = 0;
+  render();
+  if (route.page === "cost") {
+    costChart.refresh();
+    loadCostTable();
+  }
+  if (route.page === "overview") overviewChart.refresh();
+}
+
+// ---- order -----------------------------------------------------------------------------
 
 /** Order saves run one after another, so quick key presses are never dropped. */
 let orderSaves = Promise.resolve();
 let pendingOrderSaves = 0;
+/** Bumped by every order change, so a read that started before one is not shown. */
+let orderVersion = 0;
 
 /** Save a new order: optimistic in the UI, then written to the store. */
 function saveOrder(ids: number[], moved: AccountView) {
@@ -632,8 +383,8 @@ function saveOrder(ids: number[], moved: AccountView) {
   const before = snap.accounts.map((a) => a.id);
   if (ids.every((id, i) => id === before[i])) return;
   snap.accounts.sort((x, y) => ids.indexOf(x.id) - ids.indexOf(y.id));
-  renderOverview();
-  renderAccounts();
+  orderVersion += 1;
+  render();
   pendingOrderSaves += 1;
   orderSaves = orderSaves
     .then(() => api.setOrder(ids))
@@ -641,6 +392,8 @@ function saveOrder(ids: number[], moved: AccountView) {
     .catch((e) => say(String(e), "error"))
     .finally(() => {
       pendingOrderSaves -= 1;
+      // A read that ran while this save was being written may hold the order before it.
+      orderVersion += 1;
       // Refresh once the last save landed, so an earlier one never shows a stale order.
       if (pendingOrderSaves === 0) refresh();
     });
@@ -653,622 +406,825 @@ function moveBy(a: AccountView, delta: number) {
   if (from < 0 || to === from) return;
   ids.splice(from, 1);
   ids.splice(to, 0, a.id);
-  state.focusGrip = a.id;
   saveOrder(ids, a);
 }
 
-/** Drag a row by its handle. Pointer events rather than HTML drag and drop, which the desktop
- * webviews handle differently (or hand to the window as a file drop). */
 function startDrag(e: PointerEvent, a: AccountView) {
-  if (e.button !== 0 || state.busy) return;
+  if (state.busy) return;
   const grip = e.currentTarget as HTMLElement;
-  const row = grip.closest("tr")!;
-  const body = row.parentElement!;
-  const rows = [...body.children] as HTMLTableRowElement[];
-  if (rows.length < 2) return;
-  e.preventDefault();
-  const from = rows.indexOf(row);
-  const boxes = rows.map((r) => r.getBoundingClientRect());
-  const height = boxes[from].height;
-  const startY = e.clientY;
-  let to = from;
-  let moved = false;
-
-  const update = (clientY: number) => {
-    const min = boxes[0].top - boxes[from].top;
-    const max = boxes[boxes.length - 1].bottom - boxes[from].bottom;
-    const dy = Math.max(min, Math.min(max, clientY - startY));
-    if (!moved && Math.abs(dy) < 3) return;
-    if (!moved) {
-      moved = true;
-      state.dragging = true;
-      row.classList.add("dragging");
-      body.classList.add("sorting");
-      document.body.classList.add("grabbing");
-    }
-    row.style.transform = `translateY(${dy}px)`;
-    const center = boxes[from].top + height / 2 + dy;
-    to = from;
-    boxes.forEach((b, i) => {
-      const mid = b.top + b.height / 2;
-      if (i < from && center < mid) to = Math.min(to, i);
-      if (i > from && center > mid) to = Math.max(to, i);
-    });
-    rows.forEach((r, i) => {
-      if (i === from) return;
-      const shift = from < to && i > from && i <= to ? -height : to < from && i >= to && i < from ? height : 0;
-      r.style.transform = shift ? `translateY(${shift}px)` : "";
-    });
-  };
-  const finish = (commit: boolean) => {
-    grip.removeEventListener("pointermove", onMove);
-    grip.removeEventListener("pointerup", onUp);
-    grip.removeEventListener("pointercancel", onCancel);
-    window.removeEventListener("keydown", onKey, true);
-    rows.forEach((r) => (r.style.transform = ""));
-    row.classList.remove("dragging");
-    body.classList.remove("sorting");
-    document.body.classList.remove("grabbing");
-    const wasDragging = state.dragging;
-    state.dragging = false;
-    if (commit && moved && to !== from) {
-      const ids = rows.map((r) => Number(r.dataset.id));
-      ids.splice(from, 1);
+  const row = grip.closest<HTMLElement>("[data-id]");
+  if (!row?.parentElement) return;
+  const rows = [...row.parentElement.children].filter((el): el is HTMLElement => el instanceof HTMLElement && el.dataset.id !== undefined);
+  dragRow(e, grip, {
+    rows,
+    row,
+    started: () => (state.dragging = true),
+    dropped: (to) => {
+      state.dragging = false;
+      const ids = rows.map((r) => Number(r.dataset.id)).filter((id) => id !== a.id);
       ids.splice(to, 0, a.id);
       saveOrder(ids, a);
-    } else if (wasDragging) {
-      renderAccounts();
-    }
-  };
-  const onMove = (ev: PointerEvent) => update(ev.clientY);
-  const onUp = () => finish(true);
-  const onCancel = () => finish(false);
-  const onKey = (ev: KeyboardEvent) => {
-    if (ev.key === "Escape") {
-      ev.preventDefault();
-      ev.stopPropagation();
-      finish(false);
-    }
-  };
-  grip.setPointerCapture(e.pointerId);
-  grip.addEventListener("pointermove", onMove);
-  grip.addEventListener("pointerup", onUp);
-  grip.addEventListener("pointercancel", onCancel);
-  window.addEventListener("keydown", onKey, true);
-}
-
-function gripKeys(e: KeyboardEvent, a: AccountView) {
-  const count = state.snap?.accounts.length ?? 0;
-  const at = state.snap?.accounts.findIndex((x) => x.id === a.id) ?? 0;
-  const delta =
-    e.key === "ArrowUp" ? -1 : e.key === "ArrowDown" ? 1 : e.key === "Home" ? -at : e.key === "End" ? count - 1 - at : 0;
-  if (delta === 0) return;
-  e.preventDefault();
-  moveBy(a, delta);
-}
-
-/** The account table's note: the order accounts are used in, as the settings make it. */
-function orderNote(s: Settings): string[] {
-  const groups = [
-    s.prefer_no_weekly_limit ? "Accounts without a weekly limit first" : null,
-    s.use_expiring_weekly ? "an account whose weekly budget would go unused" : null,
-  ].filter((g): g is string => g !== null);
-  const within = s.strict_order
-    ? "top to bottom"
-    : "the account in use stays until a limit, then accounts with a running 5-hour window, then top to bottom";
-  const note = [];
-  if (groups.length > 0) {
-    const first = groups.join(", then ");
-    note.push(`${first[0].toUpperCase()}${first.slice(1)}${s.prefer_no_weekly_limit ? "" : " first"}.`);
-    note.push(`Within each group, ${within}.`);
-  } else {
-    note.push(`${within[0].toUpperCase()}${within.slice(1)}.`);
-  }
-  if (s.prefer_no_weekly_limit) note.push("An account with a weekly limit gives way as soon as one without is ready.");
-  return note;
-}
-
-function renderAccounts() {
-  if (state.dragging) return;
-  const snap = state.snap;
-  if (!snap || snap.accounts.length === 0) {
-    replace(accountsBody, h("p", { class: "muted empty" }, "No accounts yet."));
-    return;
-  }
-  const count = snap.accounts.length;
-  const active = document.activeElement as HTMLElement | null;
-  const hadFocus = active && accountsBody.contains(active) ? active.dataset.grip : undefined;
-  const rows = snap.accounts.map((a, i) => {
-    const actions = [];
-    if (a.state === "parked")
-      actions.push(h("button", { class: "link", onclick: () => act(() => api.swapNow(a.id), () => `Swapped to ${a.label}`) }, "Use now"));
-    if (a.state === "paused")
-      actions.push(h("button", { class: "link", onclick: () => act(() => api.setPaused(a.id, false), () => `Resumed ${a.label}`) }, "Resume"));
-    if (a.state === "needs_login") actions.push(h("button", { class: "link", onclick: () => openLogin(a) }, "Sign in again"));
-    actions.push(h("button", { class: "link quiet-link", onclick: () => openManage(a), "aria-label": `More options for ${a.label}` }, "More"));
-
-    const grip = h(
-      "button",
-      {
-        class: "grip",
-        type: "button",
-        title: "Drag to reorder",
-        "aria-label": `${a.label}, ${ordinal(i + 1)} of ${count} in your order. Use the up and down arrow keys to move it.`,
-        "data-grip": a.id,
-        onpointerdown: (e: PointerEvent) => startDrag(e, a),
-        onkeydown: (e: KeyboardEvent) => gripKeys(e, a),
-      },
-      GRIP(),
-    );
-
-    return h(
-      "tr",
-      { class: a.state === "active" ? "is-active" : "", "data-id": a.id, title: a.reason ? `${a.rank ? `${ordinal(a.rank)} pick: ` : ""}${a.reason}` : null },
-      h("td", { class: "order" }, grip),
-      h(
-        "td",
-        null,
-        h(
-          "div",
-          { class: "who" },
-          h("span", { class: "swatch", style: { background: colorOf(a.id) }, "aria-hidden": "true" }),
-          h(
-            "div",
-            null,
-            h("div", { class: "who-label" }, a.label, a.plan && h("span", { class: "plan" }, a.plan)),
-            h("div", { class: "muted who-email" }, a.email ?? ""),
-          ),
-        ),
-      ),
-      h(
-        "td",
-        null,
-        h("span", { class: `badge ${a.state}${a.state === "parked" && !a.eligible ? " resting" : ""}` }, stateText(a)),
-        h(
-          "div",
-          { class: "muted updated", title: readTitle(a) },
-          readText(a),
-        ),
-        a.sign_in_ends_soon &&
-          a.refresh_expires_at &&
-          h(
-            "div",
-            { class: "updated sign-in-ends", title: new Date(a.refresh_expires_at).toLocaleString() },
-            `sign-in ends in ${until(a.refresh_expires_at / 1000)}`,
-          ),
-      ),
-      h("td", null, meter(fiveOf(a), !!a.last_sample_at)),
-      h("td", null, weeklyCell(a)),
-      h("td", { class: "actions" }, actions),
-    );
+    },
+    ended: () => {
+      if (!state.dragging) return;
+      state.dragging = false;
+      render();
+    },
   });
-  replace(
-    accountsBody,
-    h(
-      "table",
-      null,
-      h(
-        "thead",
-        null,
-        h(
-          "tr",
-          null,
-          h("th", { class: "order" }, h("span", { class: "sr" }, "Order")),
-          h("th", null, "Account"),
-          h("th", null, "State"),
-          h("th", null, "5-hour limit"),
-          h("th", null, "Weekly limit"),
-          h("th", null, h("span", { class: "sr" }, "Actions")),
-        ),
-      ),
-      h("tbody", null, rows),
-    ),
-    h(
-      "p",
-      { class: "muted table-note" },
-      [
-        ...orderNote(snap.settings),
-        "Drag to reorder.",
-      ]
-        .filter(Boolean)
-        .join(" "),
-    ),
-  );
-  // Keep keyboard focus on the same account's handle across re-renders.
-  const keep = state.focusGrip ?? (hadFocus ? Number(hadFocus) : null);
-  if (keep !== null) {
-    accountsBody.querySelector<HTMLElement>(`[data-grip="${keep}"]`)?.focus();
-    state.focusGrip = null;
-  }
 }
 
-// ---- chart -----------------------------------------------------------------------------
-
-const DAY_MS = 86_400_000;
-const IN_RANGE: Record<RangeDays, string> = { 1: "in the last 24 hours", 7: "in the last 7 days" };
-
-/** Renders started so far; a slower read that comes back after a later render started is dropped. */
-let chartRenders = 0;
-
-function chartMessage(title: string, detail?: string) {
-  chart.show(null);
-  replace(chartLegend);
-  replace(chartEmpty, h("p", null, title), detail && h("p", { class: "muted" }, detail));
-  chartEmpty.hidden = false;
-}
-
-/** A control changed what the chart shows: draw it again, and say so if its data can't be read. */
-function showChart() {
-  renderChart().catch((e) => say(`Couldn't load the chart: ${e}`, "error"));
-}
-
-const VIEWS: [UiState["view"], string][] = [
-  ["usage", "Usage limits"],
-  ["cost", "API cost"],
-];
-
-function pickView(view: UiState["view"]) {
-  state.view = view;
-  showChart();
-}
-
-// The tabs and buttons are built once and updated in place, so a refresh never takes focus from
-// them or has a screen reader announce them again.
-const tabButtons = VIEWS.map(([view, text], i) =>
-  h(
+/** An account's drag handle, in the sidebar or the plan. */
+function grip(a: AccountView, at: number, count: number, where: "side" | "plan") {
+  return h(
     "button",
     {
-      role: "tab",
-      id: `chart-tab-${view}`,
-      "aria-controls": "chart-view",
-      onclick: () => pickView(view),
-      // Arrow keys move between tabs, as in any tab list.
+      class: "grip",
+      type: "button",
+      title: "Drag to reorder",
+      "aria-label": `${a.label}, ${ordinal(at + 1)} of ${count} in your order. Use the up and down arrow keys to move it.`,
+      "data-focus": `grip-${where}-${a.id}`,
+      onpointerdown: (e: PointerEvent) => startDrag(e, a),
       onkeydown: (e: KeyboardEvent) => {
-        const step = e.key === "ArrowRight" ? 1 : e.key === "ArrowLeft" ? -1 : 0;
-        if (step === 0) return;
+        if (!["ArrowUp", "ArrowDown", "Home", "End"].includes(e.key)) return;
         e.preventDefault();
-        const next = (i + step + VIEWS.length) % VIEWS.length;
-        pickView(VIEWS[next][0]);
-        tabButtons[next].focus();
+        const delta = keyMove(e, at, count);
+        if (delta === 0) return;
+        state.focus = `grip-${where}-${a.id}`;
+        moveBy(a, delta);
       },
     },
-    text,
-  ),
-);
-
-function segmented<T extends string>(label: string, options: [T, string][], pick: (value: T) => void) {
-  const buttons = options.map(([value, text]) => h("button", { onclick: () => pick(value) }, text));
-  return {
-    el: h("div", { class: "segmented", role: "group", "aria-label": label }, buttons),
-    sync(current: T) {
-      buttons.forEach((b, i) => {
-        const on = options[i][0] === current;
-        b.classList.toggle("on", on);
-        b.setAttribute("aria-pressed", String(on));
-      });
-    },
-  };
+    GRIP(),
+  );
 }
 
-const metricControl = segmented<Metric>(
-  "Limit",
-  [
-    ["weekly", "Weekly"],
-    ["five_hour", "5-hour"],
-  ],
-  (value) => {
-    state.metric = value;
-    showChart();
-  },
-);
-const rangeControl = segmented<"1" | "7">(
-  "Range",
-  [
-    ["1", "24 hours"],
-    ["7", "7 days"],
-  ],
-  (value) => {
-    state.rangeDays = Number(value) as RangeDays;
-    showChart();
-  },
-);
-chartTabs.append(...tabButtons);
-chartControls.append(metricControl.el, rangeControl.el);
-
-function syncChartControls() {
-  tabButtons.forEach((b, i) => {
-    const on = VIEWS[i][0] === state.view;
-    b.classList.toggle("on", on);
-    b.setAttribute("aria-selected", String(on));
-    b.tabIndex = on ? 0 : -1;
-  });
-  chartView.setAttribute("aria-labelledby", `chart-tab-${state.view}`);
-  metricControl.el.hidden = state.view !== "usage";
-  metricControl.sync(state.metric);
-  rangeControl.sync(String(state.rangeDays) as "1" | "7");
+/** How cc-rotate uses the order, as the settings make it. */
+function orderNote(s: Settings): string {
+  const first =
+    s.prefer_no_weekly_limit && s.use_expiring_weekly
+      ? "Accounts without a weekly limit go first, then weekly budget that would go unused."
+      : s.prefer_no_weekly_limit
+        ? "Accounts without a weekly limit go first."
+        : s.use_expiring_weekly
+          ? "Weekly budget that would go unused goes first."
+          : "";
+  const within = s.strict_order
+    ? "top to bottom"
+    : "the account in use stays until a limit, then one whose 5-hour window is already running comes first, then the rest top to bottom";
+  const note = first ? `${first} Within each group, ${within}.` : `${within[0].toUpperCase()}${within.slice(1)}.`;
+  return s.prefer_no_weekly_limit ? `${note} An account with a weekly limit gives way as soon as one without is ready.` : note;
 }
 
-async function renderChart() {
-  const render = ++chartRenders;
+// ---- sidebar ---------------------------------------------------------------------------
+
+function sideState(a: AccountView): { text: string; tone: string } {
+  switch (a.state) {
+    case "active":
+      return { text: "In use", tone: "on" };
+    case "paused":
+      return { text: "Paused", tone: "" };
+    case "needs_login":
+      return { text: "Sign in", tone: "danger" };
+    case "parked":
+      if (a.eligible) return { text: state.snap && nextUp(state.snap) === a.id ? "Next" : "Ready", tone: "" };
+      if (!a.available_at) return { text: "Waiting", tone: "warn" };
+      // Today's time, or the weekday for a weekly limit days away.
+      return { text: a.available_at * 1000 - Date.now() < 20 * 3_600_000 ? new Date(a.available_at * 1000).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : new Date(a.available_at * 1000).toLocaleDateString([], { weekday: "short" }), tone: "warn" };
+  }
+}
+
+function renderNav() {
   const snap = state.snap;
-  syncChartControls();
-
-  if (!snap || snap.accounts.length === 0) {
-    replace(chartSummary);
-    chartMessage("Charts appear here once a session runs in the cc-rotate profile.");
-    return;
-  }
-  if (state.view === "usage") await renderUsage(snap, render);
-  else await renderCost(snap, render);
-}
-
-async function renderUsage(snap: Snapshot, render: number) {
-  const nowMs = Date.now();
-  const sinceMs = nowMs - state.rangeDays * DAY_MS;
-  const weekly = state.metric === "weekly";
-  // With each account's last reading before the range: the one in force when it starts.
-  const [samples, swaps] = await Promise.all([api.series(sinceMs), api.swaps(sinceMs)]);
-  if (render !== chartRenders) return;
-  const lines = usageLines(snap.accounts, samples, state.metric, sinceMs, nowMs);
-  const limitName = weekly ? "weekly" : "5-hour";
-  const caption = weekly
-    ? "How much of each account's weekly limit was used. A line drops to 0 when its limit resets."
-    : "How much of each account's 5-hour limit was used. Each climb is one 5-hour window, back to 0 when it resets.";
-  replace(chartSummary, h("p", { class: "chart-caption" }, caption));
-  if (lines.every((l) => l.points.length === 0)) {
-    const noLimit = weekly && snap.accounts.every((a) => a.weekly.effective === "none");
-    chartMessage(
-      noLimit ? "None of your accounts has a weekly limit." : `No ${limitName} usage read ${IN_RANGE[state.rangeDays]}.`,
-      noLimit ? "Their use shows under 5-hour." : "Usage is read from the status line of sessions in the cc-rotate profile, and by usage checks.",
+  const accounts = snap?.accounts ?? [];
+  const item = (page: Page, label: string, count?: string | null) =>
+    h(
+      "button",
+      { class: "nav-item", "data-focus": `nav-${page}`, "aria-current": isPage(page) ? "page" : null, onclick: () => go({ page }) },
+      ICONS[page](),
+      h("span", null, label),
+      count && h("span", { class: "count" }, count),
     );
-    return;
-  }
-  const threshold = weekly ? snap.settings.swap_threshold_7d : snap.settings.swap_threshold_5h;
-  // An account's own weekly cap stops it sooner.
-  const capped = weekly && snap.accounts.some((a) => a.weekly_cap !== null && a.weekly_cap < threshold);
-  chartEmpty.hidden = true;
-  replace(
-    chartLegend,
-    lines.map(({ account: a, points }) => {
-      const why = points.length > 0 ? null : weekly && a.weekly.effective === "none" ? "no weekly limit" : "no readings";
-      return h(
-        "span",
-        { class: why ? "key off" : "key" },
-        h("i", { class: "key-line", style: { background: colorOf(a.id) } }),
-        a.label,
-        why && h("span", { class: "key-note" }, why),
-      );
-    }),
-    h("span", { class: state.rangeDays === 7 ? "key swap-key tick" : "key swap-key" }, h("i"), "Swap, in the color of the account swapped to"),
-    h("span", { class: "key threshold-key" }, h("i"), `cc-rotate swaps at ${threshold}%${capped ? ", or an account's own cap" : ""}`),
-  );
-  chart.show(
-    drawUsage({
-      lines,
-      swaps: swaps.filter((e) => e.account_from !== null && e.account_to !== null),
-      color: colorOf,
-      describeSwap: (e) => `Swapped to ${labelOf(e.account_to)} ${REASONS[e.reason ?? ""] ?? ""}`.trimEnd(),
-      limitName,
-      sinceMs,
-      nowMs,
-      rangeDays: state.rangeDays,
-      threshold,
-    }),
-    `${caption} Over the last ${state.rangeDays === 1 ? "24 hours" : "7 days"}.`,
-  );
-}
-
-async function renderCost(snap: Snapshot, render: number) {
-  const nowMs = Date.now();
-  const since = costBuckets([], state.rangeDays, nowMs)[0].start;
-  const costs = await api.costs(since);
-  if (render !== chartRenders) return;
-  const buckets = costBuckets(costs, state.rangeDays, nowMs);
-  const total = buckets.reduce((sum, b) => sum + b.total, 0);
-  const byAccount = (id: number) => buckets.reduce((sum, b) => sum + (b.usd.get(id) ?? 0), 0);
-  const caption =
-    "What each account's use would have cost at API prices, as Claude Code estimates it (what /cost shows). It's a measure of what your plans are worth, not a bill.";
-  if (total === 0) {
-    replace(chartSummary, h("p", { class: "chart-caption" }, caption));
-    chartMessage(
-      `No API cost counted ${IN_RANGE[state.rangeDays]}.`,
-      "It's counted from the status line of sessions in the cc-rotate profile, and of other profiles cc-rotate tracks.",
-    );
-    return;
-  }
-  chartEmpty.hidden = true;
-  replace(
-    chartSummary,
-    h("p", { class: "chart-figure" }, h("strong", null, usd(total)), ` ${IN_RANGE[state.rangeDays]}`),
-    h("p", { class: "chart-caption" }, caption),
-  );
-  replace(
-    chartLegend,
-    snap.accounts
-      .filter((a) => byAccount(a.id) > 0)
-      .map((a) =>
-        h(
-          "span",
-          { class: "key" },
-          h("i", { class: "key-box", style: { background: colorOf(a.id) } }),
-          a.label,
-          h("span", { class: "key-note" }, usd(byAccount(a.id))),
+  rerender(
+    nav,
+    h("div", { class: "brand" }, h("img", { src: "/icon.svg", alt: "", width: 22, height: 22 }), "cc-rotate"),
+    h(
+      "div",
+      { class: "nav-items" },
+      item("overview", "Overview"),
+      item("activity", "Activity", snap ? `${snap.pool.swaps_24h} ${snap.pool.swaps_24h === 1 ? "swap" : "swaps"}` : null),
+      item("cost", "API cost"),
+      item("settings", "Settings"),
+    ),
+    h(
+      "div",
+      { class: "side-group" },
+      h("h2", null, "Accounts"),
+      h("button", { class: "icon-btn", title: "Add account", "aria-label": "Add account", "data-focus": "nav-add", onclick: () => openLogin(null) }, icon("M8 3v10", "M3 8h10")),
+    ),
+    accounts.length === 0
+      ? h("p", { class: "side-note" }, "No accounts yet.")
+      : h(
+          "ol",
+          { class: "side-accounts", "aria-label": "Accounts, in your order" },
+          accounts.map((a, i) => {
+            const five = fiveOf(a);
+            const left = a.state === "needs_login" ? 0 : five ? Math.max(0, 100 - five.pct) : 100;
+            const st = sideState(a);
+            return h(
+              "li",
+              { class: "side-acct", "data-id": a.id },
+              grip(a, i, accounts.length, "side"),
+              h(
+                "button",
+                {
+                  class: "side-link",
+                  "data-focus": `acct-${a.id}`,
+                  "aria-current": isAccount(a.id) ? "page" : null,
+                  title: a.email ?? a.label,
+                  onclick: () => go({ page: "account", id: a.id }),
+                },
+                h("span", { class: "swatch", style: { background: colorOf(a.id) } }),
+                h("span", { class: "side-name" }, a.label),
+                h("span", { class: `side-state ${st.tone}`.trim() }, st.text),
+                h("span", { class: five ? "mini" : "mini unread", "aria-hidden": "true" }, h("i", { style: { width: `${left}%`, background: colorOf(a.id) } })),
+              ),
+            );
+          }),
         ),
-      ),
-  );
-  chart.show(
-    drawCost({ accounts: snap.accounts, buckets, color: colorOf, rangeDays: state.rangeDays, nowMs }),
-    `${usd(total)} at API prices ${IN_RANGE[state.rangeDays]}, by ${state.rangeDays === 1 ? "hour" : "day"} and account.`,
+    accounts.length > 1 && h("p", { class: "side-note" }, "Drag to change your order. Bars show the 5-hour window left."),
   );
 }
 
-// ---- activity rail ---------------------------------------------------------------------
+// ---- page head and banner --------------------------------------------------------------
 
-const REASONS: Record<string, string> = {
-  threshold_5h: "at the 5-hour limit",
-  threshold_7d: "at the weekly limit",
-  threshold_other: "at a usage limit",
-  preferred_available: "now that it's ready again",
-  stop_failure: "after Claude Code hit a limit",
-  avoid_extra_usage: "so sessions wait instead of paying for extra usage",
-  dead_login: "because the login stopped working",
-  manual: "by hand",
-  login: "after its first sign-in",
-  completed: "after an interrupted swap",
-};
-
-/** A usage check's outcome, as a swap event lists it. A check that read the usage needs no note. */
-const CHECKED: Record<string, string> = {
-  read: "",
-  skipped: "skipped",
-  rate_limited: "asked to wait",
-  login_rejected: "login rejected",
-  failed: "check failed",
-};
-
-const nb = (text: string) => h("span", { class: "nb" }, text);
-
-function describe(e: EventRow): { parts: Child[]; tone?: "warn" | "danger" } {
-  const from = nb(labelOf(e.account_from));
-  const to = nb(labelOf(e.account_to));
-  const detail = (k: string) => (e.detail?.[k] as string | undefined) ?? "";
-  switch (e.kind) {
-    case "swap": {
-      const pick = detail("pick");
-      const why = pick ? h("small", { class: "why" }, `Picked: ${pick}`) : null;
-      const arrived = e.detail?.arrived_over_limit
-        ? h("small", { class: "why" }, `${labelOf(e.account_from)} was already at this limit when it was swapped in`)
-        : null;
-      const checkedList = (e.detail?.checked as { label: string; outcome: string }[] | undefined) ?? [];
-      const checked = checkedList.length
-        ? h("small", { class: "why" }, `Checked first: ${checkedList.map((c) => { const note = CHECKED[c.outcome] ?? c.outcome; return note ? `${c.label} (${note})` : c.label; }).join(", ")}`)
-        : null;
-      return e.account_from
-        ? { parts: ["Swapped from ", from, " to ", to, ` ${REASONS[e.reason ?? ""] ?? ""}`.trimEnd(), arrived, checked, why] }
-        : { parts: ["Started using ", to, why] };
-    }
-    case "swap_skipped":
-      return { parts: [`No swap: ${detail("why")}`] };
-    case "login":
-      return { parts: e.reason === "added" ? ["Added ", to] : ["Signed in to ", to, " again"] };
-    case "sync":
-      return e.reason === "usage_check" || e.reason === "recovered"
-        ? { parts: ["Saved ", from, "'s renewed login after a usage check"] }
-        : { parts: ["Saved ", from, "'s renewed login"] };
-    case "dead_login":
-      return e.reason === "sign_in_ended"
-        ? { parts: [from, "'s sign-in ended"], tone: "danger" }
-        : { parts: [from, "'s login stopped working"], tone: "danger" };
-    case "login_expiring": {
-      const at = e.detail?.expires_at as number | undefined;
-      return { parts: [from, "'s sign-in ends", at ? ` on ${new Date(at).toLocaleDateString([], { weekday: "long", month: "short", day: "numeric" })}` : " soon"], tone: "warn" };
-    }
-    case "session":
-      if (e.reason === "waiting") return { parts: e.account_from ? ["A session stopped at ", from, "'s usage limit"] : ["A session stopped at a usage limit"] };
-      if (e.reason === "woken") return { parts: ["Woke a session that was stopped at a limit, now on ", to] };
-      if (e.reason === "resumed")
-        return e.detail?.woken === false
-          ? { parts: ["A session stopped at a limit continued on ", to] }
-          : { parts: ["A woken session continued on ", to] };
-      return { parts: ["A session ", e.reason ?? "changed"] };
-    case "paid_usage":
-      return { parts: ["Every account is at a limit, and ", from, " is running on paid extra usage"], tone: "warn" };
-    case "session_stuck":
-      return { parts: ["A session woken on ", to, " hasn't continued"], tone: "warn" };
-    case "claude_version": {
-      const version = detail("version");
-      return e.detail?.tested === false
-        ? { parts: [`Claude Code ${version} is in use, not yet tested with cc-rotate`] }
-        : { parts: [`Claude Code ${version} is in use`] };
-    }
-    case "warm_up":
-      return { parts: ["Started ", from, "'s next 5-hour window"] };
-    case "pool_exhausted":
-      return { parts: ["No other account was ready to take over"], tone: "warn" };
-    case "adopted_login":
-      return { parts: ["Now using ", to, " after a /login in the profile"] };
-    case "foreign_login":
-      return { parts: ["The cc-rotate profile was signed in to an account that isn't in cc-rotate"], tone: "warn" };
-    case "state":
-      if (e.reason === "removed") return { parts: ["Removed ", nb(detail("label") || "an account")] };
-      if (e.reason === "paused") return { parts: ["Paused ", from] };
-      if (e.reason === "parked") return { parts: ["Resumed ", from] };
-      if (e.reason === "order") return { parts: ["Changed the order"] };
-      if (e.reason === "weekly_limit") {
-        const value = detail("weekly_limit");
-        const who = nb(detail("label") || labelOf(e.account_from));
-        if (value === "yes") return { parts: ["Set ", who, " to have a weekly limit"] };
-        if (value === "no") return { parts: ["Set ", who, " to no weekly limit"] };
-        return { parts: ["Set ", who, " to detect its weekly limit from usage"] };
-      }
-      if (e.reason === "use_expiring") {
-        const who = nb(detail("label") || labelOf(e.account_from));
-        return e.detail?.use_expiring
-          ? { parts: ["Set ", who, " to use its weekly budget before it resets"] }
-          : { parts: ["Set ", who, " to never move ahead for its weekly budget"] };
-      }
-      if (e.reason === "keep_running") {
-        const who = nb(detail("label") || labelOf(e.account_from));
-        return e.detail?.keep_running
-          ? { parts: ["Set ", who, " to keep its 5-hour window running"] }
-          : { parts: ["Set ", who, " to start its 5-hour window only when it's used"] };
-      }
-      if (e.reason === "weekly_cap") {
-        const value = e.detail?.weekly_cap as number | null | undefined;
-        const who = nb(detail("label") || labelOf(e.account_from));
-        return value == null
-          ? { parts: ["Set ", who, " to stop at the weekly usage in Settings"] }
-          : { parts: ["Set ", who, ` to stop at ${value}% weekly usage`] };
-      }
-      return { parts: [from, ` is now ${e.reason ?? "updated"}`] };
-    case "error":
-      return { parts: [detail("message") || "Something went wrong"], tone: "danger" };
-    default:
-      return { parts: [e.kind] };
+function renderHead() {
+  const snap = state.snap;
+  const r = state.route;
+  const title = (text: Child, sub?: Child) => [h("div", { class: "page-title" }, h("h1", null, text), sub && h("p", { class: "page-sub" }, sub))];
+  const swap =
+    snap && snap.accounts.length > 0
+      ? h(
+          "button",
+          {
+            class: "btn",
+            disabled: !snap.pool.eligible,
+            title: snap.pool.eligible ? "Swap to the next account in line" : "No other account is ready",
+            "data-focus": "head-swap",
+            onclick: swapNow,
+          },
+          "Swap now",
+        )
+      : null;
+  const add = h("button", { class: "btn primary", "data-focus": "head-add", onclick: () => openLogin(null) }, "Add account");
+  if (r.page === "overview") {
+    const active = snap?.accounts.find((a) => a.id === snap.active_id);
+    const since = activeSince();
+    rerender(head, title("Overview", active ? ["Using ", h("b", null, active.label), since ? ` since ${clock(since)}` : ""] : null), h("div", { class: "page-actions" }, swap, add));
+  } else if (r.page === "account") {
+    const a = snap?.accounts.find((x) => x.id === r.id);
+    if (!a) return replace(head, title("Account"));
+    const btn = (text: string, key: string, onclick: () => void, primary = false) => h("button", { class: primary ? "btn primary" : "btn", "data-focus": `head-${key}`, onclick }, text);
+    rerender(
+      head,
+      h(
+        "div",
+        { class: "page-title" },
+        h("h1", null, h("span", { class: "swatch big", style: { background: colorOf(a.id) } }), a.label, a.plan && h("span", { class: "plan" }, a.plan)),
+        h("p", { class: "page-sub" }, h("span", { class: `badge ${a.state}${a.state === "parked" && !a.eligible ? " resting" : ""}` }, stateText(a)), " ", a.email ?? ""),
+      ),
+      h(
+        "div",
+        { class: "page-actions" },
+        a.state === "parked" && btn("Use now", "use", () => useNow(a), true),
+        a.state === "parked" && btn("Pause", "pause", () => act(() => api.setPaused(a.id, true), () => `Paused ${a.label}`)),
+        a.state === "paused" && btn("Resume", "pause", () => resume(a), true),
+        (a.state === "parked" || a.state === "paused") && btn("Check usage", "check", () => act(() => api.checkUsage(a.id), (res) => checkMessage(a.label, res))),
+        btn("Sign in again", "sign-in", () => openLogin(a), a.state === "needs_login"),
+      ),
+    );
+  } else if (r.page === "activity") {
+    const toggle = h("input", {
+      type: "checkbox",
+      id: "routine",
+      checked: state.showRoutine,
+      "data-focus": "routine",
+      onchange: (e: Event) => {
+        state.showRoutine = (e.target as HTMLInputElement).checked;
+        renderPage();
+      },
+    });
+    rerender(head, title("Activity", snap ? `${snap.pool.swaps_24h} ${snap.pool.swaps_24h === 1 ? "swap" : "swaps"} in the last 24 hours` : null), h("label", { class: "check", for: "routine" }, toggle, "Show renewals and other routine events"));
+  } else if (r.page === "cost") {
+    rerender(head, title("API cost", "What your use would have cost at API prices, as Claude Code estimates it"));
+  } else {
+    rerender(head, title("Settings"));
   }
 }
 
-function dayName(ts: number): string {
-  const day = new Date(ts).toDateString();
-  const today = new Date();
-  if (day === today.toDateString()) return "Today";
-  if (day === new Date(today.getTime() - 86_400_000).toDateString()) return "Yesterday";
-  return new Date(ts).toLocaleDateString([], { weekday: "long", month: "short", day: "numeric" });
+function renderBanner() {
+  const snap = state.snap;
+  const show = (tone: "warn" | "danger", ...children: Child[]) => {
+    banner.hidden = false;
+    banner.className = `banner ${tone}`;
+    rerender(banner, ...children);
+  };
+  const needs = snap?.accounts.filter((a) => a.state === "needs_login") ?? [];
+  if (snap?.pool.swap_unsettled) {
+    show("warn", h("span", null, "A swap was interrupted. Swaps are on hold until cc-rotate confirms which account the profile is signed in to. Your sessions keep working."));
+  } else if (needs.length > 0) {
+    show(
+      "danger",
+      h(
+        "span",
+        null,
+        needs.length === 1 ? `${needs[0].label} is signed out. Sign in again to use it.` : `${needs.map((a) => a.label).join(", ")} are signed out. Sign in again to use them.`,
+      ),
+      h("button", { class: "btn small", "data-focus": "banner-action", onclick: () => openLogin(needs[0]) }, `Sign in to ${needs[0].label}`),
+    );
+  } else if (snap && snap.pool.sessions_waiting > 0) {
+    show("warn", h("span", null, `${snap.pool.sessions_waiting === 1 ? "A session is" : `${snap.pool.sessions_waiting} sessions are`} stopped at a limit, waiting for an account with room.`));
+  } else if (snap?.pool.exhausted && snap.accounts.length > 0 && !isPage("overview")) {
+    // The overview's headline says it there.
+    const next = snap.pool.next_available_at;
+    show("warn", h("span", null, "No account is ready to take over. ", next ? `The next one frees up in ${until(next)}.` : ""));
+  } else if (snap && snap.pool.sign_ins_ending.length > 0) {
+    // The sign-in that ends first, first.
+    const ending = snap.accounts.filter((a) => a.sign_in_ends_soon).sort((x, y) => (x.refresh_expires_at ?? 0) - (y.refresh_expires_at ?? 0));
+    const first = ending[0];
+    show(
+      "warn",
+      h(
+        "span",
+        null,
+        ending.length === 1 && first.refresh_expires_at
+          ? `${first.label}'s sign-in ends in ${until(first.refresh_expires_at / 1000)}. Sign in again to keep it in rotation.`
+          : `${ending.map((a) => a.label).join(", ")} need a new sign-in soon. Sign in again to keep them in rotation.`,
+      ),
+      h("button", { class: "btn small", "data-focus": "banner-action", onclick: () => openLogin(first) }, `Sign in to ${first.label}`),
+    );
+  } else {
+    banner.hidden = true;
+  }
 }
+
+// ---- overview --------------------------------------------------------------------------
+
+const chartContext = {
+  snap: () => state.snap,
+  color: (id: number) => colorOf(id),
+  labelOf,
+  error: (message: string) => say(message, "error"),
+};
+const overviewChart = new ChartPanel(chartContext, ["usage", "cost"], "overview-chart");
+const costChart = new ChartPanel(chartContext, ["cost"], "cost-chart");
+
+function onboarding(): Child {
+  return h(
+    "section",
+    { class: "onboard" },
+    h("h2", null, "Add your first account"),
+    h(
+      "p",
+      null,
+      "Sign in to each of your Claude accounts once. cc-rotate keeps the logins encrypted on this computer and swaps the cc-rotate profile to another account when one nears its limits.",
+    ),
+    h("button", { class: "btn primary", "data-focus": "onboard-add", onclick: () => openLogin(null) }, "Add account"),
+  );
+}
+
+function planSection(snap: Snapshot): Child {
+  const view = planView(Date.now());
+  const all = lanes(snap, activeSince(), view, (id) => labelOf(id));
+  const count = snap.accounts.length;
+  const next = nextUp(snap);
+  const rows = snap.accounts.map((a, i) => {
+    const action =
+      a.state === "needs_login"
+        ? h("button", { class: "row-action danger", "data-focus": `row-${a.id}`, onclick: () => openLogin(a) }, "Sign in")
+        : a.state === "paused"
+          ? h("button", { class: "row-action", "data-focus": `row-${a.id}`, onclick: () => resume(a) }, "Resume")
+          : a.state === "parked" && a.eligible
+            ? h("button", { class: "row-action quiet", "data-focus": `row-${a.id}`, onclick: () => useNow(a), title: `Swap to ${a.label} now` }, "Use now")
+            : null;
+    const st = stateLine(a, next === a.id);
+    return h(
+      "li",
+      { class: `plan-row${a.id === snap.active_id ? " is-active" : ""}`, "data-id": a.id, style: { "--c": colorOf(a.id) } },
+      h(
+        "div",
+        { class: "plan-info" },
+        grip(a, i, count, "plan"),
+        h(
+          "button",
+          { class: "plan-who", "data-focus": `plan-${a.id}`, title: a.reason ? `${a.rank ? `${ordinal(a.rank)} pick: ` : ""}${a.reason}` : null, onclick: () => go({ page: "account", id: a.id }) },
+          h("span", { class: "plan-name" }, h("span", { class: "swatch" }), a.label, a.plan && h("span", { class: "plan-tag" }, a.plan)),
+          h("span", { class: `plan-state ${a.state === "needs_login" ? "danger" : ""}`.trim() }, st),
+        ),
+        action,
+      ),
+      laneEl(all.get(a.id)!, view, colorOf(a.id)),
+    );
+  });
+  const p = snap.pool;
+  return h(
+    "section",
+    { class: "card plan-card", "aria-label": "Plan" },
+    h("div", { class: "plan-top" }, h("div", { class: "plan-corner" }, "Your order"), axis(snap, view)),
+    h("div", { class: "plan-rows" }, overlay(snap, view), h("ol", { class: "plan-list" }, rows)),
+    h(
+      "div",
+      { class: "plan-foot" },
+      h(
+        "div",
+        { class: "plan-keys", "aria-hidden": "true" },
+        h("span", null, h("i", { class: "k-use" }), "In use"),
+        h("span", null, h("i", { class: "k-next" }), "Planned"),
+        h("span", null, h("i", { class: "k-rest" }), "Waiting for a limit to reset"),
+      ),
+      h("p", { class: "muted" }, orderNote(snap.settings), p.weekly_limited > 0 ? ` Weekly budget left: ${p.weekly_accounts_left.toFixed(1)} of ${p.weekly_limited} ${p.weekly_limited === 1 ? "account" : "accounts"}.` : ""),
+    ),
+  );
+}
+
+function renderOverview() {
+  const snap = state.snap;
+  if (!snap || snap.accounts.length === 0) {
+    mount(slots.summary);
+    rerender(slots.summary, onboarding());
+    return;
+  }
+  mount(slots.summary, slots.plan, overviewChart.el, slots.recent);
+  const s = summary(snap, (id) => labelOf(id));
+  rerender(slots.summary, h("section", { class: `plan-summary ${s.tone}` }, h("h2", null, s.title), h("p", null, s.story)));
+  rerender(slots.plan, planSection(snap));
+  fitLabels(slots.plan);
+  const recent = state.events.filter((e) => !routine(e));
+  rerender(
+    slots.recent,
+    h(
+      "section",
+      { class: "card recent" },
+      h("div", { class: "panel-head" }, h("h2", null, "Recent activity"), h("button", { class: "link", "data-focus": "see-all", onclick: () => go({ page: "activity" }) }, "See all")),
+      h("ol", { class: "activity" }, activityItems(recent, labelOf, 6)),
+    ),
+  );
+}
+
+// ---- account page ----------------------------------------------------------------------
+
+function meter(w: WindowUsage | undefined, live: boolean) {
+  const used = w?.pct ?? 0;
+  const lvl = level(used, w?.threshold ?? 100);
+  // A usage report names no reset time for a window that has not started (nothing used yet).
+  // No window at all is not 0% used: nothing was reported for it, so no number is shown.
+  const reset = !w
+    ? live
+      ? "not reported yet"
+      : "no data yet"
+    : w.resets_at && w.resets_at * 1000 > Date.now()
+      ? `resets in ${until(w.resets_at)}, at ${clock(w.resets_at * 1000)}`
+      : w.resets_at === null
+        ? "not started"
+        : live
+          ? "has reset"
+          : "no data yet";
+  return h(
+    "div",
+    { class: `meter big ${lvl}` },
+    h(
+      "div",
+      { class: "bar", role: "img", "aria-label": w ? `${pct(used)} used` : reset },
+      h("span", { style: { width: `${Math.min(100, used)}%` } }),
+      w && h("b", { class: "mark", style: { left: `${Math.min(100, w.threshold)}%` }, title: `cc-rotate swaps at ${pct(w.threshold)}` }),
+    ),
+    h("div", { class: "meter-text" }, h("strong", { class: "tnum" }, w ? `${pct(used)} used` : "-"), h("span", { class: "muted" }, reset)),
+  );
+}
+
+function accountLive(a: AccountView): Child[] {
+  const others = otherWindows(a);
+  const week = weekOf(a);
+  const warmStopped = state.snap?.warm_ups_blocked ?? null;
+  const warmPaused = state.snap?.warm_ups_paused ?? null;
+  const hist = accountHistory?.id === a.id ? accountHistory : null;
+  const loading = h("span", { class: "muted" }, hist?.failed ? "couldn't be read" : "Loading…");
+  const accounts = state.snap?.accounts ?? [];
+  const at = accounts.findIndex((x) => x.id === a.id);
+  const count = accounts.length;
+  return [
+    h(
+      "div",
+      { class: "meters" },
+      h("section", { class: "card" }, h("h2", null, "5-hour window"), meter(fiveOf(a), !!a.last_sample_at)),
+      h(
+        "section",
+        { class: "card" },
+        h("h2", null, "Weekly limit"),
+        week || !noWeekly(a)
+          ? meter(week, !!a.last_sample_at)
+          : h("div", { class: "meter-text none" }, h("strong", null, "No weekly limit"), h("span", { class: "muted" }, a.weekly.setting === "no" ? "set by you" : "detected from what Claude Code reports")),
+        others.length > 0 &&
+          h(
+            "ul",
+            { class: "scoped" },
+            others.map((w) =>
+              h(
+                "li",
+                { class: `${w.applies ? "" : "muted"} ${w.applies && w.pct >= w.threshold ? "over" : ""}`.trim() || null },
+                `${w.label[0].toUpperCase()}${w.label.slice(1)} ${pct(w.pct)}`,
+                !w.applies && h("span", null, ", not for the model in use"),
+              ),
+            ),
+          ),
+      ),
+    ),
+    h(
+      "section",
+      { class: "card" },
+      h("h2", null, "Details"),
+      h(
+        "dl",
+        { class: "facts" },
+        h("dt", null, "Usage"),
+        h("dd", { title: readTitle(a) }, readText(a)),
+        a.org_name && h("dt", null, "Organization"),
+        a.org_name && h("dd", null, a.org_name),
+        h("dt", null, "Recent weeks"),
+        h("dd", { class: "recent-weeks" }, hist?.hist ? recentWeeks(hist.hist) : loading),
+        h("dt", null, "API value"),
+        h("dd", { title: "What this use would have cost at API prices, as Claude Code estimates it" }, hist?.hist ? valueText(hist.hist) : loading.cloneNode(true)),
+        a.extra_usage && h("dt", null, "Extra usage"),
+        a.extra_usage && h("dd", { class: a.extra_usage.enabled ? "warn" : null, title: `As of ${new Date(a.extra_usage.read_at).toLocaleString()}` }, extraText(a.extra_usage)),
+        h("dt", null, "Your order"),
+        h(
+          "dd",
+          { class: "order-row" },
+          `${ordinal(at + 1)} of ${count}`,
+          h("button", { class: "btn small", disabled: at <= 0, "data-focus": "move-up", "data-focus-alt": "move-down", onclick: () => ((state.focus = "move-up"), moveBy(a, -1)) }, "Move up"),
+          h("button", { class: "btn small", disabled: at >= count - 1, "data-focus": "move-down", "data-focus-alt": "move-up", onclick: () => ((state.focus = "move-down"), moveBy(a, 1)) }, "Move down"),
+        ),
+        h("dt", null, "Pick order"),
+        h("dd", null, a.rank ? `${ordinal(a.rank)} - ${a.reason}` : `not available${a.reason ? ` - ${a.reason}` : ""}`),
+        h("dt", null, "Login updated"),
+        h("dd", null, a.login_updated_at ? ago(a.login_updated_at) : "never"),
+        a.refresh_expires_at && a.state !== "needs_login" && h("dt", null, "Sign-in ends"),
+        a.refresh_expires_at &&
+          a.state !== "needs_login" &&
+          h("dd", { class: a.sign_in_ends_soon ? "warn" : null, title: new Date(a.refresh_expires_at).toLocaleString() }, a.refresh_expires_at > Date.now() ? `in ${until(a.refresh_expires_at / 1000)}` : "ended"),
+        h("dt", null, "Usage check"),
+        h("dd", null, checkText(a)),
+        a.keep_running && h("dt", null, "Keeping it running"),
+        a.keep_running && h("dd", null, warmText(a)),
+        a.keep_running && warmStopped && h("dt", null, ""),
+        a.keep_running &&
+          warmStopped &&
+          h(
+            "dd",
+            { class: "warn" },
+            `Stopped because ${warmStopped}. `,
+            h(
+              "button",
+              {
+                class: "link",
+                "data-focus": "start-again",
+                onclick: () =>
+                  api
+                    .setKeepRunning(a.id, true)
+                    .then(() => (say("Keeping 5-hour windows running again"), refresh()))
+                    .catch((e) => say(String(e), "error")),
+              },
+              "Start again",
+            ),
+          ),
+        a.keep_running && !warmStopped && warmPaused && h("dt", null, ""),
+        a.keep_running && !warmStopped && warmPaused && h("dd", { class: "warn" }, `Not running now: ${warmPaused}.`),
+      ),
+    ),
+  ];
+}
+
+/** The account's own settings, built when its page opens. */
+function accountSettings(a: AccountView): HTMLElement {
+  const label = h("input", { type: "text", value: a.label, maxlength: 40 });
+  const error = h("p", { class: "login-status error", hidden: true });
+  const save = h("button", { class: "btn primary" }, "Save changes");
+  const remove = h("button", { class: "btn danger-outline" }, "Remove account");
+  const weekly = h(
+    "select",
+    {
+      onchange: (e: Event) => {
+        const value = (e.target as HTMLSelectElement).value as WeeklyLimitSetting;
+        api
+          .setWeeklyLimit(a.id, value)
+          .then(() => (say("Weekly limit saved"), refresh()))
+          .catch((err) => say(String(err), "error"));
+      },
+    },
+    (
+      [
+        ["auto", `Detect from usage (${WEEKLY_TEXT[a.weekly.detected]})`],
+        ["yes", "Has a weekly limit"],
+        ["no", "No weekly limit"],
+      ] as const
+    ).map(([value, text]) => h("option", { value, selected: a.weekly.setting === value }, text)),
+  );
+  const weeklyThreshold = state.snap?.settings.swap_threshold_7d ?? 98;
+  const cap = h("input", { type: "number", min: 1, max: 100, step: "any", value: a.weekly_cap === null ? "" : String(a.weekly_cap), placeholder: String(weeklyThreshold) });
+  const useExpiring = h("input", { type: "checkbox", checked: a.use_expiring });
+  const keepRunning = h("input", { type: "checkbox", checked: a.keep_running });
+  save.addEventListener("click", async () => {
+    try {
+      // Only a change is checked and saved: a cap set from the CLI can be any number from 1 to 100.
+      const capValue = cap.value.trim() === "" ? null : Number(cap.value);
+      if (cap.validity.badInput || (capValue !== null && !(Number.isFinite(capValue) && capValue >= 1 && capValue <= 100))) {
+        throw new Error("Use a number from 1 to 100, or leave it empty.");
+      }
+      // Each saved change becomes the new baseline, so a retry after a failed rename does not
+      // save (and log) the others again.
+      if (capValue !== a.weekly_cap) {
+        await api.setWeeklyCap(a.id, capValue);
+        a.weekly_cap = capValue;
+      }
+      if (useExpiring.checked !== a.use_expiring) {
+        await api.setUseExpiring(a.id, useExpiring.checked);
+        a.use_expiring = useExpiring.checked;
+      }
+      if (keepRunning.checked !== a.keep_running) {
+        await api.setKeepRunning(a.id, keepRunning.checked);
+        a.keep_running = keepRunning.checked;
+      }
+      if (label.value.trim() !== a.label) {
+        await api.renameAccount(a.id, label.value.trim());
+        a.label = label.value.trim();
+      }
+      error.hidden = true;
+      say("Saved");
+      await refresh();
+    } catch (e) {
+      error.hidden = false;
+      error.textContent = String(e);
+    }
+  });
+  let armed = false;
+  remove.addEventListener("click", async () => {
+    if (state.snap?.active_id === a.id) {
+      error.hidden = false;
+      error.textContent = `${a.label} is in use. Swap to another account first.`;
+      return;
+    }
+    if (!armed) {
+      armed = true;
+      remove.textContent = `Yes, remove ${a.label}`;
+      return;
+    }
+    try {
+      await api.removeAccount(a.id);
+      say(`Removed ${a.label}`);
+      go({ page: "overview" });
+      await refresh();
+    } catch (e) {
+      error.hidden = false;
+      error.textContent = String(e);
+    }
+  });
+  return h(
+    "section",
+    { class: "card" },
+    h("h2", null, "Settings for this account"),
+    h(
+      "div",
+      { class: "fields" },
+      h("label", null, h("span", null, "Label"), label),
+      h("label", null, h("span", null, "Weekly limit"), weekly, h("small", { class: "muted" }, "Detected from the usage Claude Code reports. Saved as soon as you pick.")),
+      a.weekly.effective !== "none" &&
+        h(
+          "label",
+          null,
+          h("span", null, "Stop using it at weekly usage (%)"),
+          cap,
+          h("small", { class: "muted" }, `Keeps the rest of its week for you. Empty uses ${weeklyThreshold}% from Settings.`),
+        ),
+      a.weekly.effective !== "none" && h("label", { class: "check" }, useExpiring, "Use its weekly budget before it resets"),
+      h(
+        "div",
+        { class: "check-field" },
+        h("label", { class: "check" }, keepRunning, "Keep its 5-hour window running"),
+        h("small", { class: "muted" }, "While it's not in use, starts its next window with a short Haiku request as soon as one ends, so a window is already counting down when it's needed."),
+      ),
+    ),
+    error,
+    h("div", { class: "form-actions spread" }, remove, save),
+  );
+}
+
+function renderAccount(id: number) {
+  const a = state.snap?.accounts.find((x) => x.id === id);
+  if (!a) {
+    mount(slots.live);
+    rerender(slots.live, h("p", { class: "muted" }, state.snap ? "This account was removed." : "Loading…"));
+    return;
+  }
+  if (accountForm?.id !== id) accountForm = { id, el: accountSettings(a) };
+  mount(slots.live, accountForm.el);
+  rerender(slots.live, accountLive(a));
+}
+
+// ---- activity, API cost and settings ---------------------------------------------------
 
 function renderActivity() {
-  const routine = (e: EventRow) => ROUTINE.has(e.kind) || (e.kind === "state" && e.reason === "order");
   const items = state.events.filter((e) => state.showRoutine || !routine(e));
-  if (items.length === 0) {
-    replace(activity, h("li", { class: "muted empty" }, "Swaps, sign-ins and problems show up here."));
-    return;
-  }
-  const rows: HTMLElement[] = [];
-  let lastDay = "";
-  for (const e of items.slice(0, 120)) {
-    const day = dayName(e.ts);
-    if (day !== lastDay) {
-      rows.push(h("li", { class: "day" }, day));
-      lastDay = day;
+  mount(slots.activity);
+  rerender(slots.activity, h("section", { class: "card" }, h("ol", { class: "activity" }, activityItems(items, labelOf, 300))));
+}
+
+/** The API cost page's table: each account's API value over three spans. */
+const costTable = h("section", { class: "card" }, h("h2", null, "By account"), h("p", { class: "muted" }, "Loading…"));
+let costReads = 0;
+
+function loadCostTable() {
+  const read = ++costReads;
+  const now = Date.now();
+  const spans: [string, number][] = [
+    ["24 hours", now - 86_400_000],
+    ["7 days", now - 7 * 86_400_000],
+    ["30 days", now - 30 * 86_400_000],
+  ];
+  api
+    .costs(spans[2][1])
+    .then((costs) => {
+      if (read !== costReads) return;
+      const accounts = state.snap?.accounts ?? [];
+      const sum = (id: number | null, since: number) => costs.filter((c) => (id === null || c.account_id === id) && c.ts + 3_600_000 > since).reduce((s, c) => s + c.usd, 0);
+      const rows = accounts.filter((a) => sum(a.id, spans[2][1]) > 0);
+      replace(
+        costTable,
+        h("h2", null, "By account"),
+        rows.length === 0
+          ? h("p", { class: "muted" }, "No API cost counted in the last 30 days.")
+          : h(
+              "table",
+              { class: "cost-table" },
+              h("thead", null, h("tr", null, h("th", null, "Account"), spans.map(([name]) => h("th", { class: "num" }, name)))),
+              h(
+                "tbody",
+                null,
+                rows.map((a) => h("tr", null, h("td", null, h("span", { class: "swatch", style: { background: colorOf(a.id) } }), a.label), spans.map(([, since]) => h("td", { class: "num" }, usd(sum(a.id, since)))))),
+              ),
+              h("tfoot", null, h("tr", null, h("td", null, "Total"), spans.map(([, since]) => h("td", { class: "num" }, usd(rows.reduce((s, a) => s + sum(a.id, since), 0)))))),
+            ),
+        h("p", { class: "muted cost-note" }, "Counted from the status line of sessions in the cc-rotate profile and other profiles cc-rotate tracks. An hour that started before a span counts in full."),
+      );
+    })
+    .catch((e) => read === costReads && replace(costTable, h("h2", null, "By account"), h("p", { class: "muted" }, `Couldn't read API cost: ${e}`)));
+}
+
+function buildSettings(snap: Snapshot): HTMLElement {
+  const checks = h("ul", { class: "checks" }, h("li", { class: "muted" }, "Running checks…"));
+  const info = h("dl", { class: "facts" });
+  const autostart = h("input", { type: "checkbox", id: "autostart" });
+  const saved = (key: string, value: string, message: string) =>
+    api
+      .setSetting(key, value)
+      .then(() => (say(message), refresh()))
+      .catch((e) => say(String(e), "error"));
+  const field = (key: string, text: string, value: number, hint: string, min: number, max: number) => {
+    const input = h("input", { type: "number", value: String(value), min, max, step: 1 });
+    input.addEventListener("change", () => saved(key, input.value, "Saved"));
+    return h("label", null, h("span", null, text), input, h("small", { class: "muted" }, hint));
+  };
+  const box = (key: keyof Settings, id: string, text: string, on: string, off: string) => {
+    const input = h("input", { type: "checkbox", id, checked: Boolean(snap.settings[key]) });
+    input.addEventListener("change", () => saved(key, String(input.checked), input.checked ? on : off));
+    return h("label", { class: "check", for: id }, input, text);
+  };
+  api.autostartEnabled().then((on) => (autostart.checked = on)).catch(() => (autostart.disabled = true));
+  autostart.addEventListener("change", () =>
+    api
+      .setAutostart(autostart.checked)
+      .then(() => say(autostart.checked ? "cc-rotate will start when you sign in" : "cc-rotate won't start when you sign in"))
+      .catch((e) => say(String(e), "error")),
+  );
+  Promise.all([api.doctor().catch(() => []), api.appInfo().catch(() => null)]).then(([results, about]) => {
+    replace(checks, results.map((c) => h("li", { class: c.status }, h("strong", null, c.name), h("span", null, c.detail))));
+    if (about) {
+      replace(
+        info,
+        h("dt", null, "cc-rotate"),
+        h("dd", null, about.version),
+        h("dt", null, "Claude Code"),
+        h("dd", null, about.claude_version ?? "not found"),
+        h("dt", null, "Profile folder"),
+        h("dd", { class: "path" }, about.profile_dir),
+        h("dt", null, "Data folder"),
+        h("dd", { class: "path" }, about.data_dir),
+      );
     }
-    const d = describe(e);
-    const time = new Date(e.ts);
-    rows.push(
+  });
+  return h(
+    "div",
+    { class: "settings" },
+    h(
+      "section",
+      { class: "card" },
+      h("h2", null, "When to swap"),
       h(
-        "li",
-        { class: d.tone ?? "" },
-        h("time", { datetime: time.toISOString(), title: time.toLocaleString() }, time.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })),
-        h("span", null, d.parts),
+        "div",
+        { class: "fields" },
+        field("swap_threshold_5h", "Swap at 5-hour usage (%)", snap.settings.swap_threshold_5h, "Swap before a 5-hour limit is reached.", 1, 100),
+        field("swap_threshold_7d", "Swap at weekly usage (%)", snap.settings.swap_threshold_7d, "Also applies to weekly limits on a single model.", 1, 100),
+        field("swap_cooldown_s", "Minimum time between swaps (seconds)", snap.settings.swap_cooldown_s, "Applies to swaps at a limit and swaps back.", 0, 3600),
       ),
-    );
+    ),
+    h(
+      "section",
+      { class: "card" },
+      h("h2", null, "Which account comes next"),
+      h(
+        "div",
+        { class: "fields" },
+        box("prefer_no_weekly_limit", "prefer-no-weekly", "Use accounts without a weekly limit first, and swap back to one as soon as it's ready", "Accounts without a weekly limit are used first", "Accounts with and without a weekly limit are used alike"),
+        box("strict_order", "strict-order", "Pick the next account by my order alone", "The next account is picked by your order alone", "The next account is one whose 5-hour window is already running, when one is"),
+        box("use_expiring_weekly", "use-expiring", "Use weekly budget before it resets", "Weekly budget is used before it resets", "Weekly budget is no longer moved ahead"),
+        box("avoid_extra_usage", "avoid-extra-usage", "When every account is at a limit, wait instead of paying for extra usage", "Sessions will wait instead of using paid extra usage", "Accounts with extra usage keep working when every account is at a limit"),
+      ),
+    ),
+    h(
+      "section",
+      { class: "card" },
+      h("h2", null, "Usage checks and sign-ins"),
+      h(
+        "div",
+        { class: "fields" },
+        box("usage_checks", "usage-checks", "Check usage of accounts not in use", "Usage checks are on", "Usage checks are off"),
+        field("usage_check_interval_s", "Check every (seconds)", snap.settings.usage_check_interval_s, "Runs Claude Code's /usage, which doesn't count against limits. Minimum 300.", 300, 86400),
+        field("usage_check_max_age_s", "Check before swapping if usage is older than (seconds)", snap.settings.usage_check_max_age_s, "Set to 0 to always check first.", 0, 86400),
+        field("login_warning_days", "Warn before a sign-in ends (days)", snap.settings.login_warning_days, "Each sign-in lasts about a month. Set to 0 to turn the warning off.", 0, 30),
+      ),
+    ),
+    h("section", { class: "card" }, h("h2", null, "General"), h("label", { class: "check", for: "autostart" }, autostart, "Start cc-rotate when I sign in")),
+    h("section", { class: "card" }, h("h2", null, "Health"), checks),
+    h("section", { class: "card" }, h("h2", null, "About"), info),
+  );
+}
+
+// ---- rendering -------------------------------------------------------------------------
+
+/** A page's sections that stay in place while what's in them is drawn again. */
+const slot = () => h("div", { class: "slot" });
+const slots = { summary: slot(), plan: slot(), recent: slot(), live: slot(), activity: slot() };
+const loadingSettings = h("p", { class: "muted" }, "Loading…");
+
+/**
+ * Show `parts` as the page body, leaving it alone when it already shows them: a refresh then
+ * never detaches a field, which would take its focus.
+ */
+function mount(...parts: HTMLElement[]) {
+  const same = parts.length === body.children.length && parts.every((p, i) => body.children[i] === p);
+  if (!same) replace(body, parts);
+}
+
+function renderPage() {
+  const r = state.route;
+  body.dataset.page = r.page;
+  switch (r.page) {
+    case "overview":
+      renderOverview();
+      break;
+    case "account":
+      renderAccount(r.id);
+      break;
+    case "activity":
+      renderActivity();
+      break;
+    case "cost":
+      mount(costChart.el, costTable);
+      break;
+    case "settings":
+      if (!settingsPage && state.snap) settingsPage = buildSettings(state.snap);
+      mount(settingsPage ?? loadingSettings);
+      break;
   }
-  replace(activity, rows);
+}
+
+// The plan's labels depend on how wide its bars are drawn.
+let bodyWidth = 0;
+new ResizeObserver(() => {
+  if (body.clientWidth === bodyWidth) return;
+  bodyWidth = body.clientWidth;
+  if (state.route.page === "overview") fitLabels(slots.plan);
+}).observe(body);
+
+function render() {
+  if (state.dragging) return;
+  renderNav();
+  renderHead();
+  renderBanner();
+  renderPage();
 }
 
 // ---- dialogs ---------------------------------------------------------------------------
 
-function dialog(title: string, ...body: HTMLElement[]): HTMLDialogElement {
-  const d = h("dialog", { class: "modal", "aria-label": title }, h("h2", null, title), ...body);
+function dialog(title: string, ...children: HTMLElement[]): HTMLDialogElement {
+  const d = h("dialog", { class: "modal", "aria-label": title }, h("h2", null, title), ...children);
   d.addEventListener("close", () => d.remove());
   document.body.append(d);
   d.showModal();
@@ -1366,10 +1322,7 @@ function openLogin(account: AccountView | null) {
         break;
       case "browser": {
         setSteps(1);
-        status.replaceChildren(
-          "Finish in your browser. ",
-          h("button", { class: "link", onclick: () => p.url && api.openUrl(p.url) }, "Open the page again"),
-        );
+        status.replaceChildren("Finish in your browser. ", h("button", { class: "link", onclick: () => p.url && api.openUrl(p.url) }, "Open the page again"));
         const code = h("input", { type: "text", placeholder: "Code", autocomplete: "off" });
         replace(
           codeRow,
@@ -1433,373 +1386,42 @@ function openLogin(account: AccountView | null) {
   });
 }
 
-function openManage(a: AccountView) {
-  const label = h("input", { type: "text", value: a.label, maxlength: 40 });
-  const error = h("p", { class: "login-status error", hidden: true });
-  const save = h("button", { class: "btn primary" }, "Save");
-  const remove = h("button", { class: "btn danger-outline", disabled: a.state === "active", title: a.state === "active" ? "Swap to another account first" : null }, "Remove account");
-  const close = h("button", { class: "btn quiet" }, "Cancel");
-  const run = (work: () => Promise<unknown>, message: string) => () => {
-    d.close();
-    act(work, () => message);
-  };
-  const accounts = state.snap?.accounts ?? [];
-  const at = accounts.findIndex((x) => x.id === a.id);
-  const quick = h(
-    "div",
-    { class: "quick" },
-    a.state === "parked" && h("button", { class: "btn small", onclick: run(() => api.swapNow(a.id), `Swapped to ${a.label}`) }, "Use now"),
-    a.state === "parked" && h("button", { class: "btn small", onclick: run(() => api.setPaused(a.id, true), `Paused ${a.label}`) }, "Pause"),
-    a.state === "paused" && h("button", { class: "btn small", onclick: run(() => api.setPaused(a.id, false), `Resumed ${a.label}`) }, "Resume"),
-    (a.state === "parked" || a.state === "paused") &&
-      h("button", { class: "btn small", onclick: () => (d.close(), act(() => api.checkUsage(a.id), (r) => checkMessage(a.label, r))) }, "Check usage"),
-    h("button", { class: "btn small", onclick: () => (d.close(), openLogin(a)) }, "Sign in again"),
-  );
-  const order = h(
-    "div",
-    { class: "order-row" },
-    h("span", null, `${ordinal(at + 1)} of ${accounts.length} in your order`),
-    h(
-      "div",
-      { class: "order-buttons" },
-      h("button", { class: "btn small", disabled: at <= 0, onclick: () => (d.close(), moveBy(a, -1)) }, "Move up"),
-      h("button", { class: "btn small", disabled: at >= accounts.length - 1, onclick: () => (d.close(), moveBy(a, 1)) }, "Move down"),
-    ),
-  );
-  const weekly = h(
-    "select",
-    {
-      onchange: (e: Event) => {
-        const value = (e.target as HTMLSelectElement).value as WeeklyLimitSetting;
-        api
-          .setWeeklyLimit(a.id, value)
-          .then(() => (say("Weekly limit saved"), refresh()))
-          .catch((err) => say(String(err), "error"));
-      },
-    },
-    (
-      [
-        ["auto", `Detect from usage (${WEEKLY_TEXT[a.weekly.detected]})`],
-        ["yes", "Has a weekly limit"],
-        ["no", "No weekly limit"],
-      ] as const
-    ).map(([value, text]) => h("option", { value, selected: a.weekly.setting === value }, text)),
-  );
-  const weeklyThreshold = state.snap?.settings.swap_threshold_7d ?? 98;
-  const cap = h("input", {
-    type: "number",
-    min: 1,
-    max: 100,
-    step: "any",
-    value: a.weekly_cap === null ? "" : String(a.weekly_cap),
-    placeholder: String(weeklyThreshold),
-  });
-  // Filled in once the history is read, which takes a moment.
-  const history = h("dd", { class: "recent-weeks" }, h("span", { class: "muted" }, "Loading…"));
-  const value = h("dd", { title: "What this use would have cost at API prices, as Claude Code estimates it" }, h("span", { class: "muted" }, "Loading…"));
-  api
-    .usageHistory(a.id)
-    .then((hist) => {
-      replace(history, recentWeeks(hist));
-      replace(value, valueText(hist));
-    })
-    .catch(() => {
-      replace(history, h("span", { class: "muted" }, "couldn't be read"));
-      replace(value, h("span", { class: "muted" }, "couldn't be read"));
-    });
-  const useExpiring = h("input", { type: "checkbox", checked: a.use_expiring });
-  const keepRunning = h("input", { type: "checkbox", checked: a.keep_running });
-  const warmStopped = state.snap?.warm_ups_blocked ?? null;
-  const warmPaused = state.snap?.warm_ups_paused ?? null;
-  const restart = h("button", { class: "link" }, "Start again");
-  restart.addEventListener("click", () =>
-    api
-      .setKeepRunning(a.id, true)
-      .then(() => (say("Keeping 5-hour windows running again"), d.close(), refresh()))
-      .catch((e) => say(String(e), "error")),
-  );
-  const details = h(
-    "dl",
-    { class: "facts info" },
-    h("dt", null, "Email"),
-    h("dd", null, a.email ?? "unknown"),
-    a.org_name && h("dt", null, "Organization"),
-    a.org_name && h("dd", null, a.org_name),
-    a.plan && h("dt", null, "Plan"),
-    a.plan && h("dd", null, a.plan),
-    h("dt", null, "Recent weeks"),
-    history,
-    h("dt", null, "API value"),
-    value,
-    a.extra_usage && h("dt", null, "Extra usage"),
-    a.extra_usage &&
-      h(
-        "dd",
-        { class: a.extra_usage.enabled ? "warn" : null, title: `As of ${new Date(a.extra_usage.read_at).toLocaleString()}` },
-        extraText(a.extra_usage),
-      ),
-    h("dt", null, "Pick order"),
-    h("dd", null, a.rank ? `${ordinal(a.rank)} - ${a.reason}` : `not available${a.reason ? ` - ${a.reason}` : ""}`),
-    h("dt", null, "Login updated"),
-    h("dd", null, a.login_updated_at ? ago(a.login_updated_at) : "never"),
-    a.refresh_expires_at && a.state !== "needs_login" && h("dt", null, "Sign-in ends"),
-    a.refresh_expires_at &&
-      a.state !== "needs_login" &&
-      h(
-        "dd",
-        { class: a.sign_in_ends_soon ? "warn" : null, title: new Date(a.refresh_expires_at).toLocaleString() },
-        a.refresh_expires_at > Date.now() ? `in ${until(a.refresh_expires_at / 1000)}` : "ended",
-      ),
-    h("dt", null, "Usage check"),
-    h("dd", null, checkText(a)),
-    a.keep_running && h("dt", null, "Keeping it running"),
-    a.keep_running && h("dd", null, warmText(a)),
-  );
-  const d = dialog(
-    a.label,
-    details,
-    quick,
-    order,
-    h(
-      "div",
-      { class: "fields" },
-      h("label", null, h("span", null, "Weekly limit"), weekly, h("small", { class: "muted" }, "Detected from the usage Claude Code reports.")),
-      a.weekly.effective !== "none" &&
-        h(
-          "label",
-          null,
-          h("span", null, "Stop using it at weekly usage (%)"),
-          cap,
-          h("small", { class: "muted" }, `Keeps the rest of its week for you. Empty uses ${weeklyThreshold}% from Settings.`),
-        ),
-      a.weekly.effective !== "none" &&
-        h("label", { class: "check" }, useExpiring, "Use its weekly budget before it resets"),
-      h(
-        "div",
-        { class: "check-field" },
-        h("label", { class: "check" }, keepRunning, "Keep its 5-hour window running"),
-        h(
-          "small",
-          { class: "muted" },
-          "While it's not in use, starts its next window with a short Haiku request as soon as one ends, so a window is already counting down when it's needed.",
-        ),
-        a.keep_running && warmStopped && h("small", { class: "warn" }, `Stopped because ${warmStopped}. `, restart),
-        a.keep_running && !warmStopped && warmPaused && h("small", { class: "warn" }, `Not running now: ${warmPaused}.`),
-      ),
-      h("label", null, h("span", null, "Label"), label),
-    ),
-    error,
-    h("div", { class: "dialog-actions spread" }, remove, h("div", null, close, save)),
-  );
-  close.addEventListener("click", () => d.close());
-  save.addEventListener("click", async () => {
-    try {
-      // Only a change is checked and saved: a cap set from the CLI can be any number from 1 to 100.
-      const capValue = cap.value.trim() === "" ? null : Number(cap.value);
-      if (cap.validity.badInput || (capValue !== null && !(Number.isFinite(capValue) && capValue >= 1 && capValue <= 100))) {
-        throw new Error("Use a number from 1 to 100, or leave it empty.");
-      }
-      // Each saved change becomes the new baseline, so a retry after a failed rename does not
-      // save (and log) the others again.
-      if (capValue !== a.weekly_cap) {
-        await api.setWeeklyCap(a.id, capValue);
-        a.weekly_cap = capValue;
-      }
-      if (useExpiring.checked !== a.use_expiring) {
-        await api.setUseExpiring(a.id, useExpiring.checked);
-        a.use_expiring = useExpiring.checked;
-      }
-      if (keepRunning.checked !== a.keep_running) {
-        await api.setKeepRunning(a.id, keepRunning.checked);
-        a.keep_running = keepRunning.checked;
-      }
-      if (label.value.trim() !== a.label) await api.renameAccount(a.id, label.value.trim());
-      d.close();
-      await refresh();
-    } catch (e) {
-      error.hidden = false;
-      error.textContent = String(e);
-    }
-  });
-  let armed = false;
-  remove.addEventListener("click", async () => {
-    if (!armed) {
-      armed = true;
-      remove.textContent = `Yes, remove ${a.label}`;
-      return;
-    }
-    try {
-      await api.removeAccount(a.id);
-      d.close();
-      say(`Removed ${a.label}`);
-      await refresh();
-    } catch (e) {
-      error.hidden = false;
-      error.textContent = String(e);
-    }
-  });
-}
-
-async function openSettings() {
-  const checks = h("ul", { class: "checks" }, h("li", { class: "muted" }, "Running checks…"));
-  const info = h("dl", { class: "facts info" });
-  const settingsForm = h("div", { class: "fields" });
-  const autostart = h("input", { type: "checkbox", id: "autostart" });
-  const d = dialog(
-    "Settings",
-    h("h3", null, "Health"),
-    checks,
-    h("h3", null, "Rotation"),
-    settingsForm,
-    h("h3", null, "General"),
-    h("label", { class: "check", for: "autostart" }, autostart, "Start cc-rotate when I sign in"),
-    h("h3", null, "About"),
-    info,
-    h("div", { class: "dialog-actions" }, h("button", { class: "btn", onclick: () => d.close() }, "Done")),
-  );
-  d.classList.add("drawer");
-
-  const snap = state.snap;
-  if (snap) {
-    const field = (key: string, text: string, value: number, hint: string, min: number, max: number) => {
-      const input = h("input", { type: "number", value: String(value), min, max, step: 1 });
-      input.addEventListener("change", () =>
-        api.setSetting(key, input.value).then(() => (say("Saved"), refresh())).catch((e) => say(String(e), "error")),
-      );
-      return h("label", null, h("span", null, text), input, h("small", { class: "muted" }, hint));
-    };
-    const checks = h("input", { type: "checkbox", id: "usage-checks", checked: snap.settings.usage_checks });
-    checks.addEventListener("change", () =>
-      api
-        .setSetting("usage_checks", String(checks.checked))
-        .then(() => (say(checks.checked ? "Usage checks are on" : "Usage checks are off"), refresh()))
-        .catch((e) => say(String(e), "error")),
-    );
-    const prefer = h("input", { type: "checkbox", id: "prefer-no-weekly", checked: snap.settings.prefer_no_weekly_limit });
-    const expiringBox = h("input", { type: "checkbox", id: "use-expiring", checked: snap.settings.use_expiring_weekly });
-    const strictBox = h("input", { type: "checkbox", id: "strict-order", checked: snap.settings.strict_order });
-    strictBox.addEventListener("change", () =>
-      api
-        .setSetting("strict_order", String(strictBox.checked))
-        .then(() =>
-          (say(strictBox.checked ? "The next account is picked by your order alone" : "The next account is one whose 5-hour window is already running, when one is"), refresh()),
-        )
-        .catch((e) => say(String(e), "error")),
-    );
-    const avoidPaid = h("input", { type: "checkbox", id: "avoid-extra-usage", checked: snap.settings.avoid_extra_usage });
-    avoidPaid.addEventListener("change", () =>
-      api
-        .setSetting("avoid_extra_usage", String(avoidPaid.checked))
-        .then(() =>
-          (say(avoidPaid.checked ? "Sessions will wait instead of using paid extra usage" : "Accounts with extra usage keep working when every account is at a limit"), refresh()),
-        )
-        .catch((e) => say(String(e), "error")),
-    );
-    expiringBox.addEventListener("change", () =>
-      api
-        .setSetting("use_expiring_weekly", String(expiringBox.checked))
-        .then(() => (say(expiringBox.checked ? "Weekly budget is used before it resets" : "Weekly budget is no longer moved ahead"), refresh()))
-        .catch((e) => say(String(e), "error")),
-    );
-    prefer.addEventListener("change", () =>
-      api
-        .setSetting("prefer_no_weekly_limit", String(prefer.checked))
-        .then(() => (say(prefer.checked ? "Accounts without a weekly limit are used first" : "Accounts with and without a weekly limit are used alike"), refresh()))
-        .catch((e) => say(String(e), "error")),
-    );
-    replace(
-      settingsForm,
-      field("swap_threshold_5h", "Swap at 5-hour usage (%)", snap.settings.swap_threshold_5h, "Swap before a 5-hour limit is reached.", 1, 100),
-      field("swap_threshold_7d", "Swap at weekly usage (%)", snap.settings.swap_threshold_7d, "Also applies to weekly limits on a single model.", 1, 100),
-      field("swap_cooldown_s", "Minimum time between swaps (seconds)", snap.settings.swap_cooldown_s, "Applies to swaps at a limit and swaps back.", 0, 3600),
-      h(
-        "label",
-        { class: "check", for: "prefer-no-weekly" },
-        prefer,
-        "Use accounts without a weekly limit first, and swap back to one as soon as it's ready",
-      ),
-      h("label", { class: "check", for: "strict-order" }, strictBox, "Pick the next account by my order alone"),
-      h("label", { class: "check", for: "use-expiring" }, expiringBox, "Use weekly budget before it resets"),
-      h(
-        "label",
-        { class: "check", for: "avoid-extra-usage" },
-        avoidPaid,
-        "When every account is at a limit, wait instead of paying for extra usage",
-      ),
-      h("label", { class: "check", for: "usage-checks" }, checks, "Check usage of accounts not in use"),
-      field(
-        "usage_check_interval_s",
-        "Check every (seconds)",
-        snap.settings.usage_check_interval_s,
-        "Runs Claude Code's /usage, which doesn't count against limits. Minimum 300.",
-        300,
-        86400,
-      ),
-      field(
-        "usage_check_max_age_s",
-        "Check before swapping if usage is older than (seconds)",
-        snap.settings.usage_check_max_age_s,
-        "Set to 0 to always check first.",
-        0,
-        86400,
-      ),
-      field(
-        "login_warning_days",
-        "Warn before a sign-in ends (days)",
-        snap.settings.login_warning_days,
-        "Each sign-in lasts about a month. Set to 0 to turn the warning off.",
-        0,
-        30,
-      ),
-    );
-  }
-  api.autostartEnabled().then((on) => (autostart.checked = on)).catch(() => (autostart.disabled = true));
-  autostart.addEventListener("change", () =>
-    api.setAutostart(autostart.checked).then(() => say(autostart.checked ? "cc-rotate will start when you sign in" : "cc-rotate won't start when you sign in")).catch((e) => say(String(e), "error")),
-  );
-
-  const [results, about] = await Promise.all([api.doctor().catch(() => []), api.appInfo().catch(() => null)]);
-  replace(
-    checks,
-    results.map((c) => h("li", { class: c.status }, h("strong", null, c.name), h("span", null, c.detail))),
-  );
-  if (about) {
-    replace(
-      info,
-      h("dt", null, "cc-rotate"),
-      h("dd", null, about.version),
-      h("dt", null, "Claude Code"),
-      h("dd", null, about.claude_version ?? "not found"),
-      h("dt", null, "Profile folder"),
-      h("dd", { class: "path" }, about.profile_dir),
-      h("dt", null, "Data folder"),
-      h("dd", { class: "path" }, about.data_dir),
-    );
-  }
-}
-
 // ---- data flow -------------------------------------------------------------------------
 
 let refreshing: Promise<void> | null = null;
-async function refresh() {
-  if (refreshing) return refreshing;
+/** A refresh was asked for while one was reading: it may have missed the change. */
+let refreshAgain = false;
+async function refresh(): Promise<void> {
+  if (refreshing) {
+    refreshAgain = true;
+    return refreshing;
+  }
   refreshing = (async () => {
     try {
+      const version = orderVersion;
       const [snap, events] = await Promise.all([api.snapshot(), api.events(300)]);
-      // An order the user just changed is still being saved; this read may predate it.
-      if (pendingOrderSaves > 0) return;
+      // An order the user just changed is still being saved, or was saved after this read began.
+      if (pendingOrderSaves > 0 || version !== orderVersion) return;
       state.snap = snap;
       state.events = events;
       colorOf = colorFor(snap.accounts);
-      renderTop();
-      renderOverview();
-      renderAccounts();
-      renderActivity();
-      await renderChart();
+      // An account page whose account was removed elsewhere goes back to the overview.
+      if (state.route.page === "account" && !snap.accounts.some((a) => state.route.page === "account" && a.id === state.route.id)) state.route = { page: "overview" };
+      render();
+      if (state.route.page === "overview") await overviewChart.render();
+      if (state.route.page === "cost") {
+        loadCostTable();
+        await costChart.render();
+      }
     } catch (e) {
       say(`Couldn't load cc-rotate's data: ${e}`, "error");
     } finally {
       refreshing = null;
+      // Also after a read dropped for being older than an order change.
+      if (refreshAgain) {
+        refreshAgain = false;
+        void refresh();
+      }
     }
   })();
   return refreshing;
@@ -1809,7 +1431,12 @@ onStoreChanged(() => refresh());
 onLoginProgress((p) => {
   if (currentLogin && p.id === currentLogin.id) currentLogin.update(p);
 });
-window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => showChart());
-// Countdowns and effective usage move with the clock even when nothing is written.
+window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+  render();
+  overviewChart.refresh();
+  costChart.refresh();
+});
+// Countdowns, effective usage and the plan move with the clock even when nothing is written.
 window.setInterval(() => refresh(), 30_000);
+render();
 refresh();

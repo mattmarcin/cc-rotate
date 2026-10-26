@@ -8,7 +8,7 @@ Because every session lives in one profile, sessions can see and message each ot
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/screenshot-dark.png">
-  <img alt="The cc-rotate dashboard" src="docs/screenshot.png">
+  <img alt="The cc-rotate app: a sidebar of accounts beside the plan for the next 12 hours, one row per account showing when it is in use, when it takes over and when it is back from a limit" src="docs/screenshot.png">
 </picture>
 
 > **Unofficial.** cc-rotate is a community project and is not affiliated with or endorsed by Anthropic.
@@ -138,13 +138,15 @@ Start it in a project folder, not your home folder.
 Claude Code does not run status lines in the home folder (trust there lasts for one run and is never saved), so cc-rotate cannot see usage or swap accounts for a session started there.
 The `cc-rotate` command warns you, and `cc-rotate-ctl doctor` lists any such session.
 
-The desktop app shows every account with its plan, how much of each limit is used, when each resets, which account is used next and why, usage over the last day or week with swaps marked, and an activity log.
+The desktop app opens on the plan for the next 12 hours: one row per account, showing which account is in use, when each one takes over at your current pace, and how long the ones at a limit wait for it to reset.
+A sidebar lists your accounts in your order, and each one opens a page with how much of each limit it has used, when each resets, why it is where it is in the pick order, and its own settings.
+Below the plan are charts of usage over the last day or week with swaps marked, and of API cost, then the latest activity.
 It lives in the tray, starts when you sign in to your computer (you can turn that off in **Settings**), and sends a notification when an account is signed out, when no account is left to swap to, and when an account is ready again after that.
 
 ### Which account is used next
 
 Every account has a place in your order.
-Drag the handles in the app's **Accounts** table to change it, or use the arrow keys on a focused handle, or `cc-rotate-ctl order` and `cc-rotate-ctl move`.
+Drag an account by its handle in the app's sidebar or plan to change it, use the arrow keys on a focused handle, use **Move up** and **Move down** on the account's page, or run `cc-rotate-ctl order` and `cc-rotate-ctl move`.
 New accounts go to the end.
 After an upgrade from an older cc-rotate, accounts that had the same priority share a place until you reorder them.
 
@@ -164,7 +166,7 @@ How much you can use over a day stays the same, and there are fewer swaps.
 
 cc-rotate finds out whether an account has a weekly limit from the usage Claude Code reports: an account that reported a weekly limit has one, and an account that went through two separate 5-hour windows in the last 8 days without ever reporting one has none.
 Until then it is not known yet.
-If that guess is wrong, set it yourself in the account's **More** dialog or with `cc-rotate-ctl weekly-limit <label> yes|no` (`auto` goes back to detecting it).
+If that guess is wrong, set it yourself on the account's page in the app or with `cc-rotate-ctl weekly-limit <label> yes|no` (`auto` goes back to detecting it).
 
 The account in use is kept until it reaches a limit, with one exception.
 While the account in use has a weekly limit, or it is not known yet whether it has one, cc-rotate swaps back to an account without a weekly limit as soon as one is ready again.
@@ -184,7 +186,7 @@ cc-rotate knows how much of each limit an account has used from four places: the
 Usage checks read the accounts that are not in use:
 - While the app runs, it checks one account a minute that has not been read for `usage_check_interval_s` (an hour by default), in the order the accounts would be used.
 - Before a swap uses an account whose usage data is older than `usage_check_max_age_s` (15 minutes), the swap checks it first and picks again if it turns out to be used up, up to three accounts per swap.
-- `cc-rotate-ctl check` checks every account that is not in use now, and the app's **More** dialog has **Check usage** for one.
+- `cc-rotate-ctl check` checks every account that is not in use now, and an account's page in the app has **Check usage** for that account.
 - Anthropic only answers a few usage requests per login in a while, and asks to wait, sometimes up to an hour, when there were too many. cc-rotate does not check that account again before then.
 - If Claude Code renews the account's login during a check, cc-rotate stores the renewed login, as it does for the account in use.
 - Paused accounts are only checked when you ask, and `cc-rotate-ctl config usage_checks false` turns the automatic checks off.
@@ -211,9 +213,9 @@ The accounts are taken in the order their weeks reset, since only one is in use 
 It learns from your usage how much of the weekly budget a 5-hour window costs on each account, how fast you use an account, and when you usually work.
 Until it has seen enough, it assumes a full 5-hour window costs a tenth of the week and that you work 10 hours a day, which errs on the side of starting early.
 Turn it off with `cc-rotate-ctl config use_expiring_weekly false`, or in **Settings**.
-To leave out one account, untick **Use its weekly budget before it resets** in its **More** dialog, or run `cc-rotate-ctl use-before-reset <label> no`: it's then used like any other account.
+To leave out one account, untick **Use its weekly budget before it resets** on its page in the app, or run `cc-rotate-ctl use-before-reset <label> no`: it's then used like any other account.
 
-To keep part of an account's week for yourself, set where rotation stops using it, in its **More** dialog or with `cc-rotate-ctl weekly-cap <label> 70` (`off` goes back to the setting).
+To keep part of an account's week for yourself, set where rotation stops using it, on its page in the app or with `cc-rotate-ctl weekly-cap <label> 70` (`off` goes back to the setting).
 cc-rotate then treats 70% as that account's weekly limit, and only plans to use its budget up to there.
 
 ### Keeping 5-hour windows running
@@ -229,15 +231,18 @@ Each request costs about a tenth of a cent at API prices (a few thousand cached 
 This is the one case where cc-rotate has Claude Code send a prompt you didn't type, so it's off until you turn it on.
 Check that requests like this are fine under your plan's terms before you do.
 
-- Turn it on for an account with **Keep its 5-hour window running** in its **More** dialog, or with `cc-rotate-ctl keep-running <label> yes`.
+- Turn it on for an account with **Keep its 5-hour window running** on its page in the app, or with `cc-rotate-ctl keep-running <label> yes`.
 - `cc-rotate-ctl warm-up <label>` starts an account's window once, now.
 - The desktop app sends the requests, so it has to be running, with usage checks on.
 - It skips an account that is in use, paused, on hold, or at a weekly limit.
-- If a request ever uses another model, takes more than one turn or costs more than 2 cents, cc-rotate stops sending them and says so in the activity log and in the account's **More** dialog, until you click **Start again** there (or run `cc-rotate-ctl keep-running <label> yes`).
+- If a request ever uses another model, takes more than one turn or costs more than 2 cents, cc-rotate stops sending them and says so in the activity log and on the account's page, until you click **Start again** there (or run `cc-rotate-ctl keep-running <label> yes`).
 
 ### How long your accounts last
 
-While you work, the dashboard shows how long your accounts last at your current pace ("all at a limit by 3:10 PM, one frees up at 4:30 PM"), and `cc-rotate-ctl status` shows the same.
+While you work, the app's overview plays your accounts forward at your current pace and draws the result as its plan.
+Its headline says whether they last: "Covered for the next 24 hours", or "Runs out around 3:10 PM" with when the first one frees up again.
+The plan carries on past that point, the way sessions stopped at a limit pick up again when an account frees up, and marks the stretch with no account left.
+`cc-rotate-ctl status` shows the same in a line.
 The app sends a notification once when they would all be at a limit within the hour.
 
 ### Which accounts earn their keep
@@ -255,8 +260,9 @@ It only reports what cc-rotate recorded, and usage history is kept for `sample_r
 Removing an account also removes the API value recorded for it.
 A week with no readings shows no numbers.
 A week with few readings is marked, since the account may have used more than cc-rotate saw.
-The app shows the same numbers for the last 4 weeks as **Recent weeks** and **API value** in the account's **More** dialog.
-Its **API cost** chart, a tab next to **Usage limits** at the bottom of the dashboard, shows the API value of the last 24 hours by hour or of the last 7 days by day, stacked per account, with the total for the period.
+The app shows the same numbers for the last 4 weeks as **Recent weeks** and **API value** on each account's page.
+Its **API cost** chart, a tab next to **Usage limits** below the plan, shows the API value of the last 24 hours by hour or of the last 7 days by day, stacked per account, with the total for the period.
+The **API cost** page in the sidebar has the same chart and each account's total over the last 24 hours, 7 days and 30 days.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/charts-dark.png">
@@ -267,7 +273,7 @@ Its **API cost** chart, a tab next to **Usage limits** at the bottom of the dash
 
 An account with extra usage turned on on claude.ai keeps working past its plan's limits, and bills the card on file.
 cc-rotate swaps before a limit, so that only happens once every account is at a limit.
-Each account's **More** dialog shows whether extra usage is on and how much it spent this month, from the account's latest usage report, and `cc-rotate-ctl status` lists the accounts that have it on.
+Each account's page in the app shows whether extra usage is on and how much it spent this month, from the account's latest usage report, and `cc-rotate-ctl status` lists the accounts that have it on.
 
 - When sessions start running on paid extra usage, the app sends a notification ("Sessions are using paid extra usage").
 - To have them wait for the next reset instead, turn on **When every account is at a limit, wait instead of paying for extra usage** in **Settings** (`avoid_extra_usage`).

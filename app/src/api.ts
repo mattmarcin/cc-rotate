@@ -203,6 +203,28 @@ export interface Settings {
   usage_check_max_age_s: number;
 }
 
+/** One stretch of the forecast's plan: an account in use from `from` to `to` (epoch seconds). */
+export interface Turn {
+  account_id: number;
+  from: number;
+  to: number;
+  /** The turn ends at a limit, rather than giving way to an account without a weekly limit or the horizon. */
+  at_limit: boolean;
+  /** After a turn at a limit, when the account is usable again (epoch seconds), if known. */
+  rests_until: number | null;
+}
+
+/** The pool played forward at the current pace (ccr-core's `forecast`). Times are epoch seconds. */
+export interface Forecast {
+  pace: number;
+  /** When every account would be at a limit, within the next 24 hours. */
+  runs_out_at: number | null;
+  /** When the first account frees up again after that. */
+  free_again_at: number | null;
+  /** Which account is in use when, oldest first. Gaps are times no account is left. */
+  plan: Turn[];
+}
+
 export interface Snapshot {
   now_ms: number;
   active_id: number | null;
@@ -233,7 +255,7 @@ export interface Snapshot {
   data_dir: string;
   last_event_id: number;
   /** How long the pool lasts at the account in use's current pace, while it is being used. */
-  forecast: { pace: number; runs_out_at: number | null; free_again_at: number | null } | null;
+  forecast: Forecast | null;
   /** Why warm-ups stopped until the user starts them again. */
   warm_ups_blocked: string | null;
   /** Why warm-ups don't run now (stopped, or usage checks off or stopped). */
