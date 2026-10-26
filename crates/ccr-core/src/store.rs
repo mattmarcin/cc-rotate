@@ -544,9 +544,11 @@ const WAITING_RETENTION_MS: i64 = 7 * 86_400_000;
 /// started another can be and still be the same process (`Store::session_process`). A
 /// reckoning is the start plus however long the status line took to start, which a busy machine
 /// can stretch to several seconds: never earlier than the start, and the earliest one is the
-/// nearest to it.
+/// nearest to it. The first one may be the slow one, so later ones can be earlier by as much; a
+/// resumed process restores the run time it had, so it never reckons earlier than the one it
+/// was resumed from.
 const PROCESS_START_LATER_MS: i64 = 20_000;
-const PROCESS_START_EARLIER_MS: i64 = 2_000;
+const PROCESS_START_EARLIER_MS: i64 = 20_000;
 /// How often an unchanged session row has its `seen_ms` refreshed, which only keeps it from
 /// being pruned: so most ticks only read.
 const SESSION_SEEN_REFRESH_MS: i64 = 10 * 60_000;
@@ -1694,9 +1696,13 @@ impl Store {
             }
             None => {
                 let key = started_ms.to_string();
+                // A key is a first reckoning, so one already taken is the same process.
                 s.conn.execute(
-                    "INSERT OR REPLACE INTO session_processes (session_id, key, started_ms, seen_ms)
-                     VALUES (?1, ?2, ?3, ?4)",
+                    "INSERT INTO session_processes (session_id, key, started_ms, seen_ms)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT (session_id, key) DO UPDATE SET
+                        started_ms = min(started_ms, excluded.started_ms),
+                        seen_ms = excluded.seen_ms",
                     params![session_id, key, started_ms, now_ms],
                 )?;
                 Ok(key)
@@ -2204,6 +2210,9 @@ mod tests {
         assert_eq!(store.session_process("s", 28_000, 90_000).unwrap(), first);
         // Started 30 s later: another process (resumed, restoring the run time it had).
         assert_eq!(store.session_process("s", 40_000, 95_000).unwrap(), "40000");
+        // A first reckoning that came late, then the true one: the same process.
+        let slow = store.session_process("u", 106_000, 110_000).unwrap();
+        assert_eq!(store.session_process("u", 100_000, 140_000).unwrap(), slow);
         // Another process of the session, resumed later, and another session.
         assert_eq!(
             store.session_process("s", 400_000, 410_000).unwrap(),

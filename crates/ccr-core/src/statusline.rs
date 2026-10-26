@@ -708,7 +708,9 @@ fn sync_profile_login(
             *unidentified = true;
             if store.meta(swap::META_LOGIN_TO_IDENTIFY)?.as_deref() != Some(marker.as_str()) {
                 store.set_meta(swap::META_LOGIN_TO_IDENTIFY, &marker)?;
-                store.set_meta(swap::META_LOGIN_CHANGED_AT, crate::time::now_ms())?;
+                if store.meta(swap::META_LOGIN_CHANGED_AT)?.is_none() {
+                    store.set_meta(swap::META_LOGIN_CHANGED_AT, crate::time::now_ms())?;
+                }
             }
             return Ok(true);
         }

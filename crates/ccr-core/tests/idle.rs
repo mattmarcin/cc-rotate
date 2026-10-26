@@ -167,6 +167,62 @@ fn a_slow_status_line_start_keeps_the_process() {
     assert!(close(cost(&e, e.a), 0.9), "{}", cost(&e, e.a));
 }
 
+/// The first tick of a process came slow, the ones after it on time: still one process, counted
+/// once.
+#[test]
+fn a_slow_first_status_line_keeps_the_process() {
+    let e = env();
+    let now = time::now_ms();
+    let resets = now / 1000 + 3600;
+    let start = now - 600_000;
+    let mut total = 1.0;
+    for i in 0..10 {
+        let at = now + i * 30_000;
+        let late = if i == 0 { 6_000 } else { 0 };
+        statusline::tick(
+            &e.store,
+            &e.paths,
+            &input("s", total, at - start - late, 10.0, resets),
+            at,
+        )
+        .unwrap();
+        total += 0.1;
+    }
+    assert!(close(cost(&e, e.a), 0.9), "{}", cost(&e, e.a));
+}
+
+/// A `/login` noticed long after `.claude.json` was written (a swap ran in between): the account
+/// in use is never recorded as active from before the account before it.
+#[test]
+fn the_time_an_account_became_active_never_moves_back() {
+    let e = env();
+    let config = e.paths.profile_config();
+    std::fs::write(
+        &config,
+        json!({"oauthAccount": {"accountUuid": "ub"}}).to_string(),
+    )
+    .unwrap();
+    statusline::tick(&e.store, &e.paths, &StatusInput::default(), time::now_ms()).unwrap();
+    swap::run(&e.store, &e.paths, &manual(e.b)).unwrap();
+    let swapped = swap::active_since(&e.store).unwrap();
+    // Then `.claude.json` names a (a `/login`), its time an hour ago.
+    std::fs::write(
+        &config,
+        json!({"oauthAccount": {"accountUuid": "ua"}}).to_string(),
+    )
+    .unwrap();
+    let an_hour_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
+    std::fs::File::options()
+        .write(true)
+        .open(&config)
+        .unwrap()
+        .set_modified(an_hour_ago)
+        .unwrap();
+    statusline::tick(&e.store, &e.paths, &StatusInput::default(), time::now_ms()).unwrap();
+    assert_eq!(e.store.active_account().unwrap().unwrap().id, e.a);
+    assert!(swap::active_since(&e.store).unwrap() >= swapped);
+}
+
 /// A `/login` of another pool account noticed by the tick that first carries its numbers: they
 /// are that account's from then on.
 #[test]

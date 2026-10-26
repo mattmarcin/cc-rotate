@@ -187,7 +187,7 @@ pub fn finish_dead_swap(store: &Store, paths: &Paths, settler: Settler) -> Resul
                     // In use since the swap wrote its login, not since this settled it: sessions
                     // may have been working on it meanwhile (`statusline::idle_since_swap`).
                     let written = if pending.at > 0 { pending.at.min(now) } else { now };
-                    s.set_meta(META_ACTIVE_SINCE, written)?;
+                    set_active_since(s, written)?;
                     s.log_event(
                         kind::SWAP,
                         pending.from,
@@ -279,8 +279,9 @@ pub const META_LOGIN_UNIDENTIFIED: &str = "login_unidentified";
 /// Set by the write-back while a changed login waits to be identified (its change marker), so
 /// the app's frequent `statusline::needs_settling` reads the store, not the credentials.
 pub(crate) const META_LOGIN_TO_IDENTIFY: &str = "login_to_identify";
-/// When the write-back first saw the login waiting to be identified (epoch ms): if it turns out
-/// to be another pool account's, that account has been in use since then.
+/// When the write-back first saw a changed login waiting to be identified (epoch ms), kept while
+/// it waits (Claude Code may renew it meanwhile): if it turns out to be another pool account's,
+/// that account has been in use since then.
 pub(crate) const META_LOGIN_CHANGED_AT: &str = "login_changed_at";
 /// How long a changed login may stay unidentified (no swap runs meanwhile) before it is stored
 /// as the active account's without Claude Code's word, as before logins were identified.
@@ -407,7 +408,8 @@ pub fn identify_changed_login(store: &Store, paths: &Paths) -> Result<Settle> {
         if s.meta(META_CRED_SEEN)?.as_deref() == Some(changed.marker.as_str())
             || s.active_account()?.map(|a| a.id) != Some(active.id)
         {
-            return Ok(());
+            s.delete_meta(META_LOGIN_TO_IDENTIFY)?;
+            return s.delete_meta(META_LOGIN_CHANGED_AT);
         }
         match &verdict {
             Verdict::Own => {
@@ -468,6 +470,13 @@ fn unidentified_for_long(store: &Store, changed: &ChangedLogin) -> Result<bool> 
     Ok(true)
 }
 
+/// Record that the active account has been in use since `at` (epoch ms): never before it was
+/// last recorded, which was for the account before it.
+fn set_active_since(s: &Store, at: i64) -> Result<()> {
+    let at = at.max(s.meta_i64(META_ACTIVE_SINCE)?.unwrap_or(0));
+    s.set_meta(META_ACTIVE_SINCE, at)
+}
+
 /// Make `account` active because the profile holds its login (a `/login` in the profile), and
 /// store that login as its own. `changed_at` is when the profile's login changed (epoch ms), as
 /// near as is known: the account has been in use since. Call inside a transaction.
@@ -482,7 +491,7 @@ pub(crate) fn adopt_login(
         s.set_state(a.id, AccountState::Parked)?;
     }
     s.set_state(account.id, AccountState::Active)?;
-    s.set_meta(META_ACTIVE_SINCE, changed_at)?;
+    set_active_since(s, changed_at)?;
     if let Some(o) = oauth.filter(|o| !credfile::is_dead(o)) {
         s.save_credential(account.id, o, "sync")?;
     }
