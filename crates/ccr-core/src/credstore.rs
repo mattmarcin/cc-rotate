@@ -2,10 +2,11 @@
 //!
 //! The credentials are one JSON document: `claudeAiOauth` (the account login) next to other keys
 //! such as `mcpOAuth`. On Windows and Linux Claude Code keeps it in
-//! `<CLAUDE_CONFIG_DIR>/.credentials.json`. On macOS it keeps it in a login Keychain item and
-//! falls back to that file when the Keychain cannot be used (for example locked, over SSH):
-//! it reads the Keychain first and the file only when the Keychain has nothing. This module
-//! mirrors that, so cc-rotate always reads what Claude Code reads and writes where it reads.
+//! `<CLAUDE_CONFIG_DIR>/.credentials.json`. On macOS it keeps it in a login Keychain item: it
+//! reads the Keychain first and the file only when the Keychain has nothing or cannot be used
+//! (locked to the session, as over SSH), and it does not write the file while the Keychain is
+//! locked (`Credentials::complete`). This module mirrors that, so cc-rotate always reads what
+//! Claude Code reads and writes where it reads.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -96,7 +97,8 @@ impl Credentials {
 
     /// Replace `claudeAiOauth` where the document lives now, keeping every other key.
     /// A profile with no credentials anywhere gets the file, which Claude Code reads when the
-    /// Keychain has nothing (and moves into the Keychain itself on its next write).
+    /// Keychain has nothing (and moves into the Keychain itself on its next write). Callers check
+    /// `complete` first: in a session the Keychain is locked to, the document's place is unknown.
     pub fn write_oauth(&self, oauth: &Value) -> Result<()> {
         if !oauth.is_object() {
             bail!("refusing to write a non-object login block");
@@ -132,6 +134,19 @@ impl Credentials {
         match &self.keychain {
             Some(keychain) => keychain.usable(),
             None => Ok(true),
+        }
+    }
+
+    /// This session cannot use the macOS Keychain, asking `security` for at most `timeout`.
+    /// macOS gives the login Keychain only to programs started from the desktop session that
+    /// unlocked it: one started over SSH, or by a program that was (a herdr or tmux server
+    /// started from an SSH connection), gets "user interaction is not allowed". Claude Code there
+    /// cannot read a login in the Keychain, and cannot save a renewed one anywhere, so a login it
+    /// renews is lost with the refresh token it replaced. Always false off macOS.
+    pub fn keychain_locked(&self, timeout: Duration) -> Result<bool> {
+        match &self.keychain {
+            Some(keychain) => Ok(!keychain.usable_within(timeout)?),
+            None => Ok(false),
         }
     }
 
@@ -255,21 +270,18 @@ impl Keychain {
         Ok(())
     }
 
-    /// Whether the Keychain can be read now (an item or not); false while it is locked or there
-    /// is no GUI session. The same read as `read` (with `-w`, which needs the password itself):
-    /// a search of the item's attributes alone succeeds on a locked Keychain too.
+    /// Whether this session can use the Keychain now (an item or not); false while it is locked
+    /// to the session, as over SSH. Asks for the default keychain's settings, which answers 36
+    /// then whether or not the profile's item exists; reading a missing item answers 44 either
+    /// way, and a search of an item's attributes succeeds on a locked Keychain too.
     pub fn usable(&self) -> Result<bool> {
-        let (code, _) = self.security(
-            &[
-                "find-generic-password",
-                "-a",
-                &self.account,
-                "-w",
-                "-s",
-                &self.service,
-            ],
-            None,
-        )?;
+        self.usable_within(SECURITY_TIMEOUT)
+    }
+
+    /// `usable`, asking `security` for at most `timeout` (a locked Keychain in a desktop
+    /// session shows an unlock dialog and waits).
+    pub fn usable_within(&self, timeout: Duration) -> Result<bool> {
+        let (code, _) = run_with_timeout(&self.program, &["show-keychain-info"], None, timeout)?;
         Ok(code != INTERACTION_NOT_ALLOWED)
     }
 
@@ -357,11 +369,19 @@ fn decode_password(out: &str) -> String {
 impl Keychain {
     /// Run `security` with a time limit (a Keychain dialog would otherwise block forever).
     fn security(&self, args: &[&str], stdin: Option<&str>) -> Result<(i32, String)> {
-        run_with_timeout(&self.program, args, stdin)
+        run_with_timeout(&self.program, args, stdin, SECURITY_TIMEOUT)
     }
 }
 
-fn run_with_timeout(program: &Path, args: &[&str], stdin: Option<&str>) -> Result<(i32, String)> {
+/// How long a `security` call may take before it is given up.
+const SECURITY_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn run_with_timeout(
+    program: &Path,
+    args: &[&str],
+    stdin: Option<&str>,
+    timeout: Duration,
+) -> Result<(i32, String)> {
     let mut child = Command::new(program)
         .args(args)
         .stdin(if stdin.is_some() {
@@ -382,7 +402,7 @@ fn run_with_timeout(program: &Path, args: &[&str], stdin: Option<&str>) -> Resul
         let _ = stdout.read_to_string(&mut out);
         out
     });
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + timeout;
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
@@ -557,17 +577,22 @@ mod tests {
 items='{}'
 run() {{
   cmd="$1"; shift
-  service=""; hex=""
+  service=""; hex=""; password=0
   while [ $# -gt 0 ]; do
     case "$1" in
       -s) service="$2"; shift 2 ;;
       -X) hex="$2"; shift 2 ;;
       -a) shift 2 ;;
+      -w) password=1; shift ;;
       *) shift ;;
     esac
   done
   case "$cmd" in
-    find-generic-password) [ -f "$items/$service" ] || exit 44; cat "$items/$service"; echo ;;
+    find-generic-password)
+      [ -f "$items/$service" ] || exit 44
+      [ "$password" = 1 ] && [ -f "$items/../locked" ] && exit 36
+      [ "$password" = 1 ] && cat "$items/$service"; echo ;;
+    show-keychain-info) [ -f "$items/../locked" ] && exit 36; exit 0 ;;
     add-generic-password) printf '%s' "$hex" > "$items/$service" ;;
     delete-generic-password) [ -f "$items/$service" ] || exit 44; rm "$items/$service" ;;
     *) exit 1 ;;
@@ -638,6 +663,40 @@ run "$@"
         creds.delete_keychain_item().unwrap();
         assert_eq!(creds.location().unwrap(), None);
         creds.delete_keychain_item().unwrap();
+    }
+
+    /// A session the Keychain is locked to (started over SSH) cannot use it, with or without an
+    /// item, and reads no login from it.
+    #[cfg(unix)]
+    #[test]
+    fn a_locked_keychain_is_told_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let keychain = Keychain {
+            service: service_name(&dir.path().to_string_lossy(), false),
+            account: "jane".into(),
+            program: fake_security(dir.path()),
+        };
+        let creds = Credentials {
+            file: dir.path().join(".credentials.json"),
+            keychain: Some(keychain.clone()),
+        };
+        let lock = || std::fs::write(dir.path().join("locked"), "").unwrap();
+        let unlock = || std::fs::remove_file(dir.path().join("locked")).unwrap();
+
+        let locked = || creds.keychain_locked(Duration::from_secs(5)).unwrap();
+        lock();
+        assert!(locked(), "no item yet");
+        unlock();
+        assert!(!locked());
+        keychain
+            .write(r#"{"claudeAiOauth":{"refreshToken":"r1"}}"#)
+            .unwrap();
+        assert!(!locked());
+        lock();
+        assert!(locked());
+        // What Claude Code then sees: no login.
+        assert!(creds.read_oauth().unwrap().is_none());
+        assert!(!creds.complete().unwrap());
     }
 
     /// On a Mac, an item that does not exist reads as absent (CI runs this on macOS).

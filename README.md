@@ -51,8 +51,21 @@ The design, with the Claude Code behavior it relies on, is in [docs/specs/2026-1
 On macOS, Claude Code keeps its login in the Keychain rather than in a file, and cc-rotate swaps the Keychain item.
 Claude Code rereads that item at most every 30 seconds, so a swap reaches running sessions within about 30 seconds instead of on their next request.
 Start Claude Code with `cc-rotate` there: the Keychain item is named after the exact profile path, which `cc-rotate` sets for you.
-Over SSH, where the Keychain cannot be used, Claude Code keeps the login in the file instead, and cc-rotate follows it there.
 `cc-rotate-ctl doctor` shows where the login lives.
+
+### macOS over SSH
+
+macOS gives your login Keychain only to programs started from the Mac's desktop session.
+A Claude Code started over SSH, or by a program that was started over SSH (a herdr or tmux server, for example), cannot read it, so it starts signed out even though the login is there and works everywhere else.
+It cannot save a login either: one it signs in to or renews there is lost, and with it the account's sign-in, since a renewal replaces the old refresh token.
+So `cc-rotate` refuses to start in such a session and says why, swaps started there are skipped, and `cc-rotate-ctl doctor` run there reports it.
+
+To use cc-rotate on a Mac you reach over SSH:
+
+- Start the program that runs your sessions from the Mac's desktop session, and connect to it over SSH.
+  For herdr, see **herdr on macOS** below; for tmux, start the tmux server from a Terminal window on the Mac, or from a launch agent the same way.
+- Or unlock the Keychain for the SSH session (and everything started from it) with `security unlock-keychain`, which asks for your Mac password.
+  It stays unlocked until that session ends or the Keychain locks itself again.
 
 ## Requirements
 
@@ -370,6 +383,38 @@ When you quit Claude Code in a pane, herdr forgets the command, just as it forge
 - `cc-rotate-ctl doctor` shows whether herdr is detected and whether the hook is installed.
   If herdr refuses a report, the reason goes to the log (see **Troubleshooting**).
 
+### herdr on macOS
+
+When you reach a Mac's herdr from another computer through a tool that starts `herdr server` over SSH when none is running (Ovis's remote setup does, for example right after the Mac restarts), that server's sessions cannot use the login Keychain (see **macOS over SSH**), and Claude Code in them starts signed out.
+Start the server from your desktop session instead, with a launch agent; the remote side then finds it running and connects to it.
+A launch agent runs while you are logged in at the Mac, so turn on automatic login, or log in once after a restart, before connecting.
+The Ovis Mac app installs such an agent itself (`sh.ovis.herdr-server`); with it, you need nothing more.
+Otherwise, run this on the Mac (it works over SSH too, since `launchctl` starts the server in the desktop session), with your own paths:
+
+```sh
+cat > ~/Library/LaunchAgents/local.herdr-server.plist <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>local.herdr-server</string>
+  <key>ProgramArguments</key>
+  <array><string>/Users/you/.local/bin/herdr</string><string>server</string></array>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>/Users/you/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/Users/you/Library/Logs/herdr-server.log</string>
+  <key>StandardErrorPath</key><string>/Users/you/Library/Logs/herdr-server.log</string>
+</dict>
+</plist>
+EOF
+pkill -f 'herdr server'   # ends the herdr sessions of a server started over SSH
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.herdr-server.plist
+```
+
+To undo it: `launchctl bootout gui/$(id -u)/local.herdr-server`, then delete the file.
+
 ## What it does not cover
 
 - **The Claude desktop app.** Its Code tab passes its own login to Claude Code directly, so swapping the profile's login cannot reach it.
@@ -389,6 +434,7 @@ When you quit Claude Code in a pane, herdr forgets the command, just as it forge
 ## Troubleshooting
 
 - Run `cc-rotate-ctl doctor` first. Its **Usage checks** line says when an account's last check failed and why.
+- On a Mac, a session that starts signed out although your accounts are signed in is usually one started over SSH (see **macOS over SSH**).
 - Errors from the status line and hooks go to `logs/cc-rotate.log` in the data folder (see **Platforms**).
 - An account marked **Signed out** had its login rejected by Anthropic, or its sign-in ended. Choose **Sign in again** in the app, or run `cc-rotate-ctl login --relogin <label>`.
 - After "A session didn't continue", look at that session: if it still shows the usage limit, type `continue`. The notification names the Claude Code version when it isn't one cc-rotate was tested with.

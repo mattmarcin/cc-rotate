@@ -7,6 +7,7 @@
 
 use std::path::Path;
 use std::process::{Command, ExitCode};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use ccr_core::login;
@@ -25,12 +26,50 @@ fn run() -> Result<ExitCode> {
     let (store, paths) = ccr_core::open(None)?;
     let claude = login::claude_executable(&store)?;
     drop(store);
+    // Asked briefly: in a desktop session a locked Keychain shows a dialog, and Claude Code will
+    // ask again anyway.
+    let locked = || {
+        paths
+            .credentials()
+            .keychain_locked(Duration::from_secs(3))
+            .unwrap_or(false)
+    };
+    if needs_login() && locked() {
+        let herdr = ccr_core::herdr::pane_from_env().is_some();
+        anyhow::bail!(
+            "{}{}",
+            ccr_core::doctor::KEYCHAIN_LOCKED,
+            if herdr {
+                " This session runs in herdr: start `herdr server` from the desktop session, for example as a launch agent (see \"herdr on macOS\" in the README)."
+            } else {
+                ""
+            }
+        );
+    }
     warn_if_home();
 
     let mut cmd = Command::new(&claude);
     cmd.args(std::env::args_os().skip(1))
         .env("CLAUDE_CONFIG_DIR", &paths.profile_dir);
     run_claude(cmd, &claude)
+}
+
+/// Whether Claude Code needs the login for these arguments: everything but printing its version
+/// or help and the commands that manage Claude Code itself.
+fn needs_login() -> bool {
+    const WITHOUT_LOGIN: &[&str] = &[
+        "--version",
+        "-v",
+        "--help",
+        "-h",
+        "update",
+        "doctor",
+        "mcp",
+        "config",
+        "install",
+    ];
+    let first = std::env::args_os().nth(1);
+    !first.is_some_and(|a| WITHOUT_LOGIN.iter().any(|w| a == *w))
 }
 
 /// Claude Code does not run status lines in the home folder (trust there is per-run only), so
