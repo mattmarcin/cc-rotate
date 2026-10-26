@@ -176,7 +176,7 @@ fn find_program_in(
         fallback
             .iter()
             .filter(|d| d.is_absolute())
-            .find_map(|d| search(name, vec![d.clone()], cwd).filter(|p| owned_safely(d, p)))
+            .find_map(|d| search(name, vec![d.clone()], cwd).filter(|p| owned_safely(p)))
     })
 }
 
@@ -189,28 +189,64 @@ fn search(name: &str, dirs: Vec<PathBuf>, cwd: &Path) -> Option<PathBuf> {
     which::which_in(name, Some(std::env::join_paths(dirs).ok()?), cwd).ok()
 }
 
-/// Whether `program`, found in `dir`, is the user's to run: the user chose PATH's folders, but
-/// not the shared ones a fallback looks in, such as a Homebrew another user of the Mac installed.
-/// On Unix the program (through any link), its folder and `dir` must belong to root or the user
-/// and not be writable by everyone; on Windows the folders are in the user's own profile.
+/// Whether `program`, found in a fallback folder, is the user's to run: the user chose PATH's
+/// folders, but not the shared ones a fallback looks in, such as a Homebrew another user of the
+/// computer installed.
+///
+/// On Unix every step to it must be root's or the user's and changeable by no one else: each
+/// link followed, what it leads to, and every folder above each of them. On Windows the folders
+/// are in the user's own profile.
 #[cfg(unix)]
-fn owned_safely(dir: &Path, program: &Path) -> bool {
+fn owned_safely(program: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
+    /// Links followed before giving up, as the system does (`MAXSYMLINKS`).
+    const MAX_LINKS: usize = 40;
     // SAFETY: getuid has no preconditions and cannot fail.
     let me = unsafe { libc::getuid() };
-    let Ok(target) = std::fs::canonicalize(program) else {
-        return false;
+    let owned = |m: &std::fs::Metadata| m.uid() == 0 || m.uid() == me;
+    // Not writable by everyone, nor by a group (except macOS's `admin`, whose members can act as
+    // root anyway). In a sticky folder such as `/tmp` no one else can rename or remove what is
+    // there, and what they add there is theirs, so the owner check refuses it.
+    let unchangeable = |m: &std::fs::Metadata| {
+        let mode = m.mode();
+        // macOS's `admin` group.
+        let admin = cfg!(target_os = "macos") && m.gid() == 80;
+        (m.is_dir() && mode & 0o1000 != 0) || (mode & 0o002 == 0 && (mode & 0o020 == 0 || admin))
     };
-    [Some(target.as_path()), target.parent(), Some(dir)]
-        .into_iter()
-        .all(|p| {
-            p.and_then(|p| std::fs::metadata(p).ok())
-                .is_some_and(|m| (m.uid() == 0 || m.uid() == me) && m.mode() & 0o002 == 0)
+    let folders_safe = |folder: &Path| {
+        folder.ancestors().all(|f| {
+            // A relative path ends in an empty one, which never reads.
+            std::fs::metadata(f).is_ok_and(|m| owned(&m) && unchangeable(&m))
         })
+    };
+    let mut step = program.to_path_buf();
+    for _ in 0..MAX_LINKS {
+        let Some(folder) = step.parent() else {
+            return false;
+        };
+        if !folders_safe(folder) {
+            return false;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(&step) else {
+            return false;
+        };
+        if !meta.file_type().is_symlink() {
+            return owned(&meta) && unchangeable(&meta);
+        }
+        // A link's own mode means nothing; who made it does.
+        if !owned(&meta) {
+            return false;
+        }
+        let Ok(to) = std::fs::read_link(&step) else {
+            return false;
+        };
+        step = folder.join(to);
+    }
+    false
 }
 
 #[cfg(windows)]
-fn owned_safely(_dir: &Path, _program: &Path) -> bool {
+fn owned_safely(_program: &Path) -> bool {
     true
 }
 
@@ -221,9 +257,8 @@ fn owned_safely(_dir: &Path, _program: &Path) -> bool {
 fn install_dirs(home: Option<&Path>) -> Vec<PathBuf> {
     let mut folders = Vec::new();
     if let Some(home) = home {
-        // Claude Code's native installer, on every platform, then its older local install.
+        // Claude Code's native installer, on every platform.
         folders.push(home.join(".local").join("bin"));
-        folders.push(home.join(".claude").join("local"));
     }
     #[cfg(unix)]
     folders.extend(
@@ -271,9 +306,25 @@ fn path_with(path: Option<OsString>, program: &Path) -> Option<OsString> {
 mod tests {
     use super::*;
 
+    /// `dir` and the folders above it, made the way installers make them (not as the umask says).
+    fn folder(dir: &Path) {
+        if dir.is_dir() {
+            return;
+        }
+        if let Some(parent) = dir.parent() {
+            folder(parent);
+        }
+        std::fs::create_dir(dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
     /// An empty file `name` in `dir` that `which` accepts as a program.
     fn program(dir: &Path, name: &str) -> PathBuf {
-        std::fs::create_dir_all(dir).unwrap();
+        folder(dir);
         let file = dir.join(if cfg!(windows) {
             format!("{name}.exe")
         } else {
@@ -295,7 +346,7 @@ mod tests {
         let home = tmp.path().join("home");
         let installed = program(&home.join(".local").join("bin"), "claude");
         let elsewhere = tmp.path().join("bin");
-        std::fs::create_dir_all(&elsewhere).unwrap();
+        folder(&elsewhere);
         let path = std::env::join_paths([&elsewhere]).unwrap();
         let fallback = install_dirs(Some(&home));
         let find = |path: Option<OsString>, fallback: &[PathBuf]| {
@@ -340,9 +391,14 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn a_fallback_folder_everyone_can_write_to_is_not_used() {
+    fn chmod(path: &Path, mode: u32) {
         use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fallback_folder_others_can_write_to_is_not_used() {
         let tmp = tempfile::tempdir().unwrap();
         let shared = tmp.path().join("shared");
         let planted = program(&shared, "claude");
@@ -357,8 +413,67 @@ mod tests {
         };
         assert_eq!(find(), Some(planted));
 
-        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+        chmod(&shared, 0o777);
         assert_eq!(find(), None);
+        // A group (not macOS's `admin`, which a temporary folder never has) is others too.
+        chmod(&shared, 0o775);
+        assert_eq!(find(), None);
+    }
+
+    /// Claude Code's native installer links `~/.local/bin/claude` to the current version.
+    #[cfg(unix)]
+    #[test]
+    fn links_are_followed_and_every_step_is_checked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        folder(&bin);
+        let version = program(&tmp.path().join("versions"), "2.1.310");
+        let claude = bin.join("claude");
+        std::os::unix::fs::symlink(&version, &claude).unwrap();
+        let find = || find_program_in("claude", None, std::slice::from_ref(&bin), None, tmp.path());
+        assert_eq!(find(), Some(claude.clone()));
+
+        // A link relative to its folder, through a second one.
+        std::fs::remove_file(&claude).unwrap();
+        std::os::unix::fs::symlink("current", &claude).unwrap();
+        std::os::unix::fs::symlink("../versions/2.1.310", bin.join("current")).unwrap();
+        assert_eq!(find(), Some(claude.clone()));
+
+        // What the link leads to sits where others can change it.
+        chmod(&tmp.path().join("versions"), 0o777);
+        assert_eq!(find(), None);
+        chmod(&tmp.path().join("versions"), 0o755);
+        assert_eq!(find(), Some(claude.clone()));
+
+        // A link that leads to itself.
+        std::fs::remove_file(bin.join("current")).unwrap();
+        std::os::unix::fs::symlink("claude", bin.join("current")).unwrap();
+        assert!(!owned_safely(&claude));
+    }
+
+    /// Someone else's link or program is never used, even when it leads to root's files.
+    #[cfg(unix)]
+    #[test]
+    fn someone_elses_link_is_not_used() {
+        // SAFETY: getuid has no preconditions.
+        if unsafe { libc::getuid() } != 0 {
+            // Only root can give a file away, so this runs only as root (in a container, say).
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        let planted = program(&bin, "claude");
+        let link = bin.join("other");
+        std::os::unix::fs::symlink(&planted, &link).unwrap();
+        // Changes a link itself, not what it leads to.
+        let give_away =
+            |path: &Path| std::os::unix::fs::lchown(path, Some(65534), Some(65534)).unwrap();
+        assert!(owned_safely(&link));
+        give_away(&link);
+        assert!(!owned_safely(&link));
+        assert!(owned_safely(&planted));
+        give_away(&planted);
+        assert!(!owned_safely(&planted));
     }
 
     #[test]

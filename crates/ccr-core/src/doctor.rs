@@ -93,7 +93,7 @@ pub fn run(store: &Store, paths: &Paths) -> Vec<Check> {
         None => checks.push(check(
             "Claude Code version",
             Status::Fail,
-            "Couldn't run `claude --version`. Install Claude Code or check your PATH.",
+            "Couldn't run `claude --version`. Install Claude Code, or set where it is with `cc-rotate-ctl config claude_path <full path>`.",
         )),
     }
 
@@ -766,7 +766,7 @@ fn herdr_check(paths: &Paths, detected: Option<herdr::Detected>) -> Check {
     let found = match (&version, &detected) {
         (Some(v), _) => format!("Version {v}"),
         (None, herdr::Detected::InPane(_)) => "Running in a herdr pane".to_string(),
-        (None, herdr::Detected::OnPath(p)) => format!("Found at {}", p.display()),
+        (None, herdr::Detected::Installed(p)) => format!("Found at {}", p.display()),
     };
     let (major, minor, patch) = herdr::MIN_VERSION;
     if let Some(v) = version.as_deref().and_then(herdr::parse_version)
@@ -842,7 +842,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let paths = Paths::new(root.path().join("data"), root.path().join("profile"));
         std::fs::create_dir_all(&paths.profile_dir).unwrap();
-        let missing_bin = herdr::Detected::OnPath(root.path().join("no-such-herdr"));
+        let missing_bin = herdr::Detected::Installed(root.path().join("no-such-herdr"));
 
         // No profile settings at all: herdr is optional, so this never fails.
         let c = herdr_check(&paths, None);

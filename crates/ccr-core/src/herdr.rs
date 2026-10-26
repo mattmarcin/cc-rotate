@@ -211,13 +211,13 @@ pub enum Detected {
     /// This process runs inside a herdr pane.
     InPane(PathBuf),
     /// herdr is on `PATH` or where programs are installed (`paths::find_program`).
-    OnPath(PathBuf),
+    Installed(PathBuf),
 }
 
 impl Detected {
     pub fn bin(&self) -> &Path {
         match self {
-            Detected::InPane(p) | Detected::OnPath(p) => p,
+            Detected::InPane(p) | Detected::Installed(p) => p,
         }
     }
 }
@@ -228,7 +228,7 @@ pub fn detect() -> Option<Detected> {
         let bin = resolve(&pane.bin).unwrap_or_else(|| PathBuf::from(&pane.bin));
         return Some(Detected::InPane(bin));
     }
-    crate::paths::find_program("herdr").map(Detected::OnPath)
+    crate::paths::find_program("herdr").map(Detected::Installed)
 }
 
 /// A herdr executable to run: a path as it is, a bare name looked up like `claude`
@@ -243,6 +243,11 @@ pub fn resolve(bin: &OsStr) -> Option<PathBuf> {
 
 /// `herdr --version`, for example `0.9.4-preview.2026-10-14-fbd2ae23927f`.
 pub fn version(bin: &Path) -> Option<String> {
+    // A bare name `resolve` couldn't find is never run: the system would look in every PATH
+    // folder, relative ones too.
+    if bin.parent().is_none_or(|p| p.as_os_str().is_empty()) {
+        return None;
+    }
     let out = Command::new(bin)
         .arg("--version")
         .stdin(Stdio::null())
