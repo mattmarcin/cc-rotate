@@ -14,7 +14,11 @@ export function h<K extends keyof HTMLElementTagNameMap>(
     if (key.startsWith("on") && typeof value === "function") {
       el.addEventListener(key.slice(2), value as EventListener);
     } else if (key === "style" && typeof value === "object") {
-      Object.assign(el.style, value);
+      for (const [prop, v] of Object.entries(value as Record<string, string>)) {
+        // Custom properties (`--c`) only take effect through setProperty.
+        if (prop.startsWith("--")) el.style.setProperty(prop, v);
+        else (el.style as unknown as Record<string, string>)[prop] = v;
+      }
     } else if (key in el && typeof value !== "string") {
       (el as unknown as Record<string, unknown>)[key] = value;
     } else {
