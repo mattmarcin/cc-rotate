@@ -1,7 +1,7 @@
 //! `cc-rotate-ctl doctor`: health checks for the store, the profile, and Claude Code.
 
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use serde::Serialize;
 use serde_json::Value;
