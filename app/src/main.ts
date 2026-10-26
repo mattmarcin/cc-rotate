@@ -1039,7 +1039,7 @@ async function renderUsage(snap: Snapshot, render: number) {
         why && h("span", { class: "key-note" }, why),
       );
     }),
-    h("span", { class: "key swap-key" }, h("i"), "Swap, in the color of the account swapped to"),
+    h("span", { class: state.rangeDays === 7 ? "key swap-key tick" : "key swap-key" }, h("i"), "Swap, in the color of the account swapped to"),
     h("span", { class: "key threshold-key" }, h("i"), `cc-rotate swaps at ${threshold}%${capped ? ", or an account's own cap" : ""}`),
   );
   chart.show(

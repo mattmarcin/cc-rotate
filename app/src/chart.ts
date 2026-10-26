@@ -304,8 +304,15 @@ export interface PlacedSwap {
 
 /** Swaps within this (px) of the first in a group share its marker; no marker spans more. */
 const SWAP_GAP = 14;
-/** Swaps a grouped marker's tooltip lists before "and N more". */
+/** Swaps a tooltip lists before "and N more". */
 const SWAPS_LISTED = 4;
+/** How near (px) the pointer has to be to a 7-day tick for the tooltip to list its swap. */
+const TICK_REACH = 7;
+
+/** The swaps within `reach` px of the pointer at `px`, oldest first. */
+export function swapsNear(swaps: PlacedSwap[], px: number, reach = TICK_REACH): PlacedSwap[] {
+  return swaps.filter((sw) => Math.abs(sw.x - px) <= reach).sort((a, b) => a.x - b.x);
+}
 
 /** One marker along the top: a triangle for one swap, a pill with a count for several. */
 export interface SwapMarker {
@@ -376,7 +383,25 @@ export function drawUsage(input: UsageInput): Draw {
       .filter((e) => e.ts >= sinceMs && e.ts <= nowMs)
       .map((e) => ({ e, x: x(e.ts) }));
     const swapColor = (e: EventRow) => (input.lines.some((l) => l.account.id === e.account_to) ? input.color(e.account_to!) : null);
-    const markers = swapMarkers(swaps, plot.left, right + PAD.right);
+    // Over 7 days, a thin tick at each swap's own time: ticks that overlap show how dense swaps
+    // were. Over 24 hours, a triangle per swap, grouped only where triangles would collide.
+    const ticks = input.rangeDays === 7;
+    const markers = ticks ? [] : swapMarkers(swaps, plot.left, right + PAD.right);
+    if (ticks) {
+      for (const { e, x: sx } of swaps) {
+        const color = swapColor(e);
+        svg.append(
+          s("rect", {
+            class: "swap-mark",
+            x: Math.round(sx) - 1,
+            y: plot.top - 11,
+            width: 2,
+            height: 9,
+            style: color ? `fill: ${color}` : null,
+          }),
+        );
+      }
+    }
     for (const m of markers) {
       if (m.swaps.length === 1) {
         const color = swapColor(m.swaps[0].e);
@@ -412,14 +437,16 @@ export function drawUsage(input: UsageInput): Draw {
           h("span", null, line.account.label),
         ]);
       }
-      // The swap marker under the pointer, if any: the nearest one, over the marker or its swaps.
+      // The swaps under the pointer: near its ticks, or the nearest marker's.
       const reach = (m: SwapMarker) =>
         Math.abs(m.x - px) <= Math.max(6, m.width / 2 + 2) || (px >= m.swaps[0].x - 4 && px <= m.swaps[m.swaps.length - 1].x + 4);
-      const marker = markers.filter(reach).sort((a, b) => Math.abs(a.x - px) - Math.abs(b.x - px))[0];
+      const under = ticks
+        ? swapsNear(swaps, px)
+        : (markers.filter(reach).sort((a, b) => Math.abs(a.x - px) - Math.abs(b.x - px))[0]?.swaps ?? []);
       // One swap: the crosshair goes to it. Several: it stays with the pointer, and the tooltip
       // lists them.
-      const near = marker?.swaps.length === 1 ? marker.swaps[0] : null;
-      const group = marker && marker.swaps.length > 1 ? marker.swaps : null;
+      const near = under.length === 1 ? under[0] : null;
+      const group = under.length > 1 ? under : null;
       return {
         crosshair: near ? near.x : cx,
         x: near ? near.x : cx,
@@ -435,7 +462,10 @@ export function drawUsage(input: UsageInput): Draw {
               group
                 .slice(0, SWAPS_LISTED)
                 .map(({ e }) => [
-                  h("i", { class: "tip-mark", style: { borderTopColor: swapColor(e) ?? "" } }),
+                  // Keyed like the chart's own markers: a tick over 7 days, a triangle over 24 hours.
+                  ticks
+                    ? h("i", { class: "tip-mark tick", style: { background: swapColor(e) ?? "" } })
+                    : h("i", { class: "tip-mark", style: { borderTopColor: swapColor(e) ?? "" } }),
                   h("span", { class: "muted" }, stamp(e.ts)),
                   h("span", null, input.describeSwap(e)),
                 ]),

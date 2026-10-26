@@ -942,6 +942,14 @@ tr.dragging .grip {
   border-top: 7px solid var(--muted);
 }
 
+/* Over 7 days a swap is a thin tick, not a triangle. */
+.swap-key.tick i {
+  width: 2px;
+  height: 9px;
+  border: 0;
+  background: var(--muted);
+}
+
 .threshold-key i {
   width: 14px;
   height: 0;
@@ -1061,7 +1069,7 @@ tr.dragging .grip {
 /* One grid for all of a tooltip's rows, so values and names line up in columns. */
 .tip-rows {
   display: grid;
-  grid-template-columns: 12px auto auto;
+  grid-template-columns: 12px auto 1fr;
   align-items: center;
   gap: 0 8px;
   margin-top: 5px;
@@ -1091,7 +1099,7 @@ tr.dragging .grip {
 
 .tip-swaps {
   display: grid;
-  grid-template-columns: 8px auto auto;
+  grid-template-columns: 8px auto 1fr;
   align-items: center;
   gap: 0 6px;
   margin-top: 3px;
@@ -1113,6 +1121,14 @@ tr.dragging .grip {
   border-left: 4px solid transparent;
   border-right: 4px solid transparent;
   border-top: 7px solid var(--muted);
+}
+
+.tip-mark.tick {
+  justify-self: center;
+  width: 2px;
+  height: 9px;
+  border: 0;
+  background: var(--muted);
 }
 
 .tip-divider {
