@@ -215,6 +215,7 @@ pub fn run(store: &Store, paths: &Paths) -> Vec<Check> {
     checks.push(credential_storage_check(paths));
 
     if let Some(account) = active.first() {
+        let locked_away = paths.credentials().keychain_locked_away().unwrap_or(false);
         let file_fp = paths
             .credentials()
             .read_oauth()
@@ -270,6 +271,11 @@ pub fn run(store: &Store, paths: &Paths) -> Vec<Check> {
                     ),
                 ),
             },
+            (None, _) if locked_away => check(
+                "Profile login",
+                Status::Warn,
+                "Can't be read from this session (see Claude Code login storage)",
+            ),
             (None, _) => check("Profile login", Status::Fail, "The profile has no usable login"),
             (_, None) => check(
                 "Profile login",
@@ -516,6 +522,10 @@ fn session_cwds(paths: &Paths) -> Vec<PathBuf> {
         .collect()
 }
 
+/// What `doctor` and the `cc-rotate` launcher say when this session cannot read the profile's
+/// login from the macOS Keychain (`Credentials::keychain_locked_away`).
+pub const LOCKED_AWAY: &str = "The login is in the macOS Keychain, but this session can't read it, so Claude Code started here is signed out. macOS gives the login Keychain only to programs started from the Mac's desktop session, not to ones started over SSH or by a program that was, such as a herdr or tmux server started from an SSH connection. Start cc-rotate (or that server) from the desktop session, or unlock the Keychain for this session with `security unlock-keychain`. See \"macOS over SSH\" in the README.";
+
 /// Where Claude Code keeps the profile's login, which is where swaps write it.
 fn credential_storage_check(paths: &Paths) -> Check {
     let name = "Claude Code login storage";
@@ -534,6 +544,9 @@ fn credential_storage_check(paths: &Paths) -> Check {
         );
     }
     let creds = paths.credentials();
+    if creds.keychain_locked_away().unwrap_or(false) {
+        return check(name, Status::Fail, LOCKED_AWAY);
+    }
     match creds.location() {
         Ok(Some(Location::Keychain)) => check(
             name,

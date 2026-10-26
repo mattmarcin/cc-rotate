@@ -135,6 +135,19 @@ impl Credentials {
         }
     }
 
+    /// The login is in the Keychain, but this session cannot read it. macOS gives the login
+    /// Keychain only to programs started from the desktop session that unlocked it: one started
+    /// over SSH, or by a program that was (a herdr or tmux server started from an SSH
+    /// connection), gets "user interaction is not allowed", and Claude Code there finds no login
+    /// (it falls back to the file, which it does not write while the Keychain is locked). Always
+    /// false off macOS.
+    pub fn keychain_locked_away(&self) -> Result<bool> {
+        match &self.keychain {
+            Some(keychain) => Ok(!keychain.usable()? && keychain.exists()?),
+            None => Ok(false),
+        }
+    }
+
     /// Delete the Keychain item, if any (for staging profiles, which are thrown away).
     pub fn delete_keychain_item(&self) -> Result<()> {
         match &self.keychain {
@@ -271,6 +284,29 @@ impl Keychain {
             None,
         )?;
         Ok(code != INTERACTION_NOT_ALLOWED)
+    }
+
+    /// Whether the item exists, whatever state the Keychain is in: a search of its attributes
+    /// alone, which succeeds on a locked Keychain too (`usable` needs the password itself).
+    pub fn exists(&self) -> Result<bool> {
+        let (code, _) = self.security(
+            &[
+                "find-generic-password",
+                "-a",
+                &self.account,
+                "-s",
+                &self.service,
+            ],
+            None,
+        )?;
+        match code {
+            0 => Ok(true),
+            ITEM_NOT_FOUND => Ok(false),
+            other => bail!(
+                "`security find-generic-password` failed (exit {other}) for {}",
+                self.service
+            ),
+        }
     }
 
     pub fn delete(&self) -> Result<()> {
@@ -557,17 +593,21 @@ mod tests {
 items='{}'
 run() {{
   cmd="$1"; shift
-  service=""; hex=""
+  service=""; hex=""; password=0
   while [ $# -gt 0 ]; do
     case "$1" in
       -s) service="$2"; shift 2 ;;
       -X) hex="$2"; shift 2 ;;
       -a) shift 2 ;;
+      -w) password=1; shift ;;
       *) shift ;;
     esac
   done
   case "$cmd" in
-    find-generic-password) [ -f "$items/$service" ] || exit 44; cat "$items/$service"; echo ;;
+    find-generic-password)
+      [ -f "$items/$service" ] || exit 44
+      [ "$password" = 1 ] && [ -f "$items/../locked" ] && exit 36
+      [ "$password" = 1 ] && cat "$items/$service"; echo ;;
     add-generic-password) printf '%s' "$hex" > "$items/$service" ;;
     delete-generic-password) [ -f "$items/$service" ] || exit 44; rm "$items/$service" ;;
     *) exit 1 ;;
@@ -638,6 +678,38 @@ run "$@"
         creds.delete_keychain_item().unwrap();
         assert_eq!(creds.location().unwrap(), None);
         creds.delete_keychain_item().unwrap();
+    }
+
+    /// A session the Keychain is locked to (started over SSH) cannot read the login, and says so;
+    /// with no item there is nothing it is missing.
+    #[cfg(unix)]
+    #[test]
+    fn a_locked_keychain_holding_the_login_is_told_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let keychain = Keychain {
+            service: service_name(&dir.path().to_string_lossy(), false),
+            account: "jane".into(),
+            program: fake_security(dir.path()),
+        };
+        let creds = Credentials {
+            file: dir.path().join(".credentials.json"),
+            keychain: Some(keychain.clone()),
+        };
+        let lock = || std::fs::write(dir.path().join("locked"), "").unwrap();
+        let unlock = || std::fs::remove_file(dir.path().join("locked")).unwrap();
+
+        lock();
+        assert!(!creds.keychain_locked_away().unwrap(), "no item yet");
+        unlock();
+        keychain
+            .write(r#"{"claudeAiOauth":{"refreshToken":"r1"}}"#)
+            .unwrap();
+        assert!(!creds.keychain_locked_away().unwrap());
+        lock();
+        assert!(creds.keychain_locked_away().unwrap());
+        // What Claude Code then sees: no login.
+        assert!(creds.read_oauth().unwrap().is_none());
+        assert!(!creds.complete().unwrap());
     }
 
     /// On a Mac, an item that does not exist reads as absent (CI runs this on macOS).

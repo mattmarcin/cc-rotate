@@ -88,6 +88,14 @@ if [ "$skip_app" -eq 0 ] && pgrep -x cc-rotate-app >/dev/null 2>&1; then
   echo "Quit it from its tray menu (Quit cc-rotate) and start it again to use the new one."
 fi
 
+# On a Mac reached over SSH, sessions started over SSH cannot read the login Keychain.
+if [ "$(uname -s)" = Darwin ] && [ -n "${SSH_CONNECTION:-}" ]; then
+  echo ""
+  echo "This looks like an SSH session. On a Mac, Claude Code started over SSH (or by a herdr or tmux"
+  echo "server started over SSH) can't read the login Keychain and starts signed out."
+  echo "See \"macOS over SSH\" in the README."
+fi
+
 echo ""
 echo "Next steps:"
 echo "  1. Add each account: cc-rotate-ctl login   (or use Add account in the app: cc-rotate-ctl dashboard)"
