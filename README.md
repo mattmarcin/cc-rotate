@@ -239,6 +239,7 @@ Compare it with what you pay for the subscription.
 cc-rotate counts it from the status line of every session in the cc-rotate profile, and of your other profiles it tracks, for the account each request went to.
 
 It only reports what cc-rotate recorded, and usage history is kept for `sample_retention_days` (90 days by default).
+Removing an account also removes the API value recorded for it.
 A week with no readings shows no numbers.
 A week with few readings is marked, since the account may have used more than cc-rotate saw.
 The app shows the same numbers for the last 4 weeks as **Recent weeks** and **API value** in the account's **More** dialog.

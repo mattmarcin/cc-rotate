@@ -44,6 +44,12 @@ pub async fn series(since_ms: i64) -> CmdResult<Vec<Sample>> {
     blocking(move |s, _| snapshot::series(s, since_ms)).await
 }
 
+/// The swaps since `since_ms`, for the usage chart's markers.
+#[tauri::command]
+pub async fn swaps(since_ms: i64) -> CmdResult<Vec<Event>> {
+    blocking(move |s, _| snapshot::swaps(s, since_ms)).await
+}
+
 /// What each account's use would have cost at API prices, hour by hour, for the cost chart.
 #[tauri::command]
 pub async fn costs(since_ms: i64) -> CmdResult<Vec<HourlyCost>> {

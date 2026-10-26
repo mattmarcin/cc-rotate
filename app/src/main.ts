@@ -18,7 +18,6 @@ import {
 } from "./api";
 import {
   Chart,
-  LOOKBACK_MS,
   colorFor,
   costBuckets,
   drawCost,
@@ -898,72 +897,101 @@ function chartMessage(title: string, detail?: string) {
   chartEmpty.hidden = false;
 }
 
+/** A control changed what the chart shows: draw it again, and say so if its data can't be read. */
+function showChart() {
+  renderChart().catch((e) => say(`Couldn't load the chart: ${e}`, "error"));
+}
+
+const VIEWS: [UiState["view"], string][] = [
+  ["usage", "Usage limits"],
+  ["cost", "API cost"],
+];
+
+function pickView(view: UiState["view"]) {
+  state.view = view;
+  showChart();
+}
+
+// The tabs and buttons are built once and updated in place, so a refresh never takes focus from
+// them or has a screen reader announce them again.
+const tabButtons = VIEWS.map(([view, text], i) =>
+  h(
+    "button",
+    {
+      role: "tab",
+      id: `chart-tab-${view}`,
+      "aria-controls": "chart-view",
+      onclick: () => pickView(view),
+      // Arrow keys move between tabs, as in any tab list.
+      onkeydown: (e: KeyboardEvent) => {
+        const step = e.key === "ArrowRight" ? 1 : e.key === "ArrowLeft" ? -1 : 0;
+        if (step === 0) return;
+        e.preventDefault();
+        const next = (i + step + VIEWS.length) % VIEWS.length;
+        pickView(VIEWS[next][0]);
+        tabButtons[next].focus();
+      },
+    },
+    text,
+  ),
+);
+
+function segmented<T extends string>(label: string, options: [T, string][], pick: (value: T) => void) {
+  const buttons = options.map(([value, text]) => h("button", { onclick: () => pick(value) }, text));
+  return {
+    el: h("div", { class: "segmented", role: "group", "aria-label": label }, buttons),
+    sync(current: T) {
+      buttons.forEach((b, i) => {
+        const on = options[i][0] === current;
+        b.classList.toggle("on", on);
+        b.setAttribute("aria-pressed", String(on));
+      });
+    },
+  };
+}
+
+const metricControl = segmented<Metric>(
+  "Limit",
+  [
+    ["weekly", "Weekly"],
+    ["five_hour", "5-hour"],
+  ],
+  (value) => {
+    state.metric = value;
+    showChart();
+  },
+);
+const rangeControl = segmented<"1" | "7">(
+  "Range",
+  [
+    ["1", "24 hours"],
+    ["7", "7 days"],
+  ],
+  (value) => {
+    state.rangeDays = Number(value) as RangeDays;
+    showChart();
+  },
+);
+chartTabs.append(...tabButtons);
+chartControls.append(metricControl.el, rangeControl.el);
+
+function syncChartControls() {
+  tabButtons.forEach((b, i) => {
+    const on = VIEWS[i][0] === state.view;
+    b.classList.toggle("on", on);
+    b.setAttribute("aria-selected", String(on));
+    b.tabIndex = on ? 0 : -1;
+  });
+  chartView.setAttribute("aria-labelledby", `chart-tab-${state.view}`);
+  metricControl.el.hidden = state.view !== "usage";
+  metricControl.sync(state.metric);
+  rangeControl.sync(String(state.rangeDays) as "1" | "7");
+}
+
 async function renderChart() {
   const render = ++chartRenders;
   const snap = state.snap;
-  // The controls are built anew; the one with keyboard focus keeps it.
-  const focused = (document.activeElement as HTMLElement | null)?.dataset.chartKey;
-  const segmented = (key: string, options: [string, string][], current: string, pick: (v: string) => void, label: string) =>
-    h(
-      "div",
-      { class: "segmented", role: "group", "aria-label": label },
-      options.map(([value, text]) =>
-        h(
-          "button",
-          {
-            class: value === current ? "on" : "",
-            "aria-pressed": String(value === current),
-            "data-chart-key": `${key}-${value}`,
-            onclick: () => pick(value),
-          },
-          text,
-        ),
-      ),
-    );
-  const views: ["usage" | "cost", string][] = [
-    ["usage", "Usage limits"],
-    ["cost", "API cost"],
-  ];
-  const pickView = (view: "usage" | "cost") => {
-    state.view = view;
-    renderChart();
-  };
-  replace(
-    chartTabs,
-    views.map(([view, text], i) =>
-      h(
-        "button",
-        {
-          role: "tab",
-          id: `chart-tab-${view}`,
-          class: view === state.view ? "on" : "",
-          "aria-selected": String(view === state.view),
-          "aria-controls": "chart-view",
-          tabindex: view === state.view ? "0" : "-1",
-          "data-chart-key": `tab-${view}`,
-          onclick: () => pickView(view),
-          // Arrow keys move between tabs, as in any tab list.
-          onkeydown: (e: KeyboardEvent) => {
-            const step = e.key === "ArrowRight" ? 1 : e.key === "ArrowLeft" ? -1 : 0;
-            if (step === 0) return;
-            e.preventDefault();
-            const next = views[(i + step + views.length) % views.length][0];
-            pickView(next);
-            document.getElementById(`chart-tab-${next}`)?.focus();
-          },
-        },
-        text,
-      ),
-    ),
-  );
-  chartView.setAttribute("aria-labelledby", `chart-tab-${state.view}`);
-  replace(
-    chartControls,
-    state.view === "usage" &&
-      segmented("metric", [["weekly", "Weekly"], ["five_hour", "5-hour"]], state.metric, (v) => ((state.metric = v as Metric), renderChart()), "Limit"),
-    segmented("range", [["1", "24 hours"], ["7", "7 days"]], String(state.rangeDays), (v) => ((state.rangeDays = Number(v) as RangeDays), renderChart()), "Range"),
-  );
-  if (focused) document.querySelector<HTMLElement>(`[data-chart-key="${focused}"]`)?.focus();
+  syncChartControls();
 
   if (!snap || snap.accounts.length === 0) {
     replace(chartSummary);
@@ -978,8 +1006,8 @@ async function renderUsage(snap: Snapshot, render: number) {
   const nowMs = Date.now();
   const sinceMs = nowMs - state.rangeDays * DAY_MS;
   const weekly = state.metric === "weekly";
-  // From further back too, for the reading each account stood at when the range starts.
-  const samples = await api.series(sinceMs - LOOKBACK_MS[state.metric]);
+  // With each account's last reading before the range: the one in force when it starts.
+  const [samples, swaps] = await Promise.all([api.series(sinceMs), api.swaps(sinceMs)]);
   if (render !== chartRenders) return;
   const lines = usageLines(snap.accounts, samples, state.metric, sinceMs, nowMs);
   const limitName = weekly ? "weekly" : "5-hour";
@@ -996,6 +1024,8 @@ async function renderUsage(snap: Snapshot, render: number) {
     return;
   }
   const threshold = weekly ? snap.settings.swap_threshold_7d : snap.settings.swap_threshold_5h;
+  // An account's own weekly cap stops it sooner.
+  const capped = weekly && snap.accounts.some((a) => a.weekly_cap !== null && a.weekly_cap < threshold);
   chartEmpty.hidden = true;
   replace(
     chartLegend,
@@ -1010,12 +1040,12 @@ async function renderUsage(snap: Snapshot, render: number) {
       );
     }),
     h("span", { class: "key swap-key" }, h("i"), "Swap, in the color of the account swapped to"),
-    h("span", { class: "key threshold-key" }, h("i"), `cc-rotate swaps at ${threshold}%`),
+    h("span", { class: "key threshold-key" }, h("i"), `cc-rotate swaps at ${threshold}%${capped ? ", or an account's own cap" : ""}`),
   );
   chart.show(
     drawUsage({
       lines,
-      swaps: state.events.filter((e) => e.kind === "swap" && e.account_from !== null && e.account_to !== null),
+      swaps: swaps.filter((e) => e.account_from !== null && e.account_to !== null),
       color: colorOf,
       describeSwap: (e) => `Swapped to ${labelOf(e.account_to)} ${REASONS[e.reason ?? ""] ?? ""}`.trimEnd(),
       limitName,
@@ -1779,7 +1809,7 @@ onStoreChanged(() => refresh());
 onLoginProgress((p) => {
   if (currentLogin && p.id === currentLogin.id) currentLogin.update(p);
 });
-window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => renderChart());
+window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => showChart());
 // Countdowns and effective usage move with the clock even when nothing is written.
 window.setInterval(() => refresh(), 30_000);
 refresh();

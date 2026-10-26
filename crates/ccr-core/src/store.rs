@@ -2060,6 +2060,15 @@ impl Store {
         )
     }
 
+    /// Events of one kind at or after `since_ms`, oldest first.
+    pub fn events_of_kind_since(&self, kind: &str, since_ms: i64) -> Result<Vec<Event>> {
+        self.events_query(
+            "SELECT id, ts, kind, account_from, account_to, reason, detail FROM events
+                           WHERE kind = ?1 AND ts >= ?2 ORDER BY ts, id",
+            params![kind, since_ms],
+        )
+    }
+
     pub fn last_event_of(&self, kind: &str) -> Result<Option<Event>> {
         Ok(self
             .events_query(
@@ -2921,5 +2930,12 @@ mod tests {
             vec![cost(a, h0 + hour, 0.5)]
         );
         assert!(s.hourly_costs_since(h0 + 2 * hour).unwrap().is_empty());
+
+        // An account's costs go with it.
+        s.remove_account(b).unwrap();
+        assert_eq!(
+            s.hourly_costs_since(h0).unwrap(),
+            vec![cost(a, h0, 2.0), cost(a, h0 + hour, 0.5)]
+        );
     }
 }

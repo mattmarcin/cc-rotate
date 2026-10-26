@@ -815,10 +815,6 @@ tr.dragging .grip {
   overflow: hidden;
 }
 
-.segmented + .segmented {
-  margin-left: 8px;
-}
-
 .segmented button {
   border: 0;
   background: transparent;
@@ -868,6 +864,7 @@ tr.dragging .grip {
 
 .chart-controls {
   display: flex;
+  gap: 8px;
 }
 
 .chart-figure {
@@ -1061,29 +1058,23 @@ tr.dragging .grip {
   margin-top: 1px;
 }
 
-.tip-sub + .tip-row {
-  margin-top: 5px;
-}
-
-.tip-row {
+/* One grid for all of a tooltip's rows, so values and names line up in columns. */
+.tip-rows {
   display: grid;
-  grid-template-columns: 12px 3.6em auto;
+  grid-template-columns: 12px auto auto;
   align-items: center;
-  gap: 8px;
+  gap: 0 8px;
+  margin-top: 5px;
   line-height: 1.65;
 }
 
-.tip-row b {
+.tip-rows b {
   font-weight: 650;
   text-align: right;
 }
 
-.tip-row span {
+.tip-rows span {
   color: var(--muted);
-}
-
-.tip-head + .tip-row {
-  margin-top: 5px;
 }
 
 .tip-line {
@@ -1124,9 +1115,9 @@ tr.dragging .grip {
   border-top: 7px solid var(--muted);
 }
 
-.tip-total {
-  margin-top: 4px;
-  padding-top: 4px;
+.tip-divider {
+  grid-column: 1 / -1;
+  margin: 4px 0 2px;
   border-top: 1px solid var(--line);
 }
 

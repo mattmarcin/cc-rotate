@@ -292,8 +292,10 @@ export type SwapOutcome =
 
 export const api = {
   snapshot: () => invoke<Snapshot>("snapshot"),
+  /** Samples since `sinceMs`, after each account's last sample before it. */
   series: (sinceMs: number) => invoke<Sample[]>("series", { sinceMs }),
   costs: (sinceMs: number) => invoke<HourlyCost[]>("costs", { sinceMs }),
+  swaps: (sinceMs: number) => invoke<EventRow[]>("swaps", { sinceMs }),
   events: (limit: number) => invoke<EventRow[]>("events", { limit }),
   usageHistory: (id: number) => invoke<AccountHistory>("usage_history", { id }),
   swapNow: (to: number | null) => invoke<SwapOutcome>("swap_now", { to }),

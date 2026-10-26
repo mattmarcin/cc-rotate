@@ -3,7 +3,6 @@
 // at API prices (bars stacked per account, one per hour or day).
 import type { Account, EventRow, HourlyCost, Sample } from "./api";
 import { h, replace, type Child } from "./dom";
-import { clock } from "./format";
 
 export type Metric = "weekly" | "five_hour";
 export type RangeDays = 1 | 7;
@@ -27,8 +26,6 @@ export function colorFor(accounts: { id: number }[]): (id: number) => string {
 /** The window each chart metric shows. */
 const WINDOW: Record<Metric, string> = { weekly: "seven_day", five_hour: "five_hour" };
 
-/** How far back a reading can still be the one in force when the chart's range starts. */
-export const LOOKBACK_MS: Record<Metric, number> = { weekly: 7 * 86_400_000, five_hour: 5 * 3_600_000 };
 
 const HOUR_MS = 3_600_000;
 
@@ -164,18 +161,30 @@ export class Chart {
 const hourLabel = (d: Date) => d.toLocaleTimeString([], { hour: "numeric", minute: d.getMinutes() === 0 ? undefined : "2-digit" });
 const weekday = (d: Date) => d.toLocaleDateString([], { weekday: "short" });
 
-function startOfDay(ms: number): Date {
+/**
+ * When the local day `days` after the one holding `ms` starts, from its calendar date: midnight,
+ * or 1 AM where a daylight saving change skips midnight, without carrying that hour to other days.
+ */
+export function dayStart(ms: number, days = 0): number {
   const d = new Date(ms);
-  d.setHours(0, 0, 0, 0);
-  return d;
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate() + days).getTime();
 }
 
-/** Local midnights after `fromMs` and before `toMs`. */
+/** Starts of the local days after `fromMs` and before `toMs`. */
 function midnights(fromMs: number, toMs: number): number[] {
   const out: number[] = [];
-  const d = startOfDay(fromMs);
-  for (d.setDate(d.getDate() + 1); d.getTime() < toMs; d.setDate(d.getDate() + 1)) out.push(d.getTime());
+  for (let i = 1, t = dayStart(fromMs, 1); t < toMs; t = dayStart(fromMs, ++i)) out.push(t);
   return out;
+}
+
+/** "3:04 PM" today, "Thu 3:04 PM" this week, "Oct 12, 3:04 PM" before: always with the time. */
+function stamp(ms: number): string {
+  const at = new Date(ms);
+  const time = at.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  const now = Date.now();
+  if (ms >= dayStart(now)) return time;
+  if (ms >= dayStart(now, -6)) return `${weekday(at)} ${time}`;
+  return `${at.toLocaleDateString([], { month: "short", day: "numeric" })}, ${time}`;
 }
 
 function text(x: number, y: number, label: string, cls: string, anchor = "middle"): SVGTextElement {
@@ -231,8 +240,9 @@ export interface UsageLine<A extends Account = Account> {
 /**
  * Each account's line: its readings of the metric's window, from the one in force when the range
  * starts (a reading before it whose window had not reset by then, else 0 if it had), with a drop to
- * 0 wherever the window reset between readings, and the last value held until now. An account
- * without a reading of the window has no line.
+ * 0 wherever the window reset between readings, and the last value held until now. A reading whose
+ * window had already reset when it was taken (an idle session repeating its last numbers) is 0,
+ * as the scheduler counts it. An account without a reading of the window has no line.
  */
 export function usageLines<A extends Account>(accounts: A[], samples: Sample[], metric: Metric, sinceMs: number, nowMs: number): UsageLine<A>[] {
   return accounts.map((account) => {
@@ -240,7 +250,9 @@ export function usageLines<A extends Account>(accounts: A[], samples: Sample[], 
       .filter((s) => s.account_id === account.id)
       .flatMap((s) => {
         const w = s.windows.find((x) => x.name === WINDOW[metric]);
-        return w ? [{ ts: s.ts, pct: w.pct, resetsMs: w.resets_at === null ? null : w.resets_at * 1000 }] : [];
+        if (!w) return [];
+        const resetsMs = w.resets_at === null ? null : w.resets_at * 1000;
+        return resetsMs !== null && resetsMs <= s.ts ? [{ ts: s.ts, pct: 0, resetsMs: null }] : [{ ts: s.ts, pct: w.pct, resetsMs }];
       });
     let first = readings.findIndex((r) => r.ts >= sinceMs);
     if (first === -1) first = readings.length;
@@ -285,18 +297,18 @@ export interface UsageInput {
   threshold: number;
 }
 
-interface PlacedSwap {
+export interface PlacedSwap {
   e: EventRow;
   x: number;
 }
 
-/** Swaps closer than this (px, under two markers wide) share one marker, so a burst of swaps is one. */
+/** Swaps within this (px) of the first in a group share its marker; no marker spans more. */
 const SWAP_GAP = 14;
 /** Swaps a grouped marker's tooltip lists before "and N more". */
 const SWAPS_LISTED = 4;
 
 /** One marker along the top: a triangle for one swap, a pill with a count for several. */
-interface SwapMarker {
+export interface SwapMarker {
   swaps: PlacedSwap[];
   x: number;
   width: number;
@@ -311,24 +323,24 @@ function swapMarker(swaps: PlacedSwap[]): SwapMarker {
 }
 
 /**
- * Swaps grouped into markers that don't collide: each swap closer than `SWAP_GAP` to the one
- * before it joins its group, and groups whose markers would still touch merge.
+ * Swaps grouped into markers along the top, between `left` and `right` (px): a swap less than
+ * `SWAP_GAP` after the first in a group joins it. A marker that would touch the one before it moves
+ * over (and back from the right edge), so markers never overlap and none spans much time.
  */
-function swapMarkers(swaps: PlacedSwap[]): SwapMarker[] {
+export function swapMarkers(swaps: PlacedSwap[], left: number, right: number): SwapMarker[] {
   const groups: PlacedSwap[][] = [];
   for (const sw of [...swaps].sort((a, b) => a.x - b.x)) {
     const last = groups[groups.length - 1];
-    if (last && sw.x - last[last.length - 1].x < SWAP_GAP) last.push(sw);
+    if (last && sw.x - last[0].x < SWAP_GAP) last.push(sw);
     else groups.push([sw]);
   }
   const markers = groups.map(swapMarker);
-  for (let i = 1; i < markers.length; ) {
-    const [a, b] = [markers[i - 1], markers[i]];
-    if (b.x - a.x < (a.width + b.width) / 2 + 2) {
-      markers.splice(i - 1, 2, swapMarker([...a.swaps, ...b.swaps]));
-      i = Math.max(1, i - 1);
-    } else i++;
-  }
+  const apart = (a: SwapMarker, b: SwapMarker) => (a.width + b.width) / 2 + 2;
+  for (let i = 1; i < markers.length; i++) markers[i].x = Math.max(markers[i].x, markers[i - 1].x + apart(markers[i - 1], markers[i]));
+  const last = markers[markers.length - 1];
+  if (last) last.x = Math.min(last.x, right - last.width / 2);
+  for (let i = markers.length - 2; i >= 0; i--) markers[i].x = Math.min(markers[i].x, markers[i + 1].x - apart(markers[i], markers[i + 1]));
+  for (const m of markers) m.x = Math.max(m.x, left + m.width / 2 - 4);
   return markers;
 }
 
@@ -364,7 +376,7 @@ export function drawUsage(input: UsageInput): Draw {
       .filter((e) => e.ts >= sinceMs && e.ts <= nowMs)
       .map((e) => ({ e, x: x(e.ts) }));
     const swapColor = (e: EventRow) => (input.lines.some((l) => l.account.id === e.account_to) ? input.color(e.account_to!) : null);
-    const markers = swapMarkers(swaps);
+    const markers = swapMarkers(swaps, plot.left, right + PAD.right);
     for (const m of markers) {
       if (m.swaps.length === 1) {
         const color = swapColor(m.swaps[0].e);
@@ -394,21 +406,16 @@ export function drawUsage(input: UsageInput): Draw {
         if (v === null) continue;
         const color = input.color(line.account.id);
         marks.push(s("circle", { class: "dot", cx, cy: y(v), r: 4, fill: color }));
-        rows.push(
-          h(
-            "div",
-            { class: "tip-row" },
-            h("i", { class: "tip-line", style: { background: color } }),
-            h("b", null, `${Math.round(v)}%`),
-            h("span", null, line.account.label),
-          ),
-        );
+        rows.push([
+          h("i", { class: "tip-line", style: { background: color } }),
+          h("b", null, `${Math.round(v)}%`),
+          h("span", null, line.account.label),
+        ]);
       }
-      // The swap marker under the pointer, if any.
-      const reach = (m: SwapMarker) => Math.max(6, m.width / 2 + 2, (m.swaps[m.swaps.length - 1].x - m.swaps[0].x) / 2 + 4);
-      const marker = markers
-        .filter((m) => Math.abs(m.x - px) <= reach(m))
-        .sort((a, b) => Math.abs(a.x - px) - Math.abs(b.x - px))[0];
+      // The swap marker under the pointer, if any: the nearest one, over the marker or its swaps.
+      const reach = (m: SwapMarker) =>
+        Math.abs(m.x - px) <= Math.max(6, m.width / 2 + 2) || (px >= m.swaps[0].x - 4 && px <= m.swaps[m.swaps.length - 1].x + 4);
+      const marker = markers.filter(reach).sort((a, b) => Math.abs(a.x - px) - Math.abs(b.x - px))[0];
       // One swap: the crosshair goes to it. Several: it stays with the pointer, and the tooltip
       // lists them.
       const near = marker?.swaps.length === 1 ? marker.swaps[0] : null;
@@ -417,7 +424,7 @@ export function drawUsage(input: UsageInput): Draw {
         crosshair: near ? near.x : cx,
         x: near ? near.x : cx,
         tip: [
-          h("div", { class: "tip-head" }, clock(near ? near.e.ts : t)),
+          h("div", { class: "tip-head" }, stamp(near ? near.e.ts : t)),
           near && h("div", { class: "tip-note" }, input.describeSwap(near.e)),
           group && [
             h("div", { class: "tip-note" }, `${group.length} swaps here`),
@@ -429,14 +436,14 @@ export function drawUsage(input: UsageInput): Draw {
                 .slice(0, SWAPS_LISTED)
                 .map(({ e }) => [
                   h("i", { class: "tip-mark", style: { borderTopColor: swapColor(e) ?? "" } }),
-                  h("span", { class: "muted" }, clock(e.ts)),
+                  h("span", { class: "muted" }, stamp(e.ts)),
                   h("span", null, input.describeSwap(e)),
                 ]),
             ),
             group.length > SWAPS_LISTED && h("div", { class: "tip-note" }, `and ${group.length - SWAPS_LISTED} more`),
           ],
           rows.length > 0
-            ? [h("div", { class: "tip-sub" }, `Of the ${input.limitName} limit used`), rows]
+            ? [h("div", { class: "tip-sub" }, `Of the ${input.limitName} limit used`), h("div", { class: "tip-rows" }, rows)]
             : h("div", { class: "tip-sub" }, "No readings yet"),
         ],
         marks,
@@ -466,9 +473,7 @@ export function costBuckets(costs: HourlyCost[], rangeDays: RangeDays, nowMs: nu
     const hour = Math.floor(nowMs / HOUR_MS) * HOUR_MS;
     for (let i = 23; i >= 0; i--) starts.push(hour - i * HOUR_MS);
   } else {
-    const d = startOfDay(nowMs);
-    d.setDate(d.getDate() - 6);
-    for (let i = 0; i < 7; i++, d.setDate(d.getDate() + 1)) starts.push(d.getTime());
+    for (let i = -6; i <= 0; i++) starts.push(dayStart(nowMs, i));
   }
   const buckets = starts.map((start, i) => ({
     start,
@@ -492,11 +497,24 @@ export function usd(v: number): string {
   return `$${v.toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits })}`;
 }
 
-/** A round step that splits 0..max into about four parts. */
-function niceStep(max: number): number {
-  const raw = max / 4;
-  const mag = 10 ** Math.floor(Math.log10(raw));
-  return ([1, 2, 2.5, 5, 10].find((m) => m * mag >= raw) ?? 10) * mag;
+/**
+ * The cost axis: a round step that splits 0..max into about four parts (up to at least 4 cents, so
+ * the labels always differ), the top, and how its labels read ("$5", "$0.25", "$0.025").
+ */
+export function costAxis(max: number): { step: number; top: number; label: (v: number) => string } {
+  const span = Math.max(max, 0.04);
+  const mag = 10 ** Math.floor(Math.log10(span / 4));
+  const step = ([1, 2, 2.5, 5, 10].find((m) => m * mag >= span / 4 - 1e-12) ?? 10) * mag;
+  const top = Math.ceil(span / step - 1e-9) * step;
+  // Whole dollars, else cents, else as many decimals as the step needs.
+  let decimals = 0;
+  while (decimals < 4 && Math.abs(Math.round(step * 10 ** decimals) - step * 10 ** decimals) > 1e-6) decimals++;
+  if (decimals > 0) decimals = Math.max(2, decimals);
+  return {
+    step,
+    top,
+    label: (v) => `$${v.toLocaleString("en-US", { minimumFractionDigits: decimals, maximumFractionDigits: decimals })}`,
+  };
 }
 
 export interface CostInput {
@@ -530,19 +548,16 @@ export function drawCost(input: CostInput): Draw {
   return (f) => {
     const { svg, plot } = f;
     const { buckets, rangeDays } = input;
-    const max = Math.max(...buckets.map((b) => b.total));
-    const step = niceStep(max);
-    const top = Math.ceil(max / step) * step;
+    const { step, top, label } = costAxis(Math.max(...buckets.map((b) => b.total)));
     const y = (v: number) => plot.top + (1 - v / top) * plot.height;
     const right = plot.left + plot.width;
     const bottom = plot.top + plot.height;
 
-    for (let v = 0; v <= top + step / 2; v += step) {
-      const gy = Math.round(y(v)) + 0.5;
-      const label = step >= 1 ? `$${Math.round(v).toLocaleString("en-US")}` : `$${v.toFixed(2)}`;
+    for (let k = 0; k * step <= top + step / 2; k++) {
+      const gy = Math.round(y(k * step)) + 0.5;
       svg.append(
-        s("line", { class: v === 0 ? "axis" : "grid", x1: plot.left, x2: right, y1: gy, y2: gy }),
-        text(plot.left - 8, gy + 4, label, "tick", "end"),
+        s("line", { class: k === 0 ? "axis" : "grid", x1: plot.left, x2: right, y1: gy, y2: gy }),
+        text(plot.left - 8, gy + 4, label(k * step), "tick", "end"),
       );
     }
 
@@ -580,15 +595,11 @@ export function drawCost(input: CostInput): Draw {
       if (!b) return null;
       const rows = input.accounts
         .filter((a) => (b.usd.get(a.id) ?? 0) > 0)
-        .map((a) =>
-          h(
-            "div",
-            { class: "tip-row" },
-            h("i", { class: "tip-swatch", style: { background: input.color(a.id) } }),
-            h("b", null, usd(b.usd.get(a.id)!)),
-            h("span", null, a.label),
-          ),
-        );
+        .map((a) => [
+          h("i", { class: "tip-swatch", style: { background: input.color(a.id) } }),
+          h("b", null, usd(b.usd.get(a.id)!)),
+          h("span", null, a.label),
+        ]);
       return {
         crosshair: null,
         x: plot.left + slot * (i + 0.5) + width / 2,
@@ -596,7 +607,12 @@ export function drawCost(input: CostInput): Draw {
           h("div", { class: "tip-head" }, bucketName(b, rangeDays, input.nowMs)),
           rows.length === 0
             ? h("div", { class: "tip-sub" }, "Nothing counted")
-            : [rows, rows.length > 1 && h("div", { class: "tip-row tip-total" }, h("i"), h("b", null, usd(b.total)), h("span", null, "in all"))],
+            : h(
+                "div",
+                { class: "tip-rows" },
+                rows,
+                rows.length > 1 && [h("div", { class: "tip-divider" }), h("i"), h("b", null, usd(b.total)), h("span", null, "in all")],
+              ),
         ],
       };
     };

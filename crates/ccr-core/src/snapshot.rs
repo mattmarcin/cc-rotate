@@ -279,8 +279,21 @@ pub fn recent_events(store: &Store, limit: usize) -> Result<Vec<Event>> {
     store.events(limit)
 }
 
+/// The samples taken at or after `since_ms`, oldest first, after each account's last sample
+/// before it: the reading in force when a chart's range starts.
 pub fn series(store: &Store, since_ms: i64) -> Result<Vec<Sample>> {
-    store.samples_since(since_ms)
+    let mut out = Vec::new();
+    for account in store.accounts()? {
+        out.extend(store.last_sample_until(account.id, since_ms - 1)?);
+    }
+    out.sort_by_key(|s| s.ts);
+    out.extend(store.samples_since(since_ms)?);
+    Ok(out)
+}
+
+/// The swaps at or after `since_ms`, oldest first, for the usage chart's markers.
+pub fn swaps(store: &Store, since_ms: i64) -> Result<Vec<Event>> {
+    store.events_of_kind_since(kind::SWAP, since_ms)
 }
 
 /// What each account's use would have cost at API prices, per hour from the hour holding
@@ -344,5 +357,95 @@ mod tests {
         assert_eq!(snap.accounts.len(), 3);
         assert_eq!(store.conn().total_changes(), before, "no row written");
         assert!(!paths.profile_dir.exists(), "the profile is left alone");
+    }
+
+    fn reading(account_id: i64, ts: i64, pct: f64) -> Sample {
+        Sample {
+            ts,
+            account_id,
+            profile: "rotate".into(),
+            session_id: None,
+            model: None,
+            windows: vec![SampleWindow {
+                name: "seven_day".into(),
+                pct,
+                resets_at: Some(ts / 1000 + 86_400),
+            }],
+        }
+    }
+
+    /// A chart's lines start at the reading in force when its range starts, so `series` leads
+    /// with each account's last sample before the range, and nothing older.
+    #[test]
+    fn series_starts_with_each_accounts_reading_before_the_range() {
+        let store = Store::open_in_memory().unwrap();
+        let ident = |u: &str| AccountIdentity {
+            account_uuid: Some(u.into()),
+            ..Default::default()
+        };
+        let a = store
+            .insert_account("a", &ident("u1"), AccountState::Active)
+            .unwrap();
+        let b = store
+            .insert_account("b", &ident("u2"), AccountState::Parked)
+            .unwrap();
+        let c = store
+            .insert_account("c", &ident("u3"), AccountState::Parked)
+            .unwrap();
+        let since = 1_800_000_000_000;
+        for s in [
+            reading(a, since - 7_200_000, 10.0),
+            reading(a, since - 3_600_000, 20.0),
+            reading(b, since - 86_400_000, 50.0),
+            reading(a, since, 30.0),
+            reading(b, since + 60_000, 55.0),
+            reading(c, since + 120_000, 5.0),
+        ] {
+            store.record_sample(&s).unwrap();
+        }
+        let got: Vec<(i64, i64, f64)> = series(&store, since)
+            .unwrap()
+            .iter()
+            .map(|s| (s.account_id, s.ts, s.windows[0].pct))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (b, since - 86_400_000, 50.0),
+                (a, since - 3_600_000, 20.0),
+                (a, since, 30.0),
+                (b, since + 60_000, 55.0),
+                (c, since + 120_000, 5.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn swaps_are_the_swap_events_in_the_range() {
+        let store = Store::open_in_memory().unwrap();
+        let since = 1_800_000_000_000;
+        for (ts, kind) in [
+            (since - 1, kind::SWAP),
+            (since, kind::SWAP),
+            (since + 10, "sync"),
+            (since + 20, kind::SWAP),
+        ] {
+            store
+                .conn()
+                .execute(
+                    "INSERT INTO events (ts, kind) VALUES (?1, ?2)",
+                    rusqlite::params![ts, kind],
+                )
+                .unwrap();
+        }
+        let got: Vec<(i64, String)> = swaps(&store, since)
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.ts, e.kind))
+            .collect();
+        assert_eq!(
+            got,
+            vec![(since, kind::SWAP.into()), (since + 20, kind::SWAP.into())]
+        );
     }
 }
