@@ -91,9 +91,10 @@ fn spawn_ctl(args: impl Fn(&mut Command), what: &str) -> Result<()> {
     let exe = std::env::current_exe()?;
     // Not the session's project folder, whose files have no business in a background job.
     // The data folder, or before it exists (nothing stored yet) the system's temp folder.
+    // Absolute, so a relative CC_ROTATE_DATA_DIR still names the same folder from there.
     let dir = ccr_core::Paths::default_data_dir()
         .ok()
-        .filter(|d| d.is_dir())
+        .and_then(|d| dunce::canonicalize(d).ok())
         .unwrap_or_else(std::env::temp_dir);
     let build = || {
         let mut cmd = Command::new(&exe);

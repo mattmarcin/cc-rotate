@@ -140,7 +140,13 @@ pub fn forward_slashes(path: &Path) -> String {
 /// and run a program from it with a login in reach.
 pub fn find_program(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
+    let home = home_dir().ok();
     let dirs: Vec<PathBuf> = std::env::split_paths(&path)
+        // A quoted `~/.local/bin` reaches PATH as is; shells expand it, so this does too.
+        .map(|d| match (d.strip_prefix("~"), &home) {
+            (Ok(rest), Some(home)) => home.join(rest),
+            _ => d,
+        })
         .filter(|d| d.is_absolute())
         .collect();
     let joined = std::env::join_paths(dirs).ok()?;

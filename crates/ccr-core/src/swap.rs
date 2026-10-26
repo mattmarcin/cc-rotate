@@ -175,9 +175,9 @@ pub fn finish_dead_swap(store: &Store, paths: &Paths, settler: Settler) -> Resul
                 if let Some(from) = pending.from
                     && s.account(from)?
                         .is_some_and(|a| a.state == AccountState::Active)
-                    {
-                        s.set_state(from, AccountState::Parked)?;
-                    }
+                {
+                    s.set_state(from, AccountState::Parked)?;
+                }
                 if s.account(pending.to)?.is_some() {
                     // Only the states: the login in the profile is stored by the write-back that
                     // follows, like any renewal of the active account's.
@@ -205,9 +205,10 @@ pub fn finish_dead_swap(store: &Store, paths: &Paths, settler: Settler) -> Resul
                 }
                 if !restored
                     && let Some(from) = pending.from
-                        && s.account(from)?.is_some() {
-                            crate::usage_check::hold_back(s, from)?;
-                        }
+                    && s.account(from)?.is_some()
+                {
+                    crate::usage_check::hold_back(s, from)?;
+                }
                 let label = |id: i64| -> Result<Option<String>> {
                     Ok(s.account(id)?.map(|a| a.label))
                 };

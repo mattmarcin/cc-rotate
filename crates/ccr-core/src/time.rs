@@ -8,7 +8,6 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Seconds since the Unix epoch.
 /// The latest epoch second a reading may name (the year 3000): anything later, negative, or not a
 /// number is not a time, and arithmetic on it in milliseconds could overflow.
 const MAX_EPOCH_S: f64 = 32_503_680_000.0;
@@ -23,6 +22,7 @@ pub fn epoch_ms(v: f64) -> Option<i64> {
     (v.is_finite() && (0.0..=MAX_EPOCH_S * 1000.0).contains(&v)).then_some(v as i64)
 }
 
+/// Seconds since the Unix epoch.
 pub fn now_s() -> i64 {
     now_ms() / 1000
 }

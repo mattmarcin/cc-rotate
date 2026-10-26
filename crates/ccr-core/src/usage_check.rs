@@ -1475,12 +1475,10 @@ pub(crate) fn record_owner(dir: &Path) -> Result<()> {
     write_private(&dir.join(PID_FILE), format!("{pid} {started}").as_bytes())
 }
 
-/// Write a small file only its owner can read (on Unix), replacing any that was there.
+/// Write a small file only its owner can read (on Unix), whole: a sweep reading it meanwhile
+/// sees the old one or the new one, never an empty one.
 fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
-    let _ = std::fs::remove_file(path);
-    let mut file = private_file(path)?;
-    std::io::Write::write_all(&mut file, contents)
-        .with_context(|| format!("writing {}", path.display()))
+    credfile::atomic_write(path, contents)
 }
 
 /// A new file only its owner can read (mode 0600 on Unix), for output that may mention a login.
@@ -1509,8 +1507,12 @@ fn running(dir: &Path) -> bool {
     };
     let started = parts.next().unwrap_or_default();
     if process::alive(pid) {
-        // Without a recorded start time (it could not be read), being alive has to do.
-        return started.is_empty() || process::start_time(pid).as_deref() == Some(started);
+        // Without a start time on either side (recorded, or readable now), being alive has to
+        // do: a folder in use must never be taken for abandoned.
+        return match process::start_time(pid) {
+            Some(now) => started.is_empty() || now == started,
+            None => true,
+        };
     }
     // The first process is gone, but on Unix what it started runs on in its process group.
     cfg!(unix) && process::group_alive(pid)

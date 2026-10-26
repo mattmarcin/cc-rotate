@@ -377,7 +377,7 @@ pub fn command_path(exe: &Path) -> String {
     let bare = |p: &str| {
         !p.is_empty()
             && p.chars()
-                .all(|c| c.is_ascii_alphanumeric() || "/._:~+-".contains(c))
+                .all(|c| c.is_alphanumeric() || "/._:~+-".contains(c))
     };
     let plain = forward_slashes(exe);
     if bare(&plain) {

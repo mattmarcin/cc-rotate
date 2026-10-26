@@ -71,8 +71,11 @@ pub fn start_time(pid: u32) -> Option<String> {
         let after = stat.rsplit_once(')')?.1;
         return after.split_whitespace().nth(19).map(str::to_string);
     }
+    // `lstart` is formatted for the locale and time zone: fixed, so every process reads it alike.
     let out = Command::new("ps")
         .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .env("LC_ALL", "C")
+        .env("TZ", "UTC0")
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .output()
@@ -313,6 +316,11 @@ impl Tree {
 
     pub fn id(&self) -> u32 {
         self.child.id()
+    }
+
+    /// The child itself, to take its pipes.
+    pub fn child_mut(&mut self) -> &mut Child {
+        &mut self.child
     }
 
     pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {

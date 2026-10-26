@@ -4,8 +4,12 @@
 /// Interrupts do not end this process while it is alive; they still reach the child, which
 /// shares the terminal. Dropping it restores the defaults.
 pub struct Held {
+    /// Once set, the signals do what they do by default again (end the process).
     #[cfg(unix)]
-    ids: Vec<signal_hook::SigId>,
+    released: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// A termination signal sent to this process alone (not Ctrl+C) arrived.
+    #[cfg(unix)]
+    ended: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Held {
@@ -14,14 +18,17 @@ impl Held {
         use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
-        let flag = Arc::new(AtomicBool::new(false));
-        // A registered handler replaces the default of ending the process. Unlike an ignored
-        // signal, it is not inherited by programs started later.
-        let ids = [SIGINT, SIGTERM, SIGHUP, SIGQUIT]
-            .into_iter()
-            .filter_map(|sig| signal_hook::flag::register(sig, Arc::clone(&flag)).ok())
-            .collect();
-        Self { ids }
+        let released = Arc::new(AtomicBool::new(false));
+        let ended = Arc::new(AtomicBool::new(false));
+        for sig in [SIGINT, SIGTERM, SIGHUP, SIGQUIT] {
+            // Does nothing until released, then ends the process the way the signal would have.
+            // A registered handler, unlike an ignored signal, is not inherited by children.
+            let _ = signal_hook::flag::register_conditional_default(sig, Arc::clone(&released));
+            if sig != SIGINT {
+                let _ = signal_hook::flag::register(sig, Arc::clone(&ended));
+            }
+        }
+        Self { released, ended }
     }
 
     #[cfg(windows)]
@@ -31,6 +38,15 @@ impl Held {
         // SAFETY: registers a handler that only returns TRUE (handled), like the launcher's.
         unsafe { SetConsoleCtrlHandler(Some(ignore), TRUE) };
         Self {}
+    }
+
+    /// Whether this process was asked to end (SIGTERM, SIGHUP, SIGQUIT) while held: the child
+    /// did not get that signal, so the caller stops it and cleans up.
+    pub fn ended(&self) -> bool {
+        #[cfg(unix)]
+        return self.ended.load(std::sync::atomic::Ordering::Acquire);
+        #[cfg(windows)]
+        return false;
     }
 }
 
@@ -42,9 +58,9 @@ unsafe extern "system" fn ignore(_ctrl_type: u32) -> windows_sys::core::BOOL {
 impl Drop for Held {
     #[cfg(unix)]
     fn drop(&mut self) {
-        for id in self.ids.drain(..) {
-            signal_hook::low_level::unregister(id);
-        }
+        // Unregistering a handler would leave the signal ignored, not back to its default.
+        self.released
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     #[cfg(windows)]
@@ -53,5 +69,20 @@ impl Drop for Held {
         use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
         // SAFETY: removes the handler `new` added.
         unsafe { SetConsoleCtrlHandler(Some(ignore), FALSE) };
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// While held, a termination signal sent to this process leaves it running and is reported,
+    /// so the sign-in can be stopped and its staging folder removed.
+    #[test]
+    fn a_termination_signal_while_held_is_reported_not_fatal() {
+        let held = Held::new();
+        assert!(!held.ended());
+        signal_hook::low_level::raise(signal_hook::consts::SIGTERM).unwrap();
+        assert!(held.ended(), "still running, and told");
     }
 }

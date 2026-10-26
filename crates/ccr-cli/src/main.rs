@@ -805,8 +805,19 @@ fn login_cmd(
     // Ctrl+C reaches Claude Code too, which ends the sign-in; this process waits for it so the
     // staging folder, which may already hold the new login, is removed on the way out.
     let status = {
-        let _held = interrupts::Held::new();
-        child.wait().context("running `claude auth login`")?
+        let held = interrupts::Held::new();
+        loop {
+            if let Some(status) = child.try_wait().context("running `claude auth login`")? {
+                break status;
+            }
+            if held.ended() {
+                // Asked to end, and Claude Code wasn't: stop it, and let the staging folder go.
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("Stopped the sign-in.");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     };
     if !status.success() {
         bail!("`claude auth login` exited with {status}");

@@ -1009,24 +1009,26 @@ impl Store {
         Ok(Settings {
             swap_threshold_5h: num("swap_threshold_5h", 98.0)?,
             swap_threshold_7d: num("swap_threshold_7d", 98.0)?,
-            swap_cooldown_s: int("swap_cooldown_s", 120)?,
+            // Clamped as written (`validate_setting`): an older version stored anything.
+            swap_cooldown_s: int("swap_cooldown_s", 120)?.clamp(0, DAY_S),
             prefer_no_weekly_limit: get("prefer_no_weekly_limit")?
                 .and_then(|v| parse_bool(&v))
                 .unwrap_or(true),
-            lock_timeout_ms: int("lock_timeout_ms", 30_000)? as u64,
-            sample_retention_days: int("sample_retention_days", 90)?,
+            lock_timeout_ms: int("lock_timeout_ms", 30_000)?.clamp(0, 10 * 60_000) as u64,
+            sample_retention_days: int("sample_retention_days", 90)?.clamp(0, 3650),
             statusline_downstream: text("statusline_downstream")?,
             profile_dir: text("profile_dir")?,
             claude_path: text("claude_path")?,
             usage_checks: get("usage_checks")?
                 .and_then(|v| parse_bool(&v))
                 .unwrap_or(true),
-            usage_check_interval_s: int("usage_check_interval_s", 3600)?,
-            usage_check_max_age_s: int("usage_check_max_age_s", 900)?,
+            usage_check_interval_s: int("usage_check_interval_s", 3600)?
+                .clamp(MIN_CHECK_INTERVAL_S, 7 * DAY_S),
+            usage_check_max_age_s: int("usage_check_max_age_s", 900)?.clamp(0, 7 * DAY_S),
             use_expiring_weekly: get("use_expiring_weekly")?
                 .and_then(|v| parse_bool(&v))
                 .unwrap_or(true),
-            login_warning_days: int("login_warning_days", 5)?,
+            login_warning_days: int("login_warning_days", 5)?.clamp(0, 30),
             strict_order: get("strict_order")?
                 .and_then(|v| parse_bool(&v))
                 .unwrap_or(false),

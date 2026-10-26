@@ -3,12 +3,13 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::process::{Child, ChildStdin, Stdio};
+use std::process::{ChildStdin, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use ccr_core::login::{self, LoginRequest, Staging};
+use ccr_core::process::Tree;
 use ccr_core::store::Account;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
@@ -19,7 +20,9 @@ const TIMEOUT: Duration = Duration::from_secs(10 * 60);
 pub const EVENT: &str = "login-progress";
 
 struct Running {
-    child: Arc<Mutex<Child>>,
+    /// `claude auth login` and whatever it starts (an npm shim's `node`), so stopping it stops
+    /// them all; on Windows they also end with the app.
+    child: Arc<Mutex<Tree>>,
     stdin: Option<ChildStdin>,
     cancelled: Arc<AtomicBool>,
     /// The sign-in page Claude Code announced, the only page `open_login_page` opens.
@@ -106,12 +109,12 @@ pub fn start_login(
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
-    let mut child = cmd.spawn().map_err(|e| {
+    let mut child = Tree::spawn(&mut cmd).map_err(|e| {
         format!("Couldn't start Claude Code's sign-in: {e}. Check that Claude Code is installed.")
     })?;
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let stdin = child.stdin.take();
+    let stdout = child.child_mut().stdout.take();
+    let stderr = child.child_mut().stderr.take();
+    let stdin = child.child_mut().stdin.take();
     let child = Arc::new(Mutex::new(child));
     let cancelled = Arc::new(AtomicBool::new(false));
     let url = Arc::new(Mutex::new(None));
@@ -194,7 +197,7 @@ fn read_pipe(
 
 fn wait_and_import(
     app: &AppHandle,
-    child: &Mutex<Child>,
+    child: &Mutex<Tree>,
     staging: Staging,
     request: &LoginRequest,
     output: &Mutex<String>,
@@ -205,7 +208,7 @@ fn wait_and_import(
         match child.lock().unwrap().try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) if started.elapsed() > TIMEOUT => {
-                let _ = child.lock().unwrap().kill();
+                child.lock().unwrap().kill();
                 let mut p = Progress::new(id, Stage::Failed);
                 p.message =
                     Some("Sign-in timed out after 10 minutes. Try again when you're ready.".into());
@@ -302,7 +305,7 @@ pub fn stop_all(app: &AppHandle) {
     };
     for running in logins.0.lock().unwrap().values() {
         running.cancelled.store(true, Ordering::Release);
-        let _ = running.child.lock().unwrap().kill();
+        running.child.lock().unwrap().kill();
     }
 }
 
@@ -311,7 +314,7 @@ pub fn stop_all(app: &AppHandle) {
 pub fn cancel_login(logins: State<'_, Logins>, id: String) -> CmdResult<()> {
     if let Some(running) = logins.0.lock().unwrap().get(&id) {
         running.cancelled.store(true, Ordering::Release);
-        let _ = running.child.lock().unwrap().kill();
+        running.child.lock().unwrap().kill();
     }
     Ok(())
 }

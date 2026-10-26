@@ -716,6 +716,45 @@ fn manual_login_inside_profile_is_adopted() {
     );
 }
 
+/// One person can belong to several organizations under one account id: a `/login` in the profile
+/// to another organization of a pooled account is a foreign login, not that account's.
+#[test]
+fn a_manual_login_to_another_organization_is_not_adopted() {
+    let env = Env::new();
+    let (store, a, b, _) = pool(&env);
+    let config = env.paths.profile_config();
+    std::fs::write(
+        &config,
+        json!({"oauthAccount": {"accountUuid": "ua", "organizationUuid": "org-x"}}).to_string(),
+    )
+    .unwrap();
+    statusline::tick(&store, &env.paths, &StatusInput::default(), time::now_ms()).unwrap();
+
+    std::thread::sleep(Duration::from_millis(20));
+    credfile::write_oauth(&env.cred_file(), &oauth("b-elsewhere")).unwrap();
+    std::fs::write(
+        &config,
+        json!({"oauthAccount": {"accountUuid": "ub", "organizationUuid": "org-other"}}).to_string(),
+    )
+    .unwrap();
+    statusline::tick(&store, &env.paths, &StatusInput::default(), time::now_ms()).unwrap();
+
+    assert_eq!(store.active_account().unwrap().unwrap().id, a);
+    assert_eq!(
+        store.credential(b).unwrap().unwrap().oauth["refreshToken"],
+        "refresh-b1",
+        "b's login not replaced by another organization's"
+    );
+    assert!(
+        store
+            .events(10)
+            .unwrap()
+            .iter()
+            .any(|e| e.kind == "foreign_login"),
+        "recorded as a login cc-rotate doesn't have"
+    );
+}
+
 /// Two Team seats ordered first and a Max account last: while the Max account is in use, a tick
 /// asks to switch back to a seat as soon as the cooldown allows, and the swap records why.
 #[test]
