@@ -957,8 +957,10 @@ impl Store {
                 ))
             })?
             .collect::<rusqlite::Result<_>>()?;
-        // Per account and window name: the latest reset time of each window, and its usage.
-        let mut seen: std::collections::HashMap<(i64, String), Vec<(i64, f64)>> =
+        // Per account and window name: each reset time recorded, with its latest row and that
+        // row's usage, matched as `window_usage_before` does.
+        type Latest = std::collections::HashMap<i64, (i64, f64)>;
+        let mut seen: std::collections::HashMap<(i64, String), Latest> =
             std::collections::HashMap::new();
         let mut update = self
             .conn
@@ -967,21 +969,15 @@ impl Store {
             let high = match resets_at {
                 None => pct,
                 Some(r) => {
-                    let windows = seen.entry((account_id, name.clone())).or_default();
-                    match windows
-                        .iter_mut()
-                        .find(|(k, _)| crate::swap::same_reset(*k, r))
-                    {
-                        Some(window) => {
-                            let high = next_high(Some(window.1), pct, settles);
-                            *window = (r, high);
-                            high
-                        }
-                        None => {
-                            windows.push((r, pct));
-                            pct
-                        }
-                    }
+                    let resets = seen.entry((account_id, name.clone())).or_default();
+                    let before = resets
+                        .iter()
+                        .filter(|(k, _)| crate::swap::same_reset(**k, r))
+                        .max_by_key(|(_, (row, _))| *row)
+                        .map(|(_, (_, high))| *high);
+                    let high = next_high(before, pct, settles);
+                    resets.insert(r, (id, high));
+                    high
                 }
             };
             update.execute(params![id, name, high])?;
@@ -2698,6 +2694,10 @@ mod tests {
             mk(a, 4_000, ROTATION_PROFILE, Some("s2"), 30.0, Some(50_000)),
             mk(a, 5_000, ROTATION_PROFILE, Some("s1"), 70.0, None),
             mk(a, 6_000, ROTATION_PROFILE, Some("s1"), 5.0, Some(70_000)),
+            // Reset times drifting further than a minute in all.
+            mk(a, 7_000, ROTATION_PROFILE, Some("s1"), 8.0, Some(70_050)),
+            mk(a, 8_000, ROTATION_PROFILE, Some("s1"), 12.0, Some(70_100)),
+            mk(a, 9_000, ROTATION_PROFILE, Some("s2"), 6.0, Some(70_000)),
         ] {
             store.record_sample(&r).unwrap();
         }
@@ -2711,7 +2711,10 @@ mod tests {
         };
         let recorded = highs(&store.conn);
         let pcts: Vec<f64> = recorded.iter().map(|(_, h)| *h).collect();
-        assert_eq!(pcts, vec![60.0, 60.0, 90.0, 40.0, 40.0, 70.0, 5.0]);
+        assert_eq!(
+            pcts,
+            vec![60.0, 60.0, 90.0, 40.0, 40.0, 70.0, 5.0, 8.0, 12.0, 8.0]
+        );
         drop(store);
         // As the store schema 9 left.
         let conn = Connection::open(&path).unwrap();
