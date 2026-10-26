@@ -37,7 +37,7 @@ const MAX_SESSION_ID_LEN: usize = 128;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pane {
     pub id: String,
-    /// The herdr executable to call: `HERDR_BIN_PATH`, else `herdr` on `PATH`.
+    /// The herdr executable to call: `HERDR_BIN_PATH`, else `herdr` (see `resolve`).
     pub bin: OsString,
 }
 
@@ -61,7 +61,7 @@ fn pane_from(var: impl Fn(&str) -> Option<OsString>) -> Option<Pane> {
     })
 }
 
-/// The herdr executable: `HERDR_BIN_PATH` when set, else `herdr` (found on `PATH`).
+/// The herdr executable: `HERDR_BIN_PATH` when set, else `herdr` (see `resolve`).
 pub fn bin_from_env() -> OsString {
     bin_from(|name| std::env::var_os(name))
 }
@@ -210,34 +210,44 @@ pub fn session_start_hook_installed(settings: &Value) -> bool {
 pub enum Detected {
     /// This process runs inside a herdr pane.
     InPane(PathBuf),
-    /// herdr is on `PATH`.
-    OnPath(PathBuf),
+    /// herdr is on `PATH` or where programs are installed (`paths::find_program`).
+    Installed(PathBuf),
 }
 
 impl Detected {
     pub fn bin(&self) -> &Path {
         match self {
-            Detected::InPane(p) | Detected::OnPath(p) => p,
+            Detected::InPane(p) | Detected::Installed(p) => p,
         }
     }
 }
 
-/// herdr, if it is installed or this process runs in one of its panes.
-pub fn detect() -> Option<Detected> {
+/// herdr, if it is installed or this process runs in one of its panes, else why not.
+pub fn detect() -> Result<Detected, crate::paths::NotFound> {
     if let Some(pane) = pane_from_env() {
-        let bin = PathBuf::from(&pane.bin);
-        let bin = if bin.components().count() > 1 {
-            bin
-        } else {
-            crate::paths::find_program(&bin.to_string_lossy()).unwrap_or(bin)
-        };
-        return Some(Detected::InPane(bin));
+        let bin = resolve(&pane.bin).unwrap_or_else(|| PathBuf::from(&pane.bin));
+        return Ok(Detected::InPane(bin));
     }
-    crate::paths::find_program("herdr").map(Detected::OnPath)
+    crate::paths::find_program("herdr").map(Detected::Installed)
+}
+
+/// A herdr executable to run: a path as it is, a bare name looked up like `claude`
+/// (`paths::find_program`, never in a relative folder). `None` when the name isn't found.
+pub fn resolve(bin: &OsStr) -> Option<PathBuf> {
+    let path = PathBuf::from(bin);
+    if path.components().count() > 1 {
+        return Some(path);
+    }
+    crate::paths::find_program(&bin.to_string_lossy()).ok()
 }
 
 /// `herdr --version`, for example `0.9.4-preview.2026-10-14-fbd2ae23927f`.
 pub fn version(bin: &Path) -> Option<String> {
+    // A bare name `resolve` couldn't find is never run: the system would look in every PATH
+    // folder, relative ones too.
+    if bin.parent().is_none_or(|p| p.as_os_str().is_empty()) {
+        return None;
+    }
     let out = Command::new(bin)
         .arg("--version")
         .stdin(Stdio::null())

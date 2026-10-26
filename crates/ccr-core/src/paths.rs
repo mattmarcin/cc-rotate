@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -135,20 +136,603 @@ pub fn forward_slashes(path: &Path) -> String {
     path.display().to_string().replace('\\', "/")
 }
 
-/// `name` on PATH, searching only absolute directories: a relative entry (`.`, an empty one,
+/// Why `find_program` has nothing to run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotFound {
+    /// Neither on PATH nor in a folder programs are installed to.
+    Missing,
+    /// In a folder programs are installed to, at `program`, but `step` on the way to it could
+    /// not be confirmed as the user's alone (`owned_safely`).
+    Refused { program: PathBuf, step: PathBuf },
+}
+
+impl NotFound {
+    /// Why `name` found at `program` isn't run, for a refusal.
+    pub fn refusal(&self, name: &str) -> Option<String> {
+        match self {
+            NotFound::Missing => None,
+            NotFound::Refused { program, step } => Some(format!(
+                "Found `{name}` at {}, but cc-rotate can't confirm that only you or root can change {}, so it won't run it",
+                program.display(),
+                step.display()
+            )),
+        }
+    }
+}
+
+/// `name` on PATH, else in a folder programs are installed to (`install_dirs`).
+///
+/// Only absolute directories are searched: a relative entry (`.`, an empty one,
 /// `node_modules/.bin`) would resolve against wherever cc-rotate runs, such as a project folder,
 /// and run a program from it with a login in reach.
-pub fn find_program(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
+pub fn find_program(name: &str) -> Result<PathBuf, NotFound> {
     let home = home_dir().ok();
-    let dirs: Vec<PathBuf> = std::env::split_paths(&path)
+    find_program_in(
+        name,
+        std::env::var_os("PATH"),
+        &install_dirs(home.as_deref()),
+        home.as_deref(),
+        &std::env::temp_dir(),
+    )
+}
+
+/// `name` in the absolute folders of `path`, then in the first of `fallback` that has one the
+/// user can trust (`owned_safely`). `cwd` is what `which` would resolve a relative folder
+/// against, were one to slip through.
+fn find_program_in(
+    name: &str,
+    path: Option<OsString>,
+    fallback: &[PathBuf],
+    home: Option<&Path>,
+    cwd: &Path,
+) -> Result<PathBuf, NotFound> {
+    let on_path: Vec<PathBuf> = path
+        .iter()
+        .flat_map(std::env::split_paths)
         // A quoted `~/.local/bin` reaches PATH as is; shells expand it, so this does too.
-        .map(|d| match (d.strip_prefix("~"), &home) {
+        .map(|d| match (d.strip_prefix("~"), home) {
             (Ok(rest), Some(home)) => home.join(rest),
             _ => d,
         })
         .filter(|d| d.is_absolute())
         .collect();
-    let joined = std::env::join_paths(dirs).ok()?;
-    which::which_in(name, Some(joined), std::env::temp_dir()).ok()
+    if let Some(found) = search(name, on_path, cwd) {
+        return Ok(found);
+    }
+    let mut refused = None;
+    for dir in fallback.iter().filter(|d| d.is_absolute()) {
+        let Some(program) = search(name, vec![dir.clone()], cwd) else {
+            continue;
+        };
+        match owned_safely(&program) {
+            Ok(()) => return Ok(program),
+            Err(step) => {
+                refused.get_or_insert(NotFound::Refused { program, step });
+            }
+        }
+    }
+    Err(refused.unwrap_or(NotFound::Missing))
+}
+
+/// `name` in `dirs`, which are all absolute.
+fn search(name: &str, dirs: Vec<PathBuf>, cwd: &Path) -> Option<PathBuf> {
+    // `which` reads an empty list as one empty folder, the current one.
+    if dirs.is_empty() {
+        return None;
+    }
+    which::which_in(name, Some(std::env::join_paths(dirs).ok()?), cwd).ok()
+}
+
+/// Whether `program`, found in a fallback folder, is the user's to run: the user chose PATH's
+/// folders, but not the shared ones a fallback looks in, such as a Homebrew another user of the
+/// computer installed. `Err` names the first step that isn't.
+///
+/// On Unix the path is walked one part at a time from `/`, following each link where it leads,
+/// as the system resolves it. Every link must belong to root or the user; so must every folder
+/// and the program, whose permissions must also let no one else change them (`unchangeable`).
+/// On Windows the folders are in the user's own profile.
+#[cfg(unix)]
+fn owned_safely(program: &Path) -> Result<(), PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Component;
+    /// Links followed before giving up: Linux follows 40, macOS 32, and `exec` refuses a
+    /// longer chain anyway.
+    const MAX_LINKS: usize = 40;
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let me = unsafe { libc::getuid() };
+    // Looked up (perhaps over the network, with LDAP) only when a step's group may write.
+    let own_group = std::cell::OnceCell::new();
+    let safe = |path: &Path, m: &std::fs::Metadata| {
+        (m.uid() == 0 || m.uid() == me)
+            && unchangeable(path, m, || *own_group.get_or_init(|| private_group(me)))
+    };
+
+    /// Add `path`'s parts to what is left to walk, which holds the next part last.
+    fn push(rest: &mut Vec<OsString>, path: &Path) {
+        let parts: Vec<OsString> = path
+            .components()
+            .filter_map(|c| match c {
+                Component::Normal(part) => Some(part.to_os_string()),
+                Component::ParentDir => Some("..".into()),
+                Component::RootDir | Component::CurDir | Component::Prefix(_) => None,
+            })
+            .collect();
+        rest.extend(parts.into_iter().rev());
+    }
+
+    if !program.is_absolute() {
+        return Err(program.to_path_buf());
+    }
+    let mut rest = Vec::new();
+    push(&mut rest, program);
+    // Where the walk is: a real folder, never a link, so `..` leaves it as the system would.
+    let mut at = PathBuf::from("/");
+    if !std::fs::symlink_metadata(&at).is_ok_and(|m| safe(&at, &m)) {
+        return Err(at);
+    }
+    let mut links = 0;
+    while let Some(part) = rest.pop() {
+        if part == ".." {
+            at.pop();
+            continue;
+        }
+        let next = at.join(&part);
+        let Ok(meta) = std::fs::symlink_metadata(&next) else {
+            return Err(next);
+        };
+        if meta.file_type().is_symlink() {
+            // A link's own permissions mean nothing; who made it does.
+            links += 1;
+            if !(meta.uid() == 0 || meta.uid() == me) || links > MAX_LINKS {
+                return Err(next);
+            }
+            let Ok(to) = std::fs::read_link(&next) else {
+                return Err(next);
+            };
+            if to.is_absolute() {
+                at = PathBuf::from("/");
+            }
+            push(&mut rest, &to);
+            continue;
+        }
+        if !safe(&next, &meta) {
+            return Err(next);
+        }
+        at = next;
+    }
+    Ok(())
+}
+
+/// Whether the permissions of `path` (its `meta`) let no one but its owner change it: not
+/// writable by everyone, nor by a group other than macOS's `admin`, whose members administer the
+/// Mac, or the user's own (`own_group`) on a file with no access control list, whose group bits
+/// would be the list's limit rather than the group's. In a sticky folder such as `/tmp` others
+/// can't rename or remove what isn't theirs.
+#[cfg(unix)]
+fn unchangeable(
+    path: &Path,
+    meta: &std::fs::Metadata,
+    own_group: impl FnOnce() -> Option<u32>,
+) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let mode = meta.mode();
+    if meta.is_dir() && mode & 0o1000 != 0 {
+        return true;
+    }
+    if mode & 0o002 != 0 {
+        return false;
+    }
+    mode & 0o020 == 0
+        || (cfg!(target_os = "macos") && meta.gid() == 80)
+        || (!has_acl(path) && Some(meta.gid()) == own_group())
+}
+
+/// Whether `path` (not what it links to) has a POSIX access control list, which can let users
+/// and groups besides its own write to it. Assumed so when it can't be told.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn has_acl(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return true;
+    };
+    // SAFETY: both are valid C strings; a null buffer of size 0 only asks for the size.
+    let size = unsafe {
+        libc::lgetxattr(
+            c_path.as_ptr(),
+            c"system.posix_acl_access".as_ptr(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    // No such attribute, or a file system without them.
+    size >= 0
+        || !matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ENODATA | libc::EOPNOTSUPP)
+        )
+}
+
+/// macOS's access control lists are not read (see SECURITY.md); other systems have no private
+/// groups to trust.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn has_acl(_path: &Path) -> bool {
+    false
+}
+
+/// The user's primary group when it is theirs alone: named after them, with no members listed,
+/// as Debian, Ubuntu and Fedora make one for every user (with a umask that lets it write).
+/// Another account whose own primary group it is isn't listed as a member, so isn't seen.
+#[cfg(unix)]
+fn private_group(uid: u32) -> Option<u32> {
+    use std::ffi::CStr;
+    // SAFETY: getgid has no preconditions and cannot fail.
+    let gid = unsafe { libc::getgid() };
+    let mut buf = vec![0 as libc::c_char; 16 * 1024];
+    // SAFETY: zeroed records are valid to fill; the user's name is copied out of `buf` before
+    // `buf` is reused for the group, whose fields are read while `buf` still holds them.
+    unsafe {
+        let mut pw: libc::passwd = std::mem::zeroed();
+        let mut found = std::ptr::null_mut();
+        if libc::getpwuid_r(uid, &mut pw, buf.as_mut_ptr(), buf.len(), &mut found) != 0
+            || found.is_null()
+        {
+            return None;
+        }
+        if pw.pw_name.is_null() {
+            return None;
+        }
+        let user = CStr::from_ptr(pw.pw_name).to_owned();
+        let mut gr: libc::group = std::mem::zeroed();
+        let mut found = std::ptr::null_mut();
+        if libc::getgrgid_r(gid, &mut gr, buf.as_mut_ptr(), buf.len(), &mut found) != 0
+            || found.is_null()
+        {
+            return None;
+        }
+        if gr.gr_name.is_null() {
+            return None;
+        }
+        let alone = gr.gr_mem.is_null() || (*gr.gr_mem).is_null();
+        (alone && CStr::from_ptr(gr.gr_name) == user.as_c_str()).then_some(gid)
+    }
+}
+
+#[cfg(windows)]
+fn owned_safely(_program: &Path) -> Result<(), PathBuf> {
+    Ok(())
+}
+
+/// Where installers and package managers put programs (Claude Code's own, Homebrew, npm), for
+/// a process whose PATH leaves them out: an app macOS starts at login gets only
+/// `/usr/bin:/bin:/usr/sbin:/sbin`, and a desktop session on Linux may not have read the shell
+/// profile that adds `~/.local/bin`.
+fn install_dirs(home: Option<&Path>) -> Vec<PathBuf> {
+    let mut folders = Vec::new();
+    if let Some(home) = home {
+        // Claude Code's native installer, on every platform.
+        folders.push(home.join(".local").join("bin"));
+    }
+    #[cfg(unix)]
+    folders.extend(
+        // Homebrew on Apple silicon, on Intel Macs (and many manual installs), and on Linux.
+        [
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/home/linuxbrew/.linuxbrew/bin",
+        ]
+        .map(PathBuf::from),
+    );
+    #[cfg(windows)]
+    if let Some(roaming) = dirs::data_dir() {
+        // `npm install -g`.
+        folders.push(roaming.join("npm"));
+    }
+    folders
+}
+
+/// A command running `program`, with `program`'s folder added to the end of the child's PATH
+/// when it is not already on it: a program found outside PATH (`find_program`) may be a script
+/// whose interpreter sits beside it, such as a `claude` installed with Homebrew's npm, which
+/// runs `node`.
+pub fn program_command(program: &Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new(program);
+    if let Some(path) = path_with(std::env::var_os("PATH"), program) {
+        cmd.env("PATH", path);
+    }
+    cmd
+}
+
+/// `path` with `program`'s folder added at the end, or `None` to leave it as it is: the folder
+/// is on it already, or there is no PATH, where the system's default search must stay.
+fn path_with(path: Option<OsString>, program: &Path) -> Option<OsString> {
+    let dir = program.parent().filter(|d| d.is_absolute())?;
+    let mut dirs: Vec<PathBuf> = std::env::split_paths(&path?).collect();
+    if dirs.iter().any(|d| d == dir) {
+        return None;
+    }
+    dirs.push(dir.to_path_buf());
+    std::env::join_paths(dirs).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `dir` and the folders above it, made the way installers make them (not as the umask says).
+    fn folder(dir: &Path) {
+        if dir.is_dir() {
+            return;
+        }
+        if let Some(parent) = dir.parent() {
+            folder(parent);
+        }
+        std::fs::create_dir(dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    /// An empty file `name` in `dir` that `which` accepts as a program.
+    fn program(dir: &Path, name: &str) -> PathBuf {
+        folder(dir);
+        let file = dir.join(if cfg!(windows) {
+            format!("{name}.exe")
+        } else {
+            name.to_string()
+        });
+        std::fs::write(&file, "").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        file
+    }
+
+    #[test]
+    fn programs_outside_path_are_found_in_install_folders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        let home = tmp.path().join("home");
+        let installed = program(&home.join(".local").join("bin"), "claude");
+        let elsewhere = tmp.path().join("bin");
+        folder(&elsewhere);
+        let path = std::env::join_paths([&elsewhere]).unwrap();
+        let fallback = install_dirs(Some(&home));
+        let find = |path: Option<OsString>, fallback: &[PathBuf]| {
+            find_program_in("claude", path, fallback, Some(&home), cwd).ok()
+        };
+
+        // A PATH like the one macOS gives apps started at login, without the install folder.
+        assert_eq!(find(Some(path.clone()), &fallback), Some(installed.clone()));
+        assert_eq!(find(None, &fallback), Some(installed));
+
+        // PATH comes first.
+        let on_path = program(&elsewhere, "claude");
+        assert_eq!(find(Some(path), &fallback), Some(on_path));
+        assert_eq!(find(None, &[]), None);
+    }
+
+    #[test]
+    fn relative_folders_are_never_searched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        // Where a relative or empty folder would lead: the folder `which` resolves them against.
+        program(&cwd.join("bin"), "claude");
+        program(cwd, "claude");
+        let relative = PathBuf::from("bin");
+        for path in [
+            std::env::join_paths([&relative]).unwrap(),
+            OsString::new(),
+            OsString::from("."),
+        ] {
+            assert_eq!(
+                find_program_in(
+                    "claude",
+                    Some(path.clone()),
+                    std::slice::from_ref(&relative),
+                    None,
+                    cwd
+                ),
+                Err(NotFound::Missing),
+                "{path:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn chmod(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn find_in(dir: &Path, cwd: &Path) -> Result<PathBuf, NotFound> {
+        find_program_in("claude", None, &[dir.to_path_buf()], None, cwd)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fallback_folder_others_can_write_to_is_not_used() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Where the walk reports steps: past macOS's `/var` link.
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let root = root.as_path();
+        let shared = root.join("shared");
+        let planted = program(&shared, "claude");
+        assert_eq!(find_in(&shared, root), Ok(planted.clone()));
+
+        chmod(&shared, 0o777);
+        assert_eq!(
+            find_in(&shared, root),
+            Err(NotFound::Refused {
+                program: planted.clone(),
+                step: shared.clone()
+            })
+        );
+        // A group counts as others unless it is the user's own (`private_group`) or macOS's
+        // `admin`, which a temporary folder never has.
+        chmod(&shared, 0o775);
+        let group = std::os::unix::fs::MetadataExt::gid(&std::fs::metadata(&shared).unwrap());
+        // SAFETY: getuid has no preconditions.
+        let own = private_group(unsafe { libc::getuid() }) == Some(group);
+        assert_eq!(find_in(&shared, root).is_ok(), own);
+    }
+
+    /// Others can't change what is theirs in a sticky folder such as `/tmp`, and what they add
+    /// there is theirs.
+    #[cfg(unix)]
+    #[test]
+    fn a_sticky_folder_on_the_way_is_safe() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Where the walk reports steps: past macOS's `/var` link.
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let root = root.as_path();
+        let sticky = root.join("sticky");
+        folder(&sticky);
+        chmod(&sticky, 0o1777);
+        let bin = sticky.join("bin");
+        let planted = program(&bin, "claude");
+        assert_eq!(find_in(&bin, root), Ok(planted.clone()));
+        // The program itself may not sit there, writable by all.
+        chmod(&planted, 0o777);
+        assert!(find_in(&bin, root).is_err());
+    }
+
+    /// Claude Code's native installer links `~/.local/bin/claude` to the current version.
+    #[cfg(unix)]
+    #[test]
+    fn links_are_followed_and_every_step_is_checked() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Where the walk reports steps: past macOS's `/var` link.
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let root = root.as_path();
+        let bin = root.join("bin");
+        folder(&bin);
+        let versions = root.join("versions");
+        let version = program(&versions, "2.1.310");
+        let claude = bin.join("claude");
+        std::os::unix::fs::symlink(&version, &claude).unwrap();
+        assert_eq!(find_in(&bin, root), Ok(claude.clone()));
+
+        // A link relative to its folder, through a second one.
+        std::fs::remove_file(&claude).unwrap();
+        std::os::unix::fs::symlink("current", &claude).unwrap();
+        std::os::unix::fs::symlink("../versions/2.1.310", bin.join("current")).unwrap();
+        assert_eq!(find_in(&bin, root), Ok(claude.clone()));
+
+        // What the link leads to sits where others can change it.
+        chmod(&versions, 0o777);
+        assert!(find_in(&bin, root).is_err());
+        chmod(&versions, 0o755);
+        assert_eq!(find_in(&bin, root), Ok(claude.clone()));
+
+        // A link that leads to itself.
+        std::fs::remove_file(bin.join("current")).unwrap();
+        std::os::unix::fs::symlink("claude", bin.join("current")).unwrap();
+        assert_eq!(owned_safely(&claude), Err(claude.clone()));
+    }
+
+    /// `..` after a linked folder leads up from where the link leads, as the system resolves it.
+    #[cfg(unix)]
+    #[test]
+    fn dot_dot_after_a_linked_folder_leaves_where_it_leads() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Where the walk reports steps: past macOS's `/var` link.
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let deep = root.join("deep").join("real");
+        program(&deep.join("versions"), "2.1.310");
+        folder(&deep.join("bin"));
+        let bin = root.join("bin");
+        std::os::unix::fs::symlink(deep.join("bin"), &bin).unwrap();
+        let claude = bin.join("claude");
+        std::os::unix::fs::symlink("../versions/2.1.310", deep.join("bin").join("claude")).unwrap();
+        assert_eq!(owned_safely(&claude), Ok(()));
+
+        // A lexical walk would look for `root/versions`, which an open folder now holds.
+        let open = root.join("versions");
+        program(&open, "2.1.310");
+        chmod(&open, 0o777);
+        assert_eq!(owned_safely(&claude), Ok(()));
+        // Opening the real one is noticed.
+        chmod(&deep.join("versions"), 0o777);
+        assert_eq!(owned_safely(&claude), Err(deep.join("versions")));
+    }
+
+    /// A folder on the way that is a link is checked where it leads, folders above included.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_folder_is_checked_where_it_leads() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Where the walk reports steps: past macOS's `/var` link.
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let root = root.as_path();
+        let open = root.join("open");
+        let planted = program(&open.join("real").join("bin"), "claude");
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(open.join("real"), &alias).unwrap();
+        let bin = alias.join("bin");
+        assert_eq!(
+            find_in(&bin, root),
+            Ok(bin.join(planted.file_name().unwrap()))
+        );
+
+        // Others could swap `real` for their own folder.
+        chmod(&open, 0o777);
+        assert_eq!(owned_safely(&bin.join("claude")), Err(open.clone()));
+    }
+
+    /// Someone else's link or program is never used, even when it leads to root's files.
+    #[cfg(unix)]
+    #[test]
+    fn someone_elses_link_is_not_used() {
+        // SAFETY: getuid has no preconditions.
+        if unsafe { libc::getuid() } != 0 {
+            eprintln!("skipped: only root can give a file away");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        // Where the walk reports steps: past macOS's `/var` link.
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let root = root.as_path();
+        let bin = root.join("bin");
+        let planted = program(&bin, "claude");
+        let link = bin.join("other");
+        std::os::unix::fs::symlink(&planted, &link).unwrap();
+        assert_eq!(owned_safely(&link), Ok(()));
+        // Changes a link itself, not what it leads to.
+        if std::os::unix::fs::lchown(&link, Some(65534), Some(65534)).is_err() {
+            eprintln!("skipped: uid 65534 isn't mapped here");
+            return;
+        }
+        assert_eq!(owned_safely(&link), Err(link.clone()));
+        assert_eq!(owned_safely(&planted), Ok(()));
+        std::os::unix::fs::lchown(&planted, Some(65534), Some(65534)).unwrap();
+        assert_eq!(owned_safely(&planted), Err(planted.clone()));
+    }
+
+    #[test]
+    fn a_programs_folder_is_added_to_the_childs_path_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("node-bin");
+        let claude = dir.join("claude");
+        let other = tmp.path().join("other");
+        let path = std::env::join_paths([&other]).unwrap();
+
+        let added = path_with(Some(path), &claude).unwrap();
+        assert_eq!(
+            std::env::split_paths(&added).collect::<Vec<_>>(),
+            vec![other, dir]
+        );
+        assert_eq!(path_with(Some(added), &claude), None);
+        // Without a PATH the system's default search stays.
+        assert_eq!(path_with(None, &claude), None);
+        // A bare name has no folder to add.
+        assert_eq!(
+            path_with(Some(OsString::from("/usr/bin")), Path::new("claude")),
+            None
+        );
+    }
 }

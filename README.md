@@ -351,7 +351,7 @@ When its input or output isn't a terminal, it prints the status once and exits.
 | `sample_retention_days` | 90 | How long usage history is kept. |
 | `statusline_downstream` | your old status line | The status line command shown after cc-rotate's label. |
 | `profile_dir` | `~/.claude-rotate` | The cc-rotate profile, recorded by `setup`. |
-| `claude_path` | found on `PATH` | The full path of the `claude` executable to use for logins, usage checks and `cc-rotate`. |
+| `claude_path` | found on `PATH`, else where Claude Code installs it | The full path of the `claude` executable to use for logins, usage checks and `cc-rotate`. |
 | `usage_checks` | true | Check the usage of accounts not in use with Claude Code's `/usage`, and ask Claude Code whose a changed login in the cc-rotate profile is. |
 | `usage_check_interval_s` | 3600 | How often the app checks each account that is not in use (at least 300, at most a week). |
 | `usage_check_max_age_s` | 900 | A swap checks the account it picked first when its usage data is older than this. 0 always checks first. |
