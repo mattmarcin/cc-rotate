@@ -93,7 +93,14 @@ pub fn run(store: &Store, paths: &Paths) -> Vec<Check> {
         None => checks.push(check(
             "Claude Code version",
             Status::Fail,
-            "Couldn't run `claude --version`. Install Claude Code, or set where it is with `cc-rotate-ctl config claude_path <full path>`.",
+            match login::claude_executable(store) {
+                // Why it wasn't found, or that one found was refused.
+                Err(e) => e.to_string(),
+                Ok(claude) => format!(
+                    "Couldn't run `{} --version`. Reinstall Claude Code, or set where it is with `cc-rotate-ctl config claude_path <full path>`.",
+                    claude.display()
+                ),
+            },
         )),
     }
 

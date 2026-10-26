@@ -228,7 +228,9 @@ pub fn detect() -> Option<Detected> {
         let bin = resolve(&pane.bin).unwrap_or_else(|| PathBuf::from(&pane.bin));
         return Some(Detected::InPane(bin));
     }
-    crate::paths::find_program("herdr").map(Detected::Installed)
+    crate::paths::find_program("herdr")
+        .ok()
+        .map(Detected::Installed)
 }
 
 /// A herdr executable to run: a path as it is, a bare name looked up like `claude`
@@ -238,7 +240,7 @@ pub fn resolve(bin: &OsStr) -> Option<PathBuf> {
     if path.components().count() > 1 {
         return Some(path);
     }
-    crate::paths::find_program(&bin.to_string_lossy())
+    crate::paths::find_program(&bin.to_string_lossy()).ok()
 }
 
 /// `herdr --version`, for example `0.9.4-preview.2026-10-14-fbd2ae23927f`.

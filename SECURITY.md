@@ -43,8 +43,10 @@ There are no versioned releases yet, so only the latest `main` is supported.
 - The desktop app's window can change only the settings shown in it: the ones that name a program to run or where the login is written (`claude_path`, `statusline_downstream`, `profile_dir`) are set with `cc-rotate-ctl config` alone, and the window can reopen only the sign-in page Claude Code announced, not any address.
 - `claude` is found in the `claude_path` setting, which must be a full path, or in the absolute folders on `PATH`: a relative `PATH` entry such as `.` is skipped, so a project folder can't put its own `claude` in reach of a login.
   When `PATH` has none, cc-rotate looks where installers put it (`~/.local/bin`, Homebrew's folders on macOS and Linux, npm's on Windows).
-  On macOS and Linux a `claude` found there is used only when every step to it (each link, what it leads to, and the folders above them) belongs to you or root and no one else can change it, since a shared Homebrew folder may belong to another user.
-  A folder a group can write to counts as changeable by others, except the `admin` group on macOS, whose members can act as root anyway.
+  On macOS and Linux a `claude` found there is used only when every step to it (each folder from `/`, each link and what it leads to) belongs to you or root and its permissions let no one else change it, since a shared Homebrew folder may belong to another user.
+  A group may write only when it is your own private group (Debian, Ubuntu, Fedora) or `admin` on macOS; a sticky folder such as `/tmp` is fine, since what others add there is theirs.
+  macOS access control lists are not read.
+  When a `claude` is found but refused, the error and `cc-rotate-ctl doctor` say which step, and setting `claude_path` uses it anyway.
 - Your other Claude Code profiles are only read, to find out which account each belongs to; their logins are never imported or changed.
 
 ## Scope
