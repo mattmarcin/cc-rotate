@@ -153,7 +153,8 @@ export class Chart {
     const right = got.x + 14;
     const left = right + w <= this.host.clientWidth ? right : Math.max(0, got.x - 14 - w);
     this.tip.style.left = `${left}px`;
-    this.tip.style.top = `${top}px`;
+    // From the top of the plot, or higher (over the legend) when it is taller than the chart.
+    this.tip.style.top = `${Math.min(top, this.host.clientHeight - this.tip.offsetHeight)}px`;
   }
 }
 
@@ -284,6 +285,53 @@ export interface UsageInput {
   threshold: number;
 }
 
+interface PlacedSwap {
+  e: EventRow;
+  x: number;
+}
+
+/** Swaps closer than this (px, under two markers wide) share one marker, so a burst of swaps is one. */
+const SWAP_GAP = 14;
+/** Swaps a grouped marker's tooltip lists before "and N more". */
+const SWAPS_LISTED = 4;
+
+/** One marker along the top: a triangle for one swap, a pill with a count for several. */
+interface SwapMarker {
+  swaps: PlacedSwap[];
+  x: number;
+  width: number;
+}
+
+function swapMarker(swaps: PlacedSwap[]): SwapMarker {
+  return {
+    swaps,
+    x: (swaps[0].x + swaps[swaps.length - 1].x) / 2,
+    width: swaps.length === 1 ? 8 : 10 + 6 * String(swaps.length).length,
+  };
+}
+
+/**
+ * Swaps grouped into markers that don't collide: each swap closer than `SWAP_GAP` to the one
+ * before it joins its group, and groups whose markers would still touch merge.
+ */
+function swapMarkers(swaps: PlacedSwap[]): SwapMarker[] {
+  const groups: PlacedSwap[][] = [];
+  for (const sw of [...swaps].sort((a, b) => a.x - b.x)) {
+    const last = groups[groups.length - 1];
+    if (last && sw.x - last[last.length - 1].x < SWAP_GAP) last.push(sw);
+    else groups.push([sw]);
+  }
+  const markers = groups.map(swapMarker);
+  for (let i = 1; i < markers.length; ) {
+    const [a, b] = [markers[i - 1], markers[i]];
+    if (b.x - a.x < (a.width + b.width) / 2 + 2) {
+      markers.splice(i - 1, 2, swapMarker([...a.swaps, ...b.swaps]));
+      i = Math.max(1, i - 1);
+    } else i++;
+  }
+  return markers;
+}
+
 export function drawUsage(input: UsageInput): Draw {
   return (f) => {
     const { svg, plot } = f;
@@ -315,14 +363,23 @@ export function drawUsage(input: UsageInput): Draw {
     const swaps = input.swaps
       .filter((e) => e.ts >= sinceMs && e.ts <= nowMs)
       .map((e) => ({ e, x: x(e.ts) }));
-    for (const { e, x: sx } of swaps) {
-      const known = input.lines.some((l) => l.account.id === e.account_to);
+    const swapColor = (e: EventRow) => (input.lines.some((l) => l.account.id === e.account_to) ? input.color(e.account_to!) : null);
+    const markers = swapMarkers(swaps);
+    for (const m of markers) {
+      if (m.swaps.length === 1) {
+        const color = swapColor(m.swaps[0].e);
+        svg.append(
+          s("path", {
+            class: "swap-mark",
+            d: `M${m.x - 4},${plot.top - 10}H${m.x + 4}L${m.x},${plot.top - 3}Z`,
+            style: color ? `fill: ${color}` : null,
+          }),
+        );
+        continue;
+      }
       svg.append(
-        s("path", {
-          class: "swap-mark",
-          d: `M${sx - 4},${plot.top - 10}H${sx + 4}L${sx},${plot.top - 3}Z`,
-          style: known ? `fill: ${input.color(e.account_to!)}` : null,
-        }),
+        s("rect", { class: "swap-group", x: m.x - m.width / 2, y: plot.top - 13, width: m.width, height: 11, rx: 5.5 }),
+        text(m.x, plot.top - 4.5, String(m.swaps.length), "swap-count"),
       );
     }
 
@@ -347,16 +404,37 @@ export function drawUsage(input: UsageInput): Draw {
           ),
         );
       }
-      // A swap within a few pixels of the pointer.
-      const near = swaps
-        .filter((sw) => Math.abs(sw.x - px) <= 6)
+      // The swap marker under the pointer, if any.
+      const reach = (m: SwapMarker) => Math.max(6, m.width / 2 + 2, (m.swaps[m.swaps.length - 1].x - m.swaps[0].x) / 2 + 4);
+      const marker = markers
+        .filter((m) => Math.abs(m.x - px) <= reach(m))
         .sort((a, b) => Math.abs(a.x - px) - Math.abs(b.x - px))[0];
+      // One swap: the crosshair goes to it. Several: it stays with the pointer, and the tooltip
+      // lists them.
+      const near = marker?.swaps.length === 1 ? marker.swaps[0] : null;
+      const group = marker && marker.swaps.length > 1 ? marker.swaps : null;
       return {
         crosshair: near ? near.x : cx,
         x: near ? near.x : cx,
         tip: [
           h("div", { class: "tip-head" }, clock(near ? near.e.ts : t)),
           near && h("div", { class: "tip-note" }, input.describeSwap(near.e)),
+          group && [
+            h("div", { class: "tip-note" }, `${group.length} swaps here`),
+            // One grid, so the times and descriptions line up in columns.
+            h(
+              "div",
+              { class: "tip-swaps" },
+              group
+                .slice(0, SWAPS_LISTED)
+                .map(({ e }) => [
+                  h("i", { class: "tip-mark", style: { borderTopColor: swapColor(e) ?? "" } }),
+                  h("span", { class: "muted" }, clock(e.ts)),
+                  h("span", null, input.describeSwap(e)),
+                ]),
+            ),
+            group.length > SWAPS_LISTED && h("div", { class: "tip-note" }, `and ${group.length - SWAPS_LISTED} more`),
+          ],
           rows.length > 0
             ? [h("div", { class: "tip-sub" }, `Of the ${input.limitName} limit used`), rows]
             : h("div", { class: "tip-sub" }, "No readings yet"),

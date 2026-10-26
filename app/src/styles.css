@@ -1005,6 +1005,16 @@ tr.dragging .grip {
   fill: var(--muted);
 }
 
+.chart-svg .swap-group {
+  fill: var(--line-strong);
+}
+
+.chart-svg .swap-count {
+  fill: var(--ink);
+  font-size: 9.5px;
+  font-weight: 650;
+}
+
 .chart-svg .crosshair {
   stroke: var(--line-strong);
 }
@@ -1086,6 +1096,32 @@ tr.dragging .grip {
   width: 10px;
   height: 10px;
   border-radius: 2px;
+}
+
+.tip-swaps {
+  display: grid;
+  grid-template-columns: 8px auto auto;
+  align-items: center;
+  gap: 0 6px;
+  margin-top: 3px;
+  line-height: 1.6;
+}
+
+.tip-swaps + .tip-note {
+  margin-top: 2px;
+}
+
+.tip-swaps + .tip-sub,
+.tip-swaps + .tip-note + .tip-sub {
+  margin-top: 6px;
+}
+
+.tip-mark {
+  width: 0;
+  height: 0;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 7px solid var(--muted);
 }
 
 .tip-total {
