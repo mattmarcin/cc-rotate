@@ -243,10 +243,10 @@ fn the_status_line_tells_a_sessions_processes_by_when_they_started() {
     tick(1.5, start + 60_000, 150_000);
     tick(1.8, start + 90_000, 180_200);
     tick(1.7, start + 95_000, 214_800);
-    let from = start / 1000 - 3_600;
+    // Hours on both sides, whenever in the hour this runs: the ticks above span up to 95 s.
     let counted = e
         .store
-        .account_cost_between(e.a, from, from + 7_200)
+        .account_cost_between(e.a, start / 1000 - 3_600, start / 1000 + 7_200)
         .unwrap()
         .unwrap();
     // 0.5 and 0.2 from the first, 0.3 from the second.
