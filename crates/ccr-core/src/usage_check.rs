@@ -873,7 +873,7 @@ fn job(
         note_verdict(s, &mut st, verdict.as_ref(), account_id, usage_started)?;
         match &outcome {
             CheckOutcome::Read { windows } => {
-                let last = s.last_sample(account_id)?;
+                let last = s.current_usage(account_id)?;
                 s.record_sample(&Sample {
                     ts: now,
                     account_id,
@@ -1329,7 +1329,7 @@ fn confirm_with(
     if let Some(extra) = &report.extra_usage {
         store.set_extra_usage(active.id, extra, report.fetched_at_ms)?;
     }
-    let last = store.last_sample(active.id)?;
+    let last = store.current_usage(active.id)?;
     let windows = profile_usage::with_carried(report.windows, last.as_ref(), now / 1000);
     store.record_sample(&Sample {
         ts: now,

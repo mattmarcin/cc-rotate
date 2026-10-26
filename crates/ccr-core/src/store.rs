@@ -422,6 +422,35 @@ pub fn same_windows(a: &[SampleWindow], b: &[SampleWindow]) -> bool {
         })
 }
 
+/// Raise each reading's windows to the highest earlier reading of the same window of the same
+/// account, as `Store::current_usage` does for the latest one. `samples` are oldest first; a
+/// usage check settles what came before it.
+pub fn level(samples: &mut [Sample]) {
+    // Per account and window name: each reset time seen, with the highest reading of it.
+    let mut highs: std::collections::HashMap<(i64, String), Vec<(i64, f64)>> =
+        std::collections::HashMap::new();
+    for s in samples {
+        let check = s.profile == crate::usage_check::SOURCE;
+        for w in &mut s.windows {
+            let Some(resets_at) = w.resets_at else {
+                continue;
+            };
+            let seen = highs.entry((s.account_id, w.name.clone())).or_default();
+            match seen
+                .iter_mut()
+                .find(|(r, _)| crate::swap::same_reset(*r, resets_at))
+            {
+                Some((_, high)) if check => *high = w.pct,
+                Some((_, high)) => {
+                    *high = high.max(w.pct);
+                    w.pct = *high;
+                }
+                None => seen.push((resets_at, w.pct)),
+            }
+        }
+    }
+}
+
 /// What an account's use in one hour would have cost at API prices (`account_costs`).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct HourlyCost {
@@ -1514,6 +1543,60 @@ impl Store {
         sample.windows = stmt
             .query_map([id], window_from_row)?
             .collect::<rusqlite::Result<_>>()?;
+        Ok(Some(sample))
+    }
+
+    /// The account's usage now (section 7): its latest reading, each window at the highest
+    /// percentage read of it (the same name, reset times within a minute) since the latest usage
+    /// check of it, that check included. Usage within a window only grows, but each session
+    /// repeats the numbers of its own last response for as long as it idles (F24), so with
+    /// several sessions the latest reading is often an older one. A check reads the account
+    /// itself and settles what came before it. `level` does the same over a run of readings.
+    pub fn current_usage(&self, account_id: i64) -> Result<Option<Sample>> {
+        self.current_usage_until(account_id, i64::MAX)
+    }
+
+    /// The account's usage as of `until_ms` (`current_usage`), from readings taken at or before it.
+    pub fn current_usage_until(&self, account_id: i64, until_ms: i64) -> Result<Option<Sample>> {
+        let Some(mut sample) = self.last_sample_until(account_id, until_ms)? else {
+            return Ok(None);
+        };
+        // Readings in the order `last_sample_until` and `samples_since` use: by time, then as
+        // recorded.
+        let mut stmt = self.conn.prepare_cached(
+            "WITH checked AS (
+                 SELECT s.ts, s.id FROM sample_windows w JOIN samples s ON s.id = w.sample_id
+                 WHERE w.account_id = ?1 AND w.name = ?2
+                   AND w.resets_at BETWEEN ?3 - ?4 AND ?3 + ?4
+                   AND s.ts <= ?5 AND s.profile = ?6
+                 ORDER BY s.ts DESC, s.id DESC LIMIT 1)
+             SELECT MAX(w.pct) FROM sample_windows w JOIN samples s ON s.id = w.sample_id
+             WHERE w.account_id = ?1 AND w.name = ?2 AND w.resets_at BETWEEN ?3 - ?4 AND ?3 + ?4
+               AND s.ts <= ?5
+               AND (NOT EXISTS (SELECT 1 FROM checked)
+                    OR (s.ts, s.id) >= (SELECT ts, id FROM checked))",
+        )?;
+        for w in &mut sample.windows {
+            let Some(resets_at) = w.resets_at else {
+                continue;
+            };
+            let high: Option<f64> = stmt.query_row(
+                params![
+                    account_id,
+                    w.name,
+                    resets_at,
+                    crate::swap::SAME_RESET_S,
+                    until_ms,
+                    crate::usage_check::SOURCE
+                ],
+                |r| r.get(0),
+            )?;
+            if let Some(high) = high
+                && high > w.pct
+            {
+                w.pct = high;
+            }
+        }
         Ok(Some(sample))
     }
 
@@ -2655,6 +2738,161 @@ mod tests {
             s.save_credential(a, &json!({"refreshToken": ""}), "login")
                 .is_err()
         );
+    }
+
+    /// Each session repeats its own last numbers, so readings of one window go up and down: the
+    /// account's usage is the highest of them since the latest usage check of that window, and
+    /// `level` agrees with `current_usage_until` at every reading.
+    #[test]
+    fn usage_is_the_highest_reading_since_the_latest_check() {
+        let s = Store::open_in_memory().unwrap();
+        let a = s
+            .insert_account("a", &ident("ua"), AccountState::Active)
+            .unwrap();
+        let b = s
+            .insert_account("b", &ident("ub"), AccountState::Parked)
+            .unwrap();
+        let w = |name: &str, pct: f64, resets_at: Option<i64>| SampleWindow {
+            name: name.into(),
+            pct,
+            resets_at,
+        };
+        let reading = |account_id, ts, profile: &str, windows| Sample {
+            ts,
+            account_id,
+            profile: profile.into(),
+            session_id: None,
+            model: None,
+            windows,
+        };
+        let (five, week) = (10_000, 90_000);
+        for r in [
+            reading(
+                a,
+                1_000,
+                "rotate",
+                vec![
+                    w("five_hour", 40.0, Some(five)),
+                    w("seven_day", 10.0, Some(week)),
+                ],
+            ),
+            reading(
+                a,
+                2_000,
+                "rotate",
+                vec![
+                    w("five_hour", 60.0, Some(five)),
+                    w("seven_day", 12.0, Some(week)),
+                ],
+            ),
+            // An idle session.
+            reading(
+                a,
+                3_000,
+                "rotate",
+                vec![
+                    w("five_hour", 25.0, Some(five)),
+                    w("seven_day", 11.0, Some(week)),
+                ],
+            ),
+            // Another account at the same reset time.
+            reading(b, 3_500, "rotate", vec![w("five_hour", 90.0, Some(five))]),
+            // Rounded to another second.
+            reading(
+                a,
+                4_000,
+                "rotate",
+                vec![
+                    w("five_hour", 30.0, Some(five + 30)),
+                    w("seven_day", 11.0, Some(week)),
+                ],
+            ),
+            // A check reads only the 5-hour window.
+            reading(a, 5_000, "check", vec![w("five_hour", 50.0, Some(five))]),
+            reading(
+                a,
+                6_000,
+                "rotate",
+                vec![
+                    w("five_hour", 45.0, Some(five)),
+                    w("seven_day", 11.0, Some(week)),
+                ],
+            ),
+            reading(
+                a,
+                7_000,
+                "rotate",
+                vec![
+                    w("five_hour", 55.0, Some(five)),
+                    w("seven_day", 11.0, Some(week)),
+                ],
+            ),
+            // A new window, and one without a reset time.
+            reading(
+                a,
+                8_000,
+                "rotate",
+                vec![
+                    w("five_hour", 5.0, Some(five + 18_000)),
+                    w("other", 3.0, None),
+                ],
+            ),
+            reading(
+                a,
+                9_000,
+                "rotate",
+                vec![
+                    w("five_hour", 4.0, Some(five + 18_000)),
+                    w("other", 2.0, None),
+                ],
+            ),
+        ] {
+            assert!(s.record_sample(&r).unwrap());
+        }
+        let pcts = |until: i64| -> Vec<(String, f64)> {
+            s.current_usage_until(a, until)
+                .unwrap()
+                .unwrap()
+                .windows
+                .into_iter()
+                .map(|w| (w.name, w.pct))
+                .collect()
+        };
+        let pairs = |v: &[(&str, f64)]| -> Vec<(String, f64)> {
+            v.iter().map(|(n, p)| (n.to_string(), *p)).collect()
+        };
+        assert_eq!(
+            pcts(3_000),
+            pairs(&[("five_hour", 60.0), ("seven_day", 12.0)])
+        );
+        assert_eq!(
+            pcts(4_000),
+            pairs(&[("five_hour", 60.0), ("seven_day", 12.0)])
+        );
+        assert_eq!(
+            pcts(5_000),
+            pairs(&[("five_hour", 50.0)]),
+            "a check settles what came before it"
+        );
+        assert_eq!(
+            pcts(6_000),
+            pairs(&[("five_hour", 50.0), ("seven_day", 12.0)])
+        );
+        assert_eq!(
+            pcts(7_000),
+            pairs(&[("five_hour", 55.0), ("seven_day", 12.0)])
+        );
+        assert_eq!(pcts(9_000), pairs(&[("five_hour", 5.0), ("other", 2.0)]));
+        assert_eq!(s.current_usage(a).unwrap().unwrap().ts, 9_000);
+        assert_eq!(s.last_sample(a).unwrap().unwrap().windows[0].pct, 4.0);
+        assert_eq!(s.current_usage(b).unwrap().unwrap().windows[0].pct, 90.0);
+
+        let mut all = s.samples_since(0).unwrap();
+        level(&mut all);
+        for r in all {
+            let usage = s.current_usage_until(r.account_id, r.ts).unwrap().unwrap();
+            assert_eq!(r.windows, usage.windows, "at {}", r.ts);
+        }
     }
 
     #[test]

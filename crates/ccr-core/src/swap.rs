@@ -635,7 +635,7 @@ pub fn load_pool(store: &Store, now_s: i64) -> Result<(Vec<Candidate>, Policy)> 
             .iter()
             .position(|&p| p == account.position)
             .unwrap_or_default();
-        let sample = store.last_sample(account.id)?;
+        let sample = store.current_usage(account.id)?;
         let thresholds = policy.thresholds.for_account(&account);
         let windows = scheduler::window_usage(sample.as_ref(), now_s, thresholds, model.as_deref());
         let stop_hold_until = stop_hold_until(
@@ -698,7 +698,8 @@ pub fn detect_weekly_limit(store: &Store, account_id: i64, now_s: i64) -> Result
 /// report, or a stop reading that never came), its room is out of date, and switching back to
 /// it would only stop the next turn again. A later reading that differs from that one (a usage
 /// check after a reset, say) is news and ends the hold; one with the same numbers is not.
-/// `latest` is the account's latest reading, `thresholds` and `model` what applies to it.
+/// `latest` is the account's usage (`Store::current_usage`), `thresholds` and `model` what
+/// applies to it.
 pub fn stop_hold_until(
     store: &Store,
     account_id: i64,
@@ -716,7 +717,7 @@ pub fn stop_hold_until(
     }
     let at_stop = match latest {
         Some(s) if s.ts <= left => Some(s.clone()),
-        _ => store.last_sample_until(account_id, left)?,
+        _ => store.current_usage_until(account_id, left)?,
     };
     if let Some(s) = &at_stop {
         // As the session that sent it saw it: a window scoped to its model applied to it.
@@ -795,7 +796,7 @@ pub enum Attribution {
 
 /// Reset times within this many seconds are the same: the status line and `/usage` may round
 /// a reset time differently.
-const SAME_RESET_S: i64 = 60;
+pub(crate) const SAME_RESET_S: i64 = 60;
 
 pub fn same_reset(a: i64, b: i64) -> bool {
     (a - b).abs() <= SAME_RESET_S
@@ -1324,7 +1325,7 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
     // Everything that can fail is read before the write; after it, only the commit can, and its
     // failure restores the outgoing login.
     let from_sample = match active_id {
-        Some(id) => store.last_sample(id)?,
+        Some(id) => store.current_usage(id)?,
         None => None,
     };
     let previous_swap = store.meta_i64(META_LAST_SWAP_AT)?;

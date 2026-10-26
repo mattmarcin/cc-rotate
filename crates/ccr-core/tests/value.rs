@@ -324,10 +324,10 @@ fn warns_once_per_episode_of_paid_extra_usage() {
     assert_eq!(ev.account_from, Some(e.a));
     assert_eq!(ev.detail.unwrap()["used"], 1240);
 
-    // An account free again ends the episode; the next one warns again.
-    five_hour(&e.store, e.b, 10.0, 1_800);
+    // An account free again (its window reset) ends the episode; the next one warns again.
+    five_hour(&e.store, e.b, 10.0, 18_000);
     extra_usage::scan(&e.store, time::now_ms()).unwrap();
-    five_hour(&e.store, e.b, 100.0, 1_800);
+    five_hour(&e.store, e.b, 100.0, 18_000);
     extra_usage::scan(&e.store, time::now_ms()).unwrap();
     assert_eq!(paid_events(&e.store), 2);
 }

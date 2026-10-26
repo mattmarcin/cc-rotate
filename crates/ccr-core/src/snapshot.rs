@@ -279,15 +279,18 @@ pub fn recent_events(store: &Store, limit: usize) -> Result<Vec<Event>> {
     store.events(limit)
 }
 
-/// The samples taken at or after `since_ms`, oldest first, after each account's last sample
-/// before it: the reading in force when a chart's range starts.
+/// The samples taken at or after `since_ms`, oldest first, after each account's usage just
+/// before it (`Store::current_usage_until`): the reading in force when a chart's range starts.
+/// Each window is at the highest reading of it so far (`store::level`), so an idle session
+/// repeating older numbers does not pull the line down.
 pub fn series(store: &Store, since_ms: i64) -> Result<Vec<Sample>> {
     let mut out = Vec::new();
     for account in store.accounts()? {
-        out.extend(store.last_sample_until(account.id, since_ms - 1)?);
+        out.extend(store.current_usage_until(account.id, since_ms - 1)?);
     }
     out.sort_by_key(|s| s.ts);
     out.extend(store.samples_since(since_ms)?);
+    crate::store::level(&mut out);
     Ok(out)
 }
 
@@ -416,6 +419,50 @@ mod tests {
                 (a, since, 30.0),
                 (b, since + 60_000, 55.0),
                 (c, since + 120_000, 5.0),
+            ]
+        );
+    }
+
+    /// An idle session repeating older numbers does not pull a chart's line down, before the
+    /// range or in it.
+    #[test]
+    fn series_holds_each_windows_highest_reading() {
+        let store = Store::open_in_memory().unwrap();
+        let a = store
+            .insert_account(
+                "a",
+                &AccountIdentity {
+                    account_uuid: Some("u1".into()),
+                    ..Default::default()
+                },
+                AccountState::Active,
+            )
+            .unwrap();
+        let since = 1_800_000_000_000;
+        let at = |ts: i64, pct: f64| {
+            let mut s = reading(a, ts, pct);
+            s.windows[0].resets_at = Some(since / 1000 + 86_400);
+            s
+        };
+        for s in [
+            at(since - 120_000, 40.0),
+            at(since - 60_000, 20.0),
+            at(since, 45.0),
+            at(since + 60_000, 30.0),
+        ] {
+            store.record_sample(&s).unwrap();
+        }
+        let got: Vec<(i64, f64)> = series(&store, since)
+            .unwrap()
+            .iter()
+            .map(|s| (s.ts, s.windows[0].pct))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (since - 60_000, 40.0),
+                (since, 45.0),
+                (since + 60_000, 45.0),
             ]
         );
     }

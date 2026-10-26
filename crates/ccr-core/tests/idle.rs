@@ -143,6 +143,45 @@ fn numbers_unchanged_while_parked_are_the_accounts_own_after_a_swap_back() {
     assert!(close(cost(&e, e.b), 0.0), "b {}", cost(&e, e.b));
 }
 
+/// Several sessions on one account each repeat the numbers of their own last response (F24), so
+/// the latest reading is often an older one: the account's usage is the highest reading of each
+/// window. An idle session's tick after the cooldown still swaps at the limit a busy session
+/// reached during it.
+#[test]
+fn an_idle_sessions_older_numbers_never_lower_the_accounts_usage() {
+    let e = env();
+    swap::run(&e.store, &e.paths, &manual(e.b)).unwrap();
+    let now = time::now_ms();
+    let resets = now / 1000 + 3600;
+    let start = now - 600_000;
+    let tick = |session: &str, pct: f64, at: i64| {
+        statusline::tick(
+            &e.store,
+            &e.paths,
+            &input(session, 1.0, at - start, pct, resets),
+            at,
+        )
+        .unwrap()
+    };
+    let usage = || e.store.current_usage(e.b).unwrap().unwrap().windows[0].pct;
+    assert!(tick("idle", 25.0, now + 1_000).swap.is_none());
+    assert!(tick("busy", 50.0, now + 2_000).swap.is_none());
+    assert!(tick("idle", 25.0, now + 3_000).swap.is_none());
+    assert_eq!(usage(), 50.0);
+    assert!(
+        tick("busy", 99.0, now + 4_000).swap.is_none(),
+        "within the cooldown of the swap to b"
+    );
+
+    // Past the cooldown, only the idle session ticks.
+    let r = tick("idle", 25.0, now + 121_000);
+    let latest = e.store.last_sample(e.b).unwrap().unwrap();
+    assert_eq!((latest.ts, latest.windows[0].pct), (now + 121_000, 25.0));
+    assert_eq!(usage(), 99.0);
+    let req = r.swap.expect("b is at its 5-hour threshold");
+    assert_eq!((req.from, req.reason), (Some(e.b), Reason::FiveHour));
+}
+
 /// A status line that takes up to several seconds to start reckons the process's start that
 /// much later: still the same process, and its cost is counted once.
 #[test]
