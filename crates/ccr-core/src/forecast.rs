@@ -344,12 +344,28 @@ mod tests {
         }
     }
 
-    /// Plays the pool forward like `forecast`, and checks what every plan must hold.
+    /// Plays the pool forward like `forecast`, and checks what the plans of these pools must
+    /// hold. (A pool already out at `NOW` would start with a gap; the snapshot shows no forecast
+    /// then.)
     fn play(pool: &[Candidate], pace: f64) -> Forecast {
         let f = forecast(pool, POLICY, &same_pace(), pace, NOW);
         let plan = &f.plan;
         if let Some(first) = plan.first() {
             assert_eq!(first.from, NOW, "the plan starts now: {plan:?}");
+        }
+        for pair in plan.windows(2) {
+            if pair[0].to == pair[1].from {
+                assert_ne!(pair[0].account_id, pair[1].account_id, "{plan:?}");
+            } else {
+                // Only a run-out leaves a gap.
+                assert!(
+                    f.runs_out_at.is_some_and(|out| pair[0].to >= out),
+                    "{plan:?}"
+                );
+            }
+        }
+        if f.runs_out_at.is_none() {
+            assert_eq!(plan.last().map(|t| t.to), Some(NOW + HORIZON_S), "{plan:?}");
         }
         for t in plan {
             assert!(t.from < t.to, "{t:?}");
@@ -452,6 +468,39 @@ mod tests {
         assert_eq!(f.free_again_at, Some(NOW + 5 * 3600), "{f:?}");
         // s1 handed over before its first step, so the plan starts with s2.
         assert_eq!(f.plan[0].account_id, 2, "{:?}", f.plan);
+    }
+
+    #[test]
+    fn an_account_with_a_weekly_limit_gives_way_mid_plan() {
+        // s1 has a weekly limit and room; s2, a seat without one, is at its 5-hour limit until
+        // an hour from now. 20 points an hour fills nothing in that hour.
+        let mut s1 = seat(1, AccountState::Active, 0.0, None);
+        s1.weekly_limit = WeeklyLimit::Has;
+        let weekly = Sample {
+            ts: NOW * 1000,
+            account_id: 1,
+            profile: "rotate".into(),
+            session_id: None,
+            model: None,
+            windows: vec![SampleWindow {
+                name: "seven_day".into(),
+                pct: 10.0,
+                resets_at: Some(NOW + 3 * 86_400),
+            }],
+        };
+        s1.windows = window_usage(Some(&weekly), NOW, T, None);
+        let pool = [s1, seat(2, AccountState::Parked, 99.0, Some(3600))];
+        let f = play(&pool, 1.0);
+        let plan = &f.plan;
+        assert_eq!(plan[0].account_id, 1, "{plan:?}");
+        // It gave way with room left, so it isn't resting.
+        assert!(!plan[0].at_limit, "{plan:?}");
+        assert_eq!(plan[0].rests_until, None);
+        assert_eq!(plan[1].account_id, 2, "{plan:?}");
+        assert!(
+            (NOW + 3600..=NOW + 3600 + STEP_S).contains(&plan[1].from),
+            "{plan:?}"
+        );
     }
 
     #[test]
