@@ -50,9 +50,18 @@ pub fn open(profile_override: Option<PathBuf>) -> Result<(Store, Paths)> {
     let profile = match profile_override.or(from_env) {
         Some(p) => p,
         None => match store.settings()?.profile_dir {
+            Some(p) if !std::path::Path::new(&p).is_absolute() => anyhow::bail!(
+                "profile_dir must be a full path. Set it with cc-rotate-ctl --profile <full path> config profile_dir <full path>."
+            ),
             Some(p) => PathBuf::from(p),
             None => Paths::default_profile_dir()?,
         },
     };
+    // Its login and settings (which can hold secrets in `env`) are the user's alone, even when
+    // an older version made them with the default mode.
+    secret::restrict_to_owner(&profile, 0o700);
+    for file in ["settings.json", "settings.local.json"] {
+        secret::restrict_to_owner(&profile.join(file), 0o600);
+    }
     Ok((store, Paths::new(data_dir, profile)))
 }

@@ -61,10 +61,10 @@ impl Credentials {
     /// Read the document the way Claude Code does: the Keychain item if it holds one, else the
     /// file. `Ok(None)` when neither has anything.
     pub fn read_raw(&self) -> Result<Option<(Location, Vec<u8>)>> {
-        if let Some(keychain) = &self.keychain {
-            if let Some(text) = keychain.read()? {
-                return Ok(Some((Location::Keychain, text.into_bytes())));
-            }
+        if let Some(keychain) = &self.keychain
+            && let Some(text) = keychain.read()?
+        {
+            return Ok(Some((Location::Keychain, text.into_bytes())));
         }
         match std::fs::read(&self.file) {
             Ok(bytes) => Ok(Some((Location::File, bytes))),
@@ -356,12 +356,11 @@ fn add_command(account: &str, service: &str, text: &str) -> String {
 
 /// `security -w` prints the password as text, or as hex when it is not printable.
 fn decode_password(out: &str) -> String {
-    if serde_json::from_str::<Value>(out).is_err() {
-        if let Ok(bytes) = hex::decode(out) {
-            if let Ok(text) = String::from_utf8(bytes) {
-                return text;
-            }
-        }
+    if serde_json::from_str::<Value>(out).is_err()
+        && let Ok(bytes) = hex::decode(out)
+        && let Ok(text) = String::from_utf8(bytes)
+    {
+        return text;
     }
     out.to_string()
 }

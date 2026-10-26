@@ -681,6 +681,13 @@ pub struct Store {
     key: OnceCell<Key>,
 }
 
+/// `path` with `suffix` added to its file name (`store.db-wal`).
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(suffix);
+    path.with_file_name(name)
+}
+
 impl Store {
     /// Open (or create) the store. Its encryption key is `master.key` next to it.
     pub fn open(path: &Path) -> Result<Store> {
@@ -688,8 +695,17 @@ impl Store {
             .parent()
             .context("the store path has no parent directory")?;
         secret::create_private_dir(dir)?;
+        secret::restrict_to_owner(dir, 0o700);
         let conn =
             Connection::open(path).with_context(|| format!("opening store {}", path.display()))?;
+        // SQLite creates the database and its journal files with the default mode.
+        for file in [
+            path.to_path_buf(),
+            with_suffix(path, "-wal"),
+            with_suffix(path, "-shm"),
+        ] {
+            secret::restrict_to_owner(&file, 0o600);
+        }
         Self::init(conn, Some(secret::key_path(dir)), OnceCell::new())
     }
 
@@ -993,24 +1009,26 @@ impl Store {
         Ok(Settings {
             swap_threshold_5h: num("swap_threshold_5h", 98.0)?,
             swap_threshold_7d: num("swap_threshold_7d", 98.0)?,
-            swap_cooldown_s: int("swap_cooldown_s", 120)?,
+            // Clamped as written (`validate_setting`): an older version stored anything.
+            swap_cooldown_s: int("swap_cooldown_s", 120)?.clamp(0, DAY_S),
             prefer_no_weekly_limit: get("prefer_no_weekly_limit")?
                 .and_then(|v| parse_bool(&v))
                 .unwrap_or(true),
-            lock_timeout_ms: int("lock_timeout_ms", 30_000)? as u64,
-            sample_retention_days: int("sample_retention_days", 90)?,
+            lock_timeout_ms: int("lock_timeout_ms", 30_000)?.clamp(0, 10 * 60_000) as u64,
+            sample_retention_days: int("sample_retention_days", 90)?.clamp(0, 3650),
             statusline_downstream: text("statusline_downstream")?,
             profile_dir: text("profile_dir")?,
             claude_path: text("claude_path")?,
             usage_checks: get("usage_checks")?
                 .and_then(|v| parse_bool(&v))
                 .unwrap_or(true),
-            usage_check_interval_s: int("usage_check_interval_s", 3600)?,
-            usage_check_max_age_s: int("usage_check_max_age_s", 900)?,
+            usage_check_interval_s: int("usage_check_interval_s", 3600)?
+                .clamp(MIN_CHECK_INTERVAL_S, 7 * DAY_S),
+            usage_check_max_age_s: int("usage_check_max_age_s", 900)?.clamp(0, 7 * DAY_S),
             use_expiring_weekly: get("use_expiring_weekly")?
                 .and_then(|v| parse_bool(&v))
                 .unwrap_or(true),
-            login_warning_days: int("login_warning_days", 5)?,
+            login_warning_days: int("login_warning_days", 5)?.clamp(0, 30),
             strict_order: get("strict_order")?
                 .and_then(|v| parse_bool(&v))
                 .unwrap_or(false),
@@ -1108,10 +1126,10 @@ impl Store {
         if let Some(a) = self.account_by_email(reference)? {
             return Ok(a);
         }
-        if let Ok(id) = reference.parse::<i64>() {
-            if let Some(a) = self.account(id)? {
-                return Ok(a);
-            }
+        if let Ok(id) = reference.parse::<i64>()
+            && let Some(a) = self.account(id)?
+        {
+            return Ok(a);
         }
         Err(anyhow!("no account matches {reference:?}"))
     }
@@ -1264,10 +1282,10 @@ impl Store {
 
     /// Set or clear (`None`) the account's weekly cap, in percent from 1 to 100.
     pub fn set_weekly_cap(&self, id: i64, cap: Option<f64>) -> Result<()> {
-        if let Some(c) = cap {
-            if !(1.0..=100.0).contains(&c) {
-                bail!("Use a number from 1 to 100.");
-            }
+        if let Some(c) = cap
+            && !(1.0..=100.0).contains(&c)
+        {
+            bail!("Use a number from 1 to 100.");
         }
         let n = self.conn.execute(
             "UPDATE accounts SET weekly_cap = ?2 WHERE id = ?1",
@@ -1443,10 +1461,11 @@ impl Store {
     /// Insert a sample unless it repeats the account's last one within a minute.
     /// Returns whether a row was written.
     pub fn record_sample(&self, s: &Sample) -> Result<bool> {
-        if let Some(last) = self.last_sample(s.account_id)? {
-            if s.ts - last.ts < 60_000 && last.same_reading(s) {
-                return Ok(false);
-            }
+        if let Some(last) = self.last_sample(s.account_id)?
+            && s.ts - last.ts < 60_000
+            && last.same_reading(s)
+        {
+            return Ok(false);
         }
         self.conn.execute_batch("SAVEPOINT record_sample")?;
         let written = (|| -> Result<()> {
@@ -1689,10 +1708,11 @@ impl Store {
                 )
                 .optional()?)
         };
-        if let Some((key, earliest, seen)) = find(self)? {
-            if earliest <= started_ms && now_ms - seen < SESSION_SEEN_REFRESH_MS {
-                return Ok(key);
-            }
+        if let Some((key, earliest, seen)) = find(self)?
+            && earliest <= started_ms
+            && now_ms - seen < SESSION_SEEN_REFRESH_MS
+        {
+            return Ok(key);
         }
         self.immediate(|s| match find(s)? {
             Some((key, earliest, _)) => {
@@ -1746,10 +1766,11 @@ impl Store {
                 .optional()?)
         };
         // The same numbers again, recently: nothing to write.
-        if let Some((last_text, since, seen)) = last(self)? {
-            if last_text == text && now_ms - seen < SESSION_SEEN_REFRESH_MS {
-                return Ok(since);
-            }
+        if let Some((last_text, since, seen)) = last(self)?
+            && last_text == text
+            && now_ms - seen < SESSION_SEEN_REFRESH_MS
+        {
+            return Ok(since);
         }
         self.immediate(|s| {
             let unchanged_since = last(s)?.and_then(|(last_text, since, _)| {
@@ -2152,12 +2173,10 @@ fn validate_setting(key: &str, value: &str) -> Result<Option<String>> {
                 bail!("Use a number from 1 to 100.");
             }
         }
-        "swap_cooldown_s" | "lock_timeout_ms" | "sample_retention_days" => {
-            let v: i64 = value.parse().map_err(|_| anyhow!("Use a whole number."))?;
-            if v < 0 {
-                bail!("Use 0 or more.");
-            }
-        }
+        // Bounded above too, so time arithmetic on them cannot overflow.
+        "swap_cooldown_s" => whole_in(value, 0, DAY_S)?,
+        "lock_timeout_ms" => whole_in(value, 0, 10 * 60_000)?,
+        "sample_retention_days" => whole_in(value, 0, 3650)?,
         "usage_check_interval_s" => {
             let v: i64 = value.parse().map_err(|_| anyhow!("Use a whole number."))?;
             if v < MIN_CHECK_INTERVAL_S {
@@ -2165,11 +2184,13 @@ fn validate_setting(key: &str, value: &str) -> Result<Option<String>> {
                     "Use {MIN_CHECK_INTERVAL_S} or more. Anthropic refuses more frequent usage checks."
                 );
             }
+            whole_in(value, MIN_CHECK_INTERVAL_S, 7 * DAY_S)?;
         }
-        "usage_check_max_age_s" => {
-            let v: i64 = value.parse().map_err(|_| anyhow!("Use a whole number."))?;
-            if v < 0 {
-                bail!("Use 0 or more.");
+        "usage_check_max_age_s" => whole_in(value, 0, 7 * DAY_S)?,
+        // A relative path would be looked up from wherever cc-rotate runs, such as a project.
+        "claude_path" | "profile_dir" => {
+            if !std::path::Path::new(value).is_absolute() {
+                bail!("Use a full path, starting from the root of the drive.");
             }
         }
         "login_warning_days" => {
@@ -2191,6 +2212,19 @@ fn validate_setting(key: &str, value: &str) -> Result<Option<String>> {
         _ => {}
     }
     Ok(None)
+}
+
+const DAY_S: i64 = 86_400;
+
+/// A whole number from `min` to `max`.
+fn whole_in(value: &str, min: i64, max: i64) -> Result<()> {
+    let v: i64 = value
+        .parse()
+        .map_err(|_| anyhow!("Use a whole number from {min} to {max}."))?;
+    if !(min..=max).contains(&v) {
+        bail!("Use a whole number from {min} to {max}.");
+    }
+    Ok(())
 }
 
 pub fn validate_label(label: &str) -> Result<()> {
@@ -2231,6 +2265,32 @@ pub fn sanitize_label(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_are_bounded_and_paths_are_full() {
+        let store = Store::open_in_memory().unwrap();
+        for (key, value) in [
+            ("lock_timeout_ms", "9999999999"),
+            ("swap_cooldown_s", "-1"),
+            ("swap_cooldown_s", "100000000"),
+            ("usage_check_interval_s", "100000000"),
+            ("claude_path", "claude"),
+            ("claude_path", "node_modules/.bin/claude"),
+            ("profile_dir", "rotate"),
+        ] {
+            assert!(
+                store.set_setting(key, Some(value)).is_err(),
+                "{key} = {value}"
+            );
+        }
+        let full = if cfg!(windows) {
+            r"C:\Tools\claude.exe"
+        } else {
+            "/usr/local/bin/claude"
+        };
+        store.set_setting("claude_path", Some(full)).unwrap();
+        store.set_setting("lock_timeout_ms", Some("60000")).unwrap();
+    }
 
     #[test]
     fn a_session_process_is_told_by_when_it_started() {

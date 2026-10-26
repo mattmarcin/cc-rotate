@@ -77,7 +77,9 @@ pub fn run(store: &Store, opts: &SetupOptions) -> Result<SetupReport> {
     if same_dir(&template, &profile) {
         bail!("the template and the cc-rotate profile must be different directories");
     }
-    std::fs::create_dir_all(&profile)?;
+    // Its settings and copies can hold secrets (an `env` block, MCP server tokens).
+    crate::secret::create_private_dir(&profile)?;
+    crate::secret::restrict_to_owner(&profile, 0o700);
     let profile = dunce::canonicalize(&profile)?;
     let rewrite = PathRewriter::new(&template, &profile);
     let mut report = SetupReport {
@@ -112,9 +114,9 @@ pub fn run(store: &Store, opts: &SetupOptions) -> Result<SetupReport> {
     report.claude_md = link_claude_md(&template, &profile)?;
 
     let (settings, downstream) = build_settings(&template, &rewrite, &opts.ctl_path)?;
-    std::fs::write(
-        profile.join("settings.json"),
-        serde_json::to_string_pretty(&settings)? + "\n",
+    crate::credfile::atomic_write(
+        &profile.join("settings.json"),
+        (serde_json::to_string_pretty(&settings)? + "\n").as_bytes(),
     )?;
     report.copied.push("settings.json".into());
     report.statusline_downstream = downstream.clone();
@@ -173,7 +175,9 @@ impl PathRewriter {
 fn rewrite_file(src: &Path, dst: &Path, rewrite: &PathRewriter) -> Result<()> {
     let text =
         std::fs::read_to_string(src).with_context(|| format!("reading {}", src.display()))?;
-    std::fs::write(dst, rewrite.apply(&text)).with_context(|| format!("writing {}", dst.display()))
+    // Owner-only, like the settings it may be (the template's may hold secrets in `env`).
+    crate::credfile::atomic_write(dst, rewrite.apply(&text).as_bytes())
+        .with_context(|| format!("writing {}", dst.display()))
 }
 
 fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
@@ -368,14 +372,21 @@ fn set_ctl_hook(hooks: &mut Map<String, Value>, event: &str, group: Value) -> Re
 #[cfg(windows)]
 pub fn command_path(exe: &Path) -> String {
     use crate::paths::forward_slashes;
+    // Only characters no shell gives a meaning to: Git Bash, PowerShell and cmd treat `'`, `$`,
+    // `&`, `(`, `;`, `%`, `^` and backticks specially, and a user folder can hold any of them.
+    let bare = |p: &str| {
+        !p.is_empty()
+            && p.chars()
+                .all(|c| c.is_alphanumeric() || "/._:~+-".contains(c))
+    };
     let plain = forward_slashes(exe);
-    if !plain.contains(char::is_whitespace) {
+    if bare(&plain) {
         return plain;
     }
-    if let Some(short) = short_path(exe).map(|p| forward_slashes(&p)) {
-        if !short.contains(char::is_whitespace) {
-            return short;
-        }
+    if let Some(short) = short_path(exe).map(|p| forward_slashes(&p))
+        && bare(&short)
+    {
+        return short;
     }
     format!("\"{plain}\"")
 }

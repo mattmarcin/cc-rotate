@@ -36,7 +36,13 @@ pub struct LoginRequest {
     pub expect_email: Option<String>,
 }
 
-/// A staging directory that removes itself when dropped.
+/// Names of sign-in staging folders: `login-<uuid>`.
+pub const STAGING_PREFIX: &str = "login-";
+/// How long a sign-in may take; a staging folder that records no owner is abandoned after it.
+pub const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// A staging directory that removes itself when dropped. It records the process using it, so
+/// `usage_check::sweep_logins` deletes it if that process ends without dropping it.
 #[derive(Debug)]
 pub struct Staging {
     dir: PathBuf,
@@ -44,11 +50,15 @@ pub struct Staging {
 
 impl Staging {
     pub fn create(paths: &Paths) -> Result<Staging> {
+        // Leftovers of earlier sign-ins that ended without cleaning up go first.
+        usage_check::sweep_logins(paths);
         let dir = paths
             .staging_root()
-            .join(uuid::Uuid::new_v4().simple().to_string());
-        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        Ok(Staging { dir })
+            .join(format!("{STAGING_PREFIX}{}", uuid::Uuid::new_v4().simple()));
+        crate::secret::create_private_dir(&dir)?;
+        let staging = Staging { dir };
+        usage_check::record_owner(&staging.dir)?;
+        Ok(staging)
     }
 
     pub fn dir(&self) -> &Path {
@@ -65,12 +75,20 @@ impl Drop for Staging {
     }
 }
 
-/// The `claude` executable: the `claude_path` setting, else the first one on PATH.
+/// The `claude` executable: the `claude_path` setting, else the first one in an absolute PATH
+/// directory (`paths::find_program`).
 pub fn claude_executable(store: &Store) -> Result<PathBuf> {
     if let Some(path) = store.settings()?.claude_path {
-        return Ok(PathBuf::from(path));
+        let path = PathBuf::from(path);
+        // Set before full paths were required; never looked up from the current folder.
+        if !path.is_absolute() {
+            bail!(
+                "claude_path must be a full path. Set it with cc-rotate-ctl config claude_path <path>."
+            );
+        }
+        return Ok(path);
     }
-    which::which("claude")
+    crate::paths::find_program("claude")
         .context("Couldn't find `claude` on PATH. Install Claude Code or set claude_path.")
 }
 
@@ -82,6 +100,9 @@ pub fn login_command(claude: &Path, staging: &Path, email: Option<&str>) -> Comm
     if let Some(email) = email.filter(|e| !e.is_empty()) {
         cmd.args(["--email", email]);
     }
+    // An inherited login or backend (`CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_*`) must not stand in
+    // for the one being made.
+    usage_check::scrub_env(&mut cmd);
     cmd.env("CLAUDE_CONFIG_DIR", staging);
     cmd
 }
@@ -116,21 +137,21 @@ pub fn import(
         profile_account::read(&staging.join(".claude.json"))?,
     );
     // The organization decides which usage readings belong to the account (section 9.1).
-    if ident.email.is_none() || ident.account_uuid.is_none() || ident.org_uuid.is_none() {
-        if let Ok(claude) = claude_executable(store) {
-            fill_from_auth_status(&mut ident, &claude, staging);
-        }
+    if (ident.email.is_none() || ident.account_uuid.is_none() || ident.org_uuid.is_none())
+        && let Ok(claude) = claude_executable(store)
+    {
+        fill_from_auth_status(&mut ident, &claude, staging);
     }
     if ident.account_uuid.is_none() && ident.email.is_none() {
         bail!("Signed in, but Claude Code didn't say which account it was. Try again.");
     }
 
-    if let (Some(expected), Some(got)) = (&req.expect_email, &ident.email) {
-        if !expected.eq_ignore_ascii_case(got) {
-            bail!(
-                "Signed in as {got}, not {expected}. Switch to {expected} in your browser and try again."
-            );
-        }
+    if let (Some(expected), Some(got)) = (&req.expect_email, &ident.email)
+        && !expected.eq_ignore_ascii_case(got)
+    {
+        bail!(
+            "Signed in as {got}, not {expected}. Switch to {expected} in your browser and try again."
+        );
     }
 
     let existing = match req.relogin {
@@ -150,6 +171,9 @@ pub fn import(
             None => None,
         }),
     };
+    if let Some(account) = &existing {
+        check_same_org(account, &ident)?;
+    }
 
     let has_active = store.active_account()?.is_some();
     // A usage check may be running Claude Code with this account's previous login; it must not
@@ -264,8 +288,11 @@ fn identity(oauth: &Value, profile: Option<ProfileAccount>) -> AccountIdentity {
 }
 
 fn fill_from_auth_status(ident: &mut AccountIdentity, claude: &Path, staging: &Path) {
-    let output = Command::new(claude)
-        .args(["auth", "status", "--json"])
+    let mut cmd = Command::new(claude);
+    cmd.args(["auth", "status", "--json"]);
+    // It must describe the staging login, not one an inherited variable points at.
+    usage_check::scrub_env(&mut cmd);
+    let output = cmd
         .env("CLAUDE_CONFIG_DIR", staging)
         .stdin(Stdio::null())
         .stderr(Stdio::null())
@@ -282,6 +309,27 @@ fn fill_from_auth_status(ident: &mut AccountIdentity, claude: &Path, staging: &P
         .subscription_type
         .take()
         .or_else(|| text("subscriptionType"));
+}
+
+/// One person can belong to several organizations under one account id, and cc-rotate keeps one
+/// login per account: a sign-in to another organization must not replace the account's login.
+fn check_same_org(target: &Account, ident: &AccountIdentity) -> Result<()> {
+    let (Some(have), Some(got)) = (&target.org_uuid, &ident.org_uuid) else {
+        return Ok(());
+    };
+    if have == got {
+        return Ok(());
+    }
+    let org = |name: &Option<String>| {
+        name.clone()
+            .unwrap_or_else(|| "another organization".into())
+    };
+    bail!(
+        "This sign-in is for {got_org}, but {label} is in {have_org}. cc-rotate keeps one login per Claude account, so {label}'s login was left as it was. Pick {have_org} when you sign in, or remove {label} first to add {got_org} instead.",
+        got_org = org(&ident.org_name),
+        have_org = org(&target.org_name),
+        label = target.label,
+    );
 }
 
 fn check_same_account(target: &Account, ident: &AccountIdentity) -> Result<()> {

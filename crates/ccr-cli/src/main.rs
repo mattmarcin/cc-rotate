@@ -1,5 +1,6 @@
 mod format;
 mod herdr;
+mod interrupts;
 mod process;
 mod ranking;
 mod stop_failure;
@@ -318,13 +319,13 @@ fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> 
             if let Some(req) = statusline::sync(store, paths)? {
                 swap::run(store, paths, &req)?;
             }
-            if statusline::needs_settling(store, paths, time::now_ms())? {
-                if let Ok(_lock) = ccr_core::lock::DirLock::acquire(
+            if statusline::needs_settling(store, paths, time::now_ms())?
+                && let Ok(_lock) = ccr_core::lock::DirLock::acquire(
                     &paths.swap_lock(),
                     ccr_core::lock::LockOptions::claude(Duration::ZERO),
-                ) {
-                    swap::settle_profile(store, paths)?;
-                }
+                )
+            {
+                swap::settle_profile(store, paths)?;
             }
             let snap = snapshot::snapshot(store, paths)?;
             if json {
@@ -798,9 +799,28 @@ fn login_cmd(
         "Your browser signs in with the claude.ai account it's signed in to. Switch accounts there first if needed.\n"
     );
 
-    let status = login::login_command(&claude, staging.dir(), email.as_deref())
-        .status()
+    let mut child = login::login_command(&claude, staging.dir(), email.as_deref())
+        .spawn()
         .context("running `claude auth login`")?;
+    // Ctrl+C reaches Claude Code too, which ends the sign-in; this process waits for it so the
+    // staging folder, which may already hold the new login, is removed on the way out.
+    let status = {
+        let held = interrupts::Held::new();
+        loop {
+            if let Some(status) = child.try_wait().context("running `claude auth login`")? {
+                break status;
+            }
+            if held.ended() {
+                // Asked to end, and Claude Code wasn't: stop it, and let the staging folder go.
+                let _ = child.kill();
+                let _ = child.wait();
+                // Removed while signals are still held, so a second one doesn't cut it short.
+                drop(staging);
+                bail!("Stopped the sign-in.");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
     if !status.success() {
         bail!("`claude auth login` exited with {status}");
     }

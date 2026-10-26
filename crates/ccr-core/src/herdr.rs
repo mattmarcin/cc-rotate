@@ -80,10 +80,10 @@ fn bin_from(var: impl Fn(&str) -> Option<OsString>) -> OsString {
 pub fn session_to_report(hook_input: &str) -> Result<Option<String>> {
     let input: Value =
         serde_json::from_str(hook_input).context("the SessionStart hook input is not JSON")?;
-    if let Some(event) = input.get("hook_event_name").and_then(Value::as_str) {
-        if event != "SessionStart" {
-            return Ok(None);
-        }
+    if let Some(event) = input.get("hook_event_name").and_then(Value::as_str)
+        && event != "SessionStart"
+    {
+        return Ok(None);
     }
     let is_subagent = input
         .get("agent_id")
@@ -229,11 +229,11 @@ pub fn detect() -> Option<Detected> {
         let bin = if bin.components().count() > 1 {
             bin
         } else {
-            which::which(&bin).unwrap_or(bin)
+            crate::paths::find_program(&bin.to_string_lossy()).unwrap_or(bin)
         };
         return Some(Detected::InPane(bin));
     }
-    which::which("herdr").ok().map(Detected::OnPath)
+    crate::paths::find_program("herdr").map(Detected::OnPath)
 }
 
 /// `herdr --version`, for example `0.9.4-preview.2026-10-14-fbd2ae23927f`.

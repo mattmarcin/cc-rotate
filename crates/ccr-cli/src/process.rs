@@ -89,10 +89,18 @@ pub fn spawn_herdr_report(pane_id: &str, session_id: &str, seq: u64) -> Result<(
 /// the pipe is closed.
 fn spawn_ctl(args: impl Fn(&mut Command), what: &str) -> Result<()> {
     let exe = std::env::current_exe()?;
+    // Not the session's project folder, whose files have no business in a background job.
+    // The data folder, or before it exists (nothing stored yet) the system's temp folder.
+    // Absolute, so a relative CC_ROTATE_DATA_DIR still names the same folder from there.
+    let dir = ccr_core::Paths::default_data_dir()
+        .ok()
+        .and_then(|d| dunce::canonicalize(d).ok())
+        .unwrap_or_else(std::env::temp_dir);
     let build = || {
         let mut cmd = Command::new(&exe);
         args(&mut cmd);
-        cmd.stdin(Stdio::null())
+        cmd.current_dir(&dir)
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         cmd
@@ -204,7 +212,9 @@ pub fn run_downstream(command: &str, stdin: &str) -> Option<String> {
 #[cfg(windows)]
 fn shell(command: &str) -> Command {
     use std::os::windows::process::CommandExt;
-    let mut cmd = Command::new("cmd");
+    // By full path: a bare `cmd` is looked up next to this executable first.
+    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+    let mut cmd = Command::new(std::path::Path::new(&root).join(r"System32\cmd.exe"));
     cmd.raw_arg(format!("/D /S /C \"{command}\""));
     cmd.creation_flags(flags::CREATE_NO_WINDOW);
     cmd
@@ -212,7 +222,7 @@ fn shell(command: &str) -> Command {
 
 #[cfg(unix)]
 fn shell(command: &str) -> Command {
-    let mut cmd = Command::new("sh");
+    let mut cmd = Command::new("/bin/sh");
     cmd.args(["-c", command]);
     cmd
 }
@@ -257,16 +267,19 @@ pub fn log_error(context: &str, error: &anyhow::Error) {
         return;
     };
     let dir = data.join("logs");
-    let _ = std::fs::create_dir_all(&dir);
+    let _ = ccr_core::secret::create_private_dir(&dir);
     let path = dir.join("cc-rotate.log");
     if std::fs::metadata(&path).is_ok_and(|m| m.len() > 1_000_000) {
         let _ = std::fs::rename(&path, dir.join("cc-rotate.log.1"));
     }
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    if let Ok(mut file) = options.open(&path) {
         let _ = writeln!(file, "{} {context}: {error:#}", ccr_core::time::now_ms());
     }
 }

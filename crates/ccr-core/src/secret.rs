@@ -150,6 +150,25 @@ pub fn create_private_dir(dir: &Path) -> Result<()> {
         .with_context(|| format!("creating {}", dir.display()))
 }
 
+/// Make `path` reachable by its owner alone (`mode`, 0700 for a folder or 0600 for a file) when
+/// it is this user's and allows others more. A folder created by an older version, or one
+/// `CC_ROTATE_DATA_DIR` names, may have been made with the default mode.
+#[cfg(unix)]
+pub fn restrict_to_owner(path: &Path, mode: u32) {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    if meta.uid() == me && meta.permissions().mode() & 0o077 != 0 {
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+    }
+}
+
+#[cfg(not(unix))]
+pub fn restrict_to_owner(_path: &Path, _mode: u32) {}
+
 /// Whether the key file is readable by anyone but its owner (Unix permission bits).
 #[cfg(unix)]
 pub fn key_file_exposed(path: &Path) -> Option<bool> {
@@ -256,6 +275,24 @@ pub mod dpapi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A data folder or store an older version made with the default mode is made owner-only.
+    #[cfg(unix)]
+    #[test]
+    fn the_store_and_its_folder_are_made_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("data");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let db = dir.join("store.db");
+        std::fs::write(&db, b"").unwrap();
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).unwrap();
+        crate::Store::open(&db).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&db), 0o600);
+    }
 
     #[test]
     fn round_trip() {

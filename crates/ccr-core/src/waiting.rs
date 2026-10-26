@@ -362,7 +362,9 @@ fn hook_alive(ws: &WaitingSession) -> bool {
     };
     process::alive(pid)
         && match &ws.hook_started {
-            Some(started) => process::start_time(pid).as_ref() == Some(started),
+            // A start time that can't be read now leaves it alive: a waiting session must not
+            // be given up on by mistake.
+            Some(started) => process::started_at(pid, started).unwrap_or(true),
             None => true,
         }
 }

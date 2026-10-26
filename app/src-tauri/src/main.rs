@@ -5,7 +5,7 @@ mod login_flow;
 mod tray;
 mod watcher;
 
-use tauri::{AppHandle, Manager, WindowEvent};
+use tauri::{AppHandle, Manager, RunEvent, WindowEvent};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 
 const MINIMIZED_ARG: &str = "--minimized";
@@ -54,7 +54,7 @@ fn main() {
             commands::app_info,
             commands::autostart_enabled,
             commands::set_autostart,
-            commands::open_url,
+            login_flow::open_login_page,
             login_flow::start_login,
             login_flow::submit_login_code,
             login_flow::cancel_login,
@@ -75,8 +75,13 @@ fn main() {
                 let _ = window.hide();
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running cc-rotate");
+        .build(tauri::generate_context!())
+        .expect("error while building cc-rotate")
+        .run(|app, event| {
+            if let RunEvent::Exit = event {
+                login_flow::stop_all(app);
+            }
+        });
 }
 
 /// The app is the only source of notifications, so it starts at login unless the user turned

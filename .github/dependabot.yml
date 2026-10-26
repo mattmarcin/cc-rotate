@@ -1,0 +1,7 @@
+# Keeps the commit-pinned actions in the CI workflow up to date.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

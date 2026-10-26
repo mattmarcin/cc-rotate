@@ -242,11 +242,12 @@ pub fn learn(by_account: &[(i64, Vec<Sample>)], now_ms: i64) -> Rates {
                 five += d5;
                 hours += span as f64 / 3_600_000.0;
                 active_hours.extend(a.ts / 3_600_000..=s.ts / 3_600_000);
-                if let (Some(w0), Some(w1)) = (window(a, "seven_day"), window(s, "seven_day")) {
-                    if same_reset(w0.resets_at, w1.resets_at) && w1.pct >= w0.pct {
-                        weekly_five += d5;
-                        weekly += w1.pct - w0.pct;
-                    }
+                if let (Some(w0), Some(w1)) = (window(a, "seven_day"), window(s, "seven_day"))
+                    && same_reset(w0.resets_at, w1.resets_at)
+                    && w1.pct >= w0.pct
+                {
+                    weekly_five += d5;
+                    weekly += w1.pct - w0.pct;
                 }
             }
             anchor = Some(s);

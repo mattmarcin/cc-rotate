@@ -59,7 +59,7 @@ fn run(app: &AppHandle, store: &Store, paths: &Paths, watch: &mut Watch) {
     loop {
         // Keep the store's copy of the active login current even when no interactive session
         // is running a statusline (for example only `claude -p` jobs).
-        if tick % SYNC_EVERY_S == 0
+        if tick.is_multiple_of(SYNC_EVERY_S)
             && !watch.swapping.load(Ordering::Acquire)
             && statusline::needs_settling(store, paths, time::now_ms()).unwrap_or(false)
         {
@@ -67,43 +67,44 @@ fn run(app: &AppHandle, store: &Store, paths: &Paths, watch: &mut Watch) {
             watch.swapping.store(true, Ordering::Release);
             let swapping = watch.swapping.clone();
             std::thread::spawn(move || {
-                if let Ok((store, paths)) = ccr_core::open(None) {
-                    if let Ok(_lock) = ccr_core::lock::DirLock::acquire(
+                if let Ok((store, paths)) = ccr_core::open(None)
+                    && let Ok(_lock) = ccr_core::lock::DirLock::acquire(
                         &paths.swap_lock(),
                         ccr_core::lock::LockOptions::claude(Duration::ZERO),
-                    ) {
-                        let _ = swap::settle_profile(&store, &paths);
-                    }
+                    )
+                {
+                    let _ = swap::settle_profile(&store, &paths);
                 }
                 swapping.store(false, Ordering::Release);
             });
         }
-        if tick % SYNC_EVERY_S == 0 && !watch.swapping.load(Ordering::Acquire) {
-            if let Ok(Some(req)) = statusline::sync(store, paths) {
-                // On its own thread: it may check accounts first, which takes seconds.
-                watch.swapping.store(true, Ordering::Release);
-                let swapping = watch.swapping.clone();
-                std::thread::spawn(move || {
-                    if let Ok((store, paths)) = ccr_core::open(None) {
-                        let _ = swap::run(&store, &paths, &req);
-                    }
-                    swapping.store(false, Ordering::Release);
-                });
-                // Our own writes do not move `data_version` for this connection.
-                watch.last_version = None;
-            }
+        if tick.is_multiple_of(SYNC_EVERY_S)
+            && !watch.swapping.load(Ordering::Acquire)
+            && let Ok(Some(req)) = statusline::sync(store, paths)
+        {
+            // On its own thread: it may check accounts first, which takes seconds.
+            watch.swapping.store(true, Ordering::Release);
+            let swapping = watch.swapping.clone();
+            std::thread::spawn(move || {
+                if let Ok((store, paths)) = ccr_core::open(None) {
+                    let _ = swap::run(&store, &paths, &req);
+                }
+                swapping.store(false, Ordering::Release);
+            });
+            // Our own writes do not move `data_version` for this connection.
+            watch.last_version = None;
         }
         // Relearn the rates that decide which weekly budgets would expire (cheap while the
         // learned ones are fresh), so the status line never has to.
-        if tick % CHECK_EVERY_S == 0 {
+        if tick.is_multiple_of(CHECK_EVERY_S) {
             let _ = ccr_core::budget::refresh_rates(store, time::now_ms());
         }
-        if tick % CHECK_EVERY_S == 0 {
+        if tick.is_multiple_of(CHECK_EVERY_S) {
             start_due_check(store, paths, &watch.checking);
         }
         // Sign-ins about to end and sessions that did not continue after a usage limit: each
         // becomes an event once, which the refresh below turns into a notification.
-        if tick % STATUS_EVERY_S == 0 {
+        if tick.is_multiple_of(STATUS_EVERY_S) {
             let _ = ccr_core::health::scan(store, time::now_ms());
         }
         let Ok(version) = store.data_version() else {
@@ -112,7 +113,7 @@ fn run(app: &AppHandle, store: &Store, paths: &Paths, watch: &mut Watch) {
         if watch.last_version != Some(version) {
             watch.last_version = Some(version);
             refresh(app, store, paths, watch);
-        } else if tick % STATUS_EVERY_S == 0 {
+        } else if tick.is_multiple_of(STATUS_EVERY_S) {
             status(app, store, paths, watch);
         }
         tick += 1;

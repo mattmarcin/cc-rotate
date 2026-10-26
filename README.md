@@ -70,7 +70,7 @@ To use cc-rotate on a Mac you reach over SSH:
 ## Requirements
 
 - Claude Code, native install (`claude --version`). Tested with 2.1.310.
-- To build from source: [Rust](https://rustup.rs) 1.85 or newer, and [Node.js](https://nodejs.org) 20 or newer for the desktop app.
+- To build from source: [Rust](https://rustup.rs) 1.89 or newer, and [Node.js](https://nodejs.org) 20 or newer for the desktop app.
 - On Linux, the desktop app also needs the WebKitGTK and tray libraries, for example on Debian and Ubuntu: `sudo apt install libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev`.
 
 ## Install
@@ -343,17 +343,17 @@ When its input or output isn't a terminal, it prints the status once and exits.
 |---|---|---|
 | `swap_threshold_5h` | 98 | Swap when a 5-hour limit reaches this percentage. |
 | `swap_threshold_7d` | 98 | Swap when a weekly limit, for all models or for one, reaches this percentage. Limits of a kind cc-rotate does not know use the lower of the two thresholds. |
-| `swap_cooldown_s` | 120 | Minimum seconds between swaps at a limit and swaps back. |
+| `swap_cooldown_s` | 120 | Minimum seconds between swaps at a limit and swaps back (up to a day). |
 | `prefer_no_weekly_limit` | true | Use accounts without a weekly limit before the ones with one, and swap back to one as soon as it is ready. |
 | `use_expiring_weekly` | true | Move an account ahead when its weekly budget would otherwise reset unused. |
 | `strict_order` | false | Pick the next account by your order alone within a group. |
-| `lock_timeout_ms` | 30000 | How long a swap waits for Claude Code to finish renewing a login. |
+| `lock_timeout_ms` | 30000 | How long a swap waits for Claude Code to finish renewing a login (up to 10 minutes). |
 | `sample_retention_days` | 90 | How long usage history is kept. |
 | `statusline_downstream` | your old status line | The status line command shown after cc-rotate's label. |
 | `profile_dir` | `~/.claude-rotate` | The cc-rotate profile, recorded by `setup`. |
-| `claude_path` | found on `PATH` | The `claude` executable to use for logins, usage checks and `cc-rotate`. |
+| `claude_path` | found on `PATH` | The full path of the `claude` executable to use for logins, usage checks and `cc-rotate`. |
 | `usage_checks` | true | Check the usage of accounts not in use with Claude Code's `/usage`, and ask Claude Code whose a changed login in the cc-rotate profile is. |
-| `usage_check_interval_s` | 3600 | How often the app checks each account that is not in use (at least 300). |
+| `usage_check_interval_s` | 3600 | How often the app checks each account that is not in use (at least 300, at most a week). |
 | `usage_check_max_age_s` | 900 | A swap checks the account it picked first when its usage data is older than this. 0 always checks first. |
 | `login_warning_days` | 5 | Warn this many days before an account's sign-in ends. 0 turns the warning off. |
 | `avoid_extra_usage` | false | When every account is at a limit and the one in use has extra usage on, move to one without, so sessions wait for a reset instead of paying. |

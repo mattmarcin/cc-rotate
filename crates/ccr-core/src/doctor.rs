@@ -769,16 +769,16 @@ fn herdr_check(paths: &Paths, detected: Option<herdr::Detected>) -> Check {
         (None, herdr::Detected::OnPath(p)) => format!("Found at {}", p.display()),
     };
     let (major, minor, patch) = herdr::MIN_VERSION;
-    if let Some(v) = version.as_deref().and_then(herdr::parse_version) {
-        if v < herdr::MIN_VERSION {
-            return check(
-                name,
-                Status::Warn,
-                format!(
-                    "{found} resumes cc-rotate sessions with plain `claude` on your default profile. Update herdr to {major}.{minor}.{patch} or newer."
-                ),
-            );
-        }
+    if let Some(v) = version.as_deref().and_then(herdr::parse_version)
+        && v < herdr::MIN_VERSION
+    {
+        return check(
+            name,
+            Status::Warn,
+            format!(
+                "{found} resumes cc-rotate sessions with plain `claude` on your default profile. Update herdr to {major}.{minor}.{patch} or newer."
+            ),
+        );
     }
     if !hook {
         return check(

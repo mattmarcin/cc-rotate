@@ -636,6 +636,52 @@ fn first_login_becomes_active_and_relogin_checks_identity() {
     );
 }
 
+/// One person can belong to several organizations under one account id: a sign-in to another
+/// one must not replace the login (and organization) of the account cc-rotate has.
+#[test]
+fn a_login_to_another_organization_does_not_replace_the_account() {
+    let env = Env::new();
+    let store = env.store();
+    let first = env.paths.data_dir.join("st1");
+    write_staging(&first, "first", "u-jane", "jane@x.test");
+    let jane = login::import(&store, &env.paths, &first, &login::LoginRequest::default())
+        .unwrap()
+        .account;
+
+    let team = env.paths.data_dir.join("st2");
+    write_staging(&team, "team", "u-jane", "jane@x.test");
+    std::fs::write(
+        team.join(".claude.json"),
+        json!({"oauthAccount": {"accountUuid": "u-jane", "emailAddress": "jane@x.test", "organizationUuid": "org-team", "organizationName": "Team"}}).to_string(),
+    )
+    .unwrap();
+    for relogin in [None, Some(jane.id)] {
+        let err = login::import(
+            &store,
+            &env.paths,
+            &team,
+            &login::LoginRequest {
+                relogin,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("This sign-in is for Team, but jane is in Org"),
+            "{err}"
+        );
+    }
+    assert_eq!(
+        store.credential(jane.id).unwrap().unwrap().oauth["refreshToken"],
+        "refresh-first"
+    );
+    assert_eq!(
+        store.account(jane.id).unwrap().unwrap().org_uuid.as_deref(),
+        Some("org")
+    );
+}
+
 #[test]
 fn manual_login_inside_profile_is_adopted() {
     let env = Env::new();
