@@ -222,15 +222,13 @@ impl Detected {
     }
 }
 
-/// herdr, if it is installed or this process runs in one of its panes.
-pub fn detect() -> Option<Detected> {
+/// herdr, if it is installed or this process runs in one of its panes, else why not.
+pub fn detect() -> Result<Detected, crate::paths::NotFound> {
     if let Some(pane) = pane_from_env() {
         let bin = resolve(&pane.bin).unwrap_or_else(|| PathBuf::from(&pane.bin));
-        return Some(Detected::InPane(bin));
+        return Ok(Detected::InPane(bin));
     }
-    crate::paths::find_program("herdr")
-        .ok()
-        .map(Detected::Installed)
+    crate::paths::find_program("herdr").map(Detected::Installed)
 }
 
 /// A herdr executable to run: a path as it is, a bare name looked up like `claude`

@@ -141,9 +141,23 @@ pub fn forward_slashes(path: &Path) -> String {
 pub enum NotFound {
     /// Neither on PATH nor in a folder programs are installed to.
     Missing,
-    /// In a folder programs are installed to, at `program`, but `step` on the way to it belongs
-    /// to another user or can be changed by one (`owned_safely`).
+    /// In a folder programs are installed to, at `program`, but `step` on the way to it could
+    /// not be confirmed as the user's alone (`owned_safely`).
     Refused { program: PathBuf, step: PathBuf },
+}
+
+impl NotFound {
+    /// Why `name` found at `program` isn't run, for a refusal.
+    pub fn refusal(&self, name: &str) -> Option<String> {
+        match self {
+            NotFound::Missing => None,
+            NotFound::Refused { program, step } => Some(format!(
+                "Found `{name}` at {}, but cc-rotate can't confirm that only you or root can change {}, so it won't run it",
+                program.display(),
+                step.display()
+            )),
+        }
+    }
 }
 
 /// `name` on PATH, else in a folder programs are installed to (`install_dirs`).
@@ -221,13 +235,17 @@ fn search(name: &str, dirs: Vec<PathBuf>, cwd: &Path) -> Option<PathBuf> {
 fn owned_safely(program: &Path) -> Result<(), PathBuf> {
     use std::os::unix::fs::MetadataExt;
     use std::path::Component;
-    /// Links followed before giving up, as the system does (`MAXSYMLINKS`).
+    /// Links followed before giving up: Linux follows 40, macOS 32, and `exec` refuses a
+    /// longer chain anyway.
     const MAX_LINKS: usize = 40;
     // SAFETY: getuid has no preconditions and cannot fail.
     let me = unsafe { libc::getuid() };
-    let own_group = private_group(me);
-    let safe =
-        |m: &std::fs::Metadata| (m.uid() == 0 || m.uid() == me) && unchangeable(m, own_group);
+    // Looked up (perhaps over the network, with LDAP) only when a step's group may write.
+    let own_group = std::cell::OnceCell::new();
+    let safe = |path: &Path, m: &std::fs::Metadata| {
+        (m.uid() == 0 || m.uid() == me)
+            && unchangeable(path, m, || *own_group.get_or_init(|| private_group(me)))
+    };
 
     /// Add `path`'s parts to what is left to walk, which holds the next part last.
     fn push(rest: &mut Vec<OsString>, path: &Path) {
@@ -249,7 +267,7 @@ fn owned_safely(program: &Path) -> Result<(), PathBuf> {
     push(&mut rest, program);
     // Where the walk is: a real folder, never a link, so `..` leaves it as the system would.
     let mut at = PathBuf::from("/");
-    if !std::fs::symlink_metadata(&at).is_ok_and(|m| safe(&m)) {
+    if !std::fs::symlink_metadata(&at).is_ok_and(|m| safe(&at, &m)) {
         return Err(at);
     }
     let mut links = 0;
@@ -277,7 +295,7 @@ fn owned_safely(program: &Path) -> Result<(), PathBuf> {
             push(&mut rest, &to);
             continue;
         }
-        if !safe(&meta) {
+        if !safe(&next, &meta) {
             return Err(next);
         }
         at = next;
@@ -285,22 +303,65 @@ fn owned_safely(program: &Path) -> Result<(), PathBuf> {
     Ok(())
 }
 
-/// Whether `meta`'s permissions let no one but its owner change it: not writable by everyone,
-/// nor by a group other than the user's own (`own_group`) or macOS's `admin`, whose members
-/// administer the Mac. In a sticky folder such as `/tmp` others can't rename or remove what
-/// isn't theirs, and what they add is theirs, which the owner check refuses.
+/// Whether the permissions of `path` (its `meta`) let no one but its owner change it: not
+/// writable by everyone, nor by a group other than macOS's `admin`, whose members administer the
+/// Mac, or the user's own (`own_group`) on a file with no access control list, whose group bits
+/// would be the list's limit rather than the group's. In a sticky folder such as `/tmp` others
+/// can't rename or remove what isn't theirs.
 #[cfg(unix)]
-fn unchangeable(meta: &std::fs::Metadata, own_group: Option<u32>) -> bool {
+fn unchangeable(
+    path: &Path,
+    meta: &std::fs::Metadata,
+    own_group: impl FnOnce() -> Option<u32>,
+) -> bool {
     use std::os::unix::fs::MetadataExt;
     let mode = meta.mode();
-    let group_ok = mode & 0o020 == 0
-        || Some(meta.gid()) == own_group
-        || (cfg!(target_os = "macos") && meta.gid() == 80);
-    (meta.is_dir() && mode & 0o1000 != 0) || (mode & 0o002 == 0 && group_ok)
+    if meta.is_dir() && mode & 0o1000 != 0 {
+        return true;
+    }
+    if mode & 0o002 != 0 {
+        return false;
+    }
+    mode & 0o020 == 0
+        || (cfg!(target_os = "macos") && meta.gid() == 80)
+        || (!has_acl(path) && Some(meta.gid()) == own_group())
+}
+
+/// Whether `path` (not what it links to) has a POSIX access control list, which can let users
+/// and groups besides its own write to it. Assumed so when it can't be told.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn has_acl(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return true;
+    };
+    // SAFETY: both are valid C strings; a null buffer of size 0 only asks for the size.
+    let size = unsafe {
+        libc::lgetxattr(
+            c_path.as_ptr(),
+            c"system.posix_acl_access".as_ptr(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    // No such attribute, or a file system without them.
+    size >= 0
+        || !matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ENODATA | libc::EOPNOTSUPP)
+        )
+}
+
+/// macOS's access control lists are not read (see SECURITY.md); other systems have no private
+/// groups to trust.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn has_acl(_path: &Path) -> bool {
+    false
 }
 
 /// The user's primary group when it is theirs alone: named after them, with no members listed,
 /// as Debian, Ubuntu and Fedora make one for every user (with a umask that lets it write).
+/// Another account whose own primary group it is isn't listed as a member, so isn't seen.
 #[cfg(unix)]
 fn private_group(uid: u32) -> Option<u32> {
     use std::ffi::CStr;
@@ -317,12 +378,18 @@ fn private_group(uid: u32) -> Option<u32> {
         {
             return None;
         }
+        if pw.pw_name.is_null() {
+            return None;
+        }
         let user = CStr::from_ptr(pw.pw_name).to_owned();
         let mut gr: libc::group = std::mem::zeroed();
         let mut found = std::ptr::null_mut();
         if libc::getgrgid_r(gid, &mut gr, buf.as_mut_ptr(), buf.len(), &mut found) != 0
             || found.is_null()
         {
+            return None;
+        }
+        if gr.gr_name.is_null() {
             return None;
         }
         let alone = gr.gr_mem.is_null() || (*gr.gr_mem).is_null();
@@ -565,7 +632,33 @@ mod tests {
         // A link that leads to itself.
         std::fs::remove_file(bin.join("current")).unwrap();
         std::os::unix::fs::symlink("claude", bin.join("current")).unwrap();
-        assert!(owned_safely(&claude).is_err());
+        assert_eq!(owned_safely(&claude), Err(claude.clone()));
+    }
+
+    /// `..` after a linked folder leads up from where the link leads, as the system resolves it.
+    #[cfg(unix)]
+    #[test]
+    fn dot_dot_after_a_linked_folder_leaves_where_it_leads() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Where the walk reports steps: past macOS's `/var` link.
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let deep = root.join("deep").join("real");
+        program(&deep.join("versions"), "2.1.310");
+        folder(&deep.join("bin"));
+        let bin = root.join("bin");
+        std::os::unix::fs::symlink(deep.join("bin"), &bin).unwrap();
+        let claude = bin.join("claude");
+        std::os::unix::fs::symlink("../versions/2.1.310", deep.join("bin").join("claude")).unwrap();
+        assert_eq!(owned_safely(&claude), Ok(()));
+
+        // A lexical walk would look for `root/versions`, which an open folder now holds.
+        let open = root.join("versions");
+        program(&open, "2.1.310");
+        chmod(&open, 0o777);
+        assert_eq!(owned_safely(&claude), Ok(()));
+        // Opening the real one is noticed.
+        chmod(&deep.join("versions"), 0o777);
+        assert_eq!(owned_safely(&claude), Err(deep.join("versions")));
     }
 
     /// A folder on the way that is a link is checked where it leads, folders above included.

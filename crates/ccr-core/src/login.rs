@@ -89,14 +89,13 @@ pub fn claude_executable(store: &Store) -> Result<PathBuf> {
         }
         return Ok(path);
     }
-    crate::paths::find_program("claude").map_err(|e| match e {
+    crate::paths::find_program("claude").map_err(|e| match &e {
         crate::paths::NotFound::Missing => anyhow::anyhow!(
             "Couldn't find `claude` on PATH or where Claude Code installs it. Install Claude Code, or set where it is with `cc-rotate-ctl config claude_path <full path>`."
         ),
-        crate::paths::NotFound::Refused { program, step } => anyhow::anyhow!(
-            "Found `claude` at {}, but other users can change {}, so cc-rotate won't run it. If you trust it, set it with `cc-rotate-ctl config claude_path {}`.",
-            program.display(),
-            step.display(),
+        crate::paths::NotFound::Refused { program, .. } => anyhow::anyhow!(
+            "{}. If you trust it, set it with `cc-rotate-ctl config claude_path '{}'`.",
+            e.refusal("claude").unwrap_or_default(),
             program.display()
         ),
     })

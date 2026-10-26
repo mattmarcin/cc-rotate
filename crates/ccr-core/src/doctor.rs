@@ -96,6 +96,10 @@ pub fn run(store: &Store, paths: &Paths) -> Vec<Check> {
             match login::claude_executable(store) {
                 // Why it wasn't found, or that one found was refused.
                 Err(e) => e.to_string(),
+                Ok(claude) if store.settings().is_ok_and(|s| s.claude_path.is_some()) => format!(
+                    "Couldn't run `{} --version`. Check the claude_path setting, or set it again with `cc-rotate-ctl config claude_path <full path>`.",
+                    claude.display()
+                ),
                 Ok(claude) => format!(
                     "Couldn't run `{} --version`. Reinstall Claude Code, or set where it is with `cc-rotate-ctl config claude_path <full path>`.",
                     claude.display()
@@ -751,22 +755,35 @@ fn environment_check(paths: &Paths, var: impl Fn(&str) -> Option<String>) -> Che
 
 /// herdr is optional: this only warns when herdr is here but would resume cc-rotate sessions
 /// with plain `claude` (spec section 19).
-fn herdr_check(paths: &Paths, detected: Option<herdr::Detected>) -> Check {
+fn herdr_check(paths: &Paths, detected: Result<herdr::Detected, crate::paths::NotFound>) -> Check {
     let name = "herdr";
     let hook = std::fs::read_to_string(paths.settings_file())
         .ok()
         .and_then(|t| serde_json::from_str::<Value>(&t).ok())
         .is_some_and(|s| herdr::session_start_hook_installed(&s));
-    let Some(detected) = detected else {
-        return check(
-            name,
-            Status::Ok,
-            if hook {
-                "Not installed (optional). The profile is ready for it."
-            } else {
-                "Not installed (optional). If you start using it, run `cc-rotate-ctl setup --force` so it resumes sessions with cc-rotate."
-            },
-        );
+    let detected = match detected {
+        Ok(detected) => detected,
+        Err(refused @ crate::paths::NotFound::Refused { .. }) => {
+            return check(
+                name,
+                Status::Warn,
+                format!(
+                    "{}. Add its folder to PATH if you trust it.",
+                    refused.refusal("herdr").unwrap_or_default()
+                ),
+            );
+        }
+        Err(crate::paths::NotFound::Missing) => {
+            return check(
+                name,
+                Status::Ok,
+                if hook {
+                    "Not installed (optional). The profile is ready for it."
+                } else {
+                    "Not installed (optional). If you start using it, run `cc-rotate-ctl setup --force` so it resumes sessions with cc-rotate."
+                },
+            );
+        }
     };
     // The check's name is "herdr", so the detail starts with what was found.
     let version = herdr::version(detected.bin());
@@ -852,11 +869,11 @@ mod tests {
         let missing_bin = herdr::Detected::Installed(root.path().join("no-such-herdr"));
 
         // No profile settings at all: herdr is optional, so this never fails.
-        let c = herdr_check(&paths, None);
+        let c = herdr_check(&paths, Err(crate::paths::NotFound::Missing));
         assert_eq!(c.status, Status::Ok);
         assert!(c.detail.contains("setup --force"), "{}", c.detail);
 
-        let c = herdr_check(&paths, Some(missing_bin.clone()));
+        let c = herdr_check(&paths, Ok(missing_bin.clone()));
         assert_eq!(c.status, Status::Warn);
         assert!(c.detail.contains("no SessionStart hook"), "{}", c.detail);
 
@@ -868,9 +885,20 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        let c = herdr_check(&paths, Some(missing_bin));
+        let c = herdr_check(&paths, Ok(missing_bin));
         assert_eq!(c.status, Status::Ok, "{}", c.detail);
         assert!(c.detail.contains("cc-rotate --resume"), "{}", c.detail);
-        assert_eq!(herdr_check(&paths, None).status, Status::Ok);
+        assert_eq!(
+            herdr_check(&paths, Err(crate::paths::NotFound::Missing)).status,
+            Status::Ok
+        );
+        // Found where someone else could have put it: said, not passed over in silence.
+        let refused = crate::paths::NotFound::Refused {
+            program: root.path().join("herdr"),
+            step: root.path().to_path_buf(),
+        };
+        let c = herdr_check(&paths, Err(refused));
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.detail.contains("can't confirm"), "{}", c.detail);
     }
 }
