@@ -917,16 +917,11 @@ pub fn copies_another(sample: &Sample, others: &[Sample]) -> bool {
         .any(|o| crate::store::same_windows(&o.windows, &sample.windows))
 }
 
-/// Whether the threshold the active account's latest reading reached may not be its own: the
-/// reading is from the status line and a window over its threshold has a reset time not known
-/// to be the account's (section 8). Then a threshold swap confirms first.
+/// Whether a threshold the active account's usage reached may not be its own: a window over its
+/// threshold got there only by readings of the rotation profile's status line (`Store::own_high`)
+/// and has a reset time not known to be the account's (section 8). Then a threshold swap
+/// confirms first.
 fn needs_confirmation(store: &Store, active_id: i64, now_ms: i64) -> Result<bool> {
-    let Some(last) = store.last_sample(active_id)? else {
-        return Ok(false);
-    };
-    if last.profile != "rotate" {
-        return Ok(false);
-    }
     let (pool, _) = load_pool(store, now_ms / 1000)?;
     let Some(active) = pool.iter().find(|c| c.account.id == active_id) else {
         return Ok(false);
@@ -937,13 +932,23 @@ fn needs_confirmation(store: &Store, active_id: i64, now_ms: i64) -> Result<bool
         .flat_map(|s| &s.windows)
         .filter_map(|w| w.resets_at)
         .collect();
-    // Unsure when the reset time is not known to be the account's own, or is another account's
-    // too (aligned reset times).
-    Ok(active.windows.iter().filter(|w| w.blocking()).any(|w| {
-        w.resets_at.is_none_or(|r| {
-            !own.iter().any(|&k| same_reset(k, r)) || others.iter().any(|&o| same_reset(o, r))
-        })
-    }))
+    for w in active.windows.iter().filter(|w| w.blocking()) {
+        let Some(r) = w.resets_at else {
+            return Ok(true);
+        };
+        if store
+            .own_high(active_id, &w.name, r)?
+            .is_some_and(|high| high > w.pct - 0.5)
+        {
+            continue;
+        }
+        // Unsure when the reset time is not known to be the account's own, or is another
+        // account's too (aligned reset times).
+        if !own.iter().any(|&k| same_reset(k, r)) || others.iter().any(|&o| same_reset(o, r)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// The reset times the stale-reading guard currently knows (`META_LAST_SWAP_FROM_RESETS`).

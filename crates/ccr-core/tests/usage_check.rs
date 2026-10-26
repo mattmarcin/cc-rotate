@@ -382,6 +382,53 @@ fn a_threshold_swap_on_an_unsure_reading_confirms_first() {
     assert_eq!(store.active_account().unwrap().unwrap().id, a);
 }
 
+/// As above, but a session's reading after the high one already shows what the check finds: the
+/// check is recorded anyway, since it settles the readings before it, and there is no swap.
+#[test]
+fn a_check_that_repeats_the_latest_reading_still_settles_a_higher_one() {
+    let e = env();
+    let store = e.store();
+    let a = add(&store, "a", AccountState::Active);
+    add(&store, "b", AccountState::Parked);
+    std::fs::write(
+        e.paths.credentials_file(),
+        json!({"claudeAiOauth": oauth("a1")}).to_string(),
+    )
+    .unwrap();
+    // The reset time `answer` reports: 2099-01-01T00:00:00Z.
+    let resets = 4_070_908_800;
+    for (session, pct, ago) in [("s1", 99.0, 2_000), ("s2", 30.0, 1_000)] {
+        let mut s = five_hour(a, pct, time::now_ms() - ago);
+        s.session_id = Some(session.into());
+        s.windows[0].resets_at = Some(resets);
+        store.record_sample(&s).unwrap();
+    }
+    assert_eq!(
+        store.current_usage(a).unwrap().unwrap().windows[0].pct,
+        99.0
+    );
+    e.answer("ua", 30.0);
+
+    let out = swap::run(
+        &store,
+        &e.paths,
+        &SwapRequest {
+            from: Some(a),
+            to: None,
+            reason: Reason::FiveHour,
+            wait: false,
+        },
+    )
+    .unwrap();
+    assert!(matches!(out, SwapOutcome::Skipped { .. }), "{out:?}");
+    assert_eq!(store.last_sample(a).unwrap().unwrap().profile, "check");
+    assert_eq!(
+        store.current_usage(a).unwrap().unwrap().windows[0].pct,
+        30.0
+    );
+    assert_eq!(store.active_account().unwrap().unwrap().id, a);
+}
+
 /// After a swap from a to b died half way, the profile's login was renewed, so its fingerprint
 /// is neither account's. Claude Code identifies it (from a copy it cannot renew), and the swap is
 /// completed or forgotten accordingly.
