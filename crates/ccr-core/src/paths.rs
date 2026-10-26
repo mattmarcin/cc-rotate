@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -147,17 +148,21 @@ pub fn find_program(name: &str) -> Option<PathBuf> {
         std::env::var_os("PATH"),
         &install_dirs(home.as_deref()),
         home.as_deref(),
+        &std::env::temp_dir(),
     )
 }
 
-/// `name` in the absolute folders of `path`, then in `fallback`.
+/// `name` in the absolute folders of `path`, then in the first of `fallback` that has one the
+/// user can trust (`owned_safely`). `cwd` is what `which` would resolve a relative folder
+/// against, were one to slip through.
 fn find_program_in(
     name: &str,
-    path: Option<std::ffi::OsString>,
+    path: Option<OsString>,
     fallback: &[PathBuf],
     home: Option<&Path>,
+    cwd: &Path,
 ) -> Option<PathBuf> {
-    let dirs: Vec<PathBuf> = path
+    let on_path: Vec<PathBuf> = path
         .iter()
         .flat_map(std::env::split_paths)
         // A quoted `~/.local/bin` reaches PATH as is; shells expand it, so this does too.
@@ -165,21 +170,60 @@ fn find_program_in(
             (Ok(rest), Some(home)) => home.join(rest),
             _ => d,
         })
-        .chain(fallback.iter().cloned())
         .filter(|d| d.is_absolute())
         .collect();
-    let joined = std::env::join_paths(dirs).ok()?;
-    which::which_in(name, Some(joined), std::env::temp_dir()).ok()
+    search(name, on_path, cwd).or_else(|| {
+        fallback
+            .iter()
+            .filter(|d| d.is_absolute())
+            .find_map(|d| search(name, vec![d.clone()], cwd).filter(|p| owned_safely(d, p)))
+    })
 }
 
-/// Where Claude Code's installers and package managers put programs, for a process whose PATH
-/// leaves them out: an app macOS starts at login gets only `/usr/bin:/bin:/usr/sbin:/sbin`, and
-/// a desktop session on Linux may not have read the shell profile that adds `~/.local/bin`.
+/// `name` in `dirs`, which are all absolute.
+fn search(name: &str, dirs: Vec<PathBuf>, cwd: &Path) -> Option<PathBuf> {
+    // `which` reads an empty list as one empty folder, the current one.
+    if dirs.is_empty() {
+        return None;
+    }
+    which::which_in(name, Some(std::env::join_paths(dirs).ok()?), cwd).ok()
+}
+
+/// Whether `program`, found in `dir`, is the user's to run: the user chose PATH's folders, but
+/// not the shared ones a fallback looks in, such as a Homebrew another user of the Mac installed.
+/// On Unix the program (through any link), its folder and `dir` must belong to root or the user
+/// and not be writable by everyone; on Windows the folders are in the user's own profile.
+#[cfg(unix)]
+fn owned_safely(dir: &Path, program: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let me = unsafe { libc::getuid() };
+    let Ok(target) = std::fs::canonicalize(program) else {
+        return false;
+    };
+    [Some(target.as_path()), target.parent(), Some(dir)]
+        .into_iter()
+        .all(|p| {
+            p.and_then(|p| std::fs::metadata(p).ok())
+                .is_some_and(|m| (m.uid() == 0 || m.uid() == me) && m.mode() & 0o002 == 0)
+        })
+}
+
+#[cfg(windows)]
+fn owned_safely(_dir: &Path, _program: &Path) -> bool {
+    true
+}
+
+/// Where installers and package managers put programs (Claude Code's own, Homebrew, npm), for
+/// a process whose PATH leaves them out: an app macOS starts at login gets only
+/// `/usr/bin:/bin:/usr/sbin:/sbin`, and a desktop session on Linux may not have read the shell
+/// profile that adds `~/.local/bin`.
 fn install_dirs(home: Option<&Path>) -> Vec<PathBuf> {
     let mut folders = Vec::new();
     if let Some(home) = home {
-        // Claude Code's native installer, on every platform.
+        // Claude Code's native installer, on every platform, then its older local install.
         folders.push(home.join(".local").join("bin"));
+        folders.push(home.join(".claude").join("local"));
     }
     #[cfg(unix)]
     folders.extend(
@@ -201,7 +245,8 @@ fn install_dirs(home: Option<&Path>) -> Vec<PathBuf> {
 
 /// A command running `program`, with `program`'s folder added to the end of the child's PATH
 /// when it is not already on it: a program found outside PATH (`find_program`) may be a script
-/// whose interpreter sits beside it, such as an npm-installed `claude` that runs `node`.
+/// whose interpreter sits beside it, such as a `claude` installed with Homebrew's npm, which
+/// runs `node`.
 pub fn program_command(program: &Path) -> std::process::Command {
     let mut cmd = std::process::Command::new(program);
     if let Some(path) = path_with(std::env::var_os("PATH"), program) {
@@ -210,10 +255,11 @@ pub fn program_command(program: &Path) -> std::process::Command {
     cmd
 }
 
-/// `path` with `program`'s folder added at the end, or `None` when it is there already.
-fn path_with(path: Option<std::ffi::OsString>, program: &Path) -> Option<std::ffi::OsString> {
+/// `path` with `program`'s folder added at the end, or `None` to leave it as it is: the folder
+/// is on it already, or there is no PATH, where the system's default search must stay.
+fn path_with(path: Option<OsString>, program: &Path) -> Option<OsString> {
     let dir = program.parent().filter(|d| d.is_absolute())?;
-    let mut dirs: Vec<PathBuf> = path.iter().flat_map(std::env::split_paths).collect();
+    let mut dirs: Vec<PathBuf> = std::env::split_paths(&path?).collect();
     if dirs.iter().any(|d| d == dir) {
         return None;
     }
@@ -245,42 +291,74 @@ mod tests {
     #[test]
     fn programs_outside_path_are_found_in_install_folders() {
         let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
         let home = tmp.path().join("home");
         let installed = program(&home.join(".local").join("bin"), "claude");
         let elsewhere = tmp.path().join("bin");
         std::fs::create_dir_all(&elsewhere).unwrap();
         let path = std::env::join_paths([&elsewhere]).unwrap();
         let fallback = install_dirs(Some(&home));
+        let find = |path: Option<OsString>, fallback: &[PathBuf]| {
+            find_program_in("claude", path, fallback, Some(&home), cwd)
+        };
 
         // A PATH like the one macOS gives apps started at login, without the install folder.
-        assert_eq!(
-            find_program_in("claude", Some(path.clone()), &fallback, Some(&home)),
-            Some(installed.clone())
-        );
-        assert_eq!(
-            find_program_in("claude", None, &fallback, Some(&home)),
-            Some(installed)
-        );
+        assert_eq!(find(Some(path.clone()), &fallback), Some(installed.clone()));
+        assert_eq!(find(None, &fallback), Some(installed));
 
         // PATH comes first.
         let on_path = program(&elsewhere, "claude");
-        assert_eq!(
-            find_program_in("claude", Some(path), &fallback, Some(&home)),
-            Some(on_path)
-        );
-        assert_eq!(find_program_in("claude", None, &[], Some(&home)), None);
+        assert_eq!(find(Some(path), &fallback), Some(on_path));
+        assert_eq!(find(None, &[]), None);
     }
 
     #[test]
     fn relative_folders_are_never_searched() {
         let tmp = tempfile::tempdir().unwrap();
-        program(tmp.path(), "claude");
+        let cwd = tmp.path();
+        // Where a relative or empty folder would lead: the folder `which` resolves them against.
+        program(&cwd.join("bin"), "claude");
+        program(cwd, "claude");
         let relative = PathBuf::from("bin");
-        let path = std::env::join_paths([&relative]).unwrap();
-        assert_eq!(
-            find_program_in("claude", Some(path), std::slice::from_ref(&relative), None),
-            None
-        );
+        for path in [
+            std::env::join_paths([&relative]).unwrap(),
+            OsString::new(),
+            OsString::from("."),
+        ] {
+            assert_eq!(
+                find_program_in(
+                    "claude",
+                    Some(path.clone()),
+                    std::slice::from_ref(&relative),
+                    None,
+                    cwd
+                ),
+                None,
+                "{path:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fallback_folder_everyone_can_write_to_is_not_used() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = tmp.path().join("shared");
+        let planted = program(&shared, "claude");
+        let find = || {
+            find_program_in(
+                "claude",
+                None,
+                std::slice::from_ref(&shared),
+                None,
+                tmp.path(),
+            )
+        };
+        assert_eq!(find(), Some(planted));
+
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert_eq!(find(), None);
     }
 
     #[test]
@@ -294,14 +372,15 @@ mod tests {
         let added = path_with(Some(path), &claude).unwrap();
         assert_eq!(
             std::env::split_paths(&added).collect::<Vec<_>>(),
-            vec![other.clone(), dir.clone()]
+            vec![other, dir]
         );
         assert_eq!(path_with(Some(added), &claude), None);
-        assert_eq!(
-            std::env::split_paths(&path_with(None, &claude).unwrap()).collect::<Vec<_>>(),
-            vec![dir]
-        );
+        // Without a PATH the system's default search stays.
+        assert_eq!(path_with(None, &claude), None);
         // A bare name has no folder to add.
-        assert_eq!(path_with(None, Path::new("claude")), None);
+        assert_eq!(
+            path_with(Some(OsString::from("/usr/bin")), Path::new("claude")),
+            None
+        );
     }
 }

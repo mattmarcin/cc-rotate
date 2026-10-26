@@ -37,6 +37,8 @@ pub fn session_start(read_stdin: impl FnOnce() -> String) -> Result<()> {
 pub fn report(pane_id: &str, session_id: &str, seq: u64, timeout: Duration) -> Result<()> {
     let args = herdr::report_args(pane_id, session_id, seq)?;
     let bin = herdr::bin_from_env();
+    let bin =
+        herdr::resolve(&bin).with_context(|| format!("Couldn't find {}", bin.to_string_lossy()))?;
     let started = Instant::now();
     let mut attempts = 0;
     loop {
@@ -45,7 +47,7 @@ pub fn report(pane_id: &str, session_id: &str, seq: u64, timeout: Duration) -> R
             .args(&args)
             .stdin(Stdio::null())
             .output()
-            .with_context(|| format!("running {}", bin.to_string_lossy()))?;
+            .with_context(|| format!("running {}", bin.display()))?;
         if out.status.success() {
             return Ok(());
         }
