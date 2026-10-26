@@ -135,20 +135,173 @@ pub fn forward_slashes(path: &Path) -> String {
     path.display().to_string().replace('\\', "/")
 }
 
-/// `name` on PATH, searching only absolute directories: a relative entry (`.`, an empty one,
+/// `name` on PATH, else in a folder programs are installed to (`install_dirs`).
+///
+/// Only absolute directories are searched: a relative entry (`.`, an empty one,
 /// `node_modules/.bin`) would resolve against wherever cc-rotate runs, such as a project folder,
 /// and run a program from it with a login in reach.
 pub fn find_program(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
     let home = home_dir().ok();
-    let dirs: Vec<PathBuf> = std::env::split_paths(&path)
+    find_program_in(
+        name,
+        std::env::var_os("PATH"),
+        &install_dirs(home.as_deref()),
+        home.as_deref(),
+    )
+}
+
+/// `name` in the absolute folders of `path`, then in `fallback`.
+fn find_program_in(
+    name: &str,
+    path: Option<std::ffi::OsString>,
+    fallback: &[PathBuf],
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    let dirs: Vec<PathBuf> = path
+        .iter()
+        .flat_map(std::env::split_paths)
         // A quoted `~/.local/bin` reaches PATH as is; shells expand it, so this does too.
-        .map(|d| match (d.strip_prefix("~"), &home) {
+        .map(|d| match (d.strip_prefix("~"), home) {
             (Ok(rest), Some(home)) => home.join(rest),
             _ => d,
         })
+        .chain(fallback.iter().cloned())
         .filter(|d| d.is_absolute())
         .collect();
     let joined = std::env::join_paths(dirs).ok()?;
     which::which_in(name, Some(joined), std::env::temp_dir()).ok()
+}
+
+/// Where Claude Code's installers and package managers put programs, for a process whose PATH
+/// leaves them out: an app macOS starts at login gets only `/usr/bin:/bin:/usr/sbin:/sbin`, and
+/// a desktop session on Linux may not have read the shell profile that adds `~/.local/bin`.
+fn install_dirs(home: Option<&Path>) -> Vec<PathBuf> {
+    let mut folders = Vec::new();
+    if let Some(home) = home {
+        // Claude Code's native installer, on every platform.
+        folders.push(home.join(".local").join("bin"));
+    }
+    #[cfg(unix)]
+    folders.extend(
+        // Homebrew on Apple silicon, on Intel Macs (and many manual installs), and on Linux.
+        [
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/home/linuxbrew/.linuxbrew/bin",
+        ]
+        .map(PathBuf::from),
+    );
+    #[cfg(windows)]
+    if let Some(roaming) = dirs::data_dir() {
+        // `npm install -g`.
+        folders.push(roaming.join("npm"));
+    }
+    folders
+}
+
+/// A command running `program`, with `program`'s folder added to the end of the child's PATH
+/// when it is not already on it: a program found outside PATH (`find_program`) may be a script
+/// whose interpreter sits beside it, such as an npm-installed `claude` that runs `node`.
+pub fn program_command(program: &Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new(program);
+    if let Some(path) = path_with(std::env::var_os("PATH"), program) {
+        cmd.env("PATH", path);
+    }
+    cmd
+}
+
+/// `path` with `program`'s folder added at the end, or `None` when it is there already.
+fn path_with(path: Option<std::ffi::OsString>, program: &Path) -> Option<std::ffi::OsString> {
+    let dir = program.parent().filter(|d| d.is_absolute())?;
+    let mut dirs: Vec<PathBuf> = path.iter().flat_map(std::env::split_paths).collect();
+    if dirs.iter().any(|d| d == dir) {
+        return None;
+    }
+    dirs.push(dir.to_path_buf());
+    std::env::join_paths(dirs).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An empty file `name` in `dir` that `which` accepts as a program.
+    fn program(dir: &Path, name: &str) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let file = dir.join(if cfg!(windows) {
+            format!("{name}.exe")
+        } else {
+            name.to_string()
+        });
+        std::fs::write(&file, "").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        file
+    }
+
+    #[test]
+    fn programs_outside_path_are_found_in_install_folders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let installed = program(&home.join(".local").join("bin"), "claude");
+        let elsewhere = tmp.path().join("bin");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let path = std::env::join_paths([&elsewhere]).unwrap();
+        let fallback = install_dirs(Some(&home));
+
+        // A PATH like the one macOS gives apps started at login, without the install folder.
+        assert_eq!(
+            find_program_in("claude", Some(path.clone()), &fallback, Some(&home)),
+            Some(installed.clone())
+        );
+        assert_eq!(
+            find_program_in("claude", None, &fallback, Some(&home)),
+            Some(installed)
+        );
+
+        // PATH comes first.
+        let on_path = program(&elsewhere, "claude");
+        assert_eq!(
+            find_program_in("claude", Some(path), &fallback, Some(&home)),
+            Some(on_path)
+        );
+        assert_eq!(find_program_in("claude", None, &[], Some(&home)), None);
+    }
+
+    #[test]
+    fn relative_folders_are_never_searched() {
+        let tmp = tempfile::tempdir().unwrap();
+        program(tmp.path(), "claude");
+        let relative = PathBuf::from("bin");
+        let path = std::env::join_paths([&relative]).unwrap();
+        assert_eq!(
+            find_program_in("claude", Some(path), &[relative.clone()], None),
+            None
+        );
+    }
+
+    #[test]
+    fn a_programs_folder_is_added_to_the_childs_path_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("node-bin");
+        let claude = dir.join("claude");
+        let other = tmp.path().join("other");
+        let path = std::env::join_paths([&other]).unwrap();
+
+        let added = path_with(Some(path), &claude).unwrap();
+        assert_eq!(
+            std::env::split_paths(&added).collect::<Vec<_>>(),
+            vec![other.clone(), dir.clone()]
+        );
+        assert_eq!(path_with(Some(added), &claude), None);
+        assert_eq!(
+            std::env::split_paths(&path_with(None, &claude).unwrap()).collect::<Vec<_>>(),
+            vec![dir]
+        );
+        // A bare name has no folder to add.
+        assert_eq!(path_with(None, Path::new("claude")), None);
+    }
 }

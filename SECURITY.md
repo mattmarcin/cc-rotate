@@ -41,7 +41,7 @@ There are no versioned releases yet, so only the latest `main` is supported.
 - On Linux and macOS, the data folder and the rotation profile are made readable only by you (mode 700) each time cc-rotate opens them, the store, logs and settings it writes only by you (600), even when an older version or `CC_ROTATE_DATA_DIR` made them with wider permissions.
 - cc-rotate makes no network requests of its own, and the desktop app opens no network port.
 - The desktop app's window can change only the settings shown in it: the ones that name a program to run or where the login is written (`claude_path`, `statusline_downstream`, `profile_dir`) are set with `cc-rotate-ctl config` alone, and the window can reopen only the sign-in page Claude Code announced, not any address.
-- `claude` is found in the `claude_path` setting, which must be a full path, or in the absolute folders on `PATH`: a relative `PATH` entry such as `.` is skipped, so a project folder can't put its own `claude` in reach of a login.
+- `claude` is found in the `claude_path` setting, which must be a full path, or in the absolute folders on `PATH`, then in the folders Claude Code's installers use (`~/.local/bin`, Homebrew's, npm's): a relative `PATH` entry such as `.` is skipped, so a project folder can't put its own `claude` in reach of a login.
 - Your other Claude Code profiles are only read, to find out which account each belongs to; their logins are never imported or changed.
 
 ## Scope

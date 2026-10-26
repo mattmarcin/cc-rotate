@@ -76,7 +76,8 @@ impl Drop for Staging {
 }
 
 /// The `claude` executable: the `claude_path` setting, else the first one in an absolute PATH
-/// directory (`paths::find_program`).
+/// directory or a folder Claude Code installs to (`paths::find_program`). Run it with
+/// `paths::program_command`.
 pub fn claude_executable(store: &Store) -> Result<PathBuf> {
     if let Some(path) = store.settings()?.claude_path {
         let path = PathBuf::from(path);
@@ -89,13 +90,13 @@ pub fn claude_executable(store: &Store) -> Result<PathBuf> {
         return Ok(path);
     }
     crate::paths::find_program("claude")
-        .context("Couldn't find `claude` on PATH. Install Claude Code or set claude_path.")
+        .context("Couldn't find `claude` on PATH or where Claude Code installs it. Install Claude Code or set claude_path.")
 }
 
 /// `claude auth login --claudeai [--email <email>]` against the staging directory.
 /// Callers choose stdio: inherited for the CLI, piped for the app.
 pub fn login_command(claude: &Path, staging: &Path, email: Option<&str>) -> Command {
-    let mut cmd = Command::new(claude);
+    let mut cmd = crate::paths::program_command(claude);
     cmd.args(["auth", "login", "--claudeai"]);
     if let Some(email) = email.filter(|e| !e.is_empty()) {
         cmd.args(["--email", email]);
@@ -288,7 +289,7 @@ fn identity(oauth: &Value, profile: Option<ProfileAccount>) -> AccountIdentity {
 }
 
 fn fill_from_auth_status(ident: &mut AccountIdentity, claude: &Path, staging: &Path) {
-    let mut cmd = Command::new(claude);
+    let mut cmd = crate::paths::program_command(claude);
     cmd.args(["auth", "status", "--json"]);
     // It must describe the staging login, not one an inherited variable points at.
     usage_check::scrub_env(&mut cmd);

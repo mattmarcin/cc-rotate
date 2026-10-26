@@ -61,7 +61,7 @@ fn age(ms: i64) -> String {
 
 pub fn claude_version(store: &Store) -> Option<String> {
     let claude = login::claude_executable(store).ok()?;
-    let out = Command::new(claude)
+    let out = crate::paths::program_command(&claude)
         .arg("--version")
         .stdin(Stdio::null())
         .stderr(Stdio::null())

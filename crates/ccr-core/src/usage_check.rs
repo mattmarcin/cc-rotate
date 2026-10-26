@@ -1612,7 +1612,7 @@ fn run_in_scratch(
     let err = private_file(&scratch.join(err_file))?;
     // Claude Code's debug log, made private before Claude Code appends to it.
     drop(private_file(&scratch.join(debug_file))?);
-    let mut cmd = Command::new(claude);
+    let mut cmd = crate::paths::program_command(claude);
     cmd.args(args)
         .arg("--debug-file")
         .arg(scratch.join(debug_file))

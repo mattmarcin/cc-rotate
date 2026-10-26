@@ -48,7 +48,7 @@ fn run() -> Result<ExitCode> {
     }
     warn_if_home();
 
-    let mut cmd = Command::new(&claude);
+    let mut cmd = ccr_core::paths::program_command(&claude);
     cmd.args(std::env::args_os().skip(1))
         .env("CLAUDE_CONFIG_DIR", &paths.profile_dir);
     run_claude(cmd, &claude)
