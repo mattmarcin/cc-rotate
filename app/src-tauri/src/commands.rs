@@ -6,7 +6,7 @@ use ccr_core::history::{self, AccountHistory};
 use ccr_core::profiles::{self, FoundProfile};
 use ccr_core::scheduler::Reason;
 use ccr_core::snapshot::{self, Snapshot};
-use ccr_core::store::{AccountState, Event, Sample, WeeklyLimitSetting, kind};
+use ccr_core::store::{AccountState, Event, HourlyCost, Sample, WeeklyLimitSetting, kind};
 use ccr_core::swap::{self, SwapOutcome, SwapRequest};
 use ccr_core::usage_check::{self, CheckOutcome, Trigger};
 use ccr_core::{Paths, Store};
@@ -42,6 +42,18 @@ pub async fn snapshot() -> CmdResult<Snapshot> {
 #[tauri::command]
 pub async fn series(since_ms: i64) -> CmdResult<Vec<Sample>> {
     blocking(move |s, _| snapshot::series(s, since_ms)).await
+}
+
+/// The swaps since `since_ms`, for the usage chart's markers.
+#[tauri::command]
+pub async fn swaps(since_ms: i64) -> CmdResult<Vec<Event>> {
+    blocking(move |s, _| snapshot::swaps(s, since_ms)).await
+}
+
+/// What each account's use would have cost at API prices, hour by hour, for the cost chart.
+#[tauri::command]
+pub async fn costs(since_ms: i64) -> CmdResult<Vec<HourlyCost>> {
+    blocking(move |s, _| snapshot::costs(s, since_ms)).await
 }
 
 #[tauri::command]

@@ -252,9 +252,16 @@ Compare it with what you pay for the subscription.
 cc-rotate counts it from the status line of every session in the cc-rotate profile, and of your other profiles it tracks, for the account each request went to.
 
 It only reports what cc-rotate recorded, and usage history is kept for `sample_retention_days` (90 days by default).
+Removing an account also removes the API value recorded for it.
 A week with no readings shows no numbers.
 A week with few readings is marked, since the account may have used more than cc-rotate saw.
 The app shows the same numbers for the last 4 weeks as **Recent weeks** and **API value** in the account's **More** dialog.
+Its **API cost** chart, a tab next to **Usage limits** at the bottom of the dashboard, shows the API value of the last 24 hours by hour or of the last 7 days by day, stacked per account, with the total for the period.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/charts-dark.png">
+  <img alt="The dashboard's API cost chart: what each account's use would have cost at API prices in the last 24 hours, as bars stacked per account for each hour, with the total and each account's share" src="docs/charts.png">
+</picture>
 
 ### Extra usage
 

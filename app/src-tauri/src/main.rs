@@ -34,6 +34,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::snapshot,
             commands::series,
+            commands::costs,
+            commands::swaps,
             commands::events,
             commands::usage_history,
             commands::swap_now,
