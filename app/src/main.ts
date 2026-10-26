@@ -16,7 +16,18 @@ import {
   type WeeklyLimitSetting,
   type WindowUsage,
 } from "./api";
-import { UsageChart, colorFor, type Metric } from "./chart";
+import {
+  Chart,
+  LOOKBACK_MS,
+  colorFor,
+  costBuckets,
+  drawCost,
+  drawUsage,
+  usageLines,
+  usd,
+  type Metric,
+  type RangeDays,
+} from "./chart";
 import { h, replace, type Child } from "./dom";
 import { ago, clock, ordinal, pct, plural, until } from "./format";
 
@@ -24,8 +35,10 @@ interface UiState {
   snap: Snapshot | null;
   events: EventRow[];
   showRoutine: boolean;
+  /** Which view the chart panel shows. */
+  view: "usage" | "cost";
   metric: Metric;
-  rangeDays: 1 | 7;
+  rangeDays: RangeDays;
   busy: boolean;
   /** A row is being dragged; renders wait until it is dropped. */
   dragging: boolean;
@@ -37,6 +50,7 @@ const state: UiState = {
   snap: null,
   events: [],
   showRoutine: false,
+  view: "usage",
   metric: "weekly",
   rangeDays: 7,
   busy: false,
@@ -54,10 +68,19 @@ const banner = h("div", { class: "banner", hidden: true });
 const bank = h("div", { class: "bank", role: "list", "aria-label": "Accounts" });
 const summary = h("div", { class: "summary" });
 const accountsBody = h("div", { class: "accounts" });
+const chartTabs = h("div", { class: "tabs", role: "tablist", "aria-label": "Charts" });
 const chartControls = h("div", { class: "chart-controls" });
+const chartSummary = h("div", { class: "chart-summary" });
 const chartLegend = h("div", { class: "legend" });
 const chartHost = h("div", { class: "chart" });
-const chartEmpty = h("p", { class: "chart-empty", hidden: true }, "Usage appears here once a session runs in the cc-rotate profile.");
+const chartEmpty = h("div", { class: "chart-empty", hidden: true });
+const chartView = h(
+  "div",
+  { id: "chart-view", role: "tabpanel" },
+  chartSummary,
+  chartLegend,
+  h("div", { class: "chart-wrap" }, chartHost, chartEmpty),
+);
 const activity = h("ol", { class: "activity" });
 const routineToggle = h("input", {
   type: "checkbox",
@@ -87,10 +110,9 @@ root.append(
       h("section", { class: "panel" }, h("h2", null, "Accounts"), accountsBody),
       h(
         "section",
-        { class: "panel" },
-        h("div", { class: "panel-head" }, h("h2", null, "Usage over time"), chartControls),
-        chartLegend,
-        h("div", { class: "chart-wrap" }, chartHost, chartEmpty),
+        { class: "panel chart-panel" },
+        h("div", { class: "panel-head" }, chartTabs, chartControls),
+        chartView,
       ),
     ),
     h(
@@ -108,7 +130,7 @@ root.append(
   toast,
 );
 
-const chart = new UsageChart(chartHost);
+const chart = new Chart(chartHost);
 
 // ---- helpers ---------------------------------------------------------------------------
 
@@ -863,43 +885,191 @@ function renderAccounts() {
 
 // ---- chart -----------------------------------------------------------------------------
 
+const DAY_MS = 86_400_000;
+const IN_RANGE: Record<RangeDays, string> = { 1: "in the last 24 hours", 7: "in the last 7 days" };
+
+/** Renders started so far; a slower read that comes back after a later render started is dropped. */
+let chartRenders = 0;
+
+function chartMessage(title: string, detail?: string) {
+  chart.show(null);
+  replace(chartLegend);
+  replace(chartEmpty, h("p", null, title), detail && h("p", { class: "muted" }, detail));
+  chartEmpty.hidden = false;
+}
+
 async function renderChart() {
+  const render = ++chartRenders;
   const snap = state.snap;
-  const segmented = (options: [string, string][], current: string, pick: (v: string) => void, label: string) =>
+  // The controls are built anew; the one with keyboard focus keeps it.
+  const focused = (document.activeElement as HTMLElement | null)?.dataset.chartKey;
+  const segmented = (key: string, options: [string, string][], current: string, pick: (v: string) => void, label: string) =>
     h(
       "div",
       { class: "segmented", role: "group", "aria-label": label },
       options.map(([value, text]) =>
-        h("button", { class: value === current ? "on" : "", "aria-pressed": String(value === current), onclick: () => pick(value) }, text),
+        h(
+          "button",
+          {
+            class: value === current ? "on" : "",
+            "aria-pressed": String(value === current),
+            "data-chart-key": `${key}-${value}`,
+            onclick: () => pick(value),
+          },
+          text,
+        ),
       ),
     );
+  const views: ["usage" | "cost", string][] = [
+    ["usage", "Usage limits"],
+    ["cost", "API cost"],
+  ];
+  const pickView = (view: "usage" | "cost") => {
+    state.view = view;
+    renderChart();
+  };
+  replace(
+    chartTabs,
+    views.map(([view, text], i) =>
+      h(
+        "button",
+        {
+          role: "tab",
+          id: `chart-tab-${view}`,
+          class: view === state.view ? "on" : "",
+          "aria-selected": String(view === state.view),
+          "aria-controls": "chart-view",
+          tabindex: view === state.view ? "0" : "-1",
+          "data-chart-key": `tab-${view}`,
+          onclick: () => pickView(view),
+          // Arrow keys move between tabs, as in any tab list.
+          onkeydown: (e: KeyboardEvent) => {
+            const step = e.key === "ArrowRight" ? 1 : e.key === "ArrowLeft" ? -1 : 0;
+            if (step === 0) return;
+            e.preventDefault();
+            const next = views[(i + step + views.length) % views.length][0];
+            pickView(next);
+            document.getElementById(`chart-tab-${next}`)?.focus();
+          },
+        },
+        text,
+      ),
+    ),
+  );
+  chartView.setAttribute("aria-labelledby", `chart-tab-${state.view}`);
   replace(
     chartControls,
-    segmented([["weekly", "Weekly"], ["five_hour", "5-hour"]], state.metric, (v) => ((state.metric = v as Metric), renderChart()), "Limit"),
-    segmented([["1", "24 hours"], ["7", "7 days"]], String(state.rangeDays), (v) => ((state.rangeDays = Number(v) as 1 | 7), renderChart()), "Range"),
+    state.view === "usage" &&
+      segmented("metric", [["weekly", "Weekly"], ["five_hour", "5-hour"]], state.metric, (v) => ((state.metric = v as Metric), renderChart()), "Limit"),
+    segmented("range", [["1", "24 hours"], ["7", "7 days"]], String(state.rangeDays), (v) => ((state.rangeDays = Number(v) as RangeDays), renderChart()), "Range"),
   );
+  if (focused) document.querySelector<HTMLElement>(`[data-chart-key="${focused}"]`)?.focus();
+
   if (!snap || snap.accounts.length === 0) {
-    chartEmpty.hidden = false;
-    replace(chartLegend);
+    replace(chartSummary);
+    chartMessage("Charts appear here once a session runs in the cc-rotate profile.");
     return;
   }
-  const sinceMs = Date.now() - state.rangeDays * 86_400_000;
-  const samples = await api.series(sinceMs);
-  chartEmpty.hidden = samples.length > 0;
+  if (state.view === "usage") await renderUsage(snap, render);
+  else await renderCost(snap, render);
+}
+
+async function renderUsage(snap: Snapshot, render: number) {
+  const nowMs = Date.now();
+  const sinceMs = nowMs - state.rangeDays * DAY_MS;
+  const weekly = state.metric === "weekly";
+  // From further back too, for the reading each account stood at when the range starts.
+  const samples = await api.series(sinceMs - LOOKBACK_MS[state.metric]);
+  if (render !== chartRenders) return;
+  const lines = usageLines(snap.accounts, samples, state.metric, sinceMs, nowMs);
+  const limitName = weekly ? "weekly" : "5-hour";
+  const caption = weekly
+    ? "How much of each account's weekly limit was used. A line drops to 0 when its limit resets."
+    : "How much of each account's 5-hour limit was used. Each climb is one 5-hour window, back to 0 when it resets.";
+  replace(chartSummary, h("p", { class: "chart-caption" }, caption));
+  if (lines.every((l) => l.points.length === 0)) {
+    const noLimit = weekly && snap.accounts.every((a) => a.weekly.effective === "none");
+    chartMessage(
+      noLimit ? "None of your accounts has a weekly limit." : `No ${limitName} usage read ${IN_RANGE[state.rangeDays]}.`,
+      noLimit ? "Their use shows under 5-hour." : "Usage is read from the status line of sessions in the cc-rotate profile, and by usage checks.",
+    );
+    return;
+  }
+  const threshold = weekly ? snap.settings.swap_threshold_7d : snap.settings.swap_threshold_5h;
+  chartEmpty.hidden = true;
   replace(
     chartLegend,
-    snap.accounts.map((a) => h("span", { class: "key" }, h("i", { style: { background: colorOf(a.id) } }), a.label)),
-    h("span", { class: "key swap-key" }, h("i"), "Swap"),
+    lines.map(({ account: a, points }) => {
+      const why = points.length > 0 ? null : weekly && a.weekly.effective === "none" ? "no weekly limit" : "no readings";
+      return h(
+        "span",
+        { class: why ? "key off" : "key" },
+        h("i", { class: "key-line", style: { background: colorOf(a.id) } }),
+        a.label,
+        why && h("span", { class: "key-note" }, why),
+      );
+    }),
+    h("span", { class: "key swap-key" }, h("i"), "Swap, in the color of the account swapped to"),
+    h("span", { class: "key threshold-key" }, h("i"), `cc-rotate swaps at ${threshold}%`),
   );
-  chart.render({
-    accounts: snap.accounts,
-    samples,
-    swaps: state.events.filter((e) => e.kind === "swap" && e.account_from !== null && e.ts >= sinceMs),
-    color: colorOf,
-    metric: state.metric,
-    sinceMs,
-    threshold: state.metric === "weekly" ? snap.settings.swap_threshold_7d : snap.settings.swap_threshold_5h,
-  });
+  chart.show(
+    drawUsage({
+      lines,
+      swaps: state.events.filter((e) => e.kind === "swap" && e.account_from !== null && e.account_to !== null),
+      color: colorOf,
+      describeSwap: (e) => `Swapped to ${labelOf(e.account_to)} ${REASONS[e.reason ?? ""] ?? ""}`.trimEnd(),
+      limitName,
+      sinceMs,
+      nowMs,
+      rangeDays: state.rangeDays,
+      threshold,
+    }),
+    `${caption} Over the last ${state.rangeDays === 1 ? "24 hours" : "7 days"}.`,
+  );
+}
+
+async function renderCost(snap: Snapshot, render: number) {
+  const nowMs = Date.now();
+  const since = costBuckets([], state.rangeDays, nowMs)[0].start;
+  const costs = await api.costs(since);
+  if (render !== chartRenders) return;
+  const buckets = costBuckets(costs, state.rangeDays, nowMs);
+  const total = buckets.reduce((sum, b) => sum + b.total, 0);
+  const byAccount = (id: number) => buckets.reduce((sum, b) => sum + (b.usd.get(id) ?? 0), 0);
+  const caption =
+    "What each account's use would have cost at API prices, as Claude Code estimates it (what /cost shows). It's a measure of what your plans are worth, not a bill.";
+  if (total === 0) {
+    replace(chartSummary, h("p", { class: "chart-caption" }, caption));
+    chartMessage(
+      `No API cost counted ${IN_RANGE[state.rangeDays]}.`,
+      "It's counted from the status line of sessions in the cc-rotate profile, and of other profiles cc-rotate tracks.",
+    );
+    return;
+  }
+  chartEmpty.hidden = true;
+  replace(
+    chartSummary,
+    h("p", { class: "chart-figure" }, h("strong", null, usd(total)), ` ${IN_RANGE[state.rangeDays]}`),
+    h("p", { class: "chart-caption" }, caption),
+  );
+  replace(
+    chartLegend,
+    snap.accounts
+      .filter((a) => byAccount(a.id) > 0)
+      .map((a) =>
+        h(
+          "span",
+          { class: "key" },
+          h("i", { class: "key-box", style: { background: colorOf(a.id) } }),
+          a.label,
+          h("span", { class: "key-note" }, usd(byAccount(a.id))),
+        ),
+      ),
+  );
+  chart.show(
+    drawCost({ accounts: snap.accounts, buckets, color: colorOf, rangeDays: state.rangeDays, nowMs }),
+    `${usd(total)} at API prices ${IN_RANGE[state.rangeDays]}, by ${state.rangeDays === 1 ? "hour" : "day"} and account.`,
+  );
 }
 
 // ---- activity rail ---------------------------------------------------------------------

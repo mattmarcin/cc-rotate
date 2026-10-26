@@ -242,6 +242,7 @@ It only reports what cc-rotate recorded, and usage history is kept for `sample_r
 A week with no readings shows no numbers.
 A week with few readings is marked, since the account may have used more than cc-rotate saw.
 The app shows the same numbers for the last 4 weeks as **Recent weeks** and **API value** in the account's **More** dialog.
+Its **API cost** chart, a tab next to **Usage limits** at the bottom of the dashboard, shows the API value of the last 24 hours by hour or of the last 7 days by day, stacked per account, with the total for the period.
 
 ### Extra usage
 

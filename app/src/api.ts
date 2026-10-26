@@ -40,6 +40,14 @@ export interface Sample {
   windows: SampleWindow[];
 }
 
+/** What an account's use in one hour would have cost at API prices, as Claude Code estimates it. */
+export interface HourlyCost {
+  account_id: number;
+  /** When the hour starts (epoch ms). */
+  ts: number;
+  usd: number;
+}
+
 export interface Account {
   id: number;
   label: string;
@@ -285,6 +293,7 @@ export type SwapOutcome =
 export const api = {
   snapshot: () => invoke<Snapshot>("snapshot"),
   series: (sinceMs: number) => invoke<Sample[]>("series", { sinceMs }),
+  costs: (sinceMs: number) => invoke<HourlyCost[]>("costs", { sinceMs }),
   events: (limit: number) => invoke<EventRow[]>("events", { limit }),
   usageHistory: (id: number) => invoke<AccountHistory>("usage_history", { id }),
   swapNow: (to: number | null) => invoke<SwapOutcome>("swap_now", { to }),

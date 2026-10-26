@@ -422,6 +422,15 @@ pub fn same_windows(a: &[SampleWindow], b: &[SampleWindow]) -> bool {
         })
 }
 
+/// What an account's use in one hour would have cost at API prices (`account_costs`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct HourlyCost {
+    pub account_id: i64,
+    /// When the hour starts (epoch ms, a whole epoch hour).
+    pub ts: i64,
+    pub usd: f64,
+}
+
 /// The highest reading recorded for one usage window (one reset time) of an account.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct WindowPeak {
@@ -1838,6 +1847,24 @@ impl Store {
         )?)
     }
 
+    /// What each account's use would have cost at API prices, hour by hour, from the hour
+    /// holding `since_ms` on: oldest first, then by account. Hours with nothing counted are left
+    /// out.
+    pub fn hourly_costs_since(&self, since_ms: i64) -> Result<Vec<HourlyCost>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT account_id, hour, usd FROM account_costs WHERE hour >= ?1
+             ORDER BY hour, account_id",
+        )?;
+        let rows = stmt.query_map([since_ms.div_euclid(3_600_000)], |r| {
+            Ok(HourlyCost {
+                account_id: r.get(0)?,
+                ts: r.get::<_, i64>(1)? * 3_600_000,
+                usd: r.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     // ---- extra usage ---------------------------------------------------------------------------
 
     /// Record an account's extra usage as a report read at `read_at` (epoch ms) gave it, unless a
@@ -2838,5 +2865,61 @@ mod tests {
         assert_eq!(s.find_account("u1@example.com").unwrap().id, a);
         assert_eq!(s.find_account(&a.to_string()).unwrap().id, a);
         assert!(s.find_account("missing").is_err());
+    }
+
+    #[test]
+    fn hourly_costs_per_account_and_hour() {
+        let s = Store::open_in_memory().unwrap();
+        assert!(
+            s.hourly_costs_since(0).unwrap().is_empty(),
+            "nothing counted yet"
+        );
+        let a = s
+            .insert_account("a", &ident("u1"), AccountState::Active)
+            .unwrap();
+        let b = s
+            .insert_account("b", &ident("u2"), AccountState::Parked)
+            .unwrap();
+        let hour = 3_600_000;
+        let h0 = 490_000 * hour;
+        // Two ticks in one hour add up; the next hour has its own bucket.
+        s.note_session_cost("s1", "p", 1.25, true, a, h0 + 60_000)
+            .unwrap();
+        s.note_session_cost("s1", "p", 2.0, false, a, h0 + hour - 1)
+            .unwrap();
+        s.note_session_cost("s1", "p", 2.5, false, a, h0 + hour)
+            .unwrap();
+        s.note_session_cost("s2", "p", 4.0, true, b, h0 + 30 * 60_000)
+            .unwrap();
+        s.note_session_cost("s3", "p", 1.0, true, a, h0 - 1)
+            .unwrap();
+        let cost = |account_id, ts, usd| HourlyCost {
+            account_id,
+            ts,
+            usd,
+        };
+        assert_eq!(
+            s.hourly_costs_since(h0 - hour).unwrap(),
+            vec![
+                cost(a, h0 - hour, 1.0),
+                cost(a, h0, 2.0),
+                cost(b, h0, 4.0),
+                cost(a, h0 + hour, 0.5),
+            ],
+            "oldest first, then by account"
+        );
+        // The hour holding `since_ms` is in, whole; the one before it is not.
+        for since in [h0, h0 + 1, h0 + hour - 1] {
+            assert_eq!(
+                s.hourly_costs_since(since).unwrap(),
+                vec![cost(a, h0, 2.0), cost(b, h0, 4.0), cost(a, h0 + hour, 0.5)],
+                "since {since}"
+            );
+        }
+        assert_eq!(
+            s.hourly_costs_since(h0 + hour).unwrap(),
+            vec![cost(a, h0 + hour, 0.5)]
+        );
+        assert!(s.hourly_costs_since(h0 + 2 * hour).unwrap().is_empty());
     }
 }

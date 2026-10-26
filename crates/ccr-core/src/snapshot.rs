@@ -6,7 +6,7 @@ use serde::Serialize;
 use crate::paths::Paths;
 use crate::scheduler::{self, Ranked, WeeklyLimit, WindowUsage};
 use crate::store::{
-    Account, AccountState, Event, Sample, Settings, Store, WeeklyLimitSetting, kind,
+    Account, AccountState, Event, HourlyCost, Sample, Settings, Store, WeeklyLimitSetting, kind,
 };
 use crate::swap::{self, META_PROFILE_MODEL};
 use crate::usage_check::{self, CheckState};
@@ -281,6 +281,12 @@ pub fn recent_events(store: &Store, limit: usize) -> Result<Vec<Event>> {
 
 pub fn series(store: &Store, since_ms: i64) -> Result<Vec<Sample>> {
     store.samples_since(since_ms)
+}
+
+/// What each account's use would have cost at API prices, per hour from the hour holding
+/// `since_ms` on, for the app's cost chart.
+pub fn costs(store: &Store, since_ms: i64) -> Result<Vec<HourlyCost>> {
+    store.hourly_costs_since(since_ms)
 }
 
 #[cfg(test)]

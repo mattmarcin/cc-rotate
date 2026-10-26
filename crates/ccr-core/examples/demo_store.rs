@@ -1,5 +1,5 @@
-//! Fill a store with fictional accounts, a week of usage and swap history, for trying the
-//! dashboard without real logins and for screenshots.
+//! Fill a store with fictional accounts, a week of usage, API cost and swap history, for trying
+//! the dashboard without real logins and for screenshots.
 //!
 //!   CC_ROTATE_DATA_DIR=/tmp/cc-rotate-demo cargo run -p ccr-core --example demo_store
 //!
@@ -37,7 +37,13 @@ struct Sim {
     five_resets: i64,
     week: f64,
     week_resets: i64,
+    /// What its demo session has cost at API prices so far, as the status line reports it.
+    spent: f64,
 }
+
+/// How busy each day of the simulated week is, the last 24 hours first, for API cost that
+/// differs by day.
+const DAY_LOAD: [f64; 7] = [1.0, 0.7, 1.3, 0.85, 1.15, 0.45, 0.95];
 
 fn main() -> Result<()> {
     let data = Paths::default_data_dir()?;
@@ -83,6 +89,7 @@ fn main() -> Result<()> {
             five_resets: 0,
             week: 9.0 + 13.0 * i as f64 % 40.0,
             week_resets: (week_start + (8 + i as i64) * 24 * hour) / 1000,
+            spent: 0.0,
         });
     }
     let ids: Vec<i64> = sims.iter().map(|s| s.id).collect();
@@ -164,6 +171,10 @@ fn main() -> Result<()> {
             if s.weekly {
                 s.week += 0.55;
             }
+            // About $2 an hour at API prices, more on busier days.
+            let day = ((now - t) / (24 * hour)) as usize;
+            s.spent += (0.18 + (t / 600_000 % 7) as f64 * 0.06) * DAY_LOAD[day.min(6)];
+            store.note_session_cost(&format!("demo-{}", s.id), "demo", s.spent, true, s.id, t)?;
         }
         if s.five_resets != 0 {
             store.record_sample(&Sample {
