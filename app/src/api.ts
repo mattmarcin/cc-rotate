@@ -208,7 +208,9 @@ export interface Turn {
   account_id: number;
   from: number;
   to: number;
-  /** The turn ends at a limit: when the account is usable again (epoch seconds). */
+  /** The turn ends at a limit, rather than giving way to an account without a weekly limit or the horizon. */
+  at_limit: boolean;
+  /** After a turn at a limit, when the account is usable again (epoch seconds), if known. */
   rests_until: number | null;
 }
 

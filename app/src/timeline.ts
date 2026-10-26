@@ -6,7 +6,7 @@ import { h, type Child } from "./dom";
 import { clock, pct } from "./format";
 
 const HOUR_MS = 3_600_000;
-/** Hours the plan shows, from the start of the current hour. */
+/** Hours the plan shows, from the start of the hour at least half an hour ago. */
 export const PLAN_HOURS = 12;
 
 export interface View {
@@ -16,7 +16,8 @@ export interface View {
 }
 
 export function planView(nowMs: number): View {
-  const start = new Date(nowMs);
+  // Now is never at the very edge, where its tag would be cut off.
+  const start = new Date(nowMs - HOUR_MS / 2);
   start.setMinutes(0, 0, 0);
   return { start: start.getTime(), end: start.getTime() + PLAN_HOURS * HOUR_MS, now: nowMs };
 }
@@ -42,6 +43,12 @@ const time = (ms: number) => new Date(ms).toLocaleTimeString([], { hour: "numeri
 /** A time on the plan: "11:07 PM" within the next day, with the weekday further out. */
 export const when = (ms: number, now: number) => (ms - now < 20 * HOUR_MS ? time(ms) : clock(ms));
 
+/** "back at 3:25 AM", or "back Thu 9:00 AM" further out. */
+const backText = (ms: number, now: number) => (ms - now < 20 * HOUR_MS ? `back at ${time(ms)}` : `back ${clock(ms)}`);
+
+/** "raid2", "raid2 and raid1", "raid2, raid1 and raid4". */
+const listOf = (names: string[]) => (names.length < 2 ? names.join("") : `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`);
+
 /** The lanes of every account, by id. `activeSince` is when the account in use was swapped in. */
 export function lanes(snap: Snapshot, activeSince: number | null, view: View, labelOf: (id: number) => string): Map<number, Lane> {
   const out = new Map<number, Lane>(snap.accounts.map((a) => [a.id, { segments: [], note: null, tone: null }]));
@@ -49,11 +56,14 @@ export function lanes(snap: Snapshot, activeSince: number | null, view: View, la
     if (s.to > view.start && s.from < view.end && s.to > s.from) out.get(id)?.segments.push(s);
   };
   const plan = snap.forecast?.plan ?? [];
+  // The plan starts with another account when the one in use hands over at once: at a limit,
+  // or giving way to an account without a weekly limit.
+  const activeTurn = plan[0]?.account_id === snap.active_id;
 
   plan.forEach((turn, i) => {
     const from = turn.from * 1000;
     const to = turn.to * 1000;
-    const first = i === 0 && turn.account_id === snap.active_id;
+    const first = i === 0 && activeTurn;
     const open = to >= view.end;
     add(turn.account_id, {
       kind: first ? "use" : "next",
@@ -70,7 +80,7 @@ export function lanes(snap: Snapshot, activeSince: number | null, view: View, la
         kind: "rest",
         from: to,
         to: back,
-        text: `back at ${time(back)}`,
+        text: backText(back, view.now),
         title: `${labelOf(turn.account_id)} reaches a limit and is ready again at ${when(back, view.now)}`,
       });
     }
@@ -78,14 +88,16 @@ export function lanes(snap: Snapshot, activeSince: number | null, view: View, la
 
   for (const a of snap.accounts) {
     const lane = out.get(a.id)!;
-    // Without a forecast there's no pace to play forward: the account in use up to now.
-    if (a.id === snap.active_id && !snap.forecast) {
+    // The account in use without a turn of its own (no pace yet, or handing over now): in use
+    // up to now.
+    if (a.id === snap.active_id && !activeTurn) {
       add(a.id, { kind: "use", from: activeSince ?? view.start, to: view.now, text: "In use", title: `${a.label} is in use` });
     }
     // An account at a limit now rests until it resets, before any turn the plan gives it.
     const back = a.available_at ? a.available_at * 1000 : null;
-    if (a.state === "parked" && back && back > view.now) {
-      add(a.id, { kind: "rest", from: view.now, to: back, text: `back ${when(back, view.now)}`, title: `${a.label} is at a limit until ${when(back, view.now)}` });
+    const usable = a.state === "parked" || (a.state === "active" && !activeTurn);
+    if (usable && back && back > view.now) {
+      add(a.id, { kind: "rest", from: view.now, to: back, text: backText(back, view.now), title: `${a.label} is at a limit until ${when(back, view.now)}` });
     }
     lane.segments.sort((x, y) => x.from - y.from);
     if (a.state === "needs_login") {
@@ -120,15 +132,18 @@ export function gaps(snap: Snapshot, view: View): { from: number; to: number }[]
 /** Where `ms` falls across the view, from 0 to 100. */
 export const at = (ms: number, view: View) => (Math.max(view.start, Math.min(view.end, ms)) - view.start) / (view.end - view.start) * 100;
 
-/** The hour labels above the lanes: every other hour, the day's name at midnight, and now. */
-export function axis(view: View): HTMLElement {
+/** The hour labels above the lanes: every other hour, the day's name at midnight, now, and where no account is left. */
+export function axis(snap: Snapshot, view: View): HTMLElement {
   const marks: HTMLElement[] = [];
+  // Wide enough gaps are named in the axis, over the hour labels where the name goes.
+  const named = gaps(snap, view).filter((g) => at(g.to, view) - at(g.from, view) > 9);
   for (let t = view.start + HOUR_MS; t < view.end; t += HOUR_MS) {
     const d = new Date(t);
     const midnight = d.getHours() === 0;
     if (!midnight && d.getHours() % 2 !== 0) continue;
     // Too close to "now" to read beside it.
     if (Math.abs(t - view.now) < 0.45 * HOUR_MS) continue;
+    if (named.some((g) => t > g.from - 0.5 * HOUR_MS && t < g.from + 1.6 * HOUR_MS)) continue;
     marks.push(
       h(
         "span",
@@ -138,6 +153,7 @@ export function axis(view: View): HTMLElement {
     );
   }
   marks.push(h("span", { class: "now-tag", style: { left: `${at(view.now, view)}%` } }, "Now"));
+  for (const g of named) marks.push(h("span", { class: "gap-tag", style: { left: `${at(g.from, view)}%` } }, "All at a limit"));
   return h("div", { class: "plan-axis", "aria-hidden": "true" }, marks);
 }
 
@@ -178,26 +194,21 @@ export function fitLabels(root: HTMLElement) {
   }
 }
 
-/** The hour lines, the gaps and the line for now, drawn once behind and over every lane. */
+/** The stretches with no account left and the hour lines behind every lane, and the line for now over them. */
 export function overlay(snap: Snapshot, view: View): HTMLElement[] {
   const lines: HTMLElement[] = [];
   for (let t = view.start + HOUR_MS; t < view.end; t += HOUR_MS) lines.push(h("i", { class: "hour", style: { left: `${at(t, view)}%` } }));
-  const bands = gaps(snap, view).map((g) =>
-    h(
-      "div",
-      { class: "plan-gap", style: { left: `${at(g.from, view)}%`, width: `${at(g.to, view) - at(g.from, view)}%` }, title: `Every account is at a limit from ${time(g.from)}` },
-      at(g.to, view) - at(g.from, view) > 9 ? "All at a limit" : "",
-    ),
-  );
+  // The axis names them; the rows say what each account does meanwhile.
+  const bands = gaps(snap, view).map((g) => h("div", { class: "plan-gap", style: { left: `${at(g.from, view)}%`, width: `${at(g.to, view) - at(g.from, view)}%` } }));
   return [
-    h("div", { class: "grid-lines", "aria-hidden": "true" }, lines),
-    h("div", { class: "plan-over" }, bands, h("i", { class: "now-line", style: { left: `${at(view.now, view)}%` } })),
+    h("div", { class: "grid-lines", "aria-hidden": "true" }, bands, lines),
+    h("div", { class: "plan-over", "aria-hidden": "true" }, h("i", { class: "now-line", style: { left: `${at(view.now, view)}%` } })),
   ];
 }
 
 /** The account that takes over next: the plan's, or the one a swap now would pick. */
 export function nextUp(snap: Snapshot): number | null {
-  const later = snap.forecast?.plan.find((t, i) => i > 0 && t.account_id !== snap.active_id);
+  const later = snap.forecast?.plan.find((t) => t.account_id !== snap.active_id);
   return later?.account_id ?? snap.next?.account_id ?? null;
 }
 
@@ -232,18 +243,25 @@ export function summary(snap: Snapshot, labelOf: (id: number) => string): { titl
     };
   }
   const first = f.plan[0];
-  // The accounts that take over after it, in the order they first do.
-  const names = [...new Set(f.plan.slice(1).map((t) => t.account_id))].map(labelOf);
-  const handover: Child[] =
-    f.plan.length < 2
+  const out = f.runs_out_at;
+  // The turns before the pool runs out, if it does.
+  const before = out ? f.plan.filter((t) => t.to <= out) : f.plan;
+  const ownTurn = first.account_id === active.id;
+  // The other accounts that take over, in the order they first do.
+  const names = [...new Set(before.map((t) => t.account_id))].filter((id) => id !== active.id).map(labelOf);
+  const opening: Child[] = ownTurn
+    ? !out && f.plan.length === 1
       ? [b(active.label), " has room for the next 24 hours at your pace."]
-      : [
-          "At your pace, ",
-          b(active.label),
-          first.rests_until ? " reaches its swap point around " : " gives way around ",
-          b(when(first.to * 1000, now)),
-          names.length === 1 ? [", and ", names[0], " takes over."] : [". Then ", names.slice(0, -1).join(", "), " and ", names[names.length - 1], " take turns."],
-        ];
+      : ["At your pace, ", b(active.label), first.at_limit ? " reaches its swap point around " : " gives way around ", b(when(first.to * 1000, now)), "."]
+    : [
+        b(active.label),
+        active.available_at && active.available_at * 1000 > now ? " is at its swap point, so " : " gives way to an account without a weekly limit: ",
+        b(labelOf(first.account_id)),
+        " takes over now.",
+      ];
+  // Who comes after the opening's accounts.
+  const rest = ownTurn ? names : names.slice(1);
+  const handover: Child[] = [opening, rest.length === 0 ? "" : rest.length === 1 ? ` Then ${rest[0]} takes over.` : ` Then ${listOf(rest)} take turns.`];
   if (f.runs_out_at) {
     return {
       title: `Runs out around ${when(f.runs_out_at * 1000, now)}`,

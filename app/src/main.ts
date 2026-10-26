@@ -107,10 +107,11 @@ function rerender(el: HTMLElement, ...children: Child[]) {
   const want = state.focus ?? had;
   if (!want) return;
   const target = el.querySelector<HTMLElement>(`[data-focus="${CSS.escape(want)}"]`);
-  if (target) {
-    target.focus();
-    state.focus = null;
-  }
+  if (!target) return;
+  state.focus = null;
+  // A button that turned off (Move up at the top) hands focus to its alternative.
+  const alt = target.matches(":disabled") && target.dataset.focusAlt ? el.querySelector<HTMLElement>(`[data-focus="${CSS.escape(target.dataset.focusAlt)}"]`) : null;
+  (alt ?? target).focus();
 }
 
 const SVG_NS = "http://www.w3.org/2000/svg";
@@ -342,10 +343,15 @@ let accountForm: { id: number; el: HTMLElement } | null = null;
 let accountHistory: { id: number; hist: AccountHistory | null; failed: boolean } | null = null;
 
 function go(route: Route) {
+  const same = route.page === state.route.page && (route.page !== "account" || (state.route.page === "account" && state.route.id === route.id));
+  if (same) {
+    body.scrollTop = 0;
+    return;
+  }
   state.route = route;
   settingsPage = null;
   accountForm = null;
-  if (route.page === "account" && accountHistory?.id !== route.id) {
+  if (route.page === "account") {
     const id = route.id;
     accountHistory = { id, hist: null, failed: false };
     api
@@ -355,7 +361,10 @@ function go(route: Route) {
   }
   body.scrollTop = 0;
   render();
-  if (route.page === "cost") costChart.refresh();
+  if (route.page === "cost") {
+    costChart.refresh();
+    loadCostTable();
+  }
   if (route.page === "overview") overviewChart.refresh();
 }
 
@@ -364,6 +373,8 @@ function go(route: Route) {
 /** Order saves run one after another, so quick key presses are never dropped. */
 let orderSaves = Promise.resolve();
 let pendingOrderSaves = 0;
+/** Bumped by every order change, so a read that started before one is not shown. */
+let orderVersion = 0;
 
 /** Save a new order: optimistic in the UI, then written to the store. */
 function saveOrder(ids: number[], moved: AccountView) {
@@ -372,6 +383,7 @@ function saveOrder(ids: number[], moved: AccountView) {
   const before = snap.accounts.map((a) => a.id);
   if (ids.every((id, i) => id === before[i])) return;
   snap.accounts.sort((x, y) => ids.indexOf(x.id) - ids.indexOf(y.id));
+  orderVersion += 1;
   render();
   pendingOrderSaves += 1;
   orderSaves = orderSaves
@@ -445,16 +457,19 @@ function grip(a: AccountView, at: number, count: number, where: "side" | "plan")
 
 /** How cc-rotate uses the order, as the settings make it. */
 function orderNote(s: Settings): string {
-  if (s.strict_order) return "cc-rotate goes down your order, top to bottom.";
   const first =
     s.prefer_no_weekly_limit && s.use_expiring_weekly
-      ? "Accounts without a weekly limit go first, then weekly budget that would go unused. "
+      ? "Accounts without a weekly limit go first, then weekly budget that would go unused."
       : s.prefer_no_weekly_limit
-        ? "Accounts without a weekly limit go first. "
+        ? "Accounts without a weekly limit go first."
         : s.use_expiring_weekly
-          ? "Weekly budget that would go unused goes first. "
+          ? "Weekly budget that would go unused goes first."
           : "";
-  return `${first}The account in use stays until a limit. After that, one whose 5-hour window is already running comes before the rest of your order.`;
+  const within = s.strict_order
+    ? "top to bottom"
+    : "the account in use stays until a limit, then one whose 5-hour window is already running comes first, then the rest top to bottom";
+  const note = first ? `${first} Within each group, ${within}.` : `${within[0].toUpperCase()}${within.slice(1)}.`;
+  return s.prefer_no_weekly_limit ? `${note} An account with a weekly limit gives way as soon as one without is ready.` : note;
 }
 
 // ---- sidebar ---------------------------------------------------------------------------
@@ -510,7 +525,7 @@ function renderNav() {
           { class: "side-accounts", "aria-label": "Accounts, in your order" },
           accounts.map((a, i) => {
             const five = fiveOf(a);
-            const left = a.state === "needs_login" || !five ? 0 : Math.max(0, 100 - five.pct);
+            const left = a.state === "needs_login" ? 0 : five ? Math.max(0, 100 - five.pct) : 100;
             const st = sideState(a);
             return h(
               "li",
@@ -528,7 +543,7 @@ function renderNav() {
                 h("span", { class: "swatch", style: { background: colorOf(a.id) } }),
                 h("span", { class: "side-name" }, a.label),
                 h("span", { class: `side-state ${st.tone}`.trim() }, st.text),
-                h("span", { class: "mini", "aria-hidden": "true" }, h("i", { style: { width: `${left}%`, background: colorOf(a.id) } })),
+                h("span", { class: five ? "mini" : "mini unread", "aria-hidden": "true" }, h("i", { style: { width: `${left}%`, background: colorOf(a.id) } })),
               ),
             );
           }),
@@ -564,7 +579,7 @@ function renderHead() {
   } else if (r.page === "account") {
     const a = snap?.accounts.find((x) => x.id === r.id);
     if (!a) return replace(head, title("Account"));
-    const btn = (text: string, onclick: () => void, primary = false) => h("button", { class: primary ? "btn primary" : "btn", onclick }, text);
+    const btn = (text: string, key: string, onclick: () => void, primary = false) => h("button", { class: primary ? "btn primary" : "btn", "data-focus": `head-${key}`, onclick }, text);
     rerender(
       head,
       h(
@@ -576,11 +591,11 @@ function renderHead() {
       h(
         "div",
         { class: "page-actions" },
-        a.state === "parked" && btn("Use now", () => useNow(a), true),
-        a.state === "parked" && btn("Pause", () => act(() => api.setPaused(a.id, true), () => `Paused ${a.label}`)),
-        a.state === "paused" && btn("Resume", () => resume(a), true),
-        (a.state === "parked" || a.state === "paused") && btn("Check usage", () => act(() => api.checkUsage(a.id), (res) => checkMessage(a.label, res))),
-        btn("Sign in again", () => openLogin(a), a.state === "needs_login"),
+        a.state === "parked" && btn("Use now", "use", () => useNow(a), true),
+        a.state === "parked" && btn("Pause", "pause", () => act(() => api.setPaused(a.id, true), () => `Paused ${a.label}`)),
+        a.state === "paused" && btn("Resume", "pause", () => resume(a), true),
+        (a.state === "parked" || a.state === "paused") && btn("Check usage", "check", () => act(() => api.checkUsage(a.id), (res) => checkMessage(a.label, res))),
+        btn("Sign in again", "sign-in", () => openLogin(a), a.state === "needs_login"),
       ),
     );
   } else if (r.page === "activity") {
@@ -607,7 +622,7 @@ function renderBanner() {
   const show = (tone: "warn" | "danger", ...children: Child[]) => {
     banner.hidden = false;
     banner.className = `banner ${tone}`;
-    replace(banner, ...children);
+    rerender(banner, ...children);
   };
   const needs = snap?.accounts.filter((a) => a.state === "needs_login") ?? [];
   if (snap?.pool.swap_unsettled) {
@@ -620,7 +635,7 @@ function renderBanner() {
         null,
         needs.length === 1 ? `${needs[0].label} is signed out. Sign in again to use it.` : `${needs.map((a) => a.label).join(", ")} are signed out. Sign in again to use them.`,
       ),
-      h("button", { class: "btn small", onclick: () => openLogin(needs[0]) }, `Sign in to ${needs[0].label}`),
+      h("button", { class: "btn small", "data-focus": "banner-action", onclick: () => openLogin(needs[0]) }, `Sign in to ${needs[0].label}`),
     );
   } else if (snap && snap.pool.sessions_waiting > 0) {
     show("warn", h("span", null, `${snap.pool.sessions_waiting === 1 ? "A session is" : `${snap.pool.sessions_waiting} sessions are`} stopped at a limit, waiting for an account with room.`));
@@ -641,7 +656,7 @@ function renderBanner() {
           ? `${first.label}'s sign-in ends in ${until(first.refresh_expires_at / 1000)}. Sign in again to keep it in rotation.`
           : `${ending.map((a) => a.label).join(", ")} need a new sign-in soon. Sign in again to keep them in rotation.`,
       ),
-      h("button", { class: "btn small", onclick: () => openLogin(first) }, `Sign in to ${first.label}`),
+      h("button", { class: "btn small", "data-focus": "banner-action", onclick: () => openLogin(first) }, `Sign in to ${first.label}`),
     );
   } else {
     banner.hidden = true;
@@ -681,11 +696,11 @@ function planSection(snap: Snapshot): Child {
   const rows = snap.accounts.map((a, i) => {
     const action =
       a.state === "needs_login"
-        ? h("button", { class: "row-action danger", onclick: () => openLogin(a) }, "Sign in")
+        ? h("button", { class: "row-action danger", "data-focus": `row-${a.id}`, onclick: () => openLogin(a) }, "Sign in")
         : a.state === "paused"
-          ? h("button", { class: "row-action", onclick: () => resume(a) }, "Resume")
+          ? h("button", { class: "row-action", "data-focus": `row-${a.id}`, onclick: () => resume(a) }, "Resume")
           : a.state === "parked" && a.eligible
-            ? h("button", { class: "row-action quiet", onclick: () => useNow(a), title: `Swap to ${a.label} now` }, "Use now")
+            ? h("button", { class: "row-action quiet", "data-focus": `row-${a.id}`, onclick: () => useNow(a), title: `Swap to ${a.label} now` }, "Use now")
             : null;
     const st = stateLine(a, next === a.id);
     return h(
@@ -710,7 +725,7 @@ function planSection(snap: Snapshot): Child {
   return h(
     "section",
     { class: "card plan-card", "aria-label": "Plan for the next 12 hours" },
-    h("div", { class: "plan-top" }, h("div", { class: "plan-corner" }, "Your order"), axis(view)),
+    h("div", { class: "plan-top" }, h("div", { class: "plan-corner" }, "Your order"), axis(snap, view)),
     h("div", { class: "plan-rows" }, overlay(snap, view), h("ol", { class: "plan-list" }, rows)),
     h(
       "div",
@@ -841,8 +856,8 @@ function accountLive(a: AccountView): Child[] {
           "dd",
           { class: "order-row" },
           `${ordinal(at + 1)} of ${count}`,
-          h("button", { class: "btn small", disabled: at <= 0, "data-focus": "move-up", onclick: () => ((state.focus = "move-up"), moveBy(a, -1)) }, "Move up"),
-          h("button", { class: "btn small", disabled: at >= count - 1, "data-focus": "move-down", onclick: () => ((state.focus = "move-down"), moveBy(a, 1)) }, "Move down"),
+          h("button", { class: "btn small", disabled: at <= 0, "data-focus": "move-up", "data-focus-alt": "move-down", onclick: () => ((state.focus = "move-up"), moveBy(a, -1)) }, "Move up"),
+          h("button", { class: "btn small", disabled: at >= count - 1, "data-focus": "move-down", "data-focus-alt": "move-up", onclick: () => ((state.focus = "move-down"), moveBy(a, 1)) }, "Move down"),
         ),
         h("dt", null, "Pick order"),
         h("dd", null, a.rank ? `${ordinal(a.rank)} - ${a.reason}` : `not available${a.reason ? ` - ${a.reason}` : ""}`),
@@ -867,6 +882,7 @@ function accountLive(a: AccountView): Child[] {
               "button",
               {
                 class: "link",
+                "data-focus": "start-again",
                 onclick: () =>
                   api
                     .setKeepRunning(a.id, true)
@@ -947,6 +963,11 @@ function accountSettings(a: AccountView): HTMLElement {
   });
   let armed = false;
   remove.addEventListener("click", async () => {
+    if (state.snap?.active_id === a.id) {
+      error.hidden = false;
+      error.textContent = `${a.label} is in use. Swap to another account first.`;
+      return;
+    }
     if (!armed) {
       armed = true;
       remove.textContent = `Yes, remove ${a.label}`;
@@ -1045,7 +1066,7 @@ function loadCostTable() {
                 null,
                 rows.map((a) => h("tr", null, h("td", null, h("span", { class: "swatch", style: { background: colorOf(a.id) } }), a.label), spans.map(([, since]) => h("td", { class: "num" }, usd(sum(a.id, since)))))),
               ),
-              h("tfoot", null, h("tr", null, h("td", null, "All accounts"), spans.map(([, since]) => h("td", { class: "num" }, usd(sum(null, since)))))),
+              h("tfoot", null, h("tr", null, h("td", null, "Total"), spans.map(([, since]) => h("td", { class: "num" }, usd(rows.reduce((s, a) => s + sum(a.id, since), 0)))))),
             ),
         h("p", { class: "muted cost-note" }, "Counted from the status line of sessions in the cc-rotate profile and other profiles cc-rotate tracks. An hour that started before a span counts in full."),
       );
@@ -1173,7 +1194,6 @@ function renderPage() {
       break;
     case "cost":
       mount(costChart.el, costTable);
-      loadCostTable();
       break;
     case "settings":
       if (!settingsPage && state.snap) settingsPage = buildSettings(state.snap);
@@ -1366,13 +1386,19 @@ function openLogin(account: AccountView | null) {
 // ---- data flow -------------------------------------------------------------------------
 
 let refreshing: Promise<void> | null = null;
-async function refresh() {
-  if (refreshing) return refreshing;
+/** A refresh was asked for while one was reading: it may have missed the change. */
+let refreshAgain = false;
+async function refresh(): Promise<void> {
+  if (refreshing) {
+    refreshAgain = true;
+    return refreshing;
+  }
   refreshing = (async () => {
     try {
+      const version = orderVersion;
       const [snap, events] = await Promise.all([api.snapshot(), api.events(300)]);
-      // An order the user just changed is still being saved; this read may predate it.
-      if (pendingOrderSaves > 0) return;
+      // An order the user just changed is still being saved, or was saved after this read began.
+      if (pendingOrderSaves > 0 || version !== orderVersion) return;
       state.snap = snap;
       state.events = events;
       colorOf = colorFor(snap.accounts);
@@ -1380,11 +1406,19 @@ async function refresh() {
       if (state.route.page === "account" && !snap.accounts.some((a) => state.route.page === "account" && a.id === state.route.id)) state.route = { page: "overview" };
       render();
       if (state.route.page === "overview") await overviewChart.render();
-      if (state.route.page === "cost") await costChart.render();
+      if (state.route.page === "cost") {
+        loadCostTable();
+        await costChart.render();
+      }
     } catch (e) {
       say(`Couldn't load cc-rotate's data: ${e}`, "error");
     } finally {
       refreshing = null;
+      // Also after a read dropped for being older than an order change.
+      if (refreshAgain) {
+        refreshAgain = false;
+        void refresh();
+      }
     }
   })();
   return refreshing;
