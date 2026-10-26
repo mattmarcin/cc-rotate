@@ -177,13 +177,14 @@ pub fn tick(store: &Store, paths: &Paths, input: &StatusInput, now_ms: i64) -> R
         },
     )?;
 
+    let process = process_key(store, input, now_ms)?;
     if !sync_profile_login(store, paths, &mut dead_login, &mut unidentified)? {
         // Nothing can be trusted about the profile's login until the swap is settled. The cost
         // still counts, for the account cc-rotate last put in the profile.
         result.settle_login = settle_due(store, now_ms)?;
         result.active = store.active_account()?;
         if let Some(active) = &result.active {
-            note_cost(store, input, active.id, now_ms)?;
+            note_cost(store, input, &process, active.id, now_ms)?;
         }
         return Ok(result);
     }
@@ -208,7 +209,11 @@ pub fn tick(store: &Store, paths: &Paths, input: &StatusInput, now_ms: i64) -> R
     // login.
     let mut cost_account = active.id;
     if let Some(sample) = input.sample_for(active.id, "rotate", now_ms) {
-        if is_stale_reading(store, &sample, now_ms)? {
+        if idle_since_swap(store, input, &process, &sample, now_ms)? {
+            // The numbers of the account the session used before; it has not had a response
+            // since.
+            cost_account = reading_account(store, &sample, active.id)?.unwrap_or(active.id);
+        } else if is_stale_reading(store, &sample, now_ms)? {
             // It carries the reset times of the account the last swap left.
             cost_account = left_account(store)?.unwrap_or(active.id);
         } else {
@@ -230,7 +235,7 @@ pub fn tick(store: &Store, paths: &Paths, input: &StatusInput, now_ms: i64) -> R
             }
         }
     }
-    note_cost(store, input, cost_account, now_ms)?;
+    note_cost(store, input, &process, cost_account, now_ms)?;
 
     let (pool, policy) = swap::load_pool(store, now_ms / 1000)?;
     crate::budget::note_in_use(store, &pool)?;
@@ -456,13 +461,55 @@ pub fn observe(
         // A profile that never swaps only ever shows its own account.
         swap::note_known_resets(store, account.id, &sample.windows, now_ms / 1000)?;
     }
-    note_cost(store, input, account.id, now_ms)?;
+    let process = process_key(store, input, now_ms)?;
+    note_cost(store, input, &process, account.id, now_ms)?;
     Ok(Some(account))
+}
+
+/// The Claude Code process that runs the session (`Store::session_process`): two can run one
+/// session (resumed twice), each with its own numbers and cost. Told by when it started, from how
+/// long it has run: the status line runs under a process of its own each time, so its parent is
+/// no guide. A process that does not say how long it has run shares one key with its session.
+fn process_key(store: &Store, input: &StatusInput, now_ms: i64) -> Result<String> {
+    let session = input.session_id.as_deref().filter(|s| !s.is_empty());
+    let ran = input
+        .cost
+        .as_ref()
+        .and_then(|c| c.total_duration_ms)
+        .filter(|d| d.is_finite() && *d >= 0.0);
+    match (session, ran) {
+        (Some(session), Some(ran)) => store.session_process(session, now_ms - ran as i64, now_ms),
+        _ => Ok(String::new()),
+    }
+}
+
+/// Whether the session has reported these numbers unchanged since before the account in use
+/// became active (`Store::note_session_reading`): it has had no response since, so they are the
+/// account it used before. A session only notices a new login when it next starts a request
+/// (F1), and repeats its last numbers until then, however long it idles (F24).
+fn idle_since_swap(
+    store: &Store,
+    input: &StatusInput,
+    process: &str,
+    sample: &Sample,
+    now_ms: i64,
+) -> Result<bool> {
+    let Some(session) = input.session_id.as_deref().filter(|s| !s.is_empty()) else {
+        return Ok(false);
+    };
+    let since = store.note_session_reading(session, process, &sample.windows, now_ms)?;
+    Ok(since < swap::active_since(store)?)
 }
 
 /// Count what the session's use cost since its last reading, at API prices, for `account_id`
 /// (`Store::note_session_cost`).
-fn note_cost(store: &Store, input: &StatusInput, account_id: i64, now_ms: i64) -> Result<()> {
+fn note_cost(
+    store: &Store,
+    input: &StatusInput,
+    process: &str,
+    account_id: i64,
+    now_ms: i64,
+) -> Result<()> {
     let Some(cost) = input.cost.as_ref() else {
         return Ok(());
     };
@@ -473,12 +520,11 @@ fn note_cost(store: &Store, input: &StatusInput, account_id: i64, now_ms: i64) -
         return Ok(());
     }
     // Two processes can run one session (resumed twice, each restoring the same total): each
-    // keeps its own count. A process that cannot be told shares one with the session.
-    let process = crate::process::Ancestors::launcher().unwrap_or_default();
+    // keeps its own count (`process_key`).
     let new_session = cost
         .total_duration_ms
         .is_some_and(|d| d.is_finite() && (0.0..NEW_SESSION_MS).contains(&d));
-    store.note_session_cost(session, &process, total, new_session, account_id, now_ms)?;
+    store.note_session_cost(session, process, total, new_session, account_id, now_ms)?;
     Ok(())
 }
 

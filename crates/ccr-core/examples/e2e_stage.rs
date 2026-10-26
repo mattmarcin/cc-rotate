@@ -1,8 +1,9 @@
 //! Copies accounts from the real cc-rotate store into a scratch store for an end-to-end test
 //! (`tests/e2e/wait-at-limit.py`). Each copy keeps the account's access token, which must still
 //! be valid, and gets a dummy refresh token, so nothing using the copy can renew the login, which
-//! would retire the real one. Never prints a secret. The real store is only read: it is never
-//! migrated, and a store whose schema differs from this build's is refused.
+//! would retire the real one. Never prints a secret. The real store is only read, through a copy
+//! that is brought up to this build's schema and deleted again (`Store::open_copy`), so it is
+//! never migrated.
 //!
 //!   cargo run -p ccr-core --example e2e_stage -- <scratch data dir> <scratch profile> <map file> <label>...
 //!
@@ -25,8 +26,26 @@ fn main() -> Result<()> {
     if std::env::var_os("CC_ROTATE_DATA_DIR").is_some() {
         bail!("unset CC_ROTATE_DATA_DIR: the accounts come from the real store");
     }
-    let real = Store::open_read_only(&ccr_core::Paths::default_data_dir()?.join("store.db"))?;
-    let scratch = Store::open(&std::path::Path::new(data_dir).join("store.db"))?;
+    let data_dir = std::path::Path::new(data_dir);
+    let copy = data_dir.join("real-store-copy.db");
+    std::fs::create_dir_all(data_dir)?;
+    let staged = stage(data_dir, &copy, profile, map_file, labels);
+    // The copy holds every account's sealed login.
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", copy.display()));
+    }
+    staged
+}
+
+fn stage(
+    data_dir: &std::path::Path,
+    copy: &std::path::Path,
+    profile: &str,
+    map_file: &str,
+    labels: &[String],
+) -> Result<()> {
+    let real = Store::open_copy(&ccr_core::Paths::default_data_dir()?.join("store.db"), copy)?;
+    let scratch = Store::open(&data_dir.join("store.db"))?;
     scratch.set_setting("usage_checks", Some("false"))?;
     scratch.set_setting("profile_dir", Some(profile))?;
     std::fs::create_dir_all(profile)?;

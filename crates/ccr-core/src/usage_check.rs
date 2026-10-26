@@ -907,12 +907,13 @@ fn job(
         }
         save_state(s, account_id, &st)
     })?;
+    // The check is done: its scratch profile goes whatever follows.
+    scratch.keep = false;
     if let (true, CheckOutcome::Read { windows }) = (vouched, &outcome) {
         // So that once the account is in use, a session still showing the account it used
         // before is told apart by its reset times (`swap::attribute`).
         swap::note_known_resets(store, account_id, windows, now / 1000)?;
     }
-    scratch.keep = false;
     Ok(outcome)
 }
 
@@ -1872,6 +1873,16 @@ mod tests {
         assert_eq!(
             swap::attribute(&e.store, &stale, a, now_s).unwrap(),
             swap::Attribution::Elsewhere
+        );
+        // A genuine reading of a whose window resets when b's latest does too stays a's.
+        let mut genuine = reading(a, 7.0, 4_070_908_800);
+        e.store
+            .record_sample(&reading(b, 96.0, 4_070_908_800))
+            .unwrap();
+        genuine.ts += 1;
+        assert_eq!(
+            swap::attribute(&e.store, &genuine, a, now_s).unwrap(),
+            swap::Attribution::Own
         );
     }
 

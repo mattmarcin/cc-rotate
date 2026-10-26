@@ -26,6 +26,7 @@ import json
 import os
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -67,15 +68,22 @@ def cleanup():
             pass
     # The scratch store holds copies of access tokens: never leave it behind. Windows can hold the
     # folders a little longer after Claude Code is stopped.
-    for _ in range(60):
+    def writable(func, path, _):
+        # A read-only file stops rmtree on Windows.
+        os.chmod(path, stat.S_IWRITE)
+        func(path)
+
+    error = None
+    for _ in range(240):
         try:
-            shutil.rmtree(scratch)
+            shutil.rmtree(scratch, onerror=writable)
             return
         except FileNotFoundError:
             return
-        except OSError:
+        except OSError as e:
+            error = e
             time.sleep(0.5)
-    print(f"Could not delete {scratch}; delete it by hand.", flush=True)
+    print(f"Could not delete {scratch} ({error}); delete it by hand.", flush=True)
 
 
 atexit.register(cleanup)
