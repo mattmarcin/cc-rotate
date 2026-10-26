@@ -29,7 +29,7 @@ use crate::{credfile, time};
 /// 8: whether cc-rotate keeps an account's 5-hour window running (`keep_running`).
 /// 9: each session's Claude Code processes (`session_processes`), and the usage each last
 ///    reported and since when (`session_readings`).
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE accounts (
@@ -224,6 +224,12 @@ CREATE TABLE session_readings (
 ) WITHOUT ROWID;
 "#;
 
+/// Schema 10: each reading's window keeps the window's usage as of that reading
+/// (`Store::current_usage`), worked out when it is recorded so that reading it back is one row.
+const SCHEMA_V10: &str = r#"
+ALTER TABLE sample_windows ADD COLUMN high REAL;
+"#;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountState {
@@ -406,6 +412,13 @@ impl Sample {
         self.windows.iter().find(|w| w.name == name)
     }
 
+    /// A reading of the account itself, not of a session's status line: a usage check, or another
+    /// profile's `/usage` (section 9.1). Such a reading has no session and does not come from the
+    /// rotation profile.
+    pub fn reads_account(&self) -> bool {
+        self.session_id.is_none() && self.profile != ROTATION_PROFILE
+    }
+
     /// Same windows and reset times, and percentages within half a point.
     fn same_reading(&self, other: &Sample) -> bool {
         same_windows(&self.windows, &other.windows)
@@ -420,6 +433,16 @@ pub fn same_windows(a: &[SampleWindow], b: &[SampleWindow]) -> bool {
                 o.name == w.name && o.resets_at == w.resets_at && (o.pct - w.pct).abs() < 0.5
             })
         })
+}
+
+/// A window's usage after a reading of it (`Store::current_usage`): the reading itself when it is
+/// a reading of the account itself (`Sample::reads_account`), which settles what came before it,
+/// else the higher of the reading and the usage before it.
+fn next_high(before: Option<f64>, pct: f64, settles: bool) -> f64 {
+    match before {
+        Some(before) if !settles => before.max(pct),
+        _ => pct,
+    }
 }
 
 /// What an account's use in one hour would have cost at API prices (`account_costs`).
@@ -446,6 +469,23 @@ pub struct WindowPeak {
 }
 
 const SAMPLE_COLS: &str = "id, ts, account_id, profile, session_id, model";
+
+/// The `profile` of readings from the rotation profile's status line.
+pub const ROTATION_PROFILE: &str = "rotate";
+
+/// How far before an account's latest reading `Store::current_usage` looks for windows it lacks.
+/// Open sessions repeat their numbers at least every 30 s (the status line's `refreshInterval`).
+pub const RECENT_WINDOW_MS: i64 = 10 * 60_000;
+
+/// The latest reading of the account itself (`Sample::reads_account`) of one window, in the
+/// order readings are taken in (by time, then as recorded): `?1` the account, `?2` the window's
+/// name, `?3` its reset time, within `?4` seconds, `?5` the latest time, `?6`
+/// `ROTATION_PROFILE`.
+const SETTLED_CTE: &str = "settled AS (
+    SELECT s.ts, s.id FROM sample_windows w JOIN samples s ON s.id = w.sample_id
+    WHERE w.account_id = ?1 AND w.name = ?2 AND w.resets_at BETWEEN ?3 - ?4 AND ?3 + ?4
+      AND s.ts <= ?5 AND s.session_id IS NULL AND s.profile <> ?6
+    ORDER BY s.ts DESC, s.id DESC LIMIT 1)";
 
 fn sample_from_row(row: &Row) -> rusqlite::Result<(i64, Sample)> {
     Ok((
@@ -886,8 +926,63 @@ impl Store {
                 s.conn.execute_batch(SCHEMA_V9)?;
                 s.conn.pragma_update(None, "user_version", 9)?;
             }
+            if version < 10 {
+                s.conn.execute_batch(SCHEMA_V10)?;
+                s.backfill_highs()?;
+                s.conn.pragma_update(None, "user_version", 10)?;
+            }
             Ok(())
         })
+    }
+
+    /// Schema 10: every recorded window's `high`, replayed in the order the readings were
+    /// recorded, as `record_sample` works it out.
+    fn backfill_highs(&self) -> Result<()> {
+        let mut stmt = self.conn.prepare(
+            "SELECT w.sample_id, s.account_id, w.name, w.pct, w.resets_at,
+                    s.session_id IS NULL AND s.profile <> ?1
+             FROM sample_windows w JOIN samples s ON s.id = w.sample_id
+             ORDER BY w.sample_id, w.name",
+        )?;
+        type Row = (i64, i64, String, f64, Option<i64>, bool);
+        let rows: Vec<Row> = stmt
+            .query_map([ROTATION_PROFILE], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        // Per account and window name: each reset time recorded, with its latest row and that
+        // row's usage, matched as `window_usage_before` does.
+        type Latest = std::collections::HashMap<i64, (i64, f64)>;
+        let mut seen: std::collections::HashMap<(i64, String), Latest> =
+            std::collections::HashMap::new();
+        let mut update = self
+            .conn
+            .prepare("UPDATE sample_windows SET high = ?3 WHERE sample_id = ?1 AND name = ?2")?;
+        for (id, account_id, name, pct, resets_at, settles) in rows {
+            let high = match resets_at {
+                None => pct,
+                Some(r) => {
+                    let resets = seen.entry((account_id, name.clone())).or_default();
+                    let before = resets
+                        .iter()
+                        .filter(|(k, _)| crate::swap::same_reset(**k, r))
+                        .max_by_key(|(_, (row, _))| *row)
+                        .map(|(_, (_, high))| *high);
+                    let high = next_high(before, pct, settles);
+                    resets.insert(r, (id, high));
+                    high
+                }
+            };
+            update.execute(params![id, name, high])?;
+        }
+        Ok(())
     }
 
     /// Schema 2: re-seal every login an older cc-rotate stored with Windows DPAPI, in the same
@@ -1458,10 +1553,13 @@ impl Store {
 
     // ---- samples -----------------------------------------------------------------------
 
-    /// Insert a sample unless it repeats the account's last one within a minute.
+    /// Insert a sample unless it repeats the account's last one within a minute. A reading of
+    /// the account itself (`Sample::reads_account`) is always inserted, since it settles the
+    /// readings before it (`current_usage`).
     /// Returns whether a row was written.
     pub fn record_sample(&self, s: &Sample) -> Result<bool> {
-        if let Some(last) = self.last_sample(s.account_id)?
+        if !s.reads_account()
+            && let Some(last) = self.last_sample(s.account_id)?
             && s.ts - last.ts < 60_000
             && last.same_reading(s)
         {
@@ -1476,10 +1574,19 @@ impl Store {
             )?;
             let id = self.conn.last_insert_rowid();
             for w in &s.windows {
+                let high = match w.resets_at {
+                    Some(r) => next_high(
+                        self.window_usage_before(s.account_id, &w.name, r)?,
+                        w.pct,
+                        s.reads_account(),
+                    ),
+                    None => w.pct,
+                };
                 self.conn.execute(
-                    "INSERT OR REPLACE INTO sample_windows (sample_id, account_id, name, pct, resets_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![id, s.account_id, w.name, w.pct, w.resets_at],
+                    "INSERT OR REPLACE INTO sample_windows
+                         (sample_id, account_id, name, pct, resets_at, high)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![id, s.account_id, w.name, w.pct, w.resets_at, high],
                 )?;
             }
             Ok(())
@@ -1494,6 +1601,12 @@ impl Store {
 
     /// The account's latest sample taken at or before `until_ms`.
     pub fn last_sample_until(&self, account_id: i64, until_ms: i64) -> Result<Option<Sample>> {
+        self.sample_until(account_id, until_ms, false)
+    }
+
+    /// The account's latest sample taken at or before `until_ms`, with each window's `high` for
+    /// its percentage when `usage`.
+    fn sample_until(&self, account_id: i64, until_ms: i64, usage: bool) -> Result<Option<Sample>> {
         let row = self
             .conn
             .query_row(
@@ -1508,22 +1621,151 @@ impl Store {
         let Some((id, mut sample)) = row else {
             return Ok(None);
         };
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT name, pct, resets_at FROM sample_windows WHERE sample_id = ?1 ORDER BY name",
-        )?;
+        let pct = if usage { "COALESCE(high, pct)" } else { "pct" };
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT name, {pct}, resets_at FROM sample_windows WHERE sample_id = ?1 ORDER BY name"
+        ))?;
         sample.windows = stmt
             .query_map([id], window_from_row)?
             .collect::<rusqlite::Result<_>>()?;
         Ok(Some(sample))
     }
 
+    /// The account's usage now (section 7.1): its latest reading, each window at the highest
+    /// percentage read of it (the same name, reset times within a minute) since the latest
+    /// reading of the account itself (`Sample::reads_account`) that has it, that one included,
+    /// in the order readings were recorded. Usage within a window only grows, but each session
+    /// repeats the numbers of its own last response for as long as it idles (F24), so with
+    /// several sessions the latest reading is often an older one; a reading of the account itself
+    /// settles what came before it. Worked out as each reading is recorded (`high`).
+    ///
+    /// A window the latest reading lacks is added when a reading in the `RECENT_WINDOW_MS` before
+    /// it, and not before the latest reading of the account itself, has one whose reset is still
+    /// ahead: a session idle since before a window reset shows none of the window that started
+    /// since.
+    pub fn current_usage(&self, account_id: i64) -> Result<Option<Sample>> {
+        self.current_usage_until(account_id, i64::MAX)
+    }
+
+    /// The account's usage as of `until_ms` (`current_usage`), from readings taken at or before it.
+    pub fn current_usage_until(&self, account_id: i64, until_ms: i64) -> Result<Option<Sample>> {
+        let Some(mut sample) = self.sample_until(account_id, until_ms, true)? else {
+            return Ok(None);
+        };
+        // Not from before a reading of the account itself, which says which windows it has
+        // (carrying the ones it cannot express, `profile_usage::with_carried`).
+        let mut recent = self.conn.prepare_cached(
+            "WITH settled AS (
+                 SELECT ts, id FROM samples
+                 WHERE account_id = ?1 AND ts BETWEEN ?2 AND ?3
+                   AND session_id IS NULL AND profile <> ?5
+                 ORDER BY ts DESC, id DESC LIMIT 1)
+             SELECT w.name, COALESCE(w.high, w.pct), w.resets_at
+             FROM samples s JOIN sample_windows w ON w.sample_id = s.id
+             WHERE s.account_id = ?1 AND s.ts BETWEEN ?2 AND ?3 AND w.resets_at > ?4
+               AND (NOT EXISTS (SELECT 1 FROM settled)
+                    OR (s.ts, s.id) >= (SELECT ts, id FROM settled))
+             ORDER BY s.ts DESC, s.id DESC",
+        )?;
+        let recent = recent
+            .query_map(
+                params![
+                    account_id,
+                    sample.ts - RECENT_WINDOW_MS,
+                    sample.ts,
+                    sample.ts / 1000,
+                    ROTATION_PROFILE
+                ],
+                window_from_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        // Newest first: each window as its latest reading has it.
+        for w in recent {
+            if sample.window(&w.name).is_none() {
+                sample.windows.push(w);
+            }
+        }
+        sample.windows.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(Some(sample))
+    }
+
+    /// One of the account's windows' usage as of its latest recorded reading (`high`), among its
+    /// reset times within `SAME_RESET_S` of `resets_at`. Few reset times fall that close, and each
+    /// takes two index seeks.
+    fn window_usage_before(
+        &self,
+        account_id: i64,
+        name: &str,
+        resets_at: i64,
+    ) -> Result<Option<f64>> {
+        let mut next = self.conn.prepare_cached(
+            "SELECT MIN(resets_at) FROM sample_windows
+             WHERE account_id = ?1 AND name = ?2 AND resets_at > ?3 AND resets_at <= ?4",
+        )?;
+        let mut latest = self.conn.prepare_cached(
+            "SELECT sample_id, COALESCE(high, pct) FROM sample_windows
+             WHERE account_id = ?1 AND name = ?2 AND resets_at = ?3
+             ORDER BY sample_id DESC LIMIT 1",
+        )?;
+        let last = resets_at + crate::swap::SAME_RESET_S;
+        let mut after = resets_at - crate::swap::SAME_RESET_S - 1;
+        let mut best: Option<(i64, f64)> = None;
+        while let Some(at) = next.query_row(params![account_id, name, after, last], |r| {
+            r.get::<_, Option<i64>>(0)
+        })? {
+            let (id, high): (i64, f64) = latest.query_row(params![account_id, name, at], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?;
+            if best.is_none_or(|(b, _)| id > b) {
+                best = Some((id, high));
+            }
+            after = at;
+        }
+        Ok(best.map(|(_, high)| high))
+    }
+
+    /// The highest reading of one of the account's windows (the same name, reset times within a
+    /// minute) that `current_usage` counts, from readings other than the rotation profile's
+    /// status line only (a usage check, another profile's `/usage` or status line): readings of
+    /// the account wherever they come from, so never another account's numbers (section 8).
+    /// It reads every such reading since the latest reading of the account itself, so it is for
+    /// a swap, not for every tick.
+    pub fn own_high(&self, account_id: i64, name: &str, resets_at: i64) -> Result<Option<f64>> {
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "WITH {SETTLED_CTE}
+             SELECT MAX(w.pct) FROM sample_windows w JOIN samples s ON s.id = w.sample_id
+             WHERE w.account_id = ?1 AND w.name = ?2 AND w.resets_at BETWEEN ?3 - ?4 AND ?3 + ?4
+               AND s.ts <= ?5 AND s.profile <> ?6
+               AND (NOT EXISTS (SELECT 1 FROM settled)
+                    OR (s.ts, s.id) >= (SELECT ts, id FROM settled))"
+        ))?;
+        Ok(stmt.query_row(
+            params![
+                account_id,
+                name,
+                resets_at,
+                crate::swap::SAME_RESET_S,
+                i64::MAX,
+                ROTATION_PROFILE
+            ],
+            |r| r.get(0),
+        )?)
+    }
+
     pub fn samples_since(&self, since_ms: i64) -> Result<Vec<Sample>> {
-        self.samples_matching(None, since_ms, i64::MAX)
+        self.samples_matching(None, since_ms, i64::MAX, false)
+    }
+
+    /// Every account's readings taken at or after `since_ms`, oldest first, each window at the
+    /// window's usage as of that reading (`current_usage`, without windows added from other
+    /// readings).
+    pub fn usage_since(&self, since_ms: i64) -> Result<Vec<Sample>> {
+        self.samples_matching(None, since_ms, i64::MAX, true)
     }
 
     /// One account's samples taken at or after `since_ms`, oldest first.
     pub fn account_samples_since(&self, account_id: i64, since_ms: i64) -> Result<Vec<Sample>> {
-        self.samples_matching(Some(account_id), since_ms, i64::MAX)
+        self.samples_matching(Some(account_id), since_ms, i64::MAX, false)
     }
 
     /// One account's samples taken from `from_ms` up to `to_ms`, both included, oldest first.
@@ -1533,7 +1775,7 @@ impl Store {
         from_ms: i64,
         to_ms: i64,
     ) -> Result<Vec<Sample>> {
-        self.samples_matching(Some(account_id), from_ms, to_ms)
+        self.samples_matching(Some(account_id), from_ms, to_ms, false)
     }
 
     fn samples_matching(
@@ -1541,6 +1783,7 @@ impl Store {
         account_id: Option<i64>,
         since_ms: i64,
         until_ms: i64,
+        usage: bool,
     ) -> Result<Vec<Sample>> {
         let mut stmt = self.conn.prepare_cached(&format!(
             "SELECT {SAMPLE_COLS} FROM samples
@@ -1554,12 +1797,17 @@ impl Store {
             .enumerate()
             .map(|(i, (id, _))| (*id, i))
             .collect();
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT w.sample_id, w.name, w.pct, w.resets_at FROM sample_windows w
+        let pct = if usage {
+            "COALESCE(w.high, w.pct)"
+        } else {
+            "w.pct"
+        };
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT w.sample_id, w.name, {pct}, w.resets_at FROM sample_windows w
              JOIN samples s ON s.id = w.sample_id
              WHERE s.ts >= ?1 AND s.ts <= ?3 AND (?2 IS NULL OR s.account_id = ?2)
-             ORDER BY w.name",
-        )?;
+             ORDER BY w.name"
+        ))?;
         let rows = stmt.query_map(params![since_ms, account_id, until_ms], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
@@ -2375,8 +2623,11 @@ mod tests {
         drop(store);
         // As the store an older build left (schema 8).
         let conn = Connection::open(&path).unwrap();
-        conn.execute_batch("DROP TABLE session_readings; DROP TABLE session_processes;")
-            .unwrap();
+        conn.execute_batch(
+            "DROP TABLE session_readings; DROP TABLE session_processes;
+             ALTER TABLE sample_windows DROP COLUMN high;",
+        )
+        .unwrap();
         conn.pragma_update(None, "user_version", 8).unwrap();
         drop(conn);
 
@@ -2402,6 +2653,78 @@ mod tests {
             Store::open_copy(&path, &copy).is_err(),
             "never overwrites a file"
         );
+    }
+
+    /// Schema 10 works out the usage of every window recorded before it as recording does.
+    #[test]
+    fn upgrading_works_out_each_recorded_windows_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        let store = Store::open(&path).unwrap();
+        let a = store
+            .insert_account("a", &ident("ua"), AccountState::Active)
+            .unwrap();
+        let b = store
+            .insert_account("b", &ident("ub"), AccountState::Parked)
+            .unwrap();
+        let mk = |account_id, ts, profile: &str, session: Option<&str>, pct, resets_at| Sample {
+            ts,
+            account_id,
+            profile: profile.into(),
+            session_id: session.map(Into::into),
+            model: None,
+            windows: vec![SampleWindow {
+                name: "five_hour".into(),
+                pct,
+                resets_at,
+            }],
+        };
+        for r in [
+            mk(a, 1_000, ROTATION_PROFILE, Some("s1"), 60.0, Some(50_000)),
+            mk(a, 2_000, ROTATION_PROFILE, Some("s2"), 20.0, Some(50_030)),
+            mk(b, 2_500, ROTATION_PROFILE, Some("s3"), 90.0, Some(50_000)),
+            mk(
+                a,
+                3_000,
+                crate::usage_check::SOURCE,
+                None,
+                40.0,
+                Some(50_000),
+            ),
+            mk(a, 4_000, ROTATION_PROFILE, Some("s2"), 30.0, Some(50_000)),
+            mk(a, 5_000, ROTATION_PROFILE, Some("s1"), 70.0, None),
+            mk(a, 6_000, ROTATION_PROFILE, Some("s1"), 5.0, Some(70_000)),
+            // Reset times drifting further than a minute in all.
+            mk(a, 7_000, ROTATION_PROFILE, Some("s1"), 8.0, Some(70_050)),
+            mk(a, 8_000, ROTATION_PROFILE, Some("s1"), 12.0, Some(70_100)),
+            mk(a, 9_000, ROTATION_PROFILE, Some("s2"), 6.0, Some(70_000)),
+        ] {
+            store.record_sample(&r).unwrap();
+        }
+        let highs = |conn: &Connection| -> Vec<(i64, f64)> {
+            conn.prepare("SELECT sample_id, high FROM sample_windows ORDER BY sample_id")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        let recorded = highs(&store.conn);
+        let pcts: Vec<f64> = recorded.iter().map(|(_, h)| *h).collect();
+        assert_eq!(
+            pcts,
+            vec![60.0, 60.0, 90.0, 40.0, 40.0, 70.0, 5.0, 8.0, 12.0, 8.0]
+        );
+        drop(store);
+        // As the store schema 9 left.
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("ALTER TABLE sample_windows DROP COLUMN high;")
+            .unwrap();
+        conn.pragma_update(None, "user_version", 9).unwrap();
+        drop(conn);
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(highs(&store.conn), recorded);
     }
 
     #[test]
@@ -2654,6 +2977,265 @@ mod tests {
         assert!(
             s.save_credential(a, &json!({"refreshToken": ""}), "login")
                 .is_err()
+        );
+    }
+
+    /// Each session repeats its own last numbers, so readings of one window go up and down: the
+    /// account's usage is the highest of them since the latest usage check of that window, and
+    /// `usage_since` agrees with `current_usage_until` at every reading.
+    #[test]
+    fn usage_is_the_highest_reading_since_the_latest_check() {
+        let s = Store::open_in_memory().unwrap();
+        let a = s
+            .insert_account("a", &ident("ua"), AccountState::Active)
+            .unwrap();
+        let b = s
+            .insert_account("b", &ident("ub"), AccountState::Parked)
+            .unwrap();
+        let w = |name: &str, pct: f64, resets_at: Option<i64>| SampleWindow {
+            name: name.into(),
+            pct,
+            resets_at,
+        };
+        let reading = |account_id, ts, profile: &str, windows| Sample {
+            ts,
+            account_id,
+            profile: profile.into(),
+            session_id: None,
+            model: None,
+            windows,
+        };
+        let (five, week) = (10_000, 90_000);
+        for r in [
+            reading(
+                a,
+                1_000,
+                "rotate",
+                vec![
+                    w("five_hour", 40.0, Some(five)),
+                    w("seven_day", 10.0, Some(week)),
+                ],
+            ),
+            reading(
+                a,
+                2_000,
+                "rotate",
+                vec![
+                    w("five_hour", 60.0, Some(five)),
+                    w("seven_day", 12.0, Some(week)),
+                ],
+            ),
+            // An idle session.
+            reading(
+                a,
+                3_000,
+                "rotate",
+                vec![
+                    w("five_hour", 25.0, Some(five)),
+                    w("seven_day", 11.0, Some(week)),
+                ],
+            ),
+            // Another account at the same reset time.
+            reading(b, 3_500, "rotate", vec![w("five_hour", 90.0, Some(five))]),
+            // Rounded to another second.
+            reading(
+                a,
+                4_000,
+                "rotate",
+                vec![
+                    w("five_hour", 30.0, Some(five + 30)),
+                    w("seven_day", 11.0, Some(week)),
+                ],
+            ),
+            // A check reads only the 5-hour window.
+            reading(a, 5_000, "check", vec![w("five_hour", 50.0, Some(five))]),
+            reading(
+                a,
+                6_000,
+                "rotate",
+                vec![
+                    w("five_hour", 45.0, Some(five)),
+                    w("seven_day", 11.0, Some(week)),
+                ],
+            ),
+            reading(
+                a,
+                7_000,
+                "rotate",
+                vec![
+                    w("five_hour", 55.0, Some(five)),
+                    w("seven_day", 11.0, Some(week)),
+                ],
+            ),
+            // Over 10 minutes later, a new window, and one without a reset time.
+            reading(
+                a,
+                668_000,
+                "rotate",
+                vec![
+                    w("five_hour", 5.0, Some(five + 18_000)),
+                    w("other", 3.0, None),
+                ],
+            ),
+            reading(
+                a,
+                669_000,
+                "rotate",
+                vec![
+                    w("five_hour", 4.0, Some(five + 18_000)),
+                    w("other", 2.0, None),
+                ],
+            ),
+        ] {
+            assert!(s.record_sample(&r).unwrap());
+        }
+        let pcts = |until: i64| -> Vec<(String, f64)> {
+            s.current_usage_until(a, until)
+                .unwrap()
+                .unwrap()
+                .windows
+                .into_iter()
+                .map(|w| (w.name, w.pct))
+                .collect()
+        };
+        let pairs = |v: &[(&str, f64)]| -> Vec<(String, f64)> {
+            v.iter().map(|(n, p)| (n.to_string(), *p)).collect()
+        };
+        assert_eq!(
+            pcts(3_000),
+            pairs(&[("five_hour", 60.0), ("seven_day", 12.0)])
+        );
+        assert_eq!(
+            pcts(4_000),
+            pairs(&[("five_hour", 60.0), ("seven_day", 12.0)])
+        );
+        assert_eq!(
+            pcts(5_000),
+            pairs(&[("five_hour", 50.0)]),
+            "a check settles what came before it, and the windows it has"
+        );
+        assert_eq!(
+            pcts(6_000),
+            pairs(&[("five_hour", 50.0), ("seven_day", 12.0)])
+        );
+        assert_eq!(
+            pcts(7_000),
+            pairs(&[("five_hour", 55.0), ("seven_day", 12.0)])
+        );
+        assert_eq!(
+            pcts(669_000),
+            pairs(&[("five_hour", 5.0), ("other", 2.0)]),
+            "no weekly window in the 10 minutes before"
+        );
+        assert_eq!(s.current_usage(a).unwrap().unwrap().ts, 669_000);
+        assert_eq!(s.last_sample(a).unwrap().unwrap().windows[0].pct, 4.0);
+        assert_eq!(s.current_usage(b).unwrap().unwrap().windows[0].pct, 90.0);
+
+        for r in s.usage_since(0).unwrap() {
+            let usage = s.current_usage_until(r.account_id, r.ts).unwrap().unwrap();
+            for w in &r.windows {
+                assert_eq!(usage.window(&w.name), Some(w), "at {}", r.ts);
+            }
+        }
+    }
+
+    /// A session idle since before its 5-hour window reset shows only the weekly window (F24),
+    /// while a busy one shows the window that started since: it still counts.
+    #[test]
+    fn a_window_an_idle_session_no_longer_shows_still_counts() {
+        let s = Store::open_in_memory().unwrap();
+        let a = s
+            .insert_account("a", &ident("ua"), AccountState::Active)
+            .unwrap();
+        let now = 1_800_000_000_000;
+        let w = |name: &str, pct: f64, resets_at: i64| SampleWindow {
+            name: name.into(),
+            pct,
+            resets_at: Some(resets_at),
+        };
+        let reading = |ts: i64, session: &str, windows| Sample {
+            ts,
+            account_id: a,
+            profile: ROTATION_PROFILE.into(),
+            session_id: Some(session.into()),
+            model: None,
+            windows,
+        };
+        let week = now / 1000 + 86_400;
+        for r in [
+            // The 5-hour window the idle session saw, reset since.
+            reading(
+                now - 7_200_000,
+                "idle",
+                vec![
+                    w("five_hour", 70.0, now / 1000 - 3_600),
+                    w("seven_day", 30.0, week),
+                ],
+            ),
+            reading(
+                now - 60_000,
+                "busy",
+                vec![
+                    w("five_hour", 98.0, now / 1000 + 3_600),
+                    w("seven_day", 40.0, week),
+                ],
+            ),
+            reading(now, "idle", vec![w("seven_day", 30.0, week)]),
+        ] {
+            assert!(s.record_sample(&r).unwrap());
+        }
+        let usage = s.current_usage(a).unwrap().unwrap();
+        assert_eq!(
+            usage.windows,
+            vec![
+                w("five_hour", 98.0, now / 1000 + 3_600),
+                w("seven_day", 40.0, week)
+            ]
+        );
+    }
+
+    /// A reading of the account itself is recorded even when it repeats the latest one, since it
+    /// settles the readings before it.
+    #[test]
+    fn a_reading_of_the_account_itself_is_never_dropped_as_a_repeat() {
+        let s = Store::open_in_memory().unwrap();
+        let a = s
+            .insert_account("a", &ident("ua"), AccountState::Active)
+            .unwrap();
+        let mk = |ts, profile: &str, session: Option<&str>, pct| Sample {
+            ts,
+            account_id: a,
+            profile: profile.into(),
+            session_id: session.map(Into::into),
+            model: None,
+            windows: vec![SampleWindow {
+                name: "five_hour".into(),
+                pct,
+                resets_at: Some(100_000),
+            }],
+        };
+        assert!(
+            s.record_sample(&mk(1_000, ROTATION_PROFILE, Some("s1"), 90.0))
+                .unwrap()
+        );
+        assert!(
+            s.record_sample(&mk(2_000, ROTATION_PROFILE, Some("s2"), 30.0))
+                .unwrap()
+        );
+        assert!(
+            !s.record_sample(&mk(3_000, ROTATION_PROFILE, Some("s2"), 30.0))
+                .unwrap()
+        );
+        assert_eq!(s.current_usage(a).unwrap().unwrap().windows[0].pct, 90.0);
+        assert!(
+            s.record_sample(&mk(4_000, crate::usage_check::SOURCE, None, 30.0))
+                .unwrap()
+        );
+        assert_eq!(s.current_usage(a).unwrap().unwrap().windows[0].pct, 30.0);
+        // Another profile's `/usage`, recorded under its folder's name.
+        assert!(
+            s.record_sample(&mk(5_000, ".claude-work", None, 30.0))
+                .unwrap()
         );
     }
 

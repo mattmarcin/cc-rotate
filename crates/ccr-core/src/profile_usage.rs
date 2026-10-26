@@ -165,7 +165,7 @@ fn reading(store: &Store, dir: &Path, view: &ConfigView, now_ms: i64) -> Result<
         // itself is not new.
         store.set_extra_usage(account.id, extra, ts)?;
     }
-    let last = store.last_sample(account.id)?;
+    let last = store.current_usage(account.id)?;
     if last.as_ref().is_some_and(|l| l.ts >= ts) {
         return Ok(Found::Nothing);
     }
@@ -184,8 +184,9 @@ fn reading(store: &Store, dir: &Path, view: &ConfigView, now_ms: i64) -> Result<
 }
 
 /// A usage report only has the windows it can express (`usage_report::expresses`). When it
-/// becomes the latest reading, the previous reading's other windows (from the status line)
-/// would stop counting; keep the ones whose reset has not passed.
+/// becomes the latest reading, the account's other windows (from the status line) would stop
+/// counting; keep the ones whose reset has not passed, at the account's usage
+/// (`Store::current_usage`), since a usage check settles every window it has, carried ones too.
 pub fn with_carried(
     mut windows: Vec<SampleWindow>,
     last: Option<&Sample>,

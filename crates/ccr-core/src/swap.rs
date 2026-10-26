@@ -635,7 +635,7 @@ pub fn load_pool(store: &Store, now_s: i64) -> Result<(Vec<Candidate>, Policy)> 
             .iter()
             .position(|&p| p == account.position)
             .unwrap_or_default();
-        let sample = store.last_sample(account.id)?;
+        let sample = store.current_usage(account.id)?;
         let thresholds = policy.thresholds.for_account(&account);
         let windows = scheduler::window_usage(sample.as_ref(), now_s, thresholds, model.as_deref());
         let stop_hold_until = stop_hold_until(
@@ -698,7 +698,8 @@ pub fn detect_weekly_limit(store: &Store, account_id: i64, now_s: i64) -> Result
 /// report, or a stop reading that never came), its room is out of date, and switching back to
 /// it would only stop the next turn again. A later reading that differs from that one (a usage
 /// check after a reset, say) is news and ends the hold; one with the same numbers is not.
-/// `latest` is the account's latest reading, `thresholds` and `model` what applies to it.
+/// `latest` is the account's usage (`Store::current_usage`), `thresholds` and `model` what
+/// applies to it.
 pub fn stop_hold_until(
     store: &Store,
     account_id: i64,
@@ -716,7 +717,7 @@ pub fn stop_hold_until(
     }
     let at_stop = match latest {
         Some(s) if s.ts <= left => Some(s.clone()),
-        _ => store.last_sample_until(account_id, left)?,
+        _ => store.current_usage_until(account_id, left)?,
     };
     if let Some(s) = &at_stop {
         // As the session that sent it saw it: a window scoped to its model applied to it.
@@ -795,7 +796,7 @@ pub enum Attribution {
 
 /// Reset times within this many seconds are the same: the status line and `/usage` may round
 /// a reset time differently.
-const SAME_RESET_S: i64 = 60;
+pub(crate) const SAME_RESET_S: i64 = 60;
 
 pub fn same_reset(a: i64, b: i64) -> bool {
     (a - b).abs() <= SAME_RESET_S
@@ -916,16 +917,11 @@ pub fn copies_another(sample: &Sample, others: &[Sample]) -> bool {
         .any(|o| crate::store::same_windows(&o.windows, &sample.windows))
 }
 
-/// Whether the threshold the active account's latest reading reached may not be its own: the
-/// reading is from the status line and a window over its threshold has a reset time not known
-/// to be the account's (section 8). Then a threshold swap confirms first.
+/// Whether a threshold the active account's usage reached may not be its own: a window over its
+/// threshold got there only by readings of the rotation profile's status line (`Store::own_high`)
+/// and has a reset time not known to be the account's (section 8). Then a threshold swap
+/// confirms first.
 fn needs_confirmation(store: &Store, active_id: i64, now_ms: i64) -> Result<bool> {
-    let Some(last) = store.last_sample(active_id)? else {
-        return Ok(false);
-    };
-    if last.profile != "rotate" {
-        return Ok(false);
-    }
     let (pool, _) = load_pool(store, now_ms / 1000)?;
     let Some(active) = pool.iter().find(|c| c.account.id == active_id) else {
         return Ok(false);
@@ -936,13 +932,30 @@ fn needs_confirmation(store: &Store, active_id: i64, now_ms: i64) -> Result<bool
         .flat_map(|s| &s.windows)
         .filter_map(|w| w.resets_at)
         .collect();
-    // Unsure when the reset time is not known to be the account's own, or is another account's
-    // too (aligned reset times).
-    Ok(active.windows.iter().filter(|w| w.blocking()).any(|w| {
-        w.resets_at.is_none_or(|r| {
-            !own.iter().any(|&k| same_reset(k, r)) || others.iter().any(|&o| same_reset(o, r))
-        })
-    }))
+    let latest_elsewhere = store
+        .last_sample(active_id)?
+        .is_some_and(|s| s.profile != crate::store::ROTATION_PROFILE);
+    for w in active.windows.iter().filter(|w| w.blocking()) {
+        // Without a reset time, a window is as the latest reading has it.
+        let Some(r) = w.resets_at else {
+            if latest_elsewhere {
+                continue;
+            }
+            return Ok(true);
+        };
+        if store
+            .own_high(active_id, &w.name, r)?
+            .is_some_and(|high| high > w.pct - 0.5)
+        {
+            continue;
+        }
+        // Unsure when the reset time is not known to be the account's own, or is another
+        // account's too (aligned reset times).
+        if !own.iter().any(|&k| same_reset(k, r)) || others.iter().any(|&o| same_reset(o, r)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// The reset times the stale-reading guard currently knows (`META_LAST_SWAP_FROM_RESETS`).
@@ -1324,7 +1337,7 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
     // Everything that can fail is read before the write; after it, only the commit can, and its
     // failure restores the outgoing login.
     let from_sample = match active_id {
-        Some(id) => store.last_sample(id)?,
+        Some(id) => store.current_usage(id)?,
         None => None,
     };
     let previous_swap = store.meta_i64(META_LAST_SWAP_AT)?;

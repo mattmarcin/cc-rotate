@@ -207,7 +207,7 @@ pub fn tick(store: &Store, paths: &Paths, input: &StatusInput, now_ms: i64) -> R
     // use, unless its reading is another account's: then the request still carried that one's
     // login.
     let mut cost_account = active.id;
-    if let Some(sample) = input.sample_for(active.id, "rotate", now_ms) {
+    if let Some(sample) = input.sample_for(active.id, crate::store::ROTATION_PROFILE, now_ms) {
         if idle_since_swap(store, input, &process, &sample, now_ms)? {
             // The numbers of the account the session used before; it has not had a response
             // since.
