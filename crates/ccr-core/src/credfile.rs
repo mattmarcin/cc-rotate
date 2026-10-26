@@ -172,8 +172,9 @@ mod tests {
     fn stale_temp_files_of_a_target_are_removed() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join(".credentials.json");
-        let old = dir.path().join(".credentials.json.cc-rotate-old.tmp");
-        let recent = dir.path().join(".credentials.json.cc-rotate-new.tmp");
+        // Named as `temp_sibling` names them: a dot, then the target's own name.
+        let old = dir.path().join("..credentials.json.cc-rotate-old.tmp");
+        let recent = dir.path().join("..credentials.json.cc-rotate-new.tmp");
         let other = dir.path().join(".other.json.cc-rotate-old.tmp");
         for path in [&old, &recent, &other] {
             std::fs::write(path, "{}").unwrap();

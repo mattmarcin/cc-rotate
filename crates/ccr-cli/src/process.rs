@@ -90,7 +90,11 @@ pub fn spawn_herdr_report(pane_id: &str, session_id: &str, seq: u64) -> Result<(
 fn spawn_ctl(args: impl Fn(&mut Command), what: &str) -> Result<()> {
     let exe = std::env::current_exe()?;
     // Not the session's project folder, whose files have no business in a background job.
-    let dir = ccr_core::Paths::default_data_dir().unwrap_or_else(|_| std::env::temp_dir());
+    // The data folder, or before it exists (nothing stored yet) the system's temp folder.
+    let dir = ccr_core::Paths::default_data_dir()
+        .ok()
+        .filter(|d| d.is_dir())
+        .unwrap_or_else(std::env::temp_dir);
     let build = || {
         let mut cmd = Command::new(&exe);
         args(&mut cmd);
