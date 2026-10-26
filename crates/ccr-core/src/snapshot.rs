@@ -281,16 +281,15 @@ pub fn recent_events(store: &Store, limit: usize) -> Result<Vec<Event>> {
 
 /// The samples taken at or after `since_ms`, oldest first, after each account's usage just
 /// before it (`Store::current_usage_until`): the reading in force when a chart's range starts.
-/// Each window is at the highest reading of it so far (`store::level`), so an idle session
-/// repeating older numbers does not pull the line down.
+/// Each window is at the account's usage as of the reading (`Store::usage_since`), so an idle
+/// session repeating older numbers does not pull the line down.
 pub fn series(store: &Store, since_ms: i64) -> Result<Vec<Sample>> {
     let mut out = Vec::new();
     for account in store.accounts()? {
         out.extend(store.current_usage_until(account.id, since_ms - 1)?);
     }
     out.sort_by_key(|s| s.ts);
-    out.extend(store.samples_since(since_ms)?);
-    crate::store::level(&mut out);
+    out.extend(store.usage_since(since_ms)?);
     Ok(out)
 }
 

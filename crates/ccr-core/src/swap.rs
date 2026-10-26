@@ -932,8 +932,15 @@ fn needs_confirmation(store: &Store, active_id: i64, now_ms: i64) -> Result<bool
         .flat_map(|s| &s.windows)
         .filter_map(|w| w.resets_at)
         .collect();
+    let latest_elsewhere = store
+        .last_sample(active_id)?
+        .is_some_and(|s| s.profile != crate::store::ROTATION_PROFILE);
     for w in active.windows.iter().filter(|w| w.blocking()) {
+        // Without a reset time, a window is as the latest reading has it.
         let Some(r) = w.resets_at else {
+            if latest_elsewhere {
+                continue;
+            }
             return Ok(true);
         };
         if store

@@ -219,8 +219,8 @@ impl WindowUsage {
     }
 }
 
-/// The windows of an account's latest sample. A window that the latest sample does not have is
-/// not reported by the data source any more, so it does not count.
+/// The windows of an account's usage (`Store::current_usage`). A window it does not have is not
+/// reported by the data source any more, so it does not count.
 pub fn window_usage(
     sample: Option<&Sample>,
     now_s: i64,
