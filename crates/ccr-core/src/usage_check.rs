@@ -1509,10 +1509,7 @@ fn running(dir: &Path) -> bool {
     if process::alive(pid) {
         // Without a start time on either side (recorded, or readable now), being alive has to
         // do: a folder in use must never be taken for abandoned.
-        return match process::start_time(pid) {
-            Some(now) => started.is_empty() || now == started,
-            None => true,
-        };
+        return started.is_empty() || process::started_at(pid, started).unwrap_or(true);
     }
     // The first process is gone, but on Unix what it started runs on in its process group.
     cfg!(unix) && process::group_alive(pid)

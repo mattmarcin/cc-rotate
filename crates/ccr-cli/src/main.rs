@@ -814,6 +814,8 @@ fn login_cmd(
                 // Asked to end, and Claude Code wasn't: stop it, and let the staging folder go.
                 let _ = child.kill();
                 let _ = child.wait();
+                // Removed while signals are still held, so a second one doesn't cut it short.
+                drop(staging);
                 bail!("Stopped the sign-in.");
             }
             std::thread::sleep(Duration::from_millis(100));

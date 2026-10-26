@@ -734,43 +734,25 @@ fn adopt_manual_login(store: &Store, paths: &Paths) -> Result<bool> {
     }
     store.set_meta(META_CONFIG_MTIME_SEEN, mtime)?;
 
-    let Some(profile) = profile_account::read(&config)? else {
+    let Some(uuid) = profile_account::read(&config)?.and_then(|a| a.account_uuid) else {
         return Ok(foreign);
-    };
-    let Some(uuid) = profile.account_uuid.clone() else {
-        return Ok(foreign);
-    };
-    let org = profile.org_uuid.as_deref();
-    // One person can belong to several organizations under one account id: an account is this
-    // login's only in the same organization, where both are known.
-    let same_org = |a: &crate::store::Account| match (a.org_uuid.as_deref(), org) {
-        (Some(have), Some(got)) => have == got,
-        _ => true,
-    };
-    // Who the profile is signed in as: the account and, when known, its organization.
-    let seen = match org {
-        Some(org) => format!("{uuid} {org}"),
-        None => uuid.clone(),
     };
     let previous = store.meta(META_PROFILE_UUID_SEEN)?;
-    if previous.as_deref() == Some(seen.as_str()) {
+    if previous.as_deref() == Some(uuid.as_str()) {
         return Ok(foreign);
     }
-    store.set_meta(META_PROFILE_UUID_SEEN, &seen)?;
+    store.set_meta(META_PROFILE_UUID_SEEN, &uuid)?;
     store.set_meta(META_PROFILE_FOREIGN, "0")?;
     if previous.is_none() {
         return Ok(false);
     }
 
     let active = store.active_account()?;
-    if active
-        .as_ref()
-        .is_some_and(|a| a.account_uuid.as_deref() == Some(uuid.as_str()) && same_org(a))
-    {
+    if active.as_ref().and_then(|a| a.account_uuid.as_deref()) == Some(uuid.as_str()) {
         return Ok(false);
     }
 
-    match store.account_by_uuid(&uuid)?.filter(same_org) {
+    match store.account_by_uuid(&uuid)? {
         Some(account) => {
             let creds = paths.credentials();
             let oauth = creds.read_oauth()?;

@@ -205,7 +205,9 @@ fn wait_and_import(
 ) -> Progress {
     let started = Instant::now();
     let status = loop {
-        match child.lock().unwrap().try_wait() {
+        // Not in the match itself: the lock would be held through its arms and the sleep.
+        let polled = child.lock().unwrap().try_wait();
+        match polled {
             Ok(Some(status)) => break Some(status),
             Ok(None) if started.elapsed() > TIMEOUT => {
                 child.lock().unwrap().kill();

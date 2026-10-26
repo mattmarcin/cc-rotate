@@ -105,8 +105,9 @@ mod tests {
         assert_eq!(
             out.status.signal(),
             Some(SIGTERM),
-            "{}",
-            String::from_utf8_lossy(&out.stdout)
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
         );
     }
 }

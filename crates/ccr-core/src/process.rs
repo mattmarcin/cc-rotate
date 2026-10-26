@@ -62,8 +62,9 @@ pub fn start_time(pid: u32) -> Option<String> {
     }
 }
 
-/// When the process `pid` started: its start time in clock ticks since boot on Linux, else what
-/// `ps` reports. `None` when it cannot be told.
+/// When the process `pid` started, to record: its start time in clock ticks since boot on Linux,
+/// else what `ps` reports in the C locale and UTC, so every process reads it alike. `None` when
+/// it cannot be told.
 #[cfg(unix)]
 pub fn start_time(pid: u32) -> Option<String> {
     if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
@@ -71,17 +72,42 @@ pub fn start_time(pid: u32) -> Option<String> {
         let after = stat.rsplit_once(')')?.1;
         return after.split_whitespace().nth(19).map(str::to_string);
     }
-    // `lstart` is formatted for the locale and time zone: fixed, so every process reads it alike.
-    let out = Command::new("ps")
-        .args(["-o", "lstart=", "-p", &pid.to_string()])
-        .env("LC_ALL", "C")
-        .env("TZ", "UTC0")
+    ps_lstart(pid, true)
+}
+
+/// `ps`'s `lstart` for `pid`, which it formats for the locale and time zone: fixed ones when
+/// `fixed`, else this process's own.
+#[cfg(unix)]
+fn ps_lstart(pid: u32, fixed: bool) -> Option<String> {
+    let mut cmd = Command::new("ps");
+    cmd.args(["-o", "lstart=", "-p", &pid.to_string()]);
+    if fixed {
+        cmd.env("LC_ALL", "C").env("TZ", "UTC0");
+    }
+    let out = cmd
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .output()
         .ok()?;
     let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (out.status.success() && !text.is_empty()).then_some(text)
+}
+
+/// Whether the process `pid` is the one that started at `recorded` (a `start_time`): `None` when
+/// its start time cannot be read now. Outside Linux, a record of an older cc-rotate, made in the
+/// locale and time zone of the process that wrote it, matches too.
+pub fn started_at(pid: u32, recorded: &str) -> Option<bool> {
+    let now = start_time(pid)?;
+    if now == recorded {
+        return Some(true);
+    }
+    #[cfg(unix)]
+    if !std::path::Path::new("/proc/self/stat").exists()
+        && ps_lstart(pid, false).as_deref() == Some(recorded)
+    {
+        return Some(true);
+    }
+    Some(false)
 }
 
 /// The parent of the process `pid`, while both run.
@@ -226,7 +252,7 @@ impl Ancestors {
         self.0.iter().all(|(pid, started)| {
             alive(*pid)
                 && match started {
-                    Some(s) => start_time(*pid).as_ref() == Some(s),
+                    Some(s) => started_at(*pid, s).unwrap_or(false),
                     None => true,
                 }
         })

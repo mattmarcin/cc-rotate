@@ -51,7 +51,7 @@ pub fn open(profile_override: Option<PathBuf>) -> Result<(Store, Paths)> {
         Some(p) => p,
         None => match store.settings()?.profile_dir {
             Some(p) if !std::path::Path::new(&p).is_absolute() => anyhow::bail!(
-                "profile_dir must be a full path. Set it with cc-rotate-ctl config profile_dir <path>."
+                "profile_dir must be a full path. Set it with cc-rotate-ctl --profile <full path> config profile_dir <full path>."
             ),
             Some(p) => PathBuf::from(p),
             None => Paths::default_profile_dir()?,
