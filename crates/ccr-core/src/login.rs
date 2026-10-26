@@ -137,21 +137,21 @@ pub fn import(
         profile_account::read(&staging.join(".claude.json"))?,
     );
     // The organization decides which usage readings belong to the account (section 9.1).
-    if ident.email.is_none() || ident.account_uuid.is_none() || ident.org_uuid.is_none() {
-        if let Ok(claude) = claude_executable(store) {
-            fill_from_auth_status(&mut ident, &claude, staging);
-        }
+    if (ident.email.is_none() || ident.account_uuid.is_none() || ident.org_uuid.is_none())
+        && let Ok(claude) = claude_executable(store)
+    {
+        fill_from_auth_status(&mut ident, &claude, staging);
     }
     if ident.account_uuid.is_none() && ident.email.is_none() {
         bail!("Signed in, but Claude Code didn't say which account it was. Try again.");
     }
 
-    if let (Some(expected), Some(got)) = (&req.expect_email, &ident.email) {
-        if !expected.eq_ignore_ascii_case(got) {
-            bail!(
-                "Signed in as {got}, not {expected}. Switch to {expected} in your browser and try again."
-            );
-        }
+    if let (Some(expected), Some(got)) = (&req.expect_email, &ident.email)
+        && !expected.eq_ignore_ascii_case(got)
+    {
+        bail!(
+            "Signed in as {got}, not {expected}. Switch to {expected} in your browser and try again."
+        );
     }
 
     let existing = match req.relogin {

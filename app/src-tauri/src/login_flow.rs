@@ -182,14 +182,12 @@ fn read_pipe(
             out.push_str(&String::from_utf8_lossy(&buf[..n]));
             strip_ansi(&out)
         };
-        if !announced {
-            if let Some(found) = login::find_sign_in_url(&text) {
-                announced = true;
-                *url.lock().unwrap() = Some(found.clone());
-                let mut p = Progress::new(id, Stage::Browser);
-                p.url = Some(found);
-                emit(app, p);
-            }
+        if !announced && let Some(found) = login::find_sign_in_url(&text) {
+            announced = true;
+            *url.lock().unwrap() = Some(found.clone());
+            let mut p = Progress::new(id, Stage::Browser);
+            p.url = Some(found);
+            emit(app, p);
         }
     }
 }

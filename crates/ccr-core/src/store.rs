@@ -1124,10 +1124,10 @@ impl Store {
         if let Some(a) = self.account_by_email(reference)? {
             return Ok(a);
         }
-        if let Ok(id) = reference.parse::<i64>() {
-            if let Some(a) = self.account(id)? {
-                return Ok(a);
-            }
+        if let Ok(id) = reference.parse::<i64>()
+            && let Some(a) = self.account(id)?
+        {
+            return Ok(a);
         }
         Err(anyhow!("no account matches {reference:?}"))
     }
@@ -1280,10 +1280,10 @@ impl Store {
 
     /// Set or clear (`None`) the account's weekly cap, in percent from 1 to 100.
     pub fn set_weekly_cap(&self, id: i64, cap: Option<f64>) -> Result<()> {
-        if let Some(c) = cap {
-            if !(1.0..=100.0).contains(&c) {
-                bail!("Use a number from 1 to 100.");
-            }
+        if let Some(c) = cap
+            && !(1.0..=100.0).contains(&c)
+        {
+            bail!("Use a number from 1 to 100.");
         }
         let n = self.conn.execute(
             "UPDATE accounts SET weekly_cap = ?2 WHERE id = ?1",
@@ -1459,10 +1459,11 @@ impl Store {
     /// Insert a sample unless it repeats the account's last one within a minute.
     /// Returns whether a row was written.
     pub fn record_sample(&self, s: &Sample) -> Result<bool> {
-        if let Some(last) = self.last_sample(s.account_id)? {
-            if s.ts - last.ts < 60_000 && last.same_reading(s) {
-                return Ok(false);
-            }
+        if let Some(last) = self.last_sample(s.account_id)?
+            && s.ts - last.ts < 60_000
+            && last.same_reading(s)
+        {
+            return Ok(false);
         }
         self.conn.execute_batch("SAVEPOINT record_sample")?;
         let written = (|| -> Result<()> {
@@ -1705,10 +1706,11 @@ impl Store {
                 )
                 .optional()?)
         };
-        if let Some((key, earliest, seen)) = find(self)? {
-            if earliest <= started_ms && now_ms - seen < SESSION_SEEN_REFRESH_MS {
-                return Ok(key);
-            }
+        if let Some((key, earliest, seen)) = find(self)?
+            && earliest <= started_ms
+            && now_ms - seen < SESSION_SEEN_REFRESH_MS
+        {
+            return Ok(key);
         }
         self.immediate(|s| match find(s)? {
             Some((key, earliest, _)) => {
@@ -1762,10 +1764,11 @@ impl Store {
                 .optional()?)
         };
         // The same numbers again, recently: nothing to write.
-        if let Some((last_text, since, seen)) = last(self)? {
-            if last_text == text && now_ms - seen < SESSION_SEEN_REFRESH_MS {
-                return Ok(since);
-            }
+        if let Some((last_text, since, seen)) = last(self)?
+            && last_text == text
+            && now_ms - seen < SESSION_SEEN_REFRESH_MS
+        {
+            return Ok(since);
         }
         self.immediate(|s| {
             let unchanged_since = last(s)?.and_then(|(last_text, since, _)| {

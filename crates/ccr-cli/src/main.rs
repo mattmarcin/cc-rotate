@@ -319,13 +319,13 @@ fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> 
             if let Some(req) = statusline::sync(store, paths)? {
                 swap::run(store, paths, &req)?;
             }
-            if statusline::needs_settling(store, paths, time::now_ms())? {
-                if let Ok(_lock) = ccr_core::lock::DirLock::acquire(
+            if statusline::needs_settling(store, paths, time::now_ms())?
+                && let Ok(_lock) = ccr_core::lock::DirLock::acquire(
                     &paths.swap_lock(),
                     ccr_core::lock::LockOptions::claude(Duration::ZERO),
-                ) {
-                    swap::settle_profile(store, paths)?;
-                }
+                )
+            {
+                swap::settle_profile(store, paths)?;
             }
             let snap = snapshot::snapshot(store, paths)?;
             if json {

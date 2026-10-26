@@ -172,13 +172,12 @@ pub fn finish_dead_swap(store: &Store, paths: &Paths, settler: Settler) -> Resul
             Verdict::NeverWritten => {}
             Verdict::Written => {
                 let now = time::now_ms();
-                if let Some(from) = pending.from {
-                    if s.account(from)?
+                if let Some(from) = pending.from
+                    && s.account(from)?
                         .is_some_and(|a| a.state == AccountState::Active)
                     {
                         s.set_state(from, AccountState::Parked)?;
                     }
-                }
                 if s.account(pending.to)?.is_some() {
                     // Only the states: the login in the profile is stored by the write-back that
                     // follows, like any renewal of the active account's.
@@ -204,13 +203,11 @@ pub fn finish_dead_swap(store: &Store, paths: &Paths, settler: Settler) -> Resul
                 if s.account(pending.to)?.is_some() {
                     crate::usage_check::hold_back(s, pending.to)?;
                 }
-                if !restored {
-                    if let Some(from) = pending.from {
-                        if s.account(from)?.is_some() {
+                if !restored
+                    && let Some(from) = pending.from
+                        && s.account(from)?.is_some() {
                             crate::usage_check::hold_back(s, from)?;
                         }
-                    }
-                }
                 let label = |id: i64| -> Result<Option<String>> {
                     Ok(s.account(id)?.map(|a| a.label))
                 };
@@ -901,10 +898,10 @@ pub fn attribute(
 pub fn others_latest(store: &Store, account_id: i64) -> Result<Vec<Sample>> {
     let mut out = Vec::new();
     for account in store.accounts()? {
-        if account.id != account_id {
-            if let Some(last) = store.last_sample(account.id)? {
-                out.push(last);
-            }
+        if account.id != account_id
+            && let Some(last) = store.last_sample(account.id)?
+        {
+            out.push(last);
         }
     }
     Ok(out)
@@ -977,10 +974,10 @@ pub fn arrived_over_limit(store: &Store, account_id: i64, now_ms: i64) -> Result
     let model = store.meta(META_PROFILE_MODEL)?;
     let mut others: Vec<i64> = Vec::new();
     for account in store.accounts()? {
-        if account.id != account_id {
-            if let Some(sample) = store.last_sample(account.id)? {
-                others.extend(sample.windows.iter().filter_map(|w| w.resets_at));
-            }
+        if account.id != account_id
+            && let Some(sample) = store.last_sample(account.id)?
+        {
+            others.extend(sample.windows.iter().filter_map(|w| w.resets_at));
         }
     }
     let own: Vec<_> = store
@@ -1057,24 +1054,24 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
     let active = store.active_account()?;
     let active_id = active.as_ref().map(|a| a.id);
 
-    if let Some(from) = req.from {
-        if active_id != Some(from) {
-            return skip(store, req, "the account in use already changed");
-        }
+    if let Some(from) = req.from
+        && active_id != Some(from)
+    {
+        return skip(store, req, "the account in use already changed");
     }
     let mut arrived_full = false;
-    if req.reason.respects_cooldown() {
-        if let Some(last) = store.meta_i64(META_LAST_SWAP_AT)? {
-            let cooldown_ms = settings.swap_cooldown_s * 1000;
-            if now - last < cooldown_ms {
-                arrived_full = req.reason.is_threshold()
-                    && match active_id {
-                        Some(id) => arrived_over_limit(store, id, now)?,
-                        None => false,
-                    };
-                if !arrived_full {
-                    return skip(store, req, "too soon after the last swap");
-                }
+    if req.reason.respects_cooldown()
+        && let Some(last) = store.meta_i64(META_LAST_SWAP_AT)?
+    {
+        let cooldown_ms = settings.swap_cooldown_s * 1000;
+        if now - last < cooldown_ms {
+            arrived_full = req.reason.is_threshold()
+                && match active_id {
+                    Some(id) => arrived_over_limit(store, id, now)?,
+                    None => false,
+                };
+            if !arrived_full {
+                return skip(store, req, "too soon after the last swap");
             }
         }
     }
@@ -1088,29 +1085,28 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
     // Checks and the confirmation share one time budget: sessions may be waiting at a limit.
     let check_deadline = Instant::now() + PRE_SWAP_CHECK_BUDGET;
     let mut confirmed = None;
-    if req.reason.is_threshold() {
-        if let Some(account) = &active {
-            if needs_confirmation(store, account.id, now)? {
-                let outcome = usage_check::confirm_active(store, paths).unwrap_or_else(|e| {
-                    usage_check::CheckOutcome::Failed {
-                        why: format!("{e:#}"),
-                    }
-                });
-                confirmed = Some(outcome.kind());
-                if matches!(outcome, usage_check::CheckOutcome::Read { .. }) {
-                    let (pool, _) = load_pool(store, time::now_s())?;
-                    let fine = pool
-                        .iter()
-                        .find(|c| c.account.id == account.id)
-                        .is_some_and(|c| c.blocking().is_none());
-                    if fine {
-                        return skip(
-                            store,
-                            req,
-                            "a fresh check shows the account in use is below its limits",
-                        );
-                    }
-                }
+    if req.reason.is_threshold()
+        && let Some(account) = &active
+        && needs_confirmation(store, account.id, now)?
+    {
+        let outcome = usage_check::confirm_active(store, paths).unwrap_or_else(|e| {
+            usage_check::CheckOutcome::Failed {
+                why: format!("{e:#}"),
+            }
+        });
+        confirmed = Some(outcome.kind());
+        if matches!(outcome, usage_check::CheckOutcome::Read { .. }) {
+            let (pool, _) = load_pool(store, time::now_s())?;
+            let fine = pool
+                .iter()
+                .find(|c| c.account.id == account.id)
+                .is_some_and(|c| c.blocking().is_none());
+            if fine {
+                return skip(
+                    store,
+                    req,
+                    "a fresh check shows the account in use is below its limits",
+                );
             }
         }
     }
@@ -1587,10 +1583,10 @@ fn pool_exhausted(
     active: Option<&Account>,
     now: i64,
 ) -> Result<SwapOutcome> {
-    if req.reason == Reason::DeadLogin {
-        if let Some(account) = active {
-            store.set_state(account.id, AccountState::NeedsLogin)?;
-        }
+    if req.reason == Reason::DeadLogin
+        && let Some(account) = active
+    {
+        store.set_state(account.id, AccountState::NeedsLogin)?;
     }
     let recent = store
         .last_event_of(kind::POOL_EXHAUSTED)?

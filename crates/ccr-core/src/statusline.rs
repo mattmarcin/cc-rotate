@@ -195,10 +195,10 @@ pub fn tick(store: &Store, paths: &Paths, input: &StatusInput, now_ms: i64) -> R
         return Ok(result);
     };
 
-    if let Some(model) = input.model_id() {
-        if store.meta(META_PROFILE_MODEL)?.as_deref() != Some(model) {
-            store.set_meta(META_PROFILE_MODEL, model)?;
-        }
+    if let Some(model) = input.model_id()
+        && store.meta(META_PROFILE_MODEL)?.as_deref() != Some(model)
+    {
+        store.set_meta(META_PROFILE_MODEL, model)?;
     }
     if let Some(version) = input.version.as_deref() {
         crate::health::note_claude_version(store, version)?;
@@ -617,11 +617,9 @@ pub fn sync_at(store: &Store, paths: &Paths, now_ms: i64) -> Result<Option<SwapR
     crate::budget::note_in_use(store, &pool)?;
     let timing = timing(store, active.id, now_ms)?;
     // The app runs this when no session ticks, as when every session waits at a limit.
-    if !dead_login {
-        if let Some(req) = avoid_extra_usage(store, &pool, policy, &active, now_ms)? {
-            store.set_meta(META_SWAP_REQUESTED_AT, now_ms)?;
-            return Ok(Some(req));
-        }
+    if !dead_login && let Some(req) = avoid_extra_usage(store, &pool, policy, &active, now_ms)? {
+        store.set_meta(META_SWAP_REQUESTED_AT, now_ms)?;
+        return Ok(Some(req));
     }
     let Some(reason) = scheduler::decide(&pool, policy, timing, dead_login, false) else {
         return Ok(None);

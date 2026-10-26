@@ -494,10 +494,10 @@ fn with_expiring(
     let expiring = budget::expiring(&pool, rates, promoted, policy.thresholds.session, now_s);
     for c in &mut pool {
         c.expiring = expiring.get(&c.account.id).copied();
-        if c.account.id == active {
-            if let Some(e) = c.expiring {
-                promoted.insert(active, e.resets_at);
-            }
+        if c.account.id == active
+            && let Some(e) = c.expiring
+        {
+            promoted.insert(active, e.resets_at);
         }
     }
     pool

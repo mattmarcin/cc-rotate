@@ -80,10 +80,10 @@ fn bin_from(var: impl Fn(&str) -> Option<OsString>) -> OsString {
 pub fn session_to_report(hook_input: &str) -> Result<Option<String>> {
     let input: Value =
         serde_json::from_str(hook_input).context("the SessionStart hook input is not JSON")?;
-    if let Some(event) = input.get("hook_event_name").and_then(Value::as_str) {
-        if event != "SessionStart" {
-            return Ok(None);
-        }
+    if let Some(event) = input.get("hook_event_name").and_then(Value::as_str)
+        && event != "SessionStart"
+    {
+        return Ok(None);
     }
     let is_subagent = input
         .get("agent_id")

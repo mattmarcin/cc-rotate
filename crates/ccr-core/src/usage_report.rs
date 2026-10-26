@@ -143,10 +143,10 @@ fn row_window(row: &Value) -> Option<SampleWindow> {
             .and_then(|v| v.get("display_name"))
             .and_then(Value::as_str)
     };
-    if let Some(surface) = named("surface") {
-        if !surface.eq_ignore_ascii_case("claude code") {
-            return None;
-        }
+    if let Some(surface) = named("surface")
+        && !surface.eq_ignore_ascii_case("claude code")
+    {
+        return None;
     }
     let family = match named("model") {
         Some(model) => Some(scheduler::model_family(model)?),

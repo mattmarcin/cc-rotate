@@ -383,10 +383,10 @@ pub fn command_path(exe: &Path) -> String {
     if bare(&plain) {
         return plain;
     }
-    if let Some(short) = short_path(exe).map(|p| forward_slashes(&p)) {
-        if bare(&short) {
-            return short;
-        }
+    if let Some(short) = short_path(exe).map(|p| forward_slashes(&p))
+        && bare(&short)
+    {
+        return short;
     }
     format!("\"{plain}\"")
 }

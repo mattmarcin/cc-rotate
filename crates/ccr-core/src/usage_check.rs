@@ -495,12 +495,12 @@ pub fn warm_up(
     account_id: i64,
     trigger: Trigger,
 ) -> Result<WarmOutcome> {
-    if trigger != Trigger::Manual {
-        if let Some(why) = warm_ups_blocked(store)? {
-            return Ok(WarmOutcome::Skipped {
-                why: format!("keeping windows running is stopped because {why}"),
-            });
-        }
+    if trigger != Trigger::Manual
+        && let Some(why) = warm_ups_blocked(store)?
+    {
+        return Ok(WarmOutcome::Skipped {
+            why: format!("keeping windows running is stopped because {why}"),
+        });
     }
     // Found by each run, so a missing `claude` is a warm-up that failed (and is retried later),
     // not an error before anything is recorded.
