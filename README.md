@@ -244,6 +244,11 @@ A week with few readings is marked, since the account may have used more than cc
 The app shows the same numbers for the last 4 weeks as **Recent weeks** and **API value** in the account's **More** dialog.
 Its **API cost** chart, a tab next to **Usage limits** at the bottom of the dashboard, shows the API value of the last 24 hours by hour or of the last 7 days by day, stacked per account, with the total for the period.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/charts-dark.png">
+  <img alt="The dashboard's API cost chart: what each account's use would have cost at API prices in the last 24 hours, as bars stacked per account for each hour, with the total and each account's share" src="docs/charts.png">
+</picture>
+
 ### Extra usage
 
 An account with extra usage turned on on claude.ai keeps working past its plan's limits, and bills the card on file.
