@@ -10,6 +10,8 @@ use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 
 const MINIMIZED_ARG: &str = "--minimized";
 const META_AUTOSTART_INITIALIZED: &str = "app_autostart_initialized";
+/// The executable start at login was last pointed at by `sync_autostart`.
+pub(crate) const META_AUTOSTART_PATH: &str = "app_autostart_path";
 
 pub fn show_main(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
@@ -86,30 +88,44 @@ fn main() {
 
 /// The app is the only source of notifications, so it starts at login unless the user turned
 /// that off. The first launch of an installed copy enables it; later launches respect the user's
-/// toggle, and while it is on, point it at the copy running now, so it follows the copy an
-/// install puts in place. A copy run from a Cargo build folder leaves it alone: login would start
-/// a build the next build replaces, and an install could not update it.
+/// toggle, and while it is on, point it at a copy at a new path, so it follows the copy an
+/// install puts in place. Only a new path rewrites it: on Linux and macOS the desktop's own
+/// switches leave the entry in place, and writing it again would undo them. A copy run from a
+/// Cargo build folder leaves it alone: login would start a build the next build replaces, and an
+/// install could not update it.
 fn sync_autostart(app: &AppHandle) {
-    let built_here = std::env::current_exe().is_ok_and(|exe| in_build_folder(&exe));
-    if cfg!(debug_assertions) || built_here {
+    let Some(exe) = autostart_exe() else {
+        return;
+    };
+    if cfg!(debug_assertions) || in_build_folder(&exe) {
         return;
     }
     let Ok((store, _)) = ccr_core::open(None) else {
         return;
     };
     let launcher = app.autolaunch();
+    let path = exe.display().to_string();
     let initialized = store
         .meta(META_AUTOSTART_INITIALIZED)
         .ok()
         .flatten()
         .is_some();
-    if !initialized {
-        let _ = launcher.enable();
-        let _ = store.set_meta(META_AUTOSTART_INITIALIZED, "1");
-    } else if launcher.is_enabled().unwrap_or(false) {
-        // Written again with this copy's path.
-        let _ = launcher.enable();
+    let registered = store.meta(META_AUTOSTART_PATH).ok().flatten();
+    let write = if !initialized {
+        true
+    } else {
+        registered.as_deref() != Some(path.as_str()) && launcher.is_enabled().unwrap_or(false)
+    };
+    if write && launcher.enable().is_ok() {
+        let _ = store.set_meta(META_AUTOSTART_PATH, &path);
     }
+    let _ = store.set_meta(META_AUTOSTART_INITIALIZED, "1");
+}
+
+/// This executable with links resolved, as the plugin registers it on macOS.
+pub(crate) fn autostart_exe() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    Some(exe.canonicalize().unwrap_or(exe))
 }
 
 /// Whether `exe` is a Cargo build's output (`target/<profile>/` or `target/<triple>/<profile>/`),

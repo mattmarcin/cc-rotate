@@ -61,7 +61,9 @@ if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
 # An app started from the build folder holds its executable open, so the build could not replace
 # it. It is closed first, and the installed copy is started in its place at the end.
 $built = Join-Path $repo "target\release\cc-rotate-app.exe"
+$app = Join-Path $BinDir "cc-rotate-app.exe"
 $fromBuild = @()
+$running = @()
 if (-not $SkipApp) {
   $fromBuild = @(Get-Process cc-rotate-app -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $built })
 }
@@ -71,36 +73,34 @@ if ($fromBuild) {
   $fromBuild | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
 }
 
-if (-not $SkipApp) {
-  Write-Host "Building the desktop app..."
-  Push-Location (Join-Path $repo "app")
-  try {
-    npm ci --no-audit --no-fund
-    if ($LASTEXITCODE -ne 0) { throw "npm ci failed" }
-    npx tauri build --no-bundle
-    if ($LASTEXITCODE -ne 0) { throw "tauri build failed" }
-  } finally {
-    Pop-Location
-  }
-}
-
-New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
-$app = Join-Path $BinDir "cc-rotate-app.exe"
-$running = @()
-if (-not $SkipApp) {
-  $running = @(Get-Process cc-rotate-app -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $app })
-}
-if ($running) {
-  Write-Host "Closing the running cc-rotate app so it can be updated..."
-  $running | Stop-Process -Force
-  $running | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
-}
 try {
+  if (-not $SkipApp) {
+    Write-Host "Building the desktop app..."
+    Push-Location (Join-Path $repo "app")
+    try {
+      npm ci --no-audit --no-fund
+      if ($LASTEXITCODE -ne 0) { throw "npm ci failed" }
+      npx tauri build --no-bundle
+      if ($LASTEXITCODE -ne 0) { throw "tauri build failed" }
+    } finally {
+      Pop-Location
+    }
+  }
+
+  New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
+  if (-not $SkipApp) {
+    $running = @(Get-Process cc-rotate-app -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $app })
+  }
+  if ($running) {
+    Write-Host "Closing the running cc-rotate app so it can be updated..."
+    $running | Stop-Process -Force
+    $running | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
+  }
   Install-Exe "cc-rotate.exe"
   Install-Exe "cc-rotate-ctl.exe"
   if (-not $SkipApp) { Install-Exe "cc-rotate-app.exe" }
 } finally {
-  # Started again even if an install step failed, with whichever build is in place.
+  # Started again even if a build or install step failed, with whichever build is in place.
   if (($running -or $fromBuild) -and (Test-Path -LiteralPath $app)) {
     Write-Host "Starting the cc-rotate app again..."
     Start-Process -FilePath $app
