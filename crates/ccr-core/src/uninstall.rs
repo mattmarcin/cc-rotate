@@ -30,6 +30,9 @@ pub const PROGRAMS: [&str; 3] = ["cc-rotate", "cc-rotate-ctl", "cc-rotate-app"];
 /// The data folder's name where cc-rotate puts it (`Paths::default_data_dir`).
 const DATA_DIR_NAME: &str = "cc-rotate";
 
+/// How long quitting the app may take.
+const STOP_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// A status line tick within this long means a session in the cc-rotate profile is open: open
 /// sessions tick at least every 30 s (`refreshInterval`), idle or not.
 pub const SESSION_OPEN_MS: i64 = 2 * 60_000;
@@ -304,8 +307,9 @@ impl System for RealSystem {
             let mut cmd = std::process::Command::new(
                 PathBuf::from(root).join("System32").join("taskkill.exe"),
             );
-            // With its WebView2 processes (`/T`), and only this user's.
-            cmd.args(["/F", "/T", "/IM"]).arg(format!(
+            // Only this user's. Not `/T` with it: together they hang. Its WebView2 processes
+            // end with it, and deleting their folder is tried for a few seconds (`remove_dir`).
+            cmd.args(["/F", "/IM"]).arg(format!(
                 "{}{}",
                 self.app_name,
                 std::env::consts::EXE_SUFFIX
@@ -324,12 +328,26 @@ impl System for RealSystem {
                 .arg(&self.app_name);
             cmd
         };
-        let status = cmd
+        let mut child = cmd
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .status()
+            .spawn()
             .context("running taskkill or pkill")?;
-        // taskkill: 0 stopped, 128 not running; pkill: 0 stopped, 1 not running.
+        let deadline = std::time::Instant::now() + STOP_TIMEOUT;
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("it didn't answer within {} s", STOP_TIMEOUT.as_secs());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        // taskkill: 0 stopped, or with a filter nothing to stop, 128 nothing to stop; pkill: 0
+        // stopped, 1 nothing to stop.
         match status.code() {
             Some(0) => {
                 // Until it lets go of its files.
@@ -528,6 +546,16 @@ fn data_removal(paths: &Paths) -> Result<DataRemoval> {
             "it is not a folder cc-rotate made".into(),
         ));
     }
+    if std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()) {
+        let target = std::fs::read_link(dir).unwrap_or_default();
+        return Ok(DataRemoval::Keep(
+            dir.clone(),
+            format!(
+                "it is a link to {}; delete that folder yourself, as it holds every saved login",
+                target.display()
+            ),
+        ));
+    }
     if !dir.join("store.db").exists() && !dir.join(secret::KEY_FILE).exists() {
         return Ok(DataRemoval::Keep(
             dir.clone(),
@@ -560,6 +588,17 @@ fn data_entries(dir: &Path) -> Result<Vec<PathBuf>> {
         .map(|name| dir.join(name))
         .filter(|p| std::fs::symlink_metadata(p).is_ok())
         .collect();
+    // What a crash can leave of writing the key or a file atomically (`secret`, `credfile`).
+    for entry in std::fs::read_dir(dir)?.filter_map(|e| e.ok()) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let temp = name.starts_with('.')
+            && name.ends_with(".tmp")
+            && (name.starts_with(&format!(".{}.", secret::KEY_FILE))
+                || name.contains(".cc-rotate-"));
+        if temp {
+            found.push(entry.path());
+        }
+    }
     /// A folder, and which names in it are cc-rotate's.
     type Folder = (&'static str, fn(&str) -> bool);
     let inside: [Folder; 4] = [
@@ -567,9 +606,12 @@ fn data_entries(dir: &Path) -> Result<Vec<PathBuf>> {
             n.starts_with("account-") && n.ends_with(".lock")
         }),
         ("staging", |n| {
-            ["check-", "confirm-", "login-"]
-                .iter()
-                .any(|p| n.starts_with(p))
+            // Older versions named sign-in folders by a bare id (`usage_check::sweep_logins`).
+            let legacy = n.len() == 32 && n.bytes().all(|b| b.is_ascii_hexdigit());
+            legacy
+                || ["check-", "confirm-", "login-"]
+                    .iter()
+                    .any(|p| n.starts_with(p))
         }),
         ("backups", |n| {
             n.starts_with("credentials-") && (n.ends_with(".ccr") || n.ends_with(".dpapi"))
@@ -824,11 +866,14 @@ pub fn run(system: &dyn System, plan: &Plan, this_exe: &Path) -> Outcome {
             system.delete_keychain_item(dir),
         );
     }
+    let mut profile_failed = false;
     if let Removal::Delete(dir) = &plan.profile_dir {
+        let result = remove_dir(dir);
+        profile_failed = result.is_err();
         step(
             format!("Deleted {}", dir.display()),
             format!("Deleting {}", dir.display()),
-            remove_dir(dir),
+            result,
         );
     }
     if let Some(lock) = &plan.profile_lock {
@@ -838,7 +883,14 @@ pub fn run(system: &dyn System, plan: &Plan, this_exe: &Path) -> Outcome {
             remove_any(lock),
         );
     }
-    match &plan.data_dir {
+    // The store says where a profile set with `config profile_dir` is: kept while the profile
+    // could not go, so running it again finds it.
+    let data_dir = if profile_failed {
+        &DataRemoval::Absent
+    } else {
+        &plan.data_dir
+    };
+    match data_dir {
         DataRemoval::Whole(dir) => step(
             format!("Deleted {}", dir.display()),
             format!("Deleting {}", dir.display()),
@@ -1432,6 +1484,8 @@ mod tests {
             "backups",
             "locks/account-1.lock",
             "staging/check-1-2-x",
+            "staging/0123456789abcdef0123456789abcdef",
+            "staging/mine",
             "photos",
         ] {
             std::fs::create_dir_all(shared.join(dir)).unwrap();
@@ -1441,6 +1495,7 @@ mod tests {
             "store.db-wal",
             "master.key",
             "store.db.json",
+            ".master.key.0a1b.tmp",
             "notes.txt",
             "logs/cc-rotate.log",
             "logs/mine.log",
@@ -1465,10 +1520,12 @@ mod tests {
         assert_eq!(
             names,
             [
+                ".master.key.0a1b.tmp",
                 "backups/credentials-2026-10-26.ccr",
                 "locks/account-1.lock",
                 "logs/cc-rotate.log",
                 "master.key",
+                "staging/0123456789abcdef0123456789abcdef",
                 "staging/check-1-2-x",
                 "store.db",
                 "store.db-wal",
@@ -1487,6 +1544,8 @@ mod tests {
                 "logs/mine.log",
                 "notes.txt",
                 "photos",
+                "staging",
+                "staging/mine",
                 "store.db.json"
             ]
         );

@@ -220,6 +220,12 @@ fn print_plan(plan: &Plan) {
         Removal::Keep(dir, why) => keep.push(format!("{}: {why}", dir.display())),
         Removal::Absent => {}
     }
+    if let Some(lock) = &plan.profile_lock {
+        remove.push(format!(
+            "Delete Claude Code's lock beside it: {}",
+            lock.display()
+        ));
+    }
     let saved = "the store, its key and every saved login";
     match &plan.data_dir {
         DataRemoval::Whole(dir) => remove.push(format!(
@@ -231,11 +237,30 @@ fn print_plan(plan: &Plan) {
                 "Delete cc-rotate's files from {} ({saved}), and the folder if nothing else is in it:",
                 dir.display()
             ));
+            // Files by name; what is inside its folders as a count per folder.
+            let mut files = Vec::new();
+            let mut folders: Vec<(String, usize)> = Vec::new();
             for entry in entries {
-                remove.push(format!(
-                    "  {}",
-                    entry.file_name().unwrap_or_default().to_string_lossy()
-                ));
+                let relative = entry.strip_prefix(dir).unwrap_or(entry);
+                let mut parts = relative.components();
+                let first = parts
+                    .next()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if parts.next().is_none() {
+                    files.push(first);
+                } else if let Some((_, n)) = folders.iter_mut().find(|(f, _)| *f == first) {
+                    *n += 1;
+                } else {
+                    folders.push((first, 1));
+                }
+            }
+            for file in files {
+                remove.push(format!("  {file}"));
+            }
+            for (folder, n) in folders {
+                let what = if n == 1 { "entry" } else { "entries" };
+                remove.push(format!("  {n} of its {what} in {folder}"));
             }
         }
         DataRemoval::Keep(dir, why) => keep.push(format!("{}: {why}", dir.display())),
