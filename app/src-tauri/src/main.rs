@@ -62,7 +62,7 @@ fn main() {
         .setup(|app| {
             tray::create(app.handle())?;
             watcher::start(app.handle().clone());
-            enable_autostart_once(app.handle());
+            sync_autostart(app.handle());
             if !std::env::args().any(|a| a == MINIMIZED_ARG) {
                 show_main(app.handle());
             }
@@ -85,21 +85,66 @@ fn main() {
 }
 
 /// The app is the only source of notifications, so it starts at login unless the user turned
-/// that off. Only the very first launch enables it; later launches respect the user's toggle.
-fn enable_autostart_once(app: &AppHandle) {
+/// that off. The first launch of an installed copy enables it; later launches respect the user's
+/// toggle, and while it is on, point it at the copy running now, so it follows the copy an
+/// install puts in place. A copy run from a Cargo build folder leaves it alone: login would start
+/// a build the next build replaces, and an install could not update it.
+fn sync_autostart(app: &AppHandle) {
+    let built_here = std::env::current_exe().is_ok_and(|exe| in_build_folder(&exe));
+    if cfg!(debug_assertions) || built_here {
+        return;
+    }
     let Ok((store, _)) = ccr_core::open(None) else {
         return;
     };
-    if store
+    let launcher = app.autolaunch();
+    let initialized = store
         .meta(META_AUTOSTART_INITIALIZED)
         .ok()
         .flatten()
-        .is_some()
-    {
-        return;
+        .is_some();
+    if !initialized {
+        let _ = launcher.enable();
+        let _ = store.set_meta(META_AUTOSTART_INITIALIZED, "1");
+    } else if launcher.is_enabled().unwrap_or(false) {
+        // Written again with this copy's path.
+        let _ = launcher.enable();
     }
-    if !cfg!(debug_assertions) {
-        let _ = app.autolaunch().enable();
+}
+
+/// Whether `exe` is a Cargo build's output (`target/<profile>/` or `target/<triple>/<profile>/`),
+/// which Cargo marks with a `CACHEDIR.TAG` in `target`, rather than an installed copy.
+fn in_build_folder(exe: &std::path::Path) -> bool {
+    exe.ancestors()
+        .skip(2)
+        .take(2)
+        .any(|dir| dir.join("CACHEDIR.TAG").is_file())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::in_build_folder;
+
+    #[test]
+    fn a_build_folder_is_told_from_an_installed_copy() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        for dir in ["release", "x86_64-pc-windows-msvc/release"] {
+            std::fs::create_dir_all(target.join(dir)).unwrap();
+        }
+        std::fs::write(
+            target.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55",
+        )
+        .unwrap();
+        let bin = root.path().join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        assert!(in_build_folder(&target.join("release/cc-rotate-app")));
+        assert!(in_build_folder(
+            &target.join("x86_64-pc-windows-msvc/release/cc-rotate-app")
+        ));
+        assert!(!in_build_folder(&bin.join("cc-rotate-app")));
+        // A copy in the target folder itself is not a build's output.
+        assert!(!in_build_folder(&target.join("cc-rotate-app")));
     }
-    let _ = store.set_meta(META_AUTOSTART_INITIALIZED, "1");
 }

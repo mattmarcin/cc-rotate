@@ -58,6 +58,19 @@ Write-Host "Building cc-rotate and cc-rotate-ctl..."
 cargo build --release --locked -p ccr-cli --manifest-path (Join-Path $repo "Cargo.toml")
 if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
 
+# An app started from the build folder holds its executable open, so the build could not replace
+# it. It is closed first, and the installed copy is started in its place at the end.
+$built = Join-Path $repo "target\release\cc-rotate-app.exe"
+$fromBuild = @()
+if (-not $SkipApp) {
+  $fromBuild = @(Get-Process cc-rotate-app -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $built })
+}
+if ($fromBuild) {
+  Write-Host "Closing the cc-rotate app started from the build folder; the installed one starts in its place..."
+  $fromBuild | Stop-Process -Force
+  $fromBuild | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
+}
+
 if (-not $SkipApp) {
   Write-Host "Building the desktop app..."
   Push-Location (Join-Path $repo "app")
@@ -88,7 +101,7 @@ try {
   if (-not $SkipApp) { Install-Exe "cc-rotate-app.exe" }
 } finally {
   # Started again even if an install step failed, with whichever build is in place.
-  if ($running) {
+  if (($running -or $fromBuild) -and (Test-Path -LiteralPath $app)) {
     Write-Host "Starting the cc-rotate app again..."
     Start-Process -FilePath $app
   }
