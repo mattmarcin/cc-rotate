@@ -92,6 +92,11 @@ pub fn run(profile: Option<PathBuf>, dry_run: bool, yes: bool, force: bool) -> R
     for line in &out.failed {
         eprintln!("error: {line}");
     }
+    if out.programs_kept {
+        println!(
+            "The programs stay, so run cc-rotate-ctl uninstall again once the errors above are fixed."
+        );
+    }
     if let Some(dir) = &out.data_left {
         println!(
             "{} held more than cc-rotate's files, so it stays with the rest.",

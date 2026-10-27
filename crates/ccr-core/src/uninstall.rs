@@ -43,6 +43,9 @@ pub struct Plan {
     pub autostart_foreign: Option<String>,
     /// The rotation profile's folder, whether it is there or not.
     pub profile: PathBuf,
+    /// Claude Code's lock beside the profile (`paths::legacy_lock_for`), when it is there and the
+    /// profile goes or is gone.
+    pub profile_lock: Option<PathBuf>,
     /// The rotation profile's login in the macOS Keychain.
     pub keychain: KeychainItem,
     /// Leftover scratch profiles (`staging/`) whose login is in the macOS Keychain.
@@ -101,8 +104,8 @@ pub enum Removal {
     Keep(PathBuf, String),
 }
 
-/// The data folder: deleted whole when it is cc-rotate's own, else only cc-rotate's entries in it
-/// (the folder goes too if that empties it).
+/// The data folder: deleted whole when it is where cc-rotate puts it, else only cc-rotate's
+/// entries in it (`data_entries`), its folders and itself going too when that empties them.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub enum DataRemoval {
     #[default]
@@ -146,6 +149,8 @@ pub struct Outcome {
     pub left: Vec<PathBuf>,
     /// What stays in a data folder that held more than cc-rotate's files.
     pub data_left: Option<PathBuf>,
+    /// An earlier step failed, so the programs stay for running it again.
+    pub programs_kept: bool,
 }
 
 /// Whatever reaches beyond the user's files.
@@ -299,15 +304,24 @@ impl System for RealSystem {
             let mut cmd = std::process::Command::new(
                 PathBuf::from(root).join("System32").join("taskkill.exe"),
             );
-            cmd.args(["/F", "/IM"]).arg(format!(
+            // With its WebView2 processes (`/T`), and only this user's.
+            cmd.args(["/F", "/T", "/IM"]).arg(format!(
                 "{}{}",
                 self.app_name,
                 std::env::consts::EXE_SUFFIX
             ));
+            if let Some(user) = std::env::var_os("USERNAME") {
+                let mut filter = std::ffi::OsString::from("USERNAME eq ");
+                filter.push(user);
+                cmd.arg("/FI").arg(filter);
+            }
             cmd
         } else {
             let mut cmd = std::process::Command::new("pkill");
-            cmd.arg("-x").arg(&self.app_name);
+            cmd.arg("-x")
+                .arg("-u")
+                .arg(uid().to_string())
+                .arg(&self.app_name);
             cmd
         };
         let status = cmd
@@ -398,8 +412,13 @@ pub fn plan(
     plan.observe = observe_modes(paths)?;
     plan.legacy_alias = system.legacy_alias();
     plan.profile_dir = profile_removal(paths);
+    if !matches!(plan.profile_dir, Removal::Keep(..)) {
+        let lock = legacy_lock_for(&paths.profile_dir);
+        plan.profile_lock = std::fs::symlink_metadata(&lock).is_ok().then_some(lock);
+    }
     plan.data_dir = data_removal(paths)?;
-    if !matches!(plan.data_dir, DataRemoval::Absent | DataRemoval::Keep(..)) {
+    let reachable = !matches!(plan.keychain, KeychainItem::Unreachable(_));
+    if reachable && !matches!(plan.data_dir, DataRemoval::Absent | DataRemoval::Keep(..)) {
         for dir in subfolders(&paths.staging_root()) {
             if matches!(system.keychain(&dir)?, KeychainItem::Present(_)) {
                 plan.staging_items.push(dir);
@@ -474,6 +493,16 @@ fn profile_removal(paths: &Paths) -> Removal {
     if !dir.exists() {
         return Removal::Absent;
     }
+    if std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()) {
+        let target = std::fs::read_link(dir).unwrap_or_default();
+        return Removal::Keep(
+            dir.clone(),
+            format!(
+                "it is a link to {}; delete that folder yourself if it is the cc-rotate profile",
+                target.display()
+            ),
+        );
+    }
     if is_home_or_root(dir, &paths.home) || profiles::is_default_profile(dir, &paths.home) {
         return Removal::Keep(dir.clone(), "it is not a profile cc-rotate made".into());
     }
@@ -499,47 +528,70 @@ fn data_removal(paths: &Paths) -> Result<DataRemoval> {
             "it is not a folder cc-rotate made".into(),
         ));
     }
-    let entries = data_entries(dir)?;
-    let holds_store = entries.iter().any(|e| {
-        e.file_name()
-            .is_some_and(|n| n == "store.db" || n == secret::KEY_FILE)
-    });
-    if !holds_store {
+    if !dir.join("store.db").exists() && !dir.join(secret::KEY_FILE).exists() {
         return Ok(DataRemoval::Keep(
             dir.clone(),
             "it holds neither cc-rotate's store nor its key".into(),
         ));
     }
-    if dir.file_name().is_some_and(|n| n == DATA_DIR_NAME) {
+    let default = dirs::data_local_dir().map(|d| d.join(DATA_DIR_NAME));
+    let canonical = |p: &Path| dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    if default.is_some_and(|d| canonical(&d) == canonical(dir)) {
         Ok(DataRemoval::Whole(dir.clone()))
     } else {
-        Ok(DataRemoval::Entries(dir.clone(), entries))
+        Ok(DataRemoval::Entries(dir.clone(), data_entries(dir)?))
     }
 }
 
-/// cc-rotate's own entries in a data folder: the store with its journal files and the copies
-/// upgrades saved (`store.<...>.db`), the key, and its lock, scratch, backup and log folders.
+/// cc-rotate's own entries in a data folder, by the names it gives them: the store and its
+/// journal files, the key, the swap lock, and inside its lock, scratch, backup and log folders
+/// the entries it makes there (those folders go once empty).
 fn data_entries(dir: &Path) -> Result<Vec<PathBuf>> {
-    const OWN: [&str; 6] = [
-        "swap.lock",
-        "locks",
-        "staging",
-        "backups",
-        "logs",
+    const TOP: [&str; 6] = [
         "store.db",
+        "store.db-wal",
+        "store.db-shm",
+        "store.db-journal",
+        secret::KEY_FILE,
+        "swap.lock",
     ];
-    let mut found = Vec::new();
-    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let store_file = name.starts_with("store.") && name.contains(".db");
-        if OWN.contains(&name.as_str()) || name == secret::KEY_FILE || store_file {
-            found.push(entry.path());
+    let mut found: Vec<PathBuf> = TOP
+        .iter()
+        .map(|name| dir.join(name))
+        .filter(|p| std::fs::symlink_metadata(p).is_ok())
+        .collect();
+    /// A folder, and which names in it are cc-rotate's.
+    type Folder = (&'static str, fn(&str) -> bool);
+    let inside: [Folder; 4] = [
+        ("locks", |n| {
+            n.starts_with("account-") && n.ends_with(".lock")
+        }),
+        ("staging", |n| {
+            ["check-", "confirm-", "login-"]
+                .iter()
+                .any(|p| n.starts_with(p))
+        }),
+        ("backups", |n| {
+            n.starts_with("credentials-") && (n.ends_with(".ccr") || n.ends_with(".dpapi"))
+        }),
+        ("logs", |n| n == "cc-rotate.log" || n == "cc-rotate.log.1"),
+    ];
+    for (folder, ours) in inside {
+        let Ok(entries) = std::fs::read_dir(dir.join(folder)) else {
+            continue;
+        };
+        for entry in entries.filter_map(|e| e.ok()) {
+            if ours(&entry.file_name().to_string_lossy()) {
+                found.push(entry.path());
+            }
         }
     }
     found.sort();
     Ok(found)
 }
+
+/// The folders `data_entries` looks in, which go once empty.
+const DATA_FOLDERS: [&str; 4] = ["locks", "staging", "backups", "logs"];
 
 fn is_home_or_root(dir: &Path, home: &Path) -> bool {
     let dir = dunce::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
@@ -778,15 +830,13 @@ pub fn run(system: &dyn System, plan: &Plan, this_exe: &Path) -> Outcome {
             format!("Deleting {}", dir.display()),
             remove_dir(dir),
         );
-        // Claude Code's lock beside it (`paths::legacy_lock_for`).
-        let lock = legacy_lock_for(dir);
-        if lock.exists() {
-            step(
-                format!("Deleted {}", lock.display()),
-                format!("Deleting {}", lock.display()),
-                remove_any(&lock),
-            );
-        }
+    }
+    if let Some(lock) = &plan.profile_lock {
+        step(
+            format!("Deleted {}", lock.display()),
+            format!("Deleting {}", lock.display()),
+            remove_any(lock),
+        );
     }
     match &plan.data_dir {
         DataRemoval::Whole(dir) => step(
@@ -801,6 +851,10 @@ pub fn run(system: &dyn System, plan: &Plan, this_exe: &Path) -> Outcome {
                     format!("Deleting {}", entry.display()),
                     remove_any(entry),
                 );
+            }
+            for folder in DATA_FOLDERS {
+                // Only when empty: a folder of that name may hold the user's files too.
+                let _ = std::fs::remove_dir(dir.join(folder));
             }
             let empty = std::fs::read_dir(dir).is_ok_and(|mut d| d.next().is_none());
             if empty {
@@ -823,6 +877,11 @@ pub fn run(system: &dyn System, plan: &Plan, this_exe: &Path) -> Outcome {
         );
     }
     out.data_left = data_left;
+    if !out.failed.is_empty() && !plan.programs.is_empty() {
+        // Running it again finishes the job; without the programs it could not.
+        out.programs_kept = true;
+        return out;
+    }
     let mut aside = Vec::new();
     for program in &plan.programs {
         match std::fs::remove_file(program) {
@@ -853,12 +912,19 @@ pub fn run(system: &dyn System, plan: &Plan, this_exe: &Path) -> Outcome {
     out
 }
 
-/// Delete a folder; one already gone (it was inside another) is fine.
+/// Delete a folder; one already gone (it was inside another) is fine. On Windows a process just
+/// stopped (the app's WebView2) may hold a file a little longer, so it tries for a few seconds.
 fn remove_dir(dir: &Path) -> Result<()> {
-    match std::fs::remove_dir_all(dir) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
-        _ => Ok(()),
+    let tries = if cfg!(windows) { 10 } else { 1 };
+    for attempt in 1..=tries {
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if attempt == tries => return Err(e.into()),
+            Err(_) => std::thread::sleep(Duration::from_millis(500)),
+        }
     }
+    Ok(())
 }
 
 fn remove_any(path: &Path) -> Result<()> {
@@ -883,7 +949,8 @@ fn rename_aside(program: &Path) -> Result<PathBuf> {
 #[cfg(windows)]
 fn delete_after_exit(files: &[PathBuf]) -> Result<()> {
     use std::os::windows::process::CommandExt;
-    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    // A console of its own, hidden, which outlives this process; a detached `cmd` would give each
+    // `ping` it starts a console window of its own.
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     // Outliving a job that kills its processes when this one ends (some terminals, CI).
     const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
@@ -895,11 +962,13 @@ fn delete_after_exit(files: &[PathBuf]) -> Result<()> {
         .iter()
         .map(|q| format!("if not exist {q} "))
         .collect();
+    // `ping` by its full path: `cmd` would look in its working folder first.
     let script = format!(
-        "/d /c for /l %i in (1,1,60) do @(ping -n 2 127.0.0.1 >nul & del /f /q {} 2>nul & {gone}exit)",
+        "/d /v:off /c for /l %i in (1,1,60) do @(\"%CCR_PING%\" -n 2 127.0.0.1 >nul & del /f /q {} 2>nul & {gone}exit)",
         quoted.join(" ")
     );
     let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+    let ping = PathBuf::from(&root).join("System32").join("PING.EXE");
     let spawn = |flags: u32| {
         let mut cmd =
             std::process::Command::new(PathBuf::from(&root).join("System32").join("cmd.exe"));
@@ -908,14 +977,15 @@ fn delete_after_exit(files: &[PathBuf]) -> Result<()> {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .creation_flags(flags);
+            .creation_flags(flags)
+            .env("CCR_PING", &ping);
         for (var, file) in vars.iter().zip(files) {
             cmd.env(var, file);
         }
         cmd.spawn()
     };
-    spawn(DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB)
-        .or_else(|_| spawn(DETACHED_PROCESS | CREATE_NO_WINDOW))
+    spawn(CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB)
+        .or_else(|_| spawn(CREATE_NO_WINDOW))
         .context("starting the helper that deletes the programs")?;
     Ok(())
 }
@@ -928,6 +998,8 @@ fn delete_after_exit(_files: &[PathBuf]) -> Result<()> {
 /// Take observe mode out of a profile's status line, if it is still `command`: drop it, or put
 /// back the command it ran after cc-rotate's. Everything else in the file stays as it is.
 pub fn restore_status_line(settings: &Path, command: &str, restore: &Restore) -> Result<()> {
+    // Through a link (a dotfiles manager's) to the file it points at, so the link stays one.
+    let settings = &dunce::canonicalize(settings).unwrap_or_else(|_| settings.to_path_buf());
     let mut doc = credfile::read_document(settings)?
         .with_context(|| format!("{} is gone", settings.display()))?;
     if status_command(&doc) != Some(command) {
@@ -1132,6 +1204,7 @@ mod tests {
         keychain: KeychainItem,
         /// Keychain items of other profiles (scratch ones) that are there.
         items: Vec<PathBuf>,
+        fail_alias: bool,
         calls: std::cell::RefCell<Vec<String>>,
     }
 
@@ -1168,6 +1241,9 @@ mod tests {
         }
         fn remove_legacy_alias(&self) -> Result<()> {
             self.calls.borrow_mut().push("remove_legacy_alias".into());
+            if self.fail_alias {
+                bail!("the PowerShell profile is read-only");
+            }
             Ok(())
         }
         fn app_data(&self) -> Vec<PathBuf> {
@@ -1250,7 +1326,14 @@ mod tests {
             plan.profile_dir,
             Removal::Delete(i.paths.profile_dir.clone())
         );
-        assert_eq!(plan.data_dir, DataRemoval::Whole(i.paths.data_dir.clone()));
+        let DataRemoval::Entries(data, _) = &plan.data_dir else {
+            panic!("{:?}", plan.data_dir)
+        };
+        assert_eq!(
+            data, &i.paths.data_dir,
+            "not where cc-rotate puts it, so by entry"
+        );
+        assert_eq!(plan.profile_lock.as_ref(), Some(&lock));
         assert_eq!(plan.staging_items, vec![scratch]);
         assert_eq!(plan.programs.len(), 3);
         assert_eq!(plan.sessions, Sessions::Closed);
@@ -1338,20 +1421,30 @@ mod tests {
         );
     }
 
-    /// `CC_ROTATE_DATA_DIR` pointing at a folder of the user's: only cc-rotate's entries go.
+    /// `CC_ROTATE_DATA_DIR` pointing at a folder of the user's: only cc-rotate's entries go, even
+    /// inside folders named like its own.
     #[test]
     fn a_data_folder_of_the_users_keeps_what_is_not_cc_rotates() {
         let i = install();
         let shared = i.paths.home.join("Dropbox");
-        std::fs::create_dir_all(shared.join("logs")).unwrap();
-        std::fs::create_dir_all(shared.join("photos")).unwrap();
+        for dir in [
+            "logs",
+            "backups",
+            "locks/account-1.lock",
+            "staging/check-1-2-x",
+            "photos",
+        ] {
+            std::fs::create_dir_all(shared.join(dir)).unwrap();
+        }
         for file in [
             "store.db",
             "store.db-wal",
-            "store.pre-v4-backup.db",
             "master.key",
+            "store.db.json",
             "notes.txt",
-            "restore.dbx",
+            "logs/cc-rotate.log",
+            "logs/mine.log",
+            "backups/credentials-2026-10-26.ccr",
         ] {
             std::fs::write(shared.join(file), "").unwrap();
         }
@@ -1362,30 +1455,111 @@ mod tests {
             panic!("{:?}", p.data_dir)
         };
         assert_eq!(dir, &shared);
-        let names: Vec<_> = entries
-            .iter()
-            .map(|e| e.file_name().unwrap().to_string_lossy().into_owned())
-            .collect();
+        let relative = |e: &PathBuf| {
+            e.strip_prefix(&shared)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/")
+        };
+        let names: Vec<_> = entries.iter().map(relative).collect();
         assert_eq!(
             names,
             [
-                "logs",
+                "backups/credentials-2026-10-26.ccr",
+                "locks/account-1.lock",
+                "logs/cc-rotate.log",
                 "master.key",
+                "staging/check-1-2-x",
                 "store.db",
                 "store.db-wal",
-                "store.pre-v4-backup.db"
             ]
         );
         assert_eq!(p.sessions, Sessions::Unknown, "a store that wasn't read");
         let out = run(&Fake::default(), &p, &i.ctl);
         assert!(out.failed.is_empty(), "{:?}", out.failed);
         assert_eq!(out.data_left, Some(shared.clone()));
-        let mut left: Vec<_> = std::fs::read_dir(&shared)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
+        let mut left: Vec<_> = walk(&shared).iter().map(relative).collect();
         left.sort();
-        assert_eq!(left, ["notes.txt", "photos", "restore.dbx"]);
+        assert_eq!(
+            left,
+            [
+                "logs",
+                "logs/mine.log",
+                "notes.txt",
+                "photos",
+                "store.db.json"
+            ]
+        );
+    }
+
+    fn walk(dir: &Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                found.extend(walk(&path));
+            }
+            found.push(path);
+        }
+        found
+    }
+
+    /// A step that fails keeps the programs, so running it again can finish.
+    #[test]
+    fn the_programs_stay_while_a_step_failed() {
+        let i = install();
+        let fake = Fake {
+            fail_alias: true,
+            ..Default::default()
+        };
+        let mut p = plan(&fake, &i.paths, None, &i.ctl, time::now_ms()).unwrap();
+        p.legacy_alias = vec![i.paths.home.join("profile.ps1")];
+        let out = run(&fake, &p, &i.ctl);
+        assert_eq!(out.failed.len(), 1, "{:?}", out.failed);
+        assert!(out.programs_kept);
+        assert!(i.ctl.exists());
+        assert!(!i.paths.profile_dir.exists(), "the rest went");
+    }
+
+    /// A profile that is a link is left alone: deleting the link would leave the login and the
+    /// history where it points.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_profile_is_left_alone() {
+        let i = install();
+        let real = i.paths.home.join("elsewhere");
+        std::fs::rename(&i.paths.profile_dir, &real).unwrap();
+        std::os::unix::fs::symlink(&real, &i.paths.profile_dir).unwrap();
+        let p = plan_of(&i.paths, &i.ctl);
+        let Removal::Keep(_, why) = &p.profile_dir else {
+            panic!("{:?}", p.profile_dir)
+        };
+        assert!(why.contains("elsewhere"), "{why}");
+    }
+
+    /// A settings file a dotfiles manager links in stays a link; the file it points at changes.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_settings_file_stays_a_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("dotfiles-settings.json");
+        let observe = "cc-rotate-ctl statusline --observe";
+        std::fs::write(
+            &real,
+            serde_json::json!({"statusLine": {"command": observe}, "model": "opus"}).to_string(),
+        )
+        .unwrap();
+        let link = dir.path().join("settings.json");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        restore_status_line(&link, observe, &Restore::Remove).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&real).unwrap()).unwrap();
+        assert_eq!(doc, serde_json::json!({"model": "opus"}));
     }
 
     #[test]
