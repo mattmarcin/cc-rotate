@@ -4,6 +4,7 @@ mod interrupts;
 mod process;
 mod ranking;
 mod stop_failure;
+mod uninstall;
 mod watch;
 
 use std::io::{IsTerminal, Read, Write};
@@ -200,6 +201,20 @@ enum Command {
         #[arg(long, conflicts_with = "force")]
         keep_existing: bool,
     },
+    /// Remove cc-rotate: start at login, observe mode in your other profiles, the macOS Keychain
+    /// item, the programs, the cc-rotate profile and the data folder with every saved login.
+    /// Shows what it will do and asks first.
+    Uninstall {
+        /// Only show what would be removed.
+        #[arg(long)]
+        dry_run: bool,
+        /// Don't ask before going ahead.
+        #[arg(long)]
+        yes: bool,
+        /// Go ahead even though a session in the cc-rotate profile ran in the last 2 minutes.
+        #[arg(long)]
+        force: bool,
+    },
     /// Check cc-rotate's data, the profile and Claude Code.
     Doctor {
         #[arg(long)]
@@ -270,6 +285,12 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<ExitCode> {
     match cli.command {
+        // Before anything opens the store for writing.
+        Command::Uninstall {
+            dry_run,
+            yes,
+            force,
+        } => uninstall::run(cli.profile, dry_run, yes, force),
         Command::Statusline { observe, then } => {
             statusline_entry(cli.profile, observe, then);
             Ok(ExitCode::SUCCESS)
@@ -617,7 +638,10 @@ fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> 
             println!();
         }
         Command::Dashboard => process::launch_app()?,
-        Command::Statusline { .. } | Command::Hook { .. } | Command::HerdrReport { .. } => {
+        Command::Statusline { .. }
+        | Command::Hook { .. }
+        | Command::HerdrReport { .. }
+        | Command::Uninstall { .. } => {
             unreachable!()
         }
     }

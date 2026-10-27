@@ -28,6 +28,7 @@ pub mod statusline;
 pub mod store;
 pub mod swap;
 pub mod time;
+pub mod uninstall;
 pub mod usage_check;
 pub mod usage_report;
 pub mod waiting;

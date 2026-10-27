@@ -5,6 +5,7 @@ mod login_flow;
 mod tray;
 mod watcher;
 
+use ccr_core::paths::in_build_folder;
 use tauri::{AppHandle, Manager, RunEvent, WindowEvent};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 
@@ -126,41 +127,4 @@ fn sync_autostart(app: &AppHandle) {
 pub(crate) fn autostart_exe() -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?;
     Some(exe.canonicalize().unwrap_or(exe))
-}
-
-/// Whether `exe` is a Cargo build's output (`target/<profile>/` or `target/<triple>/<profile>/`),
-/// which Cargo marks with a `CACHEDIR.TAG` in `target`, rather than an installed copy.
-fn in_build_folder(exe: &std::path::Path) -> bool {
-    exe.ancestors()
-        .skip(2)
-        .take(2)
-        .any(|dir| dir.join("CACHEDIR.TAG").is_file())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::in_build_folder;
-
-    #[test]
-    fn a_build_folder_is_told_from_an_installed_copy() {
-        let root = tempfile::tempdir().unwrap();
-        let target = root.path().join("target");
-        for dir in ["release", "x86_64-pc-windows-msvc/release"] {
-            std::fs::create_dir_all(target.join(dir)).unwrap();
-        }
-        std::fs::write(
-            target.join("CACHEDIR.TAG"),
-            "Signature: 8a477f597d28d172789f06886806bc55",
-        )
-        .unwrap();
-        let bin = root.path().join(".local/bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        assert!(in_build_folder(&target.join("release/cc-rotate-app")));
-        assert!(in_build_folder(
-            &target.join("x86_64-pc-windows-msvc/release/cc-rotate-app")
-        ));
-        assert!(!in_build_folder(&bin.join("cc-rotate-app")));
-        // A copy in the target folder itself is not a build's output.
-        assert!(!in_build_folder(&target.join("cc-rotate-app")));
-    }
 }
