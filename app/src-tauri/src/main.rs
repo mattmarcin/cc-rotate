@@ -10,6 +10,8 @@ use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 
 const MINIMIZED_ARG: &str = "--minimized";
 const META_AUTOSTART_INITIALIZED: &str = "app_autostart_initialized";
+/// The executable start at login was last pointed at by `sync_autostart`.
+pub(crate) const META_AUTOSTART_PATH: &str = "app_autostart_path";
 
 pub fn show_main(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
@@ -62,7 +64,7 @@ fn main() {
         .setup(|app| {
             tray::create(app.handle())?;
             watcher::start(app.handle().clone());
-            enable_autostart_once(app.handle());
+            sync_autostart(app.handle());
             if !std::env::args().any(|a| a == MINIMIZED_ARG) {
                 show_main(app.handle());
             }
@@ -85,21 +87,80 @@ fn main() {
 }
 
 /// The app is the only source of notifications, so it starts at login unless the user turned
-/// that off. Only the very first launch enables it; later launches respect the user's toggle.
-fn enable_autostart_once(app: &AppHandle) {
+/// that off. The first launch of an installed copy enables it; later launches respect the user's
+/// toggle, and while it is on, point it at a copy at a new path, so it follows the copy an
+/// install puts in place. Only a new path rewrites it: on Linux and macOS the desktop's own
+/// switches leave the entry in place, and writing it again would undo them. A copy run from a
+/// Cargo build folder leaves it alone: login would start a build the next build replaces, and an
+/// install could not update it.
+fn sync_autostart(app: &AppHandle) {
+    let Some(exe) = autostart_exe() else {
+        return;
+    };
+    if cfg!(debug_assertions) || in_build_folder(&exe) {
+        return;
+    }
     let Ok((store, _)) = ccr_core::open(None) else {
         return;
     };
-    if store
+    let launcher = app.autolaunch();
+    let path = exe.display().to_string();
+    let initialized = store
         .meta(META_AUTOSTART_INITIALIZED)
         .ok()
         .flatten()
-        .is_some()
-    {
-        return;
-    }
-    if !cfg!(debug_assertions) {
-        let _ = app.autolaunch().enable();
+        .is_some();
+    let registered = store.meta(META_AUTOSTART_PATH).ok().flatten();
+    let write = if !initialized {
+        true
+    } else {
+        registered.as_deref() != Some(path.as_str()) && launcher.is_enabled().unwrap_or(false)
+    };
+    if write && launcher.enable().is_ok() {
+        let _ = store.set_meta(META_AUTOSTART_PATH, &path);
     }
     let _ = store.set_meta(META_AUTOSTART_INITIALIZED, "1");
+}
+
+/// This executable with links resolved, as the plugin registers it on macOS.
+pub(crate) fn autostart_exe() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    Some(exe.canonicalize().unwrap_or(exe))
+}
+
+/// Whether `exe` is a Cargo build's output (`target/<profile>/` or `target/<triple>/<profile>/`),
+/// which Cargo marks with a `CACHEDIR.TAG` in `target`, rather than an installed copy.
+fn in_build_folder(exe: &std::path::Path) -> bool {
+    exe.ancestors()
+        .skip(2)
+        .take(2)
+        .any(|dir| dir.join("CACHEDIR.TAG").is_file())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::in_build_folder;
+
+    #[test]
+    fn a_build_folder_is_told_from_an_installed_copy() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        for dir in ["release", "x86_64-pc-windows-msvc/release"] {
+            std::fs::create_dir_all(target.join(dir)).unwrap();
+        }
+        std::fs::write(
+            target.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55",
+        )
+        .unwrap();
+        let bin = root.path().join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        assert!(in_build_folder(&target.join("release/cc-rotate-app")));
+        assert!(in_build_folder(
+            &target.join("x86_64-pc-windows-msvc/release/cc-rotate-app")
+        ));
+        assert!(!in_build_folder(&bin.join("cc-rotate-app")));
+        // A copy in the target folder itself is not a build's output.
+        assert!(!in_build_folder(&target.join("cc-rotate-app")));
+    }
 }

@@ -324,5 +324,13 @@ pub fn set_autostart(app: AppHandle, enabled: bool) -> CmdResult<()> {
     } else {
         launcher.disable()
     }
-    .map_err(err)
+    .map_err(err)?;
+    // Which copy it now starts, so an installed copy launched later points it at itself.
+    if enabled
+        && let Some(exe) = crate::autostart_exe()
+        && let Ok((store, _)) = ccr_core::open(None)
+    {
+        let _ = store.set_meta(crate::META_AUTOSTART_PATH, exe.display());
+    }
+    Ok(())
 }

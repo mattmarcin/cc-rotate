@@ -85,7 +85,7 @@ esac
 if [ "$skip_app" -eq 0 ] && pgrep -x cc-rotate-app >/dev/null 2>&1; then
   echo ""
   echo "The cc-rotate app is still running the previous version."
-  echo "Quit it from its tray menu (Quit cc-rotate) and start it again to use the new one."
+  echo "Quit it from its tray menu (Quit cc-rotate) and start $bin_dir/cc-rotate-app to use the new one."
 fi
 
 # On a Mac reached over SSH, sessions started over SSH cannot read the login Keychain.
