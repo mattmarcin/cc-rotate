@@ -1,11 +1,12 @@
 //! Removing cc-rotate (spec section 4.5): first what its install and its use leave outside its own
-//! folders (the app starting at login, the rotation profile's macOS Keychain item, observe mode in
-//! the user's other profiles, the PowerShell function older versions added), then the programs,
-//! the rotation profile and the data folder.
+//! folders (the app starting at login, the macOS Keychain items of the rotation profile and of
+//! leftover scratch profiles, observe mode in the user's other profiles, the PowerShell function
+//! older versions added, the app's webview data), then the programs, the rotation profile and the
+//! data folder.
 //!
 //! `plan` only reads; `run` carries a plan out. Whatever reaches beyond the user's files (the
-//! running app, start at login, the Keychain) goes through `System`, so tests can never touch the
-//! real install.
+//! running app, start at login, the Keychain, the PowerShell profiles, the app's webview data)
+//! goes through `System`, so tests can never touch the real install.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -14,16 +15,20 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value};
 
 use crate::credstore::Credentials;
-use crate::paths::{Paths, in_build_folder};
+use crate::paths::{Paths, in_build_folder, legacy_lock_for};
 use crate::store::Store;
-use crate::{credfile, profiles, setup, statusline, time};
+use crate::{credfile, profiles, secret, setup, statusline, time};
 
 /// The name the app registers to start at login under (the Windows `Run` value, the macOS
 /// LaunchAgent label and plist, the Linux `.desktop` file), and its executable's name.
 pub const AUTOSTART_NAME: &str = "cc-rotate";
 pub const APP_NAME: &str = "cc-rotate-app";
+/// The app's identifier (`tauri.conf.json`), which names the folders its webview keeps data in.
+pub const APP_IDENTIFIER: &str = "com.ccrotate.app";
 /// The programs an install puts in its folder (`scripts/install.*`).
 pub const PROGRAMS: [&str; 3] = ["cc-rotate", "cc-rotate-ctl", "cc-rotate-app"];
+/// The data folder's name where cc-rotate puts it (`Paths::default_data_dir`).
+const DATA_DIR_NAME: &str = "cc-rotate";
 
 /// A status line tick within this long means a session in the cc-rotate profile is open: open
 /// sessions tick at least every 30 s (`refreshInterval`), idle or not.
@@ -36,22 +41,47 @@ pub struct Plan {
     pub autostart: Option<String>,
     /// An entry by that name that is not the app's, left alone.
     pub autostart_foreign: Option<String>,
+    /// The rotation profile's folder, whether it is there or not.
+    pub profile: PathBuf,
+    /// The rotation profile's login in the macOS Keychain.
     pub keychain: KeychainItem,
+    /// Leftover scratch profiles (`staging/`) whose login is in the macOS Keychain.
+    pub staging_items: Vec<PathBuf>,
     /// Other profiles whose status line runs cc-rotate in observe mode.
     pub observe: Vec<ObserveMode>,
     /// PowerShell profiles that still define the function older versions added.
     pub legacy_alias: Vec<PathBuf>,
     pub profile_dir: Removal,
-    pub data_dir: Removal,
+    pub data_dir: DataRemoval,
+    /// The folders the app's webview keeps its data in.
+    pub app_data: Vec<PathBuf>,
     /// The installed programs, and copies earlier upgrades renamed aside (Windows).
     pub programs: Vec<PathBuf>,
     /// Why the programs are left alone, when they are.
     pub programs_kept: Option<String>,
-    /// A session in the cc-rotate profile ticked within `SESSION_OPEN_MS`.
-    pub sessions_open: bool,
+    pub sessions: Sessions,
 }
 
-/// The rotation profile's login in the macOS Keychain (`credstore`).
+impl Plan {
+    /// Whether `run` deletes the rotation profile's Keychain item: it is there, and the profile
+    /// goes too or is gone already.
+    pub fn deletes_keychain_item(&self) -> bool {
+        matches!(self.keychain, KeychainItem::Present(_))
+            && !matches!(self.profile_dir, Removal::Keep(..))
+    }
+}
+
+/// Whether sessions in the cc-rotate profile are open (`SESSION_OPEN_MS`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum Sessions {
+    #[default]
+    Closed,
+    Open,
+    /// The store could not be read to tell.
+    Unknown,
+}
+
+/// A login in the macOS Keychain (`credstore`).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub enum KeychainItem {
     /// Not macOS, or nothing there.
@@ -71,10 +101,23 @@ pub enum Removal {
     Keep(PathBuf, String),
 }
 
+/// The data folder: deleted whole when it is cc-rotate's own, else only cc-rotate's entries in it
+/// (the folder goes too if that empties it).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub enum DataRemoval {
+    #[default]
+    Absent,
+    Whole(PathBuf),
+    Entries(PathBuf, Vec<PathBuf>),
+    Keep(PathBuf, String),
+}
+
 /// A profile whose status line runs `cc-rotate-ctl statusline --observe`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObserveMode {
     pub settings: PathBuf,
+    /// The status line command as it is now; `run` changes it only if it still is.
+    pub command: String,
     pub restore: Restore,
 }
 
@@ -85,7 +128,8 @@ pub enum Restore {
     Remove,
     /// The command observe mode ran after cc-rotate's (`--then`) becomes the status line.
     Command(String),
-    /// A `--then` that cannot be taken out reliably: the user changes it.
+    /// More than cc-rotate's observe mode, or written in a way not taken apart: the user changes
+    /// it.
     ByHand,
 }
 
@@ -95,11 +139,13 @@ pub struct Outcome {
     pub done: Vec<String>,
     pub failed: Vec<String>,
     /// This program, which Windows will not delete while it runs: renamed aside, and deleted by
-    /// a helper a few seconds after this process exits.
+    /// a helper once this process exits.
     pub deleted_later: Vec<PathBuf>,
     /// Programs another process still runs (an open session), renamed aside: the helper tries
-    /// them too, but they may still run then, so the user deletes what is left.
+    /// them too for a minute, but they may still run then, so the user deletes what is left.
     pub left: Vec<PathBuf>,
+    /// What stays in a data folder that held more than cc-rotate's files.
+    pub data_left: Option<PathBuf>,
 }
 
 /// Whatever reaches beyond the user's files.
@@ -110,11 +156,14 @@ pub trait System {
     fn remove_autostart(&self) -> Result<()>;
     /// Quit the app, if it runs.
     fn stop_app(&self) -> Result<()>;
+    /// The Keychain item of the profile Claude Code runs with `CLAUDE_CONFIG_DIR=<profile>`.
     fn keychain(&self, profile: &Path) -> Result<KeychainItem>;
     fn delete_keychain_item(&self, profile: &Path) -> Result<()>;
     /// PowerShell profiles with the function older versions added (`setup`).
     fn legacy_alias(&self) -> Vec<PathBuf>;
     fn remove_legacy_alias(&self) -> Result<()>;
+    /// The folders the app's webview keeps its data in, those that are there.
+    fn app_data(&self) -> Vec<PathBuf>;
 }
 
 /// The real system, for the names and places an install uses. Tests point it at names and places
@@ -128,12 +177,32 @@ pub struct RealSystem {
     /// macOS: where LaunchAgents live; whether to unload the agent with `launchctl`.
     pub launch_agents: PathBuf,
     pub launchctl: bool,
-    /// Linux: the XDG autostart folder.
+    /// Linux: the autostart folder the app writes to (`~/.config/autostart`, whatever
+    /// `XDG_CONFIG_HOME` says, as the `auto-launch` crate does).
     pub xdg_autostart: PathBuf,
+    /// Where the app's webview may keep data.
+    pub app_data: Vec<PathBuf>,
 }
 
 impl RealSystem {
     pub fn installed(home: &Path) -> RealSystem {
+        let mut app_data = Vec::new();
+        if cfg!(target_os = "macos") {
+            let library = home.join("Library");
+            for dir in ["WebKit", "Caches", "Application Support"] {
+                app_data.push(library.join(dir).join(APP_IDENTIFIER));
+            }
+        } else {
+            for base in [dirs::data_local_dir(), dirs::data_dir(), dirs::cache_dir()]
+                .into_iter()
+                .flatten()
+            {
+                let dir = base.join(APP_IDENTIFIER);
+                if !app_data.contains(&dir) {
+                    app_data.push(dir);
+                }
+            }
+        }
         RealSystem {
             autostart_name: AUTOSTART_NAME.into(),
             app_name: APP_NAME.into(),
@@ -142,9 +211,8 @@ impl RealSystem {
                 .into(),
             launch_agents: home.join("Library").join("LaunchAgents"),
             launchctl: true,
-            xdg_autostart: dirs::config_dir()
-                .unwrap_or_else(|| home.join(".config"))
-                .join("autostart"),
+            xdg_autostart: home.join(".config").join("autostart"),
+            app_data,
         }
     }
 
@@ -256,7 +324,7 @@ impl System for RealSystem {
             }
             Some(1) if !cfg!(windows) => Ok(()),
             Some(128) if cfg!(windows) => Ok(()),
-            other => bail!("couldn't stop {} (exit {other:?})", self.app_name),
+            other => bail!("exit {other:?}"),
         }
     }
 
@@ -286,6 +354,14 @@ impl System for RealSystem {
     fn remove_legacy_alias(&self) -> Result<()> {
         setup::remove_powershell_alias().map(|_| ())
     }
+
+    fn app_data(&self) -> Vec<PathBuf> {
+        self.app_data
+            .iter()
+            .filter(|d| d.is_dir())
+            .cloned()
+            .collect()
+    }
 }
 
 #[cfg(unix)]
@@ -299,9 +375,9 @@ fn uid() -> u32 {
     0
 }
 
-/// What removing cc-rotate would do. Reads only; `store` is the store opened read-only, if there
-/// is one; `bin_dir` is where the running `cc-rotate-ctl` is (the install folder), with
-/// `this_exe` the running program itself.
+/// What removing cc-rotate would do. Reads only. `store` is the store opened read-only, `None`
+/// when there is none or it could not be read; `this_exe` is the running `cc-rotate-ctl`, whose
+/// folder is the install folder.
 pub fn plan(
     system: &dyn System,
     paths: &Paths,
@@ -309,7 +385,10 @@ pub fn plan(
     this_exe: &Path,
     now_ms: i64,
 ) -> Result<Plan> {
-    let mut plan = Plan::default();
+    let mut plan = Plan {
+        profile: paths.profile_dir.clone(),
+        ..Default::default()
+    };
     match system.autostart()? {
         Some((entry, true)) => plan.autostart = Some(entry),
         Some((entry, false)) => plan.autostart_foreign = Some(entry),
@@ -319,12 +398,27 @@ pub fn plan(
     plan.observe = observe_modes(paths)?;
     plan.legacy_alias = system.legacy_alias();
     plan.profile_dir = profile_removal(paths);
-    plan.data_dir = data_removal(paths);
-    if let Some(store) = store {
-        plan.sessions_open = store
-            .meta_i64(statusline::META_LAST_TICK_AT)?
-            .is_some_and(|t| now_ms - t < SESSION_OPEN_MS);
+    plan.data_dir = data_removal(paths)?;
+    if !matches!(plan.data_dir, DataRemoval::Absent | DataRemoval::Keep(..)) {
+        for dir in subfolders(&paths.staging_root()) {
+            if matches!(system.keychain(&dir)?, KeychainItem::Present(_)) {
+                plan.staging_items.push(dir);
+            }
+        }
     }
+    plan.app_data = system.app_data();
+    plan.sessions = match store {
+        Some(store) => {
+            let ticked = store.meta_i64(statusline::META_LAST_TICK_AT)?;
+            if ticked.is_some_and(|t| now_ms - t < SESSION_OPEN_MS) {
+                Sessions::Open
+            } else {
+                Sessions::Closed
+            }
+        }
+        None if paths.store_db().exists() => Sessions::Unknown,
+        None => Sessions::Closed,
+    };
     if in_build_folder(this_exe) {
         plan.programs_kept = Some(format!(
             "{} is a build's output, not an install",
@@ -334,6 +428,19 @@ pub fn plan(
         plan.programs = programs_in(dir)?;
     }
     Ok(plan)
+}
+
+fn subfolders(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| e.path())
+        .collect();
+    found.sort();
+    found
 }
 
 /// The installed programs in `dir`, and (Windows) the copies upgrades renamed aside while they
@@ -379,22 +486,59 @@ fn profile_removal(paths: &Paths) -> Removal {
     Removal::Delete(dir.clone())
 }
 
-/// The data folder, unless it does not hold cc-rotate's store or key.
-fn data_removal(paths: &Paths) -> Removal {
+/// The data folder: whole when it is named as cc-rotate names it and holds its store or key;
+/// otherwise (`CC_ROTATE_DATA_DIR` pointing at a folder of the user's) only cc-rotate's entries.
+fn data_removal(paths: &Paths) -> Result<DataRemoval> {
     let dir = &paths.data_dir;
     if !dir.exists() {
-        return Removal::Absent;
+        return Ok(DataRemoval::Absent);
     }
-    if is_home_or_root(dir, &paths.home) {
-        return Removal::Keep(dir.clone(), "it is not a folder cc-rotate made".into());
+    if is_home_or_root(dir, &paths.home) || profiles::is_default_profile(dir, &paths.home) {
+        return Ok(DataRemoval::Keep(
+            dir.clone(),
+            "it is not a folder cc-rotate made".into(),
+        ));
     }
-    if !dir.join("store.db").exists() && !dir.join("master.key").exists() {
-        return Removal::Keep(
+    let entries = data_entries(dir)?;
+    let holds_store = entries.iter().any(|e| {
+        e.file_name()
+            .is_some_and(|n| n == "store.db" || n == secret::KEY_FILE)
+    });
+    if !holds_store {
+        return Ok(DataRemoval::Keep(
             dir.clone(),
             "it holds neither cc-rotate's store nor its key".into(),
-        );
+        ));
     }
-    Removal::Delete(dir.clone())
+    if dir.file_name().is_some_and(|n| n == DATA_DIR_NAME) {
+        Ok(DataRemoval::Whole(dir.clone()))
+    } else {
+        Ok(DataRemoval::Entries(dir.clone(), entries))
+    }
+}
+
+/// cc-rotate's own entries in a data folder: the store with its journal files and the copies
+/// upgrades saved (`store.<...>.db`), the key, and its lock, scratch, backup and log folders.
+fn data_entries(dir: &Path) -> Result<Vec<PathBuf>> {
+    const OWN: [&str; 6] = [
+        "swap.lock",
+        "locks",
+        "staging",
+        "backups",
+        "logs",
+        "store.db",
+    ];
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let store_file = name.starts_with("store.") && name.contains(".db");
+        if OWN.contains(&name.as_str()) || name == secret::KEY_FILE || store_file {
+            found.push(entry.path());
+        }
+    }
+    found.sort();
+    Ok(found)
 }
 
 fn is_home_or_root(dir: &Path, home: &Path) -> bool {
@@ -408,9 +552,12 @@ fn runs_cc_rotate(dir: &Path) -> bool {
     let Ok(Some(settings)) = credfile::read_document(&dir.join("settings.json")) else {
         return false;
     };
-    status_command(&settings).is_some_and(|c| {
-        c.contains("cc-rotate-ctl") && c.contains("statusline") && !c.contains("--observe")
-    })
+    status_command(&settings)
+        .and_then(ctl_args)
+        .is_some_and(|args| {
+            args.first().is_some_and(|a| a == "statusline")
+                && !args.iter().any(|a| a == "--observe")
+        })
 }
 
 fn status_command(settings: &Map<String, Value>) -> Option<&str> {
@@ -418,6 +565,85 @@ fn status_command(settings: &Map<String, Value>) -> Option<&str> {
         .get("statusLine")
         .and_then(|s| s.get("command"))
         .and_then(Value::as_str)
+}
+
+/// The arguments of a command that only runs `cc-rotate-ctl` (setup may write its path in the
+/// Windows 8.3 form), without the global `--profile <dir>`; `None` for anything else.
+fn ctl_args(command: &str) -> Option<Vec<String>> {
+    let mut words = shell_words(command)?.into_iter();
+    if !is_ctl(&words.next()?) {
+        return None;
+    }
+    let mut args = Vec::new();
+    while let Some(word) = words.next() {
+        if word == "--profile" {
+            words.next()?;
+        } else if !word.starts_with("--profile=") {
+            args.push(word);
+        }
+    }
+    Some(args)
+}
+
+/// Whether `program` names `cc-rotate-ctl`.
+fn is_ctl(program: &str) -> bool {
+    let named = |path: &Path| {
+        path.file_stem().is_some_and(|s| {
+            let s = s.to_string_lossy();
+            if cfg!(windows) {
+                s.eq_ignore_ascii_case("cc-rotate-ctl")
+            } else {
+                s == "cc-rotate-ctl"
+            }
+        })
+    };
+    let path = Path::new(program);
+    // A short name (`CC-ROT~1.EXE`) says what it is once resolved.
+    named(path) || (cfg!(windows) && dunce::canonicalize(path).is_ok_and(|p| named(&p)))
+}
+
+/// The words of a simple command: separated by whitespace, with single quotes taken literally and
+/// double quotes allowing `\"` and `\\`. `None` when it is more than one simple command (pipes,
+/// `;`, `&&`, redirections, substitutions) or a quote is not closed.
+fn shell_words(command: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut word: Option<String> = None;
+    let mut chars = command.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            c if c.is_whitespace() => words.extend(word.take()),
+            '\'' => {
+                let w = word.get_or_insert_with(String::new);
+                loop {
+                    match chars.next()? {
+                        '\'' => break,
+                        c => w.push(c),
+                    }
+                }
+            }
+            '"' => {
+                let w = word.get_or_insert_with(String::new);
+                loop {
+                    match chars.next()? {
+                        '"' => break,
+                        '\\' => match chars.next()? {
+                            n @ ('"' | '\\') => w.push(n),
+                            n => {
+                                w.push('\\');
+                                w.push(n);
+                            }
+                        },
+                        '$' | '`' => return None,
+                        c => w.push(c),
+                    }
+                }
+            }
+            '|' | '&' | ';' | '<' | '>' | '(' | ')' | '$' | '`' => return None,
+            c => word.get_or_insert_with(String::new).push(c),
+        }
+    }
+    words.extend(word);
+    Some(words)
 }
 
 /// The settings files of other profiles whose status line runs cc-rotate in observe mode.
@@ -434,112 +660,169 @@ fn observe_modes(paths: &Paths) -> Result<Vec<ObserveMode>> {
             let Ok(Some(doc)) = credfile::read_document(&settings) else {
                 continue;
             };
-            if let Some(restore) = status_command(&doc).and_then(restore_for) {
-                found.push(ObserveMode { settings, restore });
+            let Some(command) = status_command(&doc) else {
+                continue;
+            };
+            if let Some(restore) = restore_for(command) {
+                found.push(ObserveMode {
+                    settings,
+                    command: command.to_string(),
+                    restore,
+                });
             }
         }
     }
     Ok(found)
 }
 
-/// How to restore a status line `command` that runs cc-rotate in observe mode, if it does.
+/// How to restore a status line `command` that runs cc-rotate in observe mode, if it does. Only a
+/// command that is exactly `cc-rotate-ctl [--profile <dir>] statusline --observe [--then <one
+/// word>]` is taken apart; anything else that mentions observe mode is left for the user.
 pub fn restore_for(command: &str) -> Option<Restore> {
-    if !(command.contains("cc-rotate-ctl")
+    let mentions = command.contains("cc-rotate-ctl")
         && command.contains("statusline")
-        && command.contains("--observe"))
-    {
+        && command.contains("--observe");
+    let Some(args) = ctl_args(command) else {
+        return mentions.then_some(Restore::ByHand);
+    };
+    let mut args = args.into_iter();
+    if args.next().as_deref() != Some("statusline") {
+        return mentions.then_some(Restore::ByHand);
+    }
+    let (mut observe, mut then) = (false, None);
+    while let Some(arg) = args.next() {
+        if arg == "--observe" {
+            observe = true;
+        } else if arg == "--then" {
+            match args.next() {
+                Some(next) => then = Some(next),
+                None => return Some(Restore::ByHand),
+            }
+        } else if let Some(value) = arg.strip_prefix("--then=") {
+            then = Some(value.to_string());
+        } else {
+            return mentions.then_some(Restore::ByHand);
+        }
+    }
+    if !observe {
         return None;
     }
-    let Some(at) = command.find("--then") else {
-        return Some(Restore::Remove);
-    };
-    let rest = command[at + "--then".len()..].trim_start();
-    let rest = rest.strip_prefix('=').unwrap_or(rest).trim_end();
-    Some(match unquote(rest) {
-        Some(inner) if !inner.trim().is_empty() => Restore::Command(inner),
-        _ => Restore::ByHand,
+    Some(match then {
+        None => Restore::Remove,
+        Some(then) if then.trim().is_empty() => Restore::ByHand,
+        Some(then) => Restore::Command(then),
     })
 }
 
-/// One shell word, as written after `--then`: double-quoted (with `\"` and `\\` inside),
-/// single-quoted, or bare. Anything more than one word is not taken apart.
-fn unquote(word: &str) -> Option<String> {
-    if let Some(body) = word.strip_prefix('"') {
-        let mut out = String::new();
-        let mut chars = body.chars();
-        while let Some(c) = chars.next() {
-            match c {
-                '\\' => match chars.next() {
-                    Some(n @ ('"' | '\\')) => out.push(n),
-                    Some(n) => {
-                        out.push('\\');
-                        out.push(n);
-                    }
-                    None => return None,
-                },
-                '"' => return chars.as_str().is_empty().then_some(out),
-                c => out.push(c),
-            }
-        }
-        None
-    } else if let Some(body) = word.strip_prefix('\'') {
-        let inner = body.strip_suffix('\'')?;
-        (!inner.contains('\'')).then(|| inner.to_string())
-    } else {
-        let bare = !word.is_empty()
-            && !word
-                .chars()
-                .any(|c| c.is_whitespace() || c == '"' || c == '\'');
-        bare.then(|| word.to_string())
-    }
-}
-
-/// Carry out `plan`, step by step, going on past a step that fails. `store` must be closed
+/// Carry out `plan`, step by step, going on past a step that fails. The store must be closed
 /// already (the data folder is deleted). On Windows, programs in use are renamed aside and
 /// deleted by a helper once free (`Outcome::deleted_later`), or left for the user.
 pub fn run(system: &dyn System, plan: &Plan, this_exe: &Path) -> Outcome {
     let mut out = Outcome::default();
-    let mut step = |what: String, result: Result<()>| match result {
-        Ok(()) => out.done.push(what),
-        Err(e) => out.failed.push(format!("{what}: {e:#}")),
+    let mut data_left = None;
+    let mut step = |done: String, failing: String, result: Result<()>| match result {
+        Ok(()) => out.done.push(done),
+        Err(e) => out.failed.push(format!("{failing}: {e:#}")),
     };
-    step("Quit the cc-rotate app".into(), system.stop_app());
+    step(
+        "Quit the cc-rotate app".into(),
+        "Quitting the cc-rotate app".into(),
+        system.stop_app(),
+    );
     if let Some(entry) = &plan.autostart {
         step(
             format!("Removed start at login ({entry})"),
+            format!("Removing start at login ({entry})"),
             system.remove_autostart(),
         );
     }
-    for observe in &plan.observe {
-        if observe.restore != Restore::ByHand {
+    for o in &plan.observe {
+        if o.restore != Restore::ByHand {
+            let settings = o.settings.display();
             step(
-                format!("Took observe mode out of {}", observe.settings.display()),
-                restore_status_line(&observe.settings, &observe.restore),
+                format!(
+                    "Took observe mode out of {settings} (it was: {})",
+                    o.command
+                ),
+                format!("Taking observe mode out of {settings}"),
+                restore_status_line(&o.settings, &o.command, &o.restore),
             );
         }
     }
     if !plan.legacy_alias.is_empty() {
         step(
             "Removed the old cc-rotate PowerShell function".into(),
+            "Removing the old cc-rotate PowerShell function".into(),
             system.remove_legacy_alias(),
         );
     }
-    if let (KeychainItem::Present(service), Removal::Delete(dir)) =
-        (&plan.keychain, &plan.profile_dir)
+    if plan.deletes_keychain_item()
+        && let KeychainItem::Present(service) = &plan.keychain
     {
         step(
             format!("Deleted the Keychain item \"{service}\""),
+            format!("Deleting the Keychain item \"{service}\""),
+            system.delete_keychain_item(&plan.profile),
+        );
+    }
+    for dir in &plan.staging_items {
+        step(
+            format!("Deleted the Keychain item of {}", dir.display()),
+            format!("Deleting the Keychain item of {}", dir.display()),
             system.delete_keychain_item(dir),
         );
     }
-    for removal in [&plan.profile_dir, &plan.data_dir] {
-        if let Removal::Delete(dir) = removal {
+    if let Removal::Delete(dir) = &plan.profile_dir {
+        step(
+            format!("Deleted {}", dir.display()),
+            format!("Deleting {}", dir.display()),
+            remove_dir(dir),
+        );
+        // Claude Code's lock beside it (`paths::legacy_lock_for`).
+        let lock = legacy_lock_for(dir);
+        if lock.exists() {
             step(
-                format!("Deleted {}", dir.display()),
-                std::fs::remove_dir_all(dir).with_context(|| format!("deleting {}", dir.display())),
+                format!("Deleted {}", lock.display()),
+                format!("Deleting {}", lock.display()),
+                remove_any(&lock),
             );
         }
     }
+    match &plan.data_dir {
+        DataRemoval::Whole(dir) => step(
+            format!("Deleted {}", dir.display()),
+            format!("Deleting {}", dir.display()),
+            remove_dir(dir),
+        ),
+        DataRemoval::Entries(dir, entries) => {
+            for entry in entries {
+                step(
+                    format!("Deleted {}", entry.display()),
+                    format!("Deleting {}", entry.display()),
+                    remove_any(entry),
+                );
+            }
+            let empty = std::fs::read_dir(dir).is_ok_and(|mut d| d.next().is_none());
+            if empty {
+                step(
+                    format!("Deleted {}", dir.display()),
+                    format!("Deleting {}", dir.display()),
+                    std::fs::remove_dir(dir).map_err(Into::into),
+                );
+            } else if dir.exists() {
+                data_left = Some(dir.clone());
+            }
+        }
+        DataRemoval::Absent | DataRemoval::Keep(..) => {}
+    }
+    for dir in &plan.app_data {
+        step(
+            format!("Deleted {}", dir.display()),
+            format!("Deleting {}", dir.display()),
+            remove_dir(dir),
+        );
+    }
+    out.data_left = data_left;
     let mut aside = Vec::new();
     for program in &plan.programs {
         match std::fs::remove_file(program) {
@@ -570,6 +853,23 @@ pub fn run(system: &dyn System, plan: &Plan, this_exe: &Path) -> Outcome {
     out
 }
 
+/// Delete a folder; one already gone (it was inside another) is fine.
+fn remove_dir(dir: &Path) -> Result<()> {
+    match std::fs::remove_dir_all(dir) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
+    }
+}
+
+fn remove_any(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.is_dir() => remove_dir(path),
+        Ok(_) => std::fs::remove_file(path).map_err(Into::into),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 fn rename_aside(program: &Path) -> Result<PathBuf> {
     let renamed = PathBuf::from(format!("{}.{}.old", program.display(), time::now_ms()));
     std::fs::rename(program, &renamed)
@@ -577,33 +877,45 @@ fn rename_aside(program: &Path) -> Result<PathBuf> {
     Ok(renamed)
 }
 
-/// Delete `files` a few seconds after this process exits (Windows only lets a running program's
-/// file go then), with a `cmd` started on its own. Paths `cmd` would read specially are refused.
+/// Delete `files` once they are free (Windows only lets a running program's file go once it
+/// exits), with a `cmd` started on its own that tries every second for a minute. The paths reach
+/// it through its environment, so no character in them means anything to `cmd`.
 #[cfg(windows)]
 fn delete_after_exit(files: &[PathBuf]) -> Result<()> {
     use std::os::windows::process::CommandExt;
     const DETACHED_PROCESS: u32 = 0x0000_0008;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let mut quoted = Vec::new();
-    for file in files {
-        let text = file.display().to_string();
-        if text.chars().any(|c| "\"%^&|<>!".contains(c)) {
-            bail!("{text} has a character cmd treats specially");
-        }
-        quoted.push(format!("\"{text}\""));
-    }
+    // Outliving a job that kills its processes when this one ends (some terminals, CI).
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+    let vars: Vec<String> = (1..=files.len())
+        .map(|i| format!("CCR_DELETE_{i}"))
+        .collect();
+    let quoted: Vec<String> = vars.iter().map(|v| format!("\"%{v}%\"")).collect();
+    let gone: String = quoted
+        .iter()
+        .map(|q| format!("if not exist {q} "))
+        .collect();
+    let script = format!(
+        "/d /c for /l %i in (1,1,60) do @(ping -n 2 127.0.0.1 >nul & del /f /q {} 2>nul & {gone}exit)",
+        quoted.join(" ")
+    );
     let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
-    std::process::Command::new(PathBuf::from(root).join("System32").join("cmd.exe"))
-        .raw_arg(format!(
-            "/d /c ping -n 4 127.0.0.1 >nul & del /f /q {}",
-            quoted.join(" ")
-        ))
-        .current_dir(std::env::temp_dir())
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW)
-        .spawn()
+    let spawn = |flags: u32| {
+        let mut cmd =
+            std::process::Command::new(PathBuf::from(&root).join("System32").join("cmd.exe"));
+        cmd.raw_arg(&script)
+            .current_dir(std::env::temp_dir())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(flags);
+        for (var, file) in vars.iter().zip(files) {
+            cmd.env(var, file);
+        }
+        cmd.spawn()
+    };
+    spawn(DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB)
+        .or_else(|_| spawn(DETACHED_PROCESS | CREATE_NO_WINDOW))
         .context("starting the helper that deletes the programs")?;
     Ok(())
 }
@@ -613,21 +925,24 @@ fn delete_after_exit(_files: &[PathBuf]) -> Result<()> {
     bail!("only Windows needs this")
 }
 
-/// Take observe mode out of a profile's status line: drop it, or put back the command it ran
-/// after cc-rotate's. Everything else in the file stays as it is.
-pub fn restore_status_line(settings: &Path, restore: &Restore) -> Result<()> {
+/// Take observe mode out of a profile's status line, if it is still `command`: drop it, or put
+/// back the command it ran after cc-rotate's. Everything else in the file stays as it is.
+pub fn restore_status_line(settings: &Path, command: &str, restore: &Restore) -> Result<()> {
     let mut doc = credfile::read_document(settings)?
         .with_context(|| format!("{} is gone", settings.display()))?;
+    if status_command(&doc) != Some(command) {
+        bail!("its status line changed since; change it by hand");
+    }
     match restore {
         Restore::Remove => {
             doc.remove("statusLine");
         }
-        Restore::Command(command) => {
+        Restore::Command(then) => {
             let status = doc
                 .get_mut("statusLine")
                 .and_then(Value::as_object_mut)
                 .context("statusLine is not an object")?;
-            status.insert("command".into(), Value::String(command.clone()));
+            status.insert("command".into(), Value::String(then.clone()));
         }
         Restore::ByHand => bail!("the status line has to be changed by hand"),
     }
@@ -642,7 +957,9 @@ mod registry {
     use std::io;
     use std::ptr::null_mut;
 
-    use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
+    use windows_sys::Win32::Foundation::{
+        ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, ERROR_UNSUPPORTED_TYPE,
+    };
     use windows_sys::Win32::System::Registry::{
         HKEY_CURRENT_USER, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW,
     };
@@ -651,7 +968,8 @@ mod registry {
         text.encode_utf16().chain(Some(0)).collect()
     }
 
-    /// The string value `name` of `key`, if it is there.
+    /// The string value `name` of `key`, if it is there; a value of another type reads as a
+    /// description of it, which names no program.
     pub fn read(key: &str, name: &str) -> io::Result<Option<String>> {
         let (key, name) = (wide(key), wide(name));
         let mut size = 0u32;
@@ -667,11 +985,11 @@ mod registry {
                 &mut size,
             )
         };
-        if rc == ERROR_FILE_NOT_FOUND {
-            return Ok(None);
-        }
-        if rc != ERROR_SUCCESS {
-            return Err(io::Error::from_raw_os_error(rc as i32));
+        match rc {
+            ERROR_SUCCESS => {}
+            ERROR_FILE_NOT_FOUND => return Ok(None),
+            ERROR_UNSUPPORTED_TYPE => return Ok(Some("a value that is not text".into())),
+            rc => return Err(io::Error::from_raw_os_error(rc as i32)),
         }
         let mut buf = vec![0u16; (size as usize).div_ceil(2) + 1];
         let mut size = (buf.len() * 2) as u32;
@@ -687,11 +1005,10 @@ mod registry {
                 &mut size,
             )
         };
-        if rc == ERROR_FILE_NOT_FOUND {
-            return Ok(None);
-        }
-        if rc != ERROR_SUCCESS {
-            return Err(io::Error::from_raw_os_error(rc as i32));
+        match rc {
+            ERROR_SUCCESS => {}
+            ERROR_FILE_NOT_FOUND => return Ok(None),
+            rc => return Err(io::Error::from_raw_os_error(rc as i32)),
         }
         let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
         Ok(Some(String::from_utf16_lossy(&buf[..len])))
@@ -732,16 +1049,20 @@ mod tests {
             Some(Restore::Remove)
         );
         assert_eq!(
+            r("cc-rotate-ctl --profile /p statusline --observe"),
+            Some(Restore::Remove)
+        );
+        assert_eq!(
             r(r#"cc-rotate-ctl statusline --observe --then "node /path/to/statusline.js""#),
             Some(Restore::Command("node /path/to/statusline.js".into()))
         );
         assert_eq!(
-            r(r#"cc-rotate-ctl statusline --observe --then "node \"my line.js\"""#),
+            r(r#"cc-rotate-ctl statusline --then "node \"my line.js\"" --observe"#),
             Some(Restore::Command(r#"node "my line.js""#.into()))
         );
         assert_eq!(
-            r("cc-rotate-ctl statusline --observe --then 'bash ~/line.sh'"),
-            Some(Restore::Command("bash ~/line.sh".into()))
+            r("cc-rotate-ctl statusline --observe --then 'bash ~/line.sh | cut -c1-80'"),
+            Some(Restore::Command("bash ~/line.sh | cut -c1-80".into()))
         );
         assert_eq!(
             r("cc-rotate-ctl statusline --observe --then=starship"),
@@ -750,30 +1071,36 @@ mod tests {
         for by_hand in [
             "cc-rotate-ctl statusline --observe --then node line.js",
             r#"cc-rotate-ctl statusline --observe --then "node" --verbose"#,
-            "cc-rotate-ctl statusline --observe --then 'it'\\''s'",
             "cc-rotate-ctl statusline --observe --then",
+            "cc-rotate-ctl statusline --observe | ccstatusline",
+            "cc-rotate-ctl statusline --observe >/dev/null; starship prompt",
+            "FOO=1 cc-rotate-ctl statusline --observe",
+            "sh -c 'cc-rotate-ctl statusline --observe'",
+            "cc-rotate-ctl statusline --observe --then \"unclosed",
         ] {
             assert_eq!(r(by_hand), Some(Restore::ByHand), "{by_hand}");
         }
     }
 
     #[test]
-    fn a_status_line_is_restored_and_the_rest_kept() {
+    fn a_status_line_is_restored_only_while_it_is_what_was_planned() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("settings.json");
+        let observe = "cc-rotate-ctl statusline --observe --then \"node a.js\"";
         let write = |v: Value| std::fs::write(&file, v.to_string()).unwrap();
         let read =
             || -> Value { serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap() };
         write(serde_json::json!({
             "model": "opus",
-            "statusLine": {"type": "command", "command": "cc-rotate-ctl statusline --observe --then \"node a.js\"", "padding": 1}
+            "statusLine": {"type": "command", "command": observe, "padding": 1}
         }));
-        restore_status_line(&file, &Restore::Command("node a.js".into())).unwrap();
+        assert!(restore_status_line(&file, "something else", &Restore::Remove).is_err());
+        restore_status_line(&file, observe, &Restore::Command("node a.js".into())).unwrap();
         assert_eq!(
             read(),
             serde_json::json!({"model": "opus", "statusLine": {"type": "command", "command": "node a.js", "padding": 1}})
         );
-        restore_status_line(&file, &Restore::Remove).unwrap();
+        restore_status_line(&file, "node a.js", &Restore::Remove).unwrap();
         assert_eq!(read(), serde_json::json!({"model": "opus"}));
     }
 
@@ -803,6 +1130,8 @@ mod tests {
     struct Fake {
         autostart: Option<(String, bool)>,
         keychain: KeychainItem,
+        /// Keychain items of other profiles (scratch ones) that are there.
+        items: Vec<PathBuf>,
         calls: std::cell::RefCell<Vec<String>>,
     }
 
@@ -818,11 +1147,20 @@ mod tests {
             self.calls.borrow_mut().push("stop_app".into());
             Ok(())
         }
-        fn keychain(&self, _profile: &Path) -> Result<KeychainItem> {
-            Ok(self.keychain.clone())
+        fn keychain(&self, profile: &Path) -> Result<KeychainItem> {
+            Ok(if self.items.iter().any(|p| p == profile) {
+                KeychainItem::Present("scratch".into())
+            } else if profile.ends_with(".claude-rotate") {
+                self.keychain.clone()
+            } else {
+                KeychainItem::None
+            })
         }
-        fn delete_keychain_item(&self, _profile: &Path) -> Result<()> {
-            self.calls.borrow_mut().push("delete_keychain_item".into());
+        fn delete_keychain_item(&self, profile: &Path) -> Result<()> {
+            let name = profile.file_name().unwrap_or_default().to_string_lossy();
+            self.calls
+                .borrow_mut()
+                .push(format!("delete_keychain_item {name}"));
             Ok(())
         }
         fn legacy_alias(&self) -> Vec<PathBuf> {
@@ -831,6 +1169,9 @@ mod tests {
         fn remove_legacy_alias(&self) -> Result<()> {
             self.calls.borrow_mut().push("remove_legacy_alias".into());
             Ok(())
+        }
+        fn app_data(&self) -> Vec<PathBuf> {
+            Vec::new()
         }
     }
 
@@ -847,7 +1188,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("home");
         let profile = home.join(".claude-rotate");
-        let data = root.path().join("data");
+        let data = root.path().join("local").join(DATA_DIR_NAME);
         let bin = home.join(".local").join("bin");
         for dir in [
             &profile,
@@ -873,8 +1214,7 @@ mod tests {
             r#"{"model": "opus"}"#,
         )
         .unwrap();
-        let store = Store::open(&data.join("store.db")).unwrap();
-        drop(store);
+        drop(Store::open(&data.join("store.db")).unwrap());
         let exe = std::env::consts::EXE_SUFFIX;
         for name in PROGRAMS {
             std::fs::write(bin.join(format!("{name}{exe}")), "").unwrap();
@@ -892,9 +1232,14 @@ mod tests {
     #[test]
     fn everything_cc_rotate_put_in_place_goes() {
         let i = install();
+        let scratch = i.paths.staging_root().join("check-1");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let lock = legacy_lock_for(&i.paths.profile_dir);
+        std::fs::create_dir_all(&lock).unwrap();
         let fake = Fake {
             autostart: Some(("the entry".into(), true)),
             keychain: KeychainItem::Present("Claude Code-credentials-abc".into()),
+            items: vec![scratch.clone()],
             ..Default::default()
         };
         let store = Store::open_read_only(&i.paths.store_db()).unwrap();
@@ -905,14 +1250,17 @@ mod tests {
             plan.profile_dir,
             Removal::Delete(i.paths.profile_dir.clone())
         );
-        assert_eq!(plan.data_dir, Removal::Delete(i.paths.data_dir.clone()));
+        assert_eq!(plan.data_dir, DataRemoval::Whole(i.paths.data_dir.clone()));
+        assert_eq!(plan.staging_items, vec![scratch]);
         assert_eq!(plan.programs.len(), 3);
-        assert!(!plan.sessions_open);
+        assert_eq!(plan.sessions, Sessions::Closed);
+        assert!(plan.deletes_keychain_item());
         let work = i.paths.home.join(".claude-work").join("settings.json");
         assert_eq!(
             plan.observe,
             vec![ObserveMode {
                 settings: work.clone(),
+                command: "cc-rotate-ctl statusline --observe".into(),
                 restore: Restore::Remove
             }]
         );
@@ -921,9 +1269,15 @@ mod tests {
         assert!(out.failed.is_empty(), "{:?}", out.failed);
         assert_eq!(
             *fake.calls.borrow(),
-            ["stop_app", "remove_autostart", "delete_keychain_item"]
+            [
+                "stop_app",
+                "remove_autostart",
+                "delete_keychain_item .claude-rotate",
+                "delete_keychain_item check-1"
+            ]
         );
         assert!(!i.paths.profile_dir.exists());
+        assert!(!lock.exists());
         assert!(!i.paths.data_dir.exists());
         assert!(i.bin.exists(), "the install folder stays");
         assert_eq!(std::fs::read_dir(&i.bin).unwrap().count(), 0);
@@ -936,6 +1290,102 @@ mod tests {
             std::fs::read_to_string(main).unwrap(),
             r#"{"model": "opus"}"#
         );
+
+        // Again: nothing left to do, nothing fails.
+        let again = super::plan(&fake, &i.paths, None, &i.ctl, time::now_ms()).unwrap();
+        assert_eq!(again.profile_dir, Removal::Absent);
+        assert_eq!(again.data_dir, DataRemoval::Absent);
+        assert!(run(&fake, &again, &i.ctl).failed.is_empty());
+    }
+
+    /// A profile deleted by hand leaves its Keychain item, which still goes; a profile kept keeps
+    /// it.
+    #[test]
+    fn the_keychain_item_goes_with_the_profile_or_after_it() {
+        let i = install();
+        let fake = Fake {
+            keychain: KeychainItem::Present("Claude Code-credentials-abc".into()),
+            ..Default::default()
+        };
+        std::fs::remove_dir_all(&i.paths.profile_dir).unwrap();
+        let p = plan(&fake, &i.paths, None, &i.ctl, time::now_ms()).unwrap();
+        assert_eq!(p.profile_dir, Removal::Absent);
+        assert!(p.deletes_keychain_item());
+        run(&fake, &p, &i.ctl);
+        assert!(
+            fake.calls
+                .borrow()
+                .iter()
+                .any(|c| c.starts_with("delete_keychain_item"))
+        );
+
+        std::fs::create_dir_all(&i.paths.profile_dir).unwrap();
+        std::fs::write(i.paths.profile_dir.join("settings.json"), "{}").unwrap();
+        let fake = Fake {
+            keychain: KeychainItem::Present("Claude Code-credentials-abc".into()),
+            ..Default::default()
+        };
+        let p = plan(&fake, &i.paths, None, &i.ctl, time::now_ms()).unwrap();
+        assert!(matches!(p.profile_dir, Removal::Keep(..)));
+        assert!(!p.deletes_keychain_item());
+        run(&fake, &p, &i.ctl);
+        assert!(
+            !fake
+                .calls
+                .borrow()
+                .iter()
+                .any(|c| c.starts_with("delete_keychain_item"))
+        );
+    }
+
+    /// `CC_ROTATE_DATA_DIR` pointing at a folder of the user's: only cc-rotate's entries go.
+    #[test]
+    fn a_data_folder_of_the_users_keeps_what_is_not_cc_rotates() {
+        let i = install();
+        let shared = i.paths.home.join("Dropbox");
+        std::fs::create_dir_all(shared.join("logs")).unwrap();
+        std::fs::create_dir_all(shared.join("photos")).unwrap();
+        for file in [
+            "store.db",
+            "store.db-wal",
+            "store.pre-v4-backup.db",
+            "master.key",
+            "notes.txt",
+            "restore.dbx",
+        ] {
+            std::fs::write(shared.join(file), "").unwrap();
+        }
+        let paths =
+            Paths::new(shared.clone(), i.paths.profile_dir.clone()).with_home(&i.paths.home);
+        let p = plan(&Fake::default(), &paths, None, &i.ctl, time::now_ms()).unwrap();
+        let DataRemoval::Entries(dir, entries) = &p.data_dir else {
+            panic!("{:?}", p.data_dir)
+        };
+        assert_eq!(dir, &shared);
+        let names: Vec<_> = entries
+            .iter()
+            .map(|e| e.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "logs",
+                "master.key",
+                "store.db",
+                "store.db-wal",
+                "store.pre-v4-backup.db"
+            ]
+        );
+        assert_eq!(p.sessions, Sessions::Unknown, "a store that wasn't read");
+        let out = run(&Fake::default(), &p, &i.ctl);
+        assert!(out.failed.is_empty(), "{:?}", out.failed);
+        assert_eq!(out.data_left, Some(shared.clone()));
+        let mut left: Vec<_> = std::fs::read_dir(&shared)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["notes.txt", "photos", "restore.dbx"]);
     }
 
     #[test]
@@ -957,7 +1407,7 @@ mod tests {
             plan.profile_dir
         );
         assert!(
-            matches!(plan.data_dir, Removal::Keep(..)),
+            matches!(plan.data_dir, DataRemoval::Keep(..)),
             "{:?}",
             plan.data_dir
         );
@@ -969,11 +1419,12 @@ mod tests {
         assert!(i.paths.home.join(".claude").exists());
         assert!(other_data.exists());
 
-        // The home folder itself, as a profile or data folder.
+        // The home folder itself, as a profile or data folder, even holding a store.
+        drop(Store::open(&i.paths.home.join("store.db")).unwrap());
         let paths = Paths::new(i.paths.home.clone(), i.paths.home.clone()).with_home(&i.paths.home);
         let plan = plan_of(&paths, &i.ctl);
         assert!(matches!(plan.profile_dir, Removal::Keep(..)));
-        assert!(matches!(plan.data_dir, Removal::Keep(..)));
+        assert!(matches!(plan.data_dir, DataRemoval::Keep(..)));
     }
 
     fn plan_of(paths: &Paths, ctl: &Path) -> Plan {
@@ -989,7 +1440,7 @@ mod tests {
             .set_meta(statusline::META_LAST_TICK_AT, now - 30_000)
             .unwrap();
         let p = plan(&Fake::default(), &i.paths, Some(&store), &i.ctl, now).unwrap();
-        assert!(p.sessions_open);
+        assert_eq!(p.sessions, Sessions::Open);
         let p = plan(
             &Fake::default(),
             &i.paths,
@@ -998,7 +1449,7 @@ mod tests {
             now + SESSION_OPEN_MS,
         )
         .unwrap();
-        assert!(!p.sessions_open);
+        assert_eq!(p.sessions, Sessions::Closed);
 
         let target = i.paths.home.join("src").join("target");
         std::fs::create_dir_all(target.join("release")).unwrap();
@@ -1009,6 +1460,31 @@ mod tests {
         assert!(p.programs_kept.is_some());
     }
 
+    /// Setup writes the program's path in the 8.3 form when its folder has a space.
+    #[cfg(windows)]
+    #[test]
+    fn a_short_program_path_is_still_cc_rotate_ctl() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("Matt Marcin").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let ctl = bin.join("cc-rotate-ctl.exe");
+        std::fs::write(&ctl, "").unwrap();
+        let Some(short) = setup::short_path(&ctl) else {
+            // This volume keeps no short names.
+            return;
+        };
+        let command = format!("{} statusline", crate::paths::forward_slashes(&short));
+        assert!(!command.contains("cc-rotate-ctl"), "{command}");
+        let profile = dir.path().join("profile");
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(
+            profile.join("settings.json"),
+            serde_json::json!({"statusLine": {"command": command}}).to_string(),
+        )
+        .unwrap();
+        assert!(runs_cc_rotate(&profile));
+    }
+
     /// A program Windows will not delete while it runs is renamed aside, and the helper deletes
     /// it once it stops.
     #[cfg(windows)]
@@ -1016,7 +1492,10 @@ mod tests {
     fn a_running_program_goes_once_it_stops() {
         let dir = tempfile::tempdir().unwrap();
         let root = std::env::var_os("SystemRoot").unwrap();
-        let program = dir.path().join("cc-rotate.exe");
+        // A character `cmd` would read specially, were it on the command line.
+        let folder = dir.path().join("Tom & Jerry %PATH%");
+        std::fs::create_dir_all(&folder).unwrap();
+        let program = folder.join("cc-rotate.exe");
         std::fs::copy(
             PathBuf::from(root).join("System32").join("ping.exe"),
             &program,
@@ -1031,11 +1510,7 @@ mod tests {
             programs: vec![program.clone()],
             ..Default::default()
         };
-        let out = run(
-            &Fake::default(),
-            &plan,
-            &dir.path().join("cc-rotate-ctl.exe"),
-        );
+        let out = run(&Fake::default(), &plan, &folder.join("cc-rotate-ctl.exe"));
         assert!(out.failed.is_empty(), "{:?}", out.failed);
         assert!(!program.exists(), "renamed aside");
         assert!(out.deleted_later.is_empty());
@@ -1043,6 +1518,8 @@ mod tests {
             panic!("{out:?}")
         };
         assert!(aside.exists());
+        // Still running a few seconds on: the helper keeps trying.
+        std::thread::sleep(Duration::from_secs(3));
         running.kill().unwrap();
         running.wait().unwrap();
         let start = std::time::Instant::now();
@@ -1066,6 +1543,7 @@ mod tests {
             launch_agents: home.path().join("LaunchAgents"),
             launchctl: false,
             xdg_autostart: home.path().join("autostart"),
+            app_data: Vec::new(),
         };
         assert_eq!(system.autostart().unwrap(), None);
         #[cfg(windows)]
@@ -1087,14 +1565,20 @@ mod tests {
         // Removing nothing is fine.
         system.remove_autostart().unwrap();
         #[cfg(windows)]
-        test_registry::delete_tree(r"Software\cc-rotate-tests");
+        {
+            // A value that is not text is someone else's.
+            test_registry::set_number(&key, &name);
+            let (_, ours) = system.autostart().unwrap().unwrap();
+            assert!(!ours);
+            test_registry::delete_tree(r"Software\cc-rotate-tests");
+        }
     }
 
     #[cfg(windows)]
     mod test_registry {
         use windows_sys::Win32::Foundation::ERROR_SUCCESS;
         use windows_sys::Win32::System::Registry::{
-            HKEY_CURRENT_USER, REG_SZ, RegDeleteTreeW, RegSetKeyValueW,
+            HKEY_CURRENT_USER, REG_DWORD, REG_SZ, RegDeleteTreeW, RegSetKeyValueW,
         };
 
         use super::super::registry::wide;
@@ -1110,6 +1594,22 @@ mod tests {
                     REG_SZ,
                     data.as_ptr().cast(),
                     (data.len() * 2) as u32,
+                )
+            };
+            assert_eq!(rc, ERROR_SUCCESS);
+        }
+
+        pub fn set_number(key: &str, name: &str) {
+            let data = 1u32;
+            // SAFETY: NUL-terminated strings; four bytes of data.
+            let rc = unsafe {
+                RegSetKeyValueW(
+                    HKEY_CURRENT_USER,
+                    wide(key).as_ptr(),
+                    wide(name).as_ptr(),
+                    REG_DWORD,
+                    (&data as *const u32).cast(),
+                    4,
                 )
             };
             assert_eq!(rc, ERROR_SUCCESS);

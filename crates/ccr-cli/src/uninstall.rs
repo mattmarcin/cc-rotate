@@ -6,7 +6,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
-use ccr_core::uninstall::{self, KeychainItem, Plan, RealSystem, Removal, Restore};
+use ccr_core::uninstall::{
+    self, DataRemoval, KeychainItem, Plan, RealSystem, Removal, Restore, Sessions,
+};
 use ccr_core::{Paths, Store, time};
 
 /// What the user types to go ahead.
@@ -15,11 +17,18 @@ const CONFIRM: &str = "uninstall";
 pub fn run(profile: Option<PathBuf>, dry_run: bool, yes: bool, force: bool) -> Result<ExitCode> {
     let data_dir = Paths::default_data_dir()?;
     let store_path = data_dir.join("store.db");
-    // Read-only: nothing changes before the user says so.
+    // Read-only: nothing changes before the user says so. A store that can't be read (another
+    // version's, damaged) only leaves open sessions unknown.
     let store = if store_path.exists() {
-        Some(Store::open_read_only(&store_path).context(
-            "the store was made by another version of cc-rotate; install this version first, or delete the files by hand (README, Uninstall)",
-        )?)
+        match Store::open_read_only(&store_path) {
+            Ok(store) => Some(store),
+            Err(e) => {
+                eprintln!(
+                    "warning: couldn't read the store, so open sessions and a profile set with `config profile_dir` can't be told ({e:#})"
+                );
+                None
+            }
+        }
     } else {
         None
     };
@@ -83,10 +92,14 @@ pub fn run(profile: Option<PathBuf>, dry_run: bool, yes: bool, force: bool) -> R
     for line in &out.failed {
         eprintln!("error: {line}");
     }
-    if !out.deleted_later.is_empty() {
+    if let Some(dir) = &out.data_left {
         println!(
-            "Windows lets these go only once they stop running; they are deleted a few seconds after this command ends:"
+            "{} held more than cc-rotate's files, so it stays with the rest.",
+            dir.display()
         );
+    }
+    if !out.deleted_later.is_empty() {
+        println!("Windows lets these go only once this command ends; they are deleted then:");
         for file in &out.deleted_later {
             println!("  {}", file.display());
         }
@@ -105,9 +118,9 @@ pub fn run(profile: Option<PathBuf>, dry_run: bool, yes: bool, force: bool) -> R
         .filter(|o| o.restore == Restore::ByHand)
         .collect();
     if !by_hand.is_empty() {
-        println!("Change the status line in these by hand, keeping what runs after --then:");
+        println!("Change the status line in these by hand, since cc-rotate-ctl is gone:");
         for o in by_hand {
-            println!("  {}", o.settings.display());
+            println!("  {}: {}", o.settings.display(), o.command);
         }
     }
     if matches!(
@@ -133,13 +146,17 @@ fn blocked(plan: &Plan, force: bool) -> Option<String> {
             "this session can't use the macOS Keychain, which holds the cc-rotate profile's login (\"{service}\"). Run cc-rotate-ctl uninstall in Terminal on the Mac itself, not over SSH."
         ));
     }
-    if plan.sessions_open && !force {
-        return Some(
+    match plan.sessions {
+        Sessions::Open if !force => Some(
             "a Claude Code session in the cc-rotate profile ran in the last 2 minutes. Quit your cc-rotate sessions first, or pass --force."
                 .into(),
-        );
+        ),
+        Sessions::Unknown if !force => Some(
+            "the store couldn't be read to tell whether cc-rotate sessions are open. Quit them, then pass --force."
+                .into(),
+        ),
+        _ => None,
     }
-    None
 }
 
 fn print_plan(plan: &Plan) {
@@ -152,18 +169,17 @@ fn print_plan(plan: &Plan) {
         keep.push(format!("{entry}: it does not start the cc-rotate app"));
     }
     for o in &plan.observe {
+        let settings = o.settings.display();
         match &o.restore {
             Restore::Remove => remove.push(format!(
-                "Take observe mode out of {} (its status line goes)",
-                o.settings.display()
+                "Take observe mode out of {settings} (its status line goes)"
             )),
             Restore::Command(command) => remove.push(format!(
-                "Take observe mode out of {} (its status line runs `{command}` again)",
-                o.settings.display()
+                "Take observe mode out of {settings} (its status line runs `{command}` again)"
             )),
             Restore::ByHand => keep.push(format!(
-                "{}: its status line runs cc-rotate in observe mode in a way this can't take apart; change it by hand",
-                o.settings.display()
+                "{settings}: its status line runs more than cc-rotate's observe mode (`{}`); change it by hand",
+                o.command
             )),
         }
     }
@@ -174,26 +190,54 @@ fn print_plan(plan: &Plan) {
         ));
     }
     match &plan.keychain {
-        KeychainItem::Present(service) => remove.push(format!(
+        KeychainItem::Present(service) if plan.deletes_keychain_item() => remove.push(format!(
             "Delete the macOS Keychain item \"{service}\" (the cc-rotate profile's login)"
+        )),
+        KeychainItem::Present(service) => keep.push(format!(
+            "The macOS Keychain item \"{service}\": it goes with the profile, which stays"
         )),
         KeychainItem::Unreachable(service) => keep.push(format!(
             "The macOS Keychain item \"{service}\": this session can't reach the Keychain"
         )),
         KeychainItem::None => {}
     }
-    for (what, removal) in [
-        ("the cc-rotate profile", &plan.profile_dir),
-        (
-            "the data folder (the store, its key and every saved login)",
-            &plan.data_dir,
-        ),
-    ] {
-        match removal {
-            Removal::Delete(dir) => remove.push(format!("Delete {what}: {}", dir.display())),
-            Removal::Keep(dir, why) => keep.push(format!("{}: {why}", dir.display())),
-            Removal::Absent => {}
+    if !plan.staging_items.is_empty() {
+        remove.push(format!(
+            "Delete the macOS Keychain items of {} leftover sign-in or usage-check folders",
+            plan.staging_items.len()
+        ));
+    }
+    match &plan.profile_dir {
+        Removal::Delete(dir) => remove.push(format!(
+            "Delete the cc-rotate profile, with the session history and memory Claude Code keeps there (copy its projects folder first to keep them): {}",
+            dir.display()
+        )),
+        Removal::Keep(dir, why) => keep.push(format!("{}: {why}", dir.display())),
+        Removal::Absent => {}
+    }
+    let saved = "the store, its key and every saved login";
+    match &plan.data_dir {
+        DataRemoval::Whole(dir) => remove.push(format!(
+            "Delete the data folder ({saved}): {}",
+            dir.display()
+        )),
+        DataRemoval::Entries(dir, entries) => {
+            remove.push(format!(
+                "Delete cc-rotate's files from {} ({saved}), and the folder if nothing else is in it:",
+                dir.display()
+            ));
+            for entry in entries {
+                remove.push(format!(
+                    "  {}",
+                    entry.file_name().unwrap_or_default().to_string_lossy()
+                ));
+            }
         }
+        DataRemoval::Keep(dir, why) => keep.push(format!("{}: {why}", dir.display())),
+        DataRemoval::Absent => {}
+    }
+    for dir in &plan.app_data {
+        remove.push(format!("Delete the app's webview data: {}", dir.display()));
     }
     for program in &plan.programs {
         remove.push(format!("Delete {}", program.display()));

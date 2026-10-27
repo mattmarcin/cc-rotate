@@ -467,7 +467,7 @@ It shows what it will remove and asks before going ahead (`--dry-run` only shows
 - the app, and its start at login;
 - observe mode in your other profiles: a status line that was only cc-rotate's goes, and one with `--then` gets back the command you gave it;
 - on macOS, the cc-rotate profile's Keychain item, which holds a working login (run it in Terminal on the Mac, not over SSH);
-- the cc-rotate profile (`~/.claude-rotate`) and the data folder (the store, its key and every saved login);
+- the cc-rotate profile (`~/.claude-rotate`), with the session history and memory Claude Code keeps there (copy its `projects` folder first to keep them), and the data folder (the store, its key and every saved login);
 - `cc-rotate`, `cc-rotate-ctl` and `cc-rotate-app` from the folder they were installed to.
 
 Your other profiles keep everything else, and your accounts stay signed in there.

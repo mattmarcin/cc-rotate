@@ -392,7 +392,7 @@ pub fn command_path(exe: &Path) -> String {
 }
 
 #[cfg(windows)]
-fn short_path(path: &Path) -> Option<PathBuf> {
+pub(crate) fn short_path(path: &Path) -> Option<PathBuf> {
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
     let wide: Vec<u16> = path
