@@ -122,6 +122,30 @@ pub fn find_sign_in_url(text: &str) -> Option<String> {
     re.find(text).map(|m| m.as_str().to_string())
 }
 
+/// The line to send Claude Code for a code pasted from the sign-in page. Claude Code wants
+/// `<code>#<state>` and only says "Invalid code" (on stderr, then keeps waiting) when either part
+/// is missing; a paste of the code alone gets this sign-in's own `state`, from the URL Claude
+/// Code printed. A code from another sign-in still fails, at the exchange.
+pub fn code_line(pasted: &str, sign_in_url: Option<&str>) -> String {
+    let pasted = pasted.trim();
+    if pasted.contains('#') {
+        return pasted.to_string();
+    }
+    let state = sign_in_url
+        .and_then(|url| url.split_once('?'))
+        .and_then(|(_, query)| query.split('&').find_map(|p| p.strip_prefix("state=")))
+        // Claude Code's states are base64url; anything else is left for it to reject.
+        .filter(|s| {
+            !s.is_empty()
+                && s.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        });
+    match state {
+        Some(state) => format!("{pasted}#{state}"),
+        None => pasted.to_string(),
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Imported {
     pub account: Account,
@@ -357,4 +381,49 @@ fn check_same_account(target: &Account, ident: &AccountIdentity) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const URL: &str = "https://claude.com/cai/oauth/authorize?code=true&client_id=x&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&code_challenge=c&code_challenge_method=S256&state=pM6CW2Gc-F0Ej7_TeazM";
+
+    #[test]
+    fn code_line_keeps_a_full_code() {
+        assert_eq!(code_line("  abc#other \n", Some(URL)), "abc#other");
+    }
+
+    #[test]
+    fn code_line_adds_this_sign_ins_state() {
+        assert_eq!(code_line("abc", Some(URL)), "abc#pM6CW2Gc-F0Ej7_TeazM");
+    }
+
+    #[test]
+    fn code_line_without_a_usable_state_is_left_alone() {
+        assert_eq!(code_line("abc", None), "abc");
+        assert_eq!(
+            code_line(
+                "abc",
+                Some("https://claude.com/cai/oauth/authorize?code=true")
+            ),
+            "abc"
+        );
+        assert_eq!(
+            code_line("abc", Some("https://x/oauth/authorize?state=")),
+            "abc"
+        );
+        assert_eq!(
+            code_line("abc", Some("https://x/oauth/authorize?state=a%23b")),
+            "abc"
+        );
+    }
+
+    #[test]
+    fn finds_the_sign_in_url() {
+        let text = format!(
+            "Opening browser to sign in…\nIf the browser didn't open, visit: {URL}\nPaste code here if prompted > "
+        );
+        assert_eq!(find_sign_in_url(&text).as_deref(), Some(URL));
+    }
 }

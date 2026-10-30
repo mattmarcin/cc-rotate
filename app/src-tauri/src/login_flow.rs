@@ -40,6 +40,9 @@ pub struct Logins(Mutex<HashMap<String, Running>>);
 pub enum Stage {
     Starting,
     Browser,
+    /// Something Claude Code said on stderr while waiting, such as a pasted code it rejected
+    /// ("Invalid code. ..."); it keeps waiting for another.
+    Notice,
     Importing,
     Done,
     Failed,
@@ -132,18 +135,16 @@ pub fn start_login(
     emit(&app, Progress::new(&id, Stage::Starting));
 
     let output = Arc::new(Mutex::new(String::new()));
-    for pipe in [
-        stdout.map(|p| Box::new(p) as Box<dyn Read + Send>),
-        stderr.map(|p| Box::new(p) as Box<dyn Read + Send>),
-    ]
-    .into_iter()
-    .flatten()
-    {
+    for (pipe, is_stderr) in [
+        (stdout.map(|p| Box::new(p) as Box<dyn Read + Send>), false),
+        (stderr.map(|p| Box::new(p) as Box<dyn Read + Send>), true),
+    ] {
+        let Some(pipe) = pipe else { continue };
         let output = output.clone();
         let app = app.clone();
         let id = id.clone();
         let url = url.clone();
-        std::thread::spawn(move || read_pipe(pipe, &output, &url, &app, &id));
+        std::thread::spawn(move || read_pipe(pipe, is_stderr, &output, &url, &app, &id));
     }
 
     let request = LoginRequest {
@@ -167,30 +168,57 @@ pub fn start_login(
     Ok(id)
 }
 
+/// Collect one of Claude Code's pipes into `output`. Whichever pipe completes the sign-in URL
+/// announces it, once; after that, each line on stderr is passed on as a notice.
 fn read_pipe(
     mut pipe: Box<dyn Read + Send>,
+    is_stderr: bool,
     output: &Mutex<String>,
     url: &Mutex<Option<String>>,
     app: &AppHandle,
     id: &str,
 ) {
     let mut buf = [0u8; 4096];
-    let mut announced = false;
+    // This pipe's text since its last full line.
+    let mut line = String::new();
     while let Ok(n) = pipe.read(&mut buf) {
         if n == 0 {
             break;
         }
+        let chunk = String::from_utf8_lossy(&buf[..n]);
         let text = {
             let mut out = output.lock().unwrap();
-            out.push_str(&String::from_utf8_lossy(&buf[..n]));
+            out.push_str(&chunk);
             strip_ansi(&out)
         };
-        if !announced && let Some(found) = login::find_sign_in_url(&text) {
-            announced = true;
-            *url.lock().unwrap() = Some(found.clone());
+        let announce = {
+            let mut url = url.lock().unwrap();
+            match login::find_sign_in_url(&text) {
+                Some(found) if url.is_none() => {
+                    *url = Some(found.clone());
+                    Some(found)
+                }
+                _ => None,
+            }
+        };
+        if let Some(found) = announce {
             let mut p = Progress::new(id, Stage::Browser);
             p.url = Some(found);
             emit(app, p);
+        }
+        if !is_stderr {
+            continue;
+        }
+        line.push_str(&chunk);
+        while let Some(end) = line.find('\n') {
+            let said = strip_ansi(&line[..end]).trim().to_string();
+            line.drain(..=end);
+            // Before the page is up, a failure shows with the exit instead.
+            if !said.is_empty() && url.lock().unwrap().is_some() {
+                let mut p = Progress::new(id, Stage::Notice);
+                p.message = Some(said);
+                emit(app, p);
+            }
         }
     }
 }
@@ -279,7 +307,8 @@ pub fn submit_login_code(logins: State<'_, Logins>, id: String, code: String) ->
             "That doesn't look like a sign-in code. Copy it again from the browser.".into(),
         );
     }
-    writeln!(stdin, "{code}").map_err(|e| e.to_string())?;
+    let line = login::code_line(code, running.url.lock().unwrap().as_deref());
+    writeln!(stdin, "{line}").map_err(|e| e.to_string())?;
     stdin.flush().map_err(|e| e.to_string())
 }
 
