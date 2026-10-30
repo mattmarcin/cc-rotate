@@ -1325,6 +1325,7 @@ function openLogin(account: AccountView | null) {
     switch (p.stage) {
       case "starting":
         setSteps(0);
+        status.className = "login-status muted";
         status.textContent = "Starting sign-in…";
         break;
       case "browser": {
@@ -1341,6 +1342,8 @@ function openLogin(account: AccountView | null) {
           try {
             await api.submitLoginCode(p.id, code.value);
           } catch (e) {
+            // The sign-in ended meanwhile; its own message says why.
+            if (currentLogin?.id !== p.id) return;
             code.disabled = submit.disabled = false;
             status.className = "login-status error";
             status.textContent = String(e);
@@ -1368,6 +1371,7 @@ function openLogin(account: AccountView | null) {
       case "importing":
         setSteps(2);
         codeRow.hidden = true;
+        status.className = "login-status muted";
         status.textContent = "Saving login…";
         break;
       case "done":
