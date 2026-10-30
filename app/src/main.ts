@@ -1314,27 +1314,64 @@ function openLogin(account: AccountView | null) {
     replace(steps, labels.map((text, i) => h("li", { class: i < active ? "done" : i === active ? "now" : "" }, text)));
   };
 
+  let codeInput: HTMLInputElement | null = null;
+  let codeSubmit: HTMLButtonElement | null = null;
+  const showWaiting = (id: string) => {
+    status.className = "login-status muted";
+    status.replaceChildren("Finish in your browser. ", h("button", { class: "link", onclick: () => api.openLoginPage(id).catch((e) => (status.textContent = String(e))) }, "Open the page again"));
+  };
+
   const update = (p: LoginProgress) => {
     switch (p.stage) {
       case "starting":
         setSteps(0);
+        status.className = "login-status muted";
         status.textContent = "Starting sign-in…";
         break;
       case "browser": {
         setSteps(1);
-        status.replaceChildren("Finish in your browser. ", h("button", { class: "link", onclick: () => api.openLoginPage(p.id).catch((e) => say(String(e), "error")) }, "Open the page again"));
+        showWaiting(p.id);
+        // A toast would sit behind the dialog, so the dialog says what happened itself.
         const code = h("input", { type: "text", placeholder: "Code", autocomplete: "off" });
-        replace(
-          codeRow,
-          h("label", null, h("span", null, "If the browser shows a code, paste it here"), code),
-          h("button", { class: "btn small", onclick: () => code.value.trim() && api.submitLoginCode(p.id, code.value).catch((e) => say(String(e), "error")) }, "Submit"),
-        );
+        const submit = h("button", { class: "btn small" }, "Submit");
+        const send = async () => {
+          if (!code.value.trim() || submit.disabled) return;
+          code.disabled = submit.disabled = true;
+          status.className = "login-status muted";
+          status.textContent = "Checking the code…";
+          try {
+            await api.submitLoginCode(p.id, code.value);
+          } catch (e) {
+            // The sign-in ended meanwhile; its own message says why.
+            if (currentLogin?.id !== p.id) return;
+            code.disabled = submit.disabled = false;
+            status.className = "login-status error";
+            status.textContent = String(e);
+          }
+        };
+        submit.addEventListener("click", send);
+        code.addEventListener("keydown", (e) => {
+          if (e.key === "Enter") void send();
+        });
+        codeInput = code;
+        codeSubmit = submit;
+        replace(codeRow, h("label", null, h("span", null, "If the browser shows a code, paste it here"), code), submit);
         codeRow.hidden = false;
         break;
       }
+      case "notice":
+        // Claude Code is still waiting: let the code be fixed and sent again.
+        if (codeInput && codeSubmit) {
+          codeInput.disabled = codeSubmit.disabled = false;
+          codeInput.select();
+        }
+        status.className = "login-status error";
+        status.replaceChildren(`${p.message ?? "Claude Code didn't take that."} `, h("button", { class: "link", onclick: () => api.openLoginPage(p.id).catch((e) => (status.textContent = String(e))) }, "Open the page again"));
+        break;
       case "importing":
         setSteps(2);
         codeRow.hidden = true;
+        status.className = "login-status muted";
         status.textContent = "Saving login…";
         break;
       case "done":

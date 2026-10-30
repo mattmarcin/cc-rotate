@@ -296,7 +296,7 @@ export interface FoundProfile {
   in_pool_as: string | null;
 }
 
-export type LoginStage = "starting" | "browser" | "importing" | "done" | "failed" | "cancelled";
+export type LoginStage = "starting" | "browser" | "notice" | "importing" | "done" | "failed" | "cancelled";
 
 export interface LoginProgress {
   id: string;

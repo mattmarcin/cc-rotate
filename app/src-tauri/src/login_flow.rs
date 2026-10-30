@@ -6,6 +6,7 @@ use std::io::{Read, Write};
 use std::process::{ChildStdin, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use ccr_core::login::{self, LoginRequest, Staging};
@@ -29,8 +30,11 @@ struct Running {
     url: Arc<Mutex<Option<String>>>,
 }
 
-/// The longest code a sign-in page shows; anything longer is not one.
-const MAX_CODE_LEN: usize = 512;
+/// How long a line Claude Code writes on stderr waits before it is shown: a line it ends the
+/// sign-in with shows with the exit instead, not as something to fix and send again.
+const NOTICE_GRACE: Duration = Duration::from_millis(400);
+/// How long a failed sign-in waits for the rest of Claude Code's output before saying why.
+const DRAIN: Duration = Duration::from_secs(1);
 
 #[derive(Default)]
 pub struct Logins(Mutex<HashMap<String, Running>>);
@@ -40,6 +44,9 @@ pub struct Logins(Mutex<HashMap<String, Running>>);
 pub enum Stage {
     Starting,
     Browser,
+    /// Something Claude Code said on stderr while waiting, such as a pasted code it rejected
+    /// ("Invalid code. ..."); it keeps waiting for another.
+    Notice,
     Importing,
     Done,
     Failed,
@@ -131,19 +138,22 @@ pub fn start_login(
     );
     emit(&app, Progress::new(&id, Stage::Starting));
 
-    let output = Arc::new(Mutex::new(String::new()));
-    for pipe in [
-        stdout.map(|p| Box::new(p) as Box<dyn Read + Send>),
-        stderr.map(|p| Box::new(p) as Box<dyn Read + Send>),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        let output = output.clone();
-        let app = app.clone();
-        let id = id.clone();
-        let url = url.clone();
-        std::thread::spawn(move || read_pipe(pipe, &output, &url, &app, &id));
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let mut readers = Vec::new();
+    for (pipe, is_stderr) in [
+        (stdout.map(|p| Box::new(p) as Box<dyn Read + Send>), false),
+        (stderr.map(|p| Box::new(p) as Box<dyn Read + Send>), true),
+    ] {
+        let Some(pipe) = pipe else { continue };
+        let reader = Reader {
+            is_stderr,
+            output: output.clone(),
+            url: url.clone(),
+            child: child.clone(),
+            app: app.clone(),
+            id: id.clone(),
+        };
+        readers.push(std::thread::spawn(move || reader.read(pipe)));
     }
 
     let request = LoginRequest {
@@ -155,7 +165,8 @@ pub fn start_login(
     let app2 = app.clone();
     let id2 = id.clone();
     std::thread::spawn(move || {
-        let mut progress = wait_and_import(&app2, &child, staging, &request, &output, &id2);
+        let mut progress =
+            wait_and_import(&app2, &child, staging, &request, &output, readers, &id2);
         if cancelled.load(Ordering::Acquire) {
             progress = Progress::new(&id2, Stage::Cancelled);
         }
@@ -167,31 +178,70 @@ pub fn start_login(
     Ok(id)
 }
 
-fn read_pipe(
-    mut pipe: Box<dyn Read + Send>,
-    output: &Mutex<String>,
-    url: &Mutex<Option<String>>,
-    app: &AppHandle,
-    id: &str,
-) {
-    let mut buf = [0u8; 4096];
-    let mut announced = false;
-    while let Ok(n) = pipe.read(&mut buf) {
-        if n == 0 {
-            break;
+/// Reads one of Claude Code's pipes into `output`. Claude Code prints the sign-in page on stdout,
+/// which announces it; after that, what it says on stderr while still running is a notice.
+struct Reader {
+    is_stderr: bool,
+    output: Arc<Mutex<Vec<u8>>>,
+    url: Arc<Mutex<Option<String>>>,
+    child: Arc<Mutex<Tree>>,
+    app: AppHandle,
+    id: String,
+}
+
+impl Reader {
+    fn read(self, mut pipe: Box<dyn Read + Send>) {
+        let mut buf = [0u8; 4096];
+        // This pipe's bytes not yet used: stdout's until the page is found, stderr's since its
+        // last full line. Bytes, so a character split between reads stays whole.
+        let mut pending = Vec::new();
+        let mut announced = false;
+        while let Ok(n) = pipe.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            self.output.lock().unwrap().extend_from_slice(&buf[..n]);
+            if self.is_stderr {
+                pending.extend_from_slice(&buf[..n]);
+                self.notice(&mut pending);
+            } else if !announced {
+                pending.extend_from_slice(&buf[..n]);
+                let text = strip_ansi(&String::from_utf8_lossy(&pending));
+                if let Some(found) = login::find_sign_in_url(&text) {
+                    announced = true;
+                    pending = Vec::new();
+                    *self.url.lock().unwrap() = Some(found.clone());
+                    let mut p = Progress::new(&self.id, Stage::Browser);
+                    p.url = Some(found);
+                    emit(&self.app, p);
+                }
+            }
         }
-        let text = {
-            let mut out = output.lock().unwrap();
-            out.push_str(&String::from_utf8_lossy(&buf[..n]));
-            strip_ansi(&out)
+    }
+
+    /// Pass on stderr's full lines, if the page is up and Claude Code is still waiting.
+    fn notice(&self, pending: &mut Vec<u8>) {
+        let Some(end) = pending.iter().rposition(|&b| b == b'\n') else {
+            return;
         };
-        if !announced && let Some(found) = login::find_sign_in_url(&text) {
-            announced = true;
-            *url.lock().unwrap() = Some(found.clone());
-            let mut p = Progress::new(id, Stage::Browser);
-            p.url = Some(found);
-            emit(app, p);
+        let lines: Vec<u8> = pending.drain(..=end).collect();
+        let said = strip_ansi(&String::from_utf8_lossy(&lines))
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        // Before the page is up, a failure shows with the exit instead.
+        if said.is_empty() || self.url.lock().unwrap().is_none() {
+            return;
         }
+        std::thread::sleep(NOTICE_GRACE);
+        if !matches!(self.child.lock().unwrap().try_wait(), Ok(None)) {
+            return;
+        }
+        let mut p = Progress::new(&self.id, Stage::Notice);
+        p.message = Some(said);
+        emit(&self.app, p);
     }
 }
 
@@ -200,7 +250,8 @@ fn wait_and_import(
     child: &Mutex<Tree>,
     staging: Staging,
     request: &LoginRequest,
-    output: &Mutex<String>,
+    output: &Mutex<Vec<u8>>,
+    readers: Vec<JoinHandle<()>>,
     id: &str,
 ) -> Progress {
     let started = Instant::now();
@@ -223,7 +274,13 @@ fn wait_and_import(
     match status {
         Some(s) if s.success() => {}
         other => {
-            let tail = strip_ansi(&output.lock().unwrap());
+            // Its last words may still be in a pipe; the pipes stay open while anything Claude
+            // Code started holds them, so this waits only so long.
+            let deadline = Instant::now() + DRAIN;
+            while readers.iter().any(|r| !r.is_finished()) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let tail = strip_ansi(&String::from_utf8_lossy(&output.lock().unwrap()));
             let last = tail
                 .lines()
                 .rev()
@@ -269,17 +326,9 @@ pub fn submit_login_code(logins: State<'_, Logins>, id: String, code: String) ->
         .stdin
         .as_mut()
         .ok_or("This sign-in isn't waiting for a code.")?;
-    let code = code.trim();
-    // One line of printable text: a newline inside would answer more than this prompt.
-    if code.is_empty()
-        || code.len() > MAX_CODE_LEN
-        || code.chars().any(|c| c.is_control() || c.is_whitespace())
-    {
-        return Err(
-            "That doesn't look like a sign-in code. Copy it again from the browser.".into(),
-        );
-    }
-    writeln!(stdin, "{code}").map_err(|e| e.to_string())?;
+    let line = login::code_line(&code, running.url.lock().unwrap().as_deref())
+        .ok_or("That doesn't look like a sign-in code. Copy it again from the browser.")?;
+    writeln!(stdin, "{line}").map_err(|e| e.to_string())?;
     stdin.flush().map_err(|e| e.to_string())
 }
 

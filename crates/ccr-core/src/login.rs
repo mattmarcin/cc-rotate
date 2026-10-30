@@ -116,10 +116,48 @@ pub fn login_command(claude: &Path, staging: &Path, email: Option<&str>) -> Comm
     cmd
 }
 
-/// The sign-in URL Claude Code prints ("If the browser didn't open, visit: <url>").
+/// The sign-in URL Claude Code prints ("If the browser didn't open, visit: <url>"), once the
+/// line ends: before that the URL may still be arriving.
 pub fn find_sign_in_url(text: &str) -> Option<String> {
-    let re = regex::Regex::new(r"https://[^\s]+/oauth/authorize\?[^\s]+").ok()?;
-    re.find(text).map(|m| m.as_str().to_string())
+    let re = regex::Regex::new(r"(https://[^\s]+/oauth/authorize\?[^\s]+)\s").ok()?;
+    re.captures(text).map(|c| c[1].to_string())
+}
+
+/// The longest code a sign-in page shows; anything longer is not one.
+const MAX_CODE_LEN: usize = 512;
+
+/// The line to send Claude Code for a code pasted from the sign-in page, or `None` if the paste
+/// is not one. Claude Code wants `<code>#<state>` and only says "Invalid code" (on stderr, then
+/// keeps waiting) when either part is missing; a paste of the code alone gets this sign-in's own
+/// `state`, from the URL Claude Code printed. A code from another sign-in still fails, at the
+/// exchange, which ends the sign-in: so a pasted address, or the state alone, is refused here.
+pub fn code_line(pasted: &str, sign_in_url: Option<&str>) -> Option<String> {
+    let pasted = pasted.trim();
+    // One line of printable text: a newline inside would answer more than this prompt.
+    if pasted.is_empty()
+        || pasted.len() > MAX_CODE_LEN
+        || pasted.chars().any(|c| c.is_control() || c.is_whitespace())
+        || pasted.contains("://")
+    {
+        return None;
+    }
+    if pasted.contains('#') {
+        return Some(pasted.to_string());
+    }
+    let state = sign_in_url
+        .and_then(|url| url.split_once('?'))
+        .and_then(|(_, query)| query.split('&').find_map(|p| p.strip_prefix("state=")))
+        // Claude Code's states are base64url; anything else is left for it to reject.
+        .filter(|s| {
+            !s.is_empty()
+                && s.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        });
+    match state {
+        Some(state) if pasted == state => None,
+        Some(state) => Some(format!("{pasted}#{state}")),
+        None => Some(pasted.to_string()),
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -357,4 +395,73 @@ fn check_same_account(target: &Account, ident: &AccountIdentity) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const STATE: &str = "pM6CW2Gc-F0Ej7_TeazM";
+    const URL: &str = "https://claude.com/cai/oauth/authorize?code=true&client_id=x&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&code_challenge=c&code_challenge_method=S256&state=pM6CW2Gc-F0Ej7_TeazM";
+
+    fn line(pasted: &str, url: Option<&str>) -> Option<String> {
+        code_line(pasted, url)
+    }
+
+    #[test]
+    fn code_line_keeps_a_full_code() {
+        assert_eq!(
+            line("  abc#other \n", Some(URL)).as_deref(),
+            Some("abc#other")
+        );
+    }
+
+    #[test]
+    fn code_line_adds_this_sign_ins_state() {
+        assert_eq!(line("abc", Some(URL)), Some(format!("abc#{STATE}")));
+    }
+
+    #[test]
+    fn code_line_without_a_usable_state_is_left_alone() {
+        let plain = Some("abc".to_string());
+        assert_eq!(line("abc", None), plain);
+        assert_eq!(
+            line(
+                "abc",
+                Some("https://claude.com/cai/oauth/authorize?code=true")
+            ),
+            plain
+        );
+        assert_eq!(line("abc", Some("https://x/oauth/authorize?state=")), plain);
+        assert_eq!(
+            line("abc", Some("https://x/oauth/authorize?state=a%23b")),
+            plain
+        );
+    }
+
+    #[test]
+    fn code_line_refuses_what_is_not_a_code() {
+        for pasted in [
+            "",
+            "  ",
+            "a b",
+            "a\nb#c",
+            "a\tb",
+            STATE,
+            URL,
+            &"x".repeat(MAX_CODE_LEN + 1),
+        ] {
+            assert_eq!(line(pasted, Some(URL)), None, "{pasted:?}");
+        }
+    }
+
+    #[test]
+    fn finds_the_sign_in_url_once_its_line_ends() {
+        let text = format!(
+            "Opening browser to sign in…\nIf the browser didn't open, visit: {URL}\nPaste code here if prompted > "
+        );
+        assert_eq!(find_sign_in_url(&text).as_deref(), Some(URL));
+        let cut = format!("If the browser didn't open, visit: {URL}");
+        assert_eq!(find_sign_in_url(&cut), None);
+    }
 }
