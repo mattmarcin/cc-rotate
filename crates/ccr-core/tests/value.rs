@@ -275,6 +275,81 @@ fn two_processes_on_one_session_each_keep_their_own_count() {
     assert!((counted - 0.90).abs() < 1e-9, "{counted}");
 }
 
+/// One Claude Code process whose ticks land on several keys, as when its reckoned start drifted
+/// past what tells two processes apart: a key left behind keeps an old total, and a tick that
+/// lands on it again counts only what the session had not reported yet.
+#[test]
+fn one_process_split_across_keys_counts_its_cost_once() {
+    let e = env();
+    let now = time::now_ms();
+    let mut counted = 0.0;
+    for (process, total, at) in [
+        ("k1", 100.0, now),
+        ("k1", 110.0, now + 60_000),
+        ("k2", 120.0, now + 120_000),
+        ("k1", 130.0, now + 180_000),
+        ("k3", 135.0, now + 240_000),
+        ("k2", 150.0, now + 300_000),
+        ("k1", 150.0, now + 360_000),
+    ] {
+        counted += e
+            .store
+            .note_session_cost("s1", process, total, false, e.a, at)
+            .unwrap();
+    }
+    assert!((counted - 50.0).abs() < 1e-9, "{counted}");
+}
+
+/// What a session spent over days in one Claude Code process, as the status line reports it: the
+/// run time it gives (`total_duration_ms`) falls minutes behind the clock over days, and a status
+/// line can take tens of seconds to start on a busy machine, so `now - total_duration_ms` wanders
+/// well past the 20 s that tell a session's processes apart. Seen live: one process's cost
+/// counted about 15 times over (2026-11-04). It is counted once, whether Claude Code names its
+/// process (`CLAUDE_PID`, one key) or not (told by when it started).
+#[test]
+fn a_process_running_for_days_counts_its_cost_once() {
+    for pid in [Some(4242), None] {
+        let e = env();
+        let start = time::now_ms();
+        let tick_every = 300_000;
+        let ticks = 3 * 24 * 12;
+        for i in 0..=ticks {
+            let at = start + i * tick_every;
+            // About 170 s behind the clock after three days, as seen live.
+            let behind = (at - start) * 65 / 100_000;
+            // Status lines starting up to 25 s late, and now and then 45 s late.
+            let late = if i % 37 == 0 {
+                45_000
+            } else {
+                (i * 7_919) % 25_000
+            };
+            let mut input = tick_input(
+                "s1",
+                i as f64 * 0.10,
+                at - start - behind - late,
+                20.0,
+                at / 1000 + 3_600,
+            );
+            input.claude_pid = pid;
+            statusline::tick(&e.store, &e.paths, &input, at).unwrap();
+        }
+        let counted = e
+            .store
+            .account_cost_between(
+                e.a,
+                start / 1000 - 3_600,
+                (start + ticks * tick_every) / 1000 + 7_200,
+            )
+            .unwrap()
+            .unwrap();
+        let spent = ticks as f64 * 0.10;
+        assert!(
+            (counted - spent).abs() < 1e-6,
+            "{pid:?}: counted {counted}, spent {spent}"
+        );
+    }
+}
+
 #[test]
 fn a_newer_extra_usage_reading_wins() {
     let e = env();

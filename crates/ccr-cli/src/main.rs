@@ -889,7 +889,8 @@ fn read_stdin() -> String {
 /// Statusline: never fails visibly. Errors go to the log and the downstream statusline still runs.
 fn statusline_entry(profile: Option<PathBuf>, observe: bool, then: Option<String>) {
     let raw = read_stdin();
-    let input = StatusInput::parse(&raw);
+    let mut input = StatusInput::parse(&raw);
+    input.claude_pid = statusline::claude_pid_from_env();
     let mut prefix = String::new();
 
     let outcome: Result<Option<String>> = (|| {

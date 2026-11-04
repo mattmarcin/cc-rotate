@@ -46,6 +46,10 @@ pub struct StatusInput {
     /// is only present while the API reports it and its reset has not passed.
     #[serde(default, deserialize_with = "lenient_windows")]
     pub rate_limits: Option<BTreeMap<String, Window>>,
+    /// The Claude Code process the status line runs for, from its `CLAUDE_PID` environment
+    /// variable (`claude_pid_from_env`), not the JSON.
+    #[serde(skip)]
+    pub claude_pid: Option<u32>,
 }
 
 /// A session whose process has run this long or less started then, unless it was resumed or
@@ -465,21 +469,38 @@ pub fn observe(
     Ok(Some(account))
 }
 
-/// The Claude Code process that runs the session (`Store::session_process`): two can run one
-/// session (resumed twice), each with its own numbers and cost. Told by when it started, from how
-/// long it has run: the status line runs under a process of its own each time, so its parent is
-/// no guide. A process that does not say how long it has run shares one key with its session.
+/// The Claude Code process that runs the session: two can run one session (resumed twice), each
+/// with its own numbers and cost. Claude Code names itself to the commands it runs
+/// (`CLAUDE_PID`, `StatusInput::claude_pid`), which tells its processes apart exactly. Without
+/// that, it is told by when it started, from how long it has run (`Store::session_process`): the
+/// status line runs under a process of its own each time, so its parent is no guide. A process
+/// that says neither shares one key with its session.
 fn process_key(store: &Store, input: &StatusInput, now_ms: i64) -> Result<String> {
-    let session = input.session_id.as_deref().filter(|s| !s.is_empty());
+    let Some(session) = input.session_id.as_deref().filter(|s| !s.is_empty()) else {
+        return Ok(String::new());
+    };
+    if let Some(pid) = input.claude_pid {
+        return Ok(format!("pid:{pid}"));
+    }
     let ran = input
         .cost
         .as_ref()
         .and_then(|c| c.total_duration_ms)
         .filter(|d| d.is_finite() && *d >= 0.0);
-    match (session, ran) {
-        (Some(session), Some(ran)) => store.session_process(session, now_ms - ran as i64, now_ms),
-        _ => Ok(String::new()),
+    match ran {
+        Some(ran) => store.session_process(session, now_ms - ran as i64, now_ms),
+        None => Ok(String::new()),
     }
+}
+
+/// The Claude Code process a status line or hook runs for: Claude Code sets `CLAUDE_PID` to its
+/// own process id for every command it runs, replacing one it inherited (Claude Code 2.1.318).
+pub fn claude_pid_from_env() -> Option<u32> {
+    claude_pid(std::env::var("CLAUDE_PID").ok().as_deref())
+}
+
+fn claude_pid(value: Option<&str>) -> Option<u32> {
+    value?.trim().parse().ok().filter(|pid| *pid > 0)
 }
 
 /// Whether the session has reported these numbers unchanged since before the account in use
@@ -821,6 +842,24 @@ mod tests {
                 .sample_for(1, "rotate", 0)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn claude_pid_is_a_process_id() {
+        assert_eq!(claude_pid(Some("39004")), Some(39004));
+        assert_eq!(claude_pid(Some(" 7 ")), Some(7));
+        for bad in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("-5"),
+            Some("abc"),
+            Some("1.5"),
+        ] {
+            assert_eq!(claude_pid(bad), None, "{bad:?}");
+        }
+        // Never read from the JSON.
+        assert_eq!(StatusInput::parse(r#"{"claude_pid":5}"#).claude_pid, None);
     }
 
     #[test]

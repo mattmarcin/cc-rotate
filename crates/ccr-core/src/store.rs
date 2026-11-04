@@ -2051,6 +2051,11 @@ impl Store {
     /// resumed or forked one, given the total and run time it had, or one running before cc-rotate
     /// counted) and is only where counting starts. A total below the last one (a `/login` resets
     /// it) is also only where counting goes on from.
+    ///
+    /// What the session's other processes reported since this one last did, up to this total,
+    /// was counted then: one process whose ticks were taken for two (`Store::session_process`)
+    /// counts only once. Two processes really running one session still each count their own,
+    /// until one passes the other's total.
     pub fn note_session_cost(
         &self,
         session_id: &str,
@@ -2064,12 +2069,13 @@ impl Store {
             return Ok(0.0);
         }
         self.immediate(|s| {
-            let last: Option<f64> = s
+            let last: Option<(f64, i64)> = s
                 .conn
                 .query_row(
-                    "SELECT total_usd FROM session_costs WHERE session_id = ?1 AND process = ?2",
+                    "SELECT total_usd, updated_at FROM session_costs
+                     WHERE session_id = ?1 AND process = ?2",
                     params![session_id, process],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?;
             let seen: bool = s.conn.query_row(
@@ -2077,11 +2083,25 @@ impl Store {
                 [session_id],
                 |r| r.get(0),
             )?;
-            let added = match last {
-                Some(last) if total_usd >= last => total_usd - last,
-                Some(_) => 0.0,
-                None if new_session && !seen => total_usd,
-                None => 0.0,
+            // The highest total another process of the session reported since this one's last,
+            // that is not above this total.
+            let others: Option<f64> = s.conn.query_row(
+                "SELECT max(total_usd) FROM session_costs
+                 WHERE session_id = ?1 AND process <> ?2 AND total_usd <= ?3 AND updated_at >= ?4",
+                params![
+                    session_id,
+                    process,
+                    total_usd,
+                    last.map_or(i64::MIN, |(_, at)| at)
+                ],
+                |r| r.get(0),
+            )?;
+            let added = match (last, others) {
+                (Some((last, _)), _) if total_usd < last => 0.0,
+                (Some((last, _)), others) => total_usd - others.map_or(last, |o| o.max(last)),
+                (None, Some(others)) => total_usd - others,
+                (None, None) if new_session && !seen => total_usd,
+                (None, None) => 0.0,
             };
             s.conn.execute(
                 "INSERT INTO session_costs (session_id, process, total_usd, updated_at)
