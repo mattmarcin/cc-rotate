@@ -260,7 +260,7 @@ pub fn version(bin: &Path) -> Option<String> {
     (!v.is_empty()).then(|| v.to_string())
 }
 
-/// The numeric `major.minor.patch` at the start of a herdr version string.
+/// The numeric `major.minor.patch` at the start of a herdr or Claude Code version string.
 pub fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
     let core = v.trim().trim_start_matches('v');
     let core = core.split(['-', '+', ' ']).next()?;

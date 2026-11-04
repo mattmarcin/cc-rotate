@@ -29,7 +29,9 @@ use crate::{credfile, time};
 /// 8: whether cc-rotate keeps an account's 5-hour window running (`keep_running`).
 /// 9: each session's Claude Code processes (`session_processes`), and the usage each last
 ///    reported and since when (`session_readings`).
-const SCHEMA_VERSION: i64 = 10;
+/// 10: each recorded window's usage as of its reading (`sample_windows.high`).
+/// 11: how long each session's process had run at its last total (`session_costs.ran_ms`).
+const SCHEMA_VERSION: i64 = 11;
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE accounts (
@@ -228,6 +230,10 @@ CREATE TABLE session_readings (
 /// (`Store::current_usage`), worked out when it is recorded so that reading it back is one row.
 const SCHEMA_V10: &str = r#"
 ALTER TABLE sample_windows ADD COLUMN high REAL;
+"#;
+
+const SCHEMA_V11: &str = r#"
+ALTER TABLE session_costs ADD COLUMN ran_ms INTEGER;
 "#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -597,6 +603,12 @@ const WAITING_RETENTION_MS: i64 = 7 * 86_400_000;
 /// resumed process restores the run time it had, so it never reckons earlier than the one it
 /// was resumed from.
 const PROCESS_START_LATER_MS: i64 = 20_000;
+/// The start of a `session_costs` process key Claude Code named (`CLAUDE_PID`, F25), as
+/// `statusline::process_key` makes it.
+pub const NAMED_PROCESS_PREFIX: &str = "pid:";
+/// A session whose process has run less than this (ms) started then, unless it was resumed or
+/// forked, which restores the run time it had (`Store::note_session_cost`).
+const NEW_SESSION_MS: i64 = 60_000;
 const PROCESS_START_EARLIER_MS: i64 = 20_000;
 /// How often an unchanged session row has its `seen_ms` refreshed, which only keeps it from
 /// being pruned: so most ticks only read.
@@ -930,6 +942,10 @@ impl Store {
                 s.conn.execute_batch(SCHEMA_V10)?;
                 s.backfill_highs()?;
                 s.conn.pragma_update(None, "user_version", 10)?;
+            }
+            if version < 11 {
+                s.conn.execute_batch(SCHEMA_V11)?;
+                s.conn.pragma_update(None, "user_version", 11)?;
             }
             Ok(())
         })
@@ -2042,73 +2058,93 @@ impl Store {
     // ---- what use would cost at API prices ---------------------------------------------------
 
     /// A session's `cost.total_cost_usd` from the status line of its Claude Code `process`
-    /// (`Store::session_process`; two processes can run one session, resumed twice, each
+    /// (`statusline::process_key`; two processes can run one session, resumed twice, each
     /// restoring the same total). What it added since that process's last total counts for
-    /// `account_id`, in the hour of `now_ms`; returns that.
+    /// `account_id`, in the hour of `now_ms`; returns that. `ran_ms` is how long the process has
+    /// run (`cost.total_duration_ms`), when the status line says.
     ///
-    /// A process's first total counts whole only when it is a `new_session`'s (it ran under a
+    /// A process's first total counts whole only when it is a new session's (it ran under a
     /// minute) that was never seen before; otherwise it carries what the session spent before (a
     /// resumed or forked one, given the total and run time it had, or one running before cc-rotate
-    /// counted) and is only where counting starts. A total below the last one (a `/login` resets
-    /// it) is also only where counting goes on from.
+    /// counted), and counts only what it adds to what the session's other processes reported, as
+    /// below. A total below the last one (a `/login` resets it) is only where counting goes on
+    /// from.
     ///
-    /// What the session's other processes reported since this one last did, up to this total,
-    /// was counted then: one process whose ticks were taken for two (`Store::session_process`)
-    /// counts only once. Two processes really running one session still each count their own,
-    /// until one passes the other's total.
+    /// What the session's other processes reported up to this total was counted then: a
+    /// process's first total counts from the highest of theirs not above it (a resumed process
+    /// counts what it adds), and a process told only by when it started
+    /// (`Store::session_process`) also counts each later tick from the highest they reported
+    /// since its own last, since its ticks may have been taken for two processes'.
+    ///
+    /// A process Claude Code names (`pid:` keys, `statusline::process_key`) is exactly one, whose
+    /// run time only grows: a tick that reports less run time than its last was taken before it
+    /// and finished after it (two status line runs at once), and changes nothing.
     pub fn note_session_cost(
         &self,
         session_id: &str,
         process: &str,
         total_usd: f64,
-        new_session: bool,
+        ran_ms: Option<i64>,
         account_id: i64,
         now_ms: i64,
     ) -> Result<f64> {
         if !total_usd.is_finite() || total_usd < 0.0 {
             return Ok(0.0);
         }
+        let named = process.starts_with(NAMED_PROCESS_PREFIX);
+        let new_session = ran_ms.is_some_and(|r| (0..NEW_SESSION_MS).contains(&r));
         self.immediate(|s| {
-            let last: Option<(f64, i64)> = s
+            let last: Option<(f64, i64, Option<i64>)> = s
                 .conn
                 .query_row(
-                    "SELECT total_usd, updated_at FROM session_costs
+                    "SELECT total_usd, updated_at, ran_ms FROM session_costs
                      WHERE session_id = ?1 AND process = ?2",
                     params![session_id, process],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
                 .optional()?;
+            if let (true, Some((_, _, Some(last_ran))), Some(ran)) = (named, last, ran_ms)
+                && ran < last_ran
+            {
+                return Ok(0.0);
+            }
             let seen: bool = s.conn.query_row(
                 "SELECT EXISTS (SELECT 1 FROM session_costs WHERE session_id = ?1)",
                 [session_id],
                 |r| r.get(0),
             )?;
-            // The highest total another process of the session reported since this one's last,
+            // The highest total another process of the session reported (since this one's last),
             // that is not above this total.
-            let others: Option<f64> = s.conn.query_row(
-                "SELECT max(total_usd) FROM session_costs
-                 WHERE session_id = ?1 AND process <> ?2 AND total_usd <= ?3 AND updated_at >= ?4",
-                params![
-                    session_id,
-                    process,
-                    total_usd,
-                    last.map_or(i64::MIN, |(_, at)| at)
-                ],
-                |r| r.get(0),
-            )?;
+            let others: Option<f64> = if named && last.is_some() {
+                None
+            } else {
+                s.conn.query_row(
+                    "SELECT max(total_usd) FROM session_costs
+                     WHERE session_id = ?1 AND process <> ?2 AND total_usd <= ?3
+                       AND updated_at >= ?4",
+                    params![
+                        session_id,
+                        process,
+                        total_usd,
+                        last.map_or(i64::MIN, |(_, at, _)| at)
+                    ],
+                    |r| r.get(0),
+                )?
+            };
             let added = match (last, others) {
-                (Some((last, _)), _) if total_usd < last => 0.0,
-                (Some((last, _)), others) => total_usd - others.map_or(last, |o| o.max(last)),
+                (Some((last, _, _)), _) if total_usd < last => 0.0,
+                (Some((last, _, _)), others) => total_usd - others.map_or(last, |o| o.max(last)),
                 (None, Some(others)) => total_usd - others,
                 (None, None) if new_session && !seen => total_usd,
                 (None, None) => 0.0,
             };
             s.conn.execute(
-                "INSERT INTO session_costs (session_id, process, total_usd, updated_at)
-                 VALUES (?1, ?2, ?3, ?4)
+                "INSERT INTO session_costs (session_id, process, total_usd, updated_at, ran_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT (session_id, process) DO UPDATE SET
-                    total_usd = excluded.total_usd, updated_at = excluded.updated_at",
-                params![session_id, process, total_usd, now_ms],
+                    total_usd = excluded.total_usd, updated_at = excluded.updated_at,
+                    ran_ms = excluded.ran_ms",
+                params![session_id, process, total_usd, now_ms, ran_ms],
             )?;
             if added > 0.0 {
                 s.conn.execute(
@@ -2645,7 +2681,8 @@ mod tests {
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(
             "DROP TABLE session_readings; DROP TABLE session_processes;
-             ALTER TABLE sample_windows DROP COLUMN high;",
+             ALTER TABLE sample_windows DROP COLUMN high;
+             ALTER TABLE session_costs DROP COLUMN ran_ms;",
         )
         .unwrap();
         conn.pragma_update(None, "user_version", 8).unwrap();
@@ -2738,13 +2775,49 @@ mod tests {
         drop(store);
         // As the store schema 9 left.
         let conn = Connection::open(&path).unwrap();
-        conn.execute_batch("ALTER TABLE sample_windows DROP COLUMN high;")
-            .unwrap();
+        conn.execute_batch(
+            "ALTER TABLE sample_windows DROP COLUMN high;
+             ALTER TABLE session_costs DROP COLUMN ran_ms;",
+        )
+        .unwrap();
         conn.pragma_update(None, "user_version", 9).unwrap();
         drop(conn);
 
         let store = Store::open(&path).unwrap();
         assert_eq!(highs(&store.conn), recorded);
+    }
+
+    /// Schema 11 keeps the costs counted before it; a process's run time is known from its next
+    /// tick on.
+    #[test]
+    fn upgrading_keeps_each_sessions_last_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        let store = Store::open(&path).unwrap();
+        let a = store
+            .insert_account("a", &AccountIdentity::default(), AccountState::Active)
+            .unwrap();
+        store
+            .note_session_cost("s1", "100", 3.0, None, a, 1_000)
+            .unwrap();
+        drop(store);
+        // As the store schema 10 left.
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("ALTER TABLE session_costs DROP COLUMN ran_ms;")
+            .unwrap();
+        conn.pragma_update(None, "user_version", 10).unwrap();
+        drop(conn);
+
+        let store = Store::open(&path).unwrap();
+        // The same process, now named: it counts from the total it last reported.
+        let added = store
+            .note_session_cost("s1", "pid:7", 3.5, Some(900_000), a, 2_000)
+            .unwrap();
+        assert!((added - 0.5).abs() < 1e-9, "{added}");
+        let added = store
+            .note_session_cost("s1", "pid:7", 3.75, Some(930_000), a, 3_000)
+            .unwrap();
+        assert!((added - 0.25).abs() < 1e-9, "{added}");
     }
 
     #[test]
@@ -3554,15 +3627,15 @@ mod tests {
         let hour = 3_600_000;
         let h0 = 490_000 * hour;
         // Two ticks in one hour add up; the next hour has its own bucket.
-        s.note_session_cost("s1", "p", 1.25, true, a, h0 + 60_000)
+        s.note_session_cost("s1", "p", 1.25, Some(1_000), a, h0 + 60_000)
             .unwrap();
-        s.note_session_cost("s1", "p", 2.0, false, a, h0 + hour - 1)
+        s.note_session_cost("s1", "p", 2.0, None, a, h0 + hour - 1)
             .unwrap();
-        s.note_session_cost("s1", "p", 2.5, false, a, h0 + hour)
+        s.note_session_cost("s1", "p", 2.5, None, a, h0 + hour)
             .unwrap();
-        s.note_session_cost("s2", "p", 4.0, true, b, h0 + 30 * 60_000)
+        s.note_session_cost("s2", "p", 4.0, Some(1_000), b, h0 + 30 * 60_000)
             .unwrap();
-        s.note_session_cost("s3", "p", 1.0, true, a, h0 - 1)
+        s.note_session_cost("s3", "p", 1.0, Some(1_000), a, h0 - 1)
             .unwrap();
         let cost = |account_id, ts, usd| HourlyCost {
             account_id,

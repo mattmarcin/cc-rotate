@@ -174,7 +174,14 @@ fn main() -> Result<()> {
             // About $2 an hour at API prices, more on busier days.
             let day = ((now - t) / (24 * hour)) as usize;
             s.spent += (0.18 + (t / 600_000 % 7) as f64 * 0.06) * DAY_LOAD[day.min(6)];
-            store.note_session_cost(&format!("demo-{}", s.id), "demo", s.spent, true, s.id, t)?;
+            store.note_session_cost(
+                &format!("demo-{}", s.id),
+                "demo",
+                s.spent,
+                Some(1_000),
+                s.id,
+                t,
+            )?;
         }
         if s.five_resets != 0 {
             store.record_sample(&Sample {
