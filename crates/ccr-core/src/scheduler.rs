@@ -8,20 +8,21 @@
 //!
 //! Ranking, best first (`Policy::tier`):
 //! 1. With `prefer_no_weekly_limit` on: accounts without a weekly limit.
-//! 2. Accounts whose weekly budget would otherwise reset unused (`budget::expiring`), the
-//!    soonest reset first.
+//! 2. Accounts included in weekly optimization, the soonest weekly reset first; at-risk
+//!    budgets (`budget::expiring`) break equal deadlines and may trigger a proactive swap.
 //! 3. With `prefer_no_weekly_limit` on: accounts whose weekly limit is not known yet, then
 //!    accounts with one.
-//! 4. Within a tier (`Policy::place`): the account in use, then accounts whose 5-hour window is
+//! 4. Within a tier, opted-in budgets go by their next weekly reset while optimization is on.
+//!    Among equal deadlines (`Policy::place`): the account in use, then accounts whose 5-hour window is
 //!    already running with `RUNNING_MARGIN` points to spare, the soonest reset first, then the
 //!    user's order (`position`), then running 5-hour windows closer to their limit. With
 //!    `strict_order` on, the user's order alone.
 //! 5. The most room before a threshold, then the label.
 //!
-//! The ranking only orders picks. The account in use is kept until a limit, since what is left
+//! The account in use is normally kept until a limit, since what is left
 //! in a 5-hour window is lost when it resets, so leaving a running window for a fresh one only
-//! adds swaps. The one exception is `switch_back_target`: an account that may have a weekly
-//! limit gives way to one without as soon as one is ready. An account's weekly cap
+//! adds swaps. `proactive_target` also lets a ready account without a weekly limit take over,
+//! or an expiring weekly budget take over from one with a later deadline. An account's weekly cap
 //! (`Account::weekly_cap`) lowers its weekly thresholds.
 
 use std::cmp::Ordering;
@@ -326,6 +327,8 @@ pub enum Reason {
     /// An account without a weekly limit is usable while one with a weekly limit is in use
     /// (switch back, `switch_back_target`).
     PreferredAvailable,
+    /// Spend an at-risk weekly budget before its earlier reset, without waiting for a limit.
+    WeeklyExpiring,
     StopFailure,
     DeadLogin,
     Manual,
@@ -342,6 +345,7 @@ impl Reason {
             Self::Weekly => "threshold_7d",
             Self::OtherLimit => "threshold_other",
             Self::PreferredAvailable => "preferred_available",
+            Self::WeeklyExpiring => "weekly_expiring",
             Self::StopFailure => "stop_failure",
             Self::DeadLogin => "dead_login",
             Self::Manual => "manual",
@@ -356,6 +360,7 @@ impl Reason {
             "threshold_7d" => Self::Weekly,
             "threshold_other" => Self::OtherLimit,
             "preferred_available" => Self::PreferredAvailable,
+            "weekly_expiring" => Self::WeeklyExpiring,
             "stop_failure" => Self::StopFailure,
             "dead_login" => Self::DeadLogin,
             "manual" => Self::Manual,
@@ -367,7 +372,7 @@ impl Reason {
 
     /// Usage-driven triggers respect the cooldown; the others are urgent or explicit.
     pub fn respects_cooldown(self) -> bool {
-        self.is_threshold() || self == Self::PreferredAvailable
+        self.is_threshold() || matches!(self, Self::PreferredAvailable | Self::WeeklyExpiring)
     }
 
     /// A window of the active account reached its threshold.
@@ -515,18 +520,20 @@ impl Policy {
         c.expiring.as_ref().filter(|_| self.use_expiring_weekly)
     }
 
-    /// 0 for no weekly limit, which always goes first, even before a weekly budget that would
-    /// reset unused; then 1 for an account whose weekly budget would reset unused, 2 for not
-    /// known yet, 3 for a weekly limit. With the preference off: 1 for a weekly budget that would
-    /// reset unused, 2 for every other account.
+    /// 0 for no weekly limit with its preference on, 1 for weekly optimization, 2 for not
+    /// known yet, 3 for other weekly accounts. With the preference off, other accounts share 2.
     pub fn tier(&self, c: &Candidate) -> u8 {
         let expiring = self.expiring(c).is_some();
+        let optimized = self.use_expiring_weekly
+            && c.account.use_expiring
+            && c.weekly_limit == WeeklyLimit::Has
+            && c.weekly().is_some();
         if !self.prefer_no_weekly_limit {
-            return if expiring { 1 } else { 2 };
+            return if optimized || expiring { 1 } else { 2 };
         }
         match c.weekly_limit {
             WeeklyLimit::None => 0,
-            _ if expiring => 1,
+            _ if optimized || expiring => 1,
             WeeklyLimit::Unknown => 2,
             WeeklyLimit::Has => 3,
         }
@@ -534,15 +541,36 @@ impl Policy {
 
     /// The rank of an account in the pick order: lower is better. Room is deliberately not part
     /// of it. Accounts whose weekly budget would reset unused go by their reset, the soonest
-    /// first, since only one account is in use at a time. The user's order is part of it only
-    /// with `strict_order`.
-    pub fn rank(&self, c: &Candidate) -> (u8, i64) {
+    /// first, since only one account is in use at a time. With weekly optimization enabled,
+    /// other opted-in weekly budgets also go by their next known reset. The user's order
+    /// breaks equal deadlines with `strict_order`.
+    pub fn rank(&self, c: &Candidate, now_s: i64) -> (u8, i64, bool, i64) {
         let tier = self.tier(c);
-        match self.expiring(c) {
-            Some(e) if tier == 1 => (tier, e.resets_at),
-            _ if self.strict_order => (tier, c.account.position),
-            _ => (tier, 0),
-        }
+        let deadline = self
+            .expiring(c)
+            .filter(|_| tier == 1)
+            .map(|e| e.resets_at)
+            .or_else(|| {
+                c.weekly()
+                    .filter(|_| {
+                        self.use_expiring_weekly
+                            && c.account.use_expiring
+                            && c.weekly_limit == WeeklyLimit::Has
+                    })
+                    .and_then(|w| w.resets_at)
+                    .filter(|&r| r > now_s)
+            })
+            .unwrap_or(i64::MAX);
+        (
+            tier,
+            deadline,
+            self.expiring(c).is_none(),
+            if self.strict_order {
+                c.account.position
+            } else {
+                0
+            },
+        )
     }
 
     /// Where an account goes among accounts of the same rank, best first. The account in use
@@ -573,7 +601,7 @@ impl Policy {
     fn pick_order(&self, a: &Candidate, b: &Candidate, now_s: i64) -> Ordering {
         a.on_stop_hold(now_s)
             .cmp(&b.on_stop_hold(now_s))
-            .then(self.rank(a).cmp(&self.rank(b)))
+            .then(self.rank(a, now_s).cmp(&self.rank(b, now_s)))
             .then(self.place(a, now_s).cmp(&self.place(b, now_s)))
             .then(b.room(self.thresholds).total_cmp(&a.room(self.thresholds)))
             .then_with(|| a.account.label.cmp(&b.account.label))
@@ -593,13 +621,13 @@ pub fn pick(
         .min_by(|a, b| policy.pick_order(a, b, now_s))
 }
 
-/// The account to switch back to, the only switch back there is: while an account that may have
+/// The account to switch back to: while an account that may have
 /// a weekly limit is in use, the best eligible account without one that has
 /// `SWITCH_BACK_MARGIN` to spare, so weekly budget is only spent while no such account can be
 /// used. Not to an account a turn just stopped on at a limit its readings do not show
 /// (`Candidate::on_stop_hold`), which would swap back and forth every cooldown. Never with
 /// `prefer_no_weekly_limit` off, and `None` while the active account is over a threshold, since
-/// the threshold trigger handles that. The account in use is otherwise kept until a limit.
+/// the threshold trigger handles that. Earlier expiring weeks use `expiring_target`.
 pub fn switch_back_target(
     candidates: &[Candidate],
     policy: Policy,
@@ -623,6 +651,55 @@ pub fn switch_back_target(
                 && !c.on_stop_hold(now_s)
         })
         .min_by(|a, b| policy.pick_order(a, b, now_s))
+}
+
+/// An at-risk weekly budget may take over before the current account hits a limit.
+/// Keep an opted-in current week with an earlier or matching deadline, even when little
+/// remains, so spending it cannot make the accounts trade places. Reset rounding within
+/// a minute counts as the same deadline. Non-weekly windows need the usual margin, but
+/// any positive weekly balance counts: the threshold already reserves the weekly buffer.
+pub fn expiring_target(candidates: &[Candidate], policy: Policy, now_s: i64) -> Option<&Candidate> {
+    let active = candidates
+        .iter()
+        .find(|c| c.account.state == AccountState::Active)?;
+    if !policy.use_expiring_weekly
+        || active.blocking().is_some()
+        || (policy.prefer_no_weekly_limit && active.weekly_limit == WeeklyLimit::None)
+    {
+        return None;
+    }
+    let deadline = active
+        .weekly()
+        .and_then(|w| w.resets_at)
+        .filter(|&t| active.account.use_expiring && t > now_s);
+    candidates
+        .iter()
+        .filter(|c| {
+            c.eligible()
+                && c.windows.iter().filter(|w| w.applies).all(|w| {
+                    if w.kind == WindowKind::Weekly {
+                        w.room() > 0.0
+                    } else {
+                        w.room() >= SWITCH_BACK_MARGIN
+                    }
+                })
+                && !c.on_stop_hold(now_s)
+                && policy.expiring(c).is_some_and(|e| {
+                    e.resets_at > now_s && deadline.is_none_or(|d| e.resets_at < d - 60)
+                })
+        })
+        .min_by(|a, b| policy.pick_order(a, b, now_s))
+}
+
+/// The same proactive choice is used by ticks, background syncs and the forecast.
+pub fn proactive_target(
+    candidates: &[Candidate],
+    policy: Policy,
+    now_s: i64,
+) -> Option<(Reason, &Candidate)> {
+    switch_back_target(candidates, policy, now_s)
+        .map(|c| (Reason::PreferredAvailable, c))
+        .or_else(|| expiring_target(candidates, policy, now_s).map(|c| (Reason::WeeklyExpiring, c)))
 }
 
 /// The threshold trigger for the active account's live usage, if any.
@@ -684,11 +761,8 @@ pub fn decide(
     if let Some((reason, _)) = threshold_trigger(active) {
         return (thresholds && !timing.throttled(reason)).then_some(reason);
     }
-    let reason = Reason::PreferredAvailable;
-    if timing.throttled(reason) {
-        return None;
-    }
-    switch_back_target(candidates, policy, timing.now_ms / 1000).map(|_| reason)
+    let (reason, _) = proactive_target(candidates, policy, timing.now_ms / 1000)?;
+    (!timing.throttled(reason)).then_some(reason)
 }
 
 /// One account in the pick order, with a short reason for its place.
@@ -722,7 +796,7 @@ pub fn ranking(candidates: &[Candidate], policy: Policy, now_s: i64) -> Vec<Rank
         let key = |x: &Candidate| {
             (
                 x.on_stop_hold(now_s),
-                policy.rank(x),
+                policy.rank(x, now_s),
                 policy.place(x, now_s),
             )
         };
@@ -1053,21 +1127,21 @@ mod tests {
         let pool = vec![max, unknown, team_b, team_a, paused];
 
         // With strict_order: no weekly limit first, then by order (team-a before team-b
-        // despite less room), then unknown, then weekly-limited.
+        // despite less room), then the optimized weekly budget, then unknown.
         let order = |policy| -> Vec<i64> {
             ranking(&pool, policy, NOW)
                 .iter()
                 .map(|r| r.account_id)
                 .collect()
         };
-        assert_eq!(order(STRICT), vec![4, 3, 2, 1, 5]);
+        assert_eq!(order(STRICT), vec![4, 3, 1, 2, 5]);
         assert_eq!(pick(&pool, STRICT, None, NOW).unwrap().account.id, 4);
         assert_eq!(pick(&pool, STRICT, Some(4), NOW).unwrap().account.id, 3);
         // Without it, the two seats' windows reset together, so the one with more room goes
         // first; the tiers are the same.
-        assert_eq!(order(POLICY), vec![3, 4, 2, 1, 5]);
+        assert_eq!(order(POLICY), vec![3, 4, 1, 2, 5]);
 
-        // With the preference off, only running windows and the user's order decide.
+        // With the unlimited preference off, the optimized weekly budget comes first.
         let off = Policy {
             prefer_no_weekly_limit: false,
             ..STRICT
@@ -1250,7 +1324,7 @@ mod tests {
     }
 
     #[test]
-    fn the_only_switch_back_is_to_an_account_without_a_weekly_limit() {
+    fn without_an_expiring_budget_only_an_unlimited_account_takes_over() {
         let timing = Timing {
             now_ms: NOW * 1000,
             cooldown_ms: 120_000,
@@ -1336,6 +1410,127 @@ mod tests {
                 true
             ),
             None
+        );
+    }
+
+    #[test]
+    fn weekly_reset_order_applies_before_a_budget_becomes_urgent() {
+        let sooner = cand(
+            acct(1, "sooner", AccountState::Parked, 9),
+            WeeklyLimit::Has,
+            &[
+                ("five_hour", 0.0, NOW + 3600),
+                ("seven_day", 70.0, NOW + 86_400),
+            ],
+        );
+        let mut later = cand(
+            acct(2, "later", AccountState::Parked, 1),
+            WeeklyLimit::Has,
+            &[
+                ("five_hour", 0.0, NOW + 3600),
+                ("seven_day", 10.0, NOW + 3 * 86_400),
+            ],
+        );
+        later.expiring = Some(crate::budget::Expiring {
+            left: 88.0,
+            hours_needed: 80.0,
+            hours_available: 20.0,
+            resets_at: NOW + 3 * 86_400,
+        });
+        let pool = [sooner, later];
+        for policy in [POLICY, STRICT] {
+            assert_eq!(pick(&pool, policy, None, NOW).unwrap().account.id, 1);
+            let off = Policy {
+                use_expiring_weekly: false,
+                ..policy
+            };
+            assert_eq!(pick(&pool, off, None, NOW).unwrap().account.id, 2);
+            assert_eq!(
+                pick(&pool, policy, None, NOW + 86_400).unwrap().account.id,
+                2,
+                "a reset that has passed is no longer an early deadline"
+            );
+        }
+    }
+
+    #[test]
+    fn expiring_switches_respect_deadlines_margins_and_cooldowns() {
+        let active = cand(
+            acct(1, "active", AccountState::Active, 1),
+            WeeklyLimit::Has,
+            &[
+                ("five_hour", 10.0, NOW + 3600),
+                ("seven_day", 10.0, NOW + 3 * 86_400),
+            ],
+        );
+        let mut urgent = cand(
+            acct(2, "urgent", AccountState::Parked, 2),
+            WeeklyLimit::Has,
+            &[
+                ("five_hour", 10.0, NOW + 3600),
+                ("seven_day", 70.0, NOW + 86_400),
+            ],
+        );
+        urgent.expiring = Some(crate::budget::Expiring {
+            left: 28.0,
+            hours_needed: 20.0,
+            hours_available: 10.0,
+            resets_at: NOW + 86_400,
+        });
+        let timing = Timing {
+            now_ms: NOW * 1000,
+            cooldown_ms: 120_000,
+            ..Default::default()
+        };
+        let mut pool = [active, urgent];
+        assert_eq!(
+            decide(&pool, POLICY, timing, false, false),
+            Some(Reason::WeeklyExpiring)
+        );
+        pool[1].windows[1].pct = 96.0;
+        assert_eq!(
+            decide(&pool, POLICY, timing, false, false),
+            Some(Reason::WeeklyExpiring),
+            "the configured weekly threshold is the buffer, not another five points"
+        );
+        pool[1].windows[1].pct = 70.0;
+        assert_eq!(
+            decide(
+                &pool,
+                POLICY,
+                Timing {
+                    last_swap_ms: timing.now_ms - 60_000,
+                    ..timing
+                },
+                false,
+                true
+            ),
+            None
+        );
+        pool[0].account.state = AccountState::Parked;
+        pool[1].account.state = AccountState::Active;
+        assert_eq!(
+            decide(&pool, POLICY, timing, false, true),
+            None,
+            "do not swap back to a later week"
+        );
+        pool[0].account.state = AccountState::Active;
+        pool[1].account.state = AccountState::Parked;
+        pool[0].windows[1].resets_at = Some(NOW + 86_400 + 30);
+        assert_eq!(
+            decide(&pool, POLICY, timing, false, true),
+            None,
+            "rounded reset times are one deadline"
+        );
+        pool[0].windows[1].resets_at = Some(NOW + 3 * 86_400);
+        pool[1].stop_hold_until = Some(NOW + 300);
+        assert_eq!(decide(&pool, POLICY, timing, false, true), None);
+        pool[1].stop_hold_until = None;
+        pool[1].windows[0].pct = 95.0;
+        assert_eq!(
+            decide(&pool, POLICY, timing, false, true),
+            None,
+            "not enough room for a proactive swap"
         );
     }
 

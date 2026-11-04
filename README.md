@@ -153,9 +153,12 @@ After an upgrade from an older cc-rotate, accounts that had the same priority sh
 When the account in use reaches a limit, cc-rotate picks the next account that is below all of its limits:
 
 1. Accounts without a weekly limit, whatever their plan.
-   Turn this off with `cc-rotate-ctl config prefer_no_weekly_limit false`: then accounts with and without a weekly limit, and those not known yet, are treated alike, and cc-rotate never swaps back (see below).
-2. Then accounts whose weekly budget would otherwise reset unused (see below), the soonest reset first, then accounts whose weekly limit is not known yet, then accounts with one.
-3. Then the account in use, then accounts whose 5-hour window is already running and at least 10 points below the swap threshold, the one that resets soonest first.
+   Turn this off with `cc-rotate-ctl config prefer_no_weekly_limit false`: then accounts with and without a weekly limit, and those not known yet, share the same base priority, and cc-rotate does not switch back just because an account has no weekly limit.
+2. Then accounts included in weekly optimization, the soonest weekly reset first.
+   At the same reset time, an at-risk budget comes first.
+   Then accounts whose weekly limit is not known yet, then other accounts with one.
+3. Within each group, earlier weekly resets come first for accounts included in weekly optimization.
+   With equal weekly resets, the account in use comes first, then accounts whose 5-hour window is already running and at least 10 points below the swap threshold, the one that resets soonest first.
 4. Then your order.
 5. Then accounts whose running 5-hour window is closer to the threshold than that, since each would last only minutes.
 6. Then, between accounts in the same place, the one with the most room left.
@@ -168,16 +171,21 @@ cc-rotate finds out whether an account has a weekly limit from the usage Claude 
 Until then it is not known yet.
 If that guess is wrong, set it yourself on the account's page in the app or with `cc-rotate-ctl weekly-limit <label> yes|no` (`auto` goes back to detecting it).
 
-The account in use is kept until it reaches a limit, with one exception.
+The account in use is usually kept until it reaches a limit.
 While the account in use has a weekly limit, or it is not known yet whether it has one, cc-rotate swaps back to an account without a weekly limit as soon as one is ready again.
 So weekly budget is only spent while no account without a weekly limit can be used.
 That includes an account you picked by hand and an account spending a weekly budget that would otherwise reset unused.
 To keep using such an account, pause the accounts without a weekly limit, or turn off `prefer_no_weekly_limit`.
 When a session stops at a usage limit that Claude Code's usage numbers did not show, that account is used last, and not swapped back to, until cc-rotate gets different numbers for it or 5 hours have passed, so such a limit cannot make it swap back and forth.
-cc-rotate never swaps back for anything else: not for an account higher in your order, and not to even out usage.
+An account whose weekly budget is at risk of going unused can also take over from an account with a later weekly reset, without waiting for that account to hit a limit.
+Both kinds of early swap respect the cooldown and skip accounts whose usage is not trusted after a session stopped at a limit.
+An early swap to a weekly budget requires at least 5 points of room in non-weekly windows, while any remaining weekly balance counts up to the configured threshold.
+Switching back to an unlimited account requires the 5-point margin in every applicable window.
+Weekly reset times within a minute count as the same deadline, and an earlier week already in use is finished before switching to a later one.
+There is no early swap just to move up your order or equalize percentages.
 
-To pick the next account by your order alone, turn on **Pick the next account by my order alone** in the app's **Settings**, or run `cc-rotate-ctl config strict_order true`.
-Then steps 3 and 5 are skipped.
+To use your order instead of preferring running 5-hour windows, turn on **Pick the next account by my order alone** in the app's **Settings**, or run `cc-rotate-ctl config strict_order true`.
+Weekly priority and reset times still come first; your order breaks ties between those accounts.
 
 `cc-rotate-ctl next --explain` lists every account in the order it would be used, with the reason for each.
 
@@ -204,11 +212,17 @@ When Claude Code reports one, cc-rotate records it too and only counts it while 
 
 Whatever an account with a weekly limit hasn't used by its weekly reset is lost.
 It can only be used as fast as its 5-hour limit allows, and only while you're working, so leaving it for last can mean there isn't time to use it.
-cc-rotate works out how many hours of use the rest of each weekly budget takes and how many working hours are left before the reset.
+cc-rotate learns how many weekly points each 5-hour point costs, then works out how much use the rest of each weekly budget needs.
+It starts with the room in the current 5-hour window and its actual reset time, then allows another window every five hours.
+For example, 98 weekly points at 0.5 weekly points per 5-hour point need 196 points, or two full 98-point windows.
+If the current window has only one point left and resets in five hours, that budget needs two further resets, at five and ten hours, before it can finish.
+It checks both whether those resets fit before the weekly deadline and whether the pool has enough working hours to spend the budgets.
+Only actual use is added across accounts: while one account waits for its next window, another can be used.
 When the account would otherwise run out of time, it moves ahead of the other accounts with a weekly limit, early enough to use its budget.
 Accounts without a weekly limit still come first, so a budget can still go unused when they carry all the work.
-Until then its budget stays in reserve for when every other account is at a limit.
+Ordinary picks already prefer earlier weekly resets; an at-risk budget can also trigger an early swap from a later weekly deadline.
 The accounts are taken in the order their weeks reset, since only one is in use at a time.
+The plan recalculates weekly urgency as budgets are spent and windows reset, so a newly reset week no longer keeps an old priority.
 
 It learns from your usage how much of the weekly budget a 5-hour window costs on each account, how fast you use an account, and when you usually work.
 Until it has seen enough, it assumes a full 5-hour window costs a tenth of the week and that you work 10 hours a day, which errs on the side of starting early.

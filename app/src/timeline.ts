@@ -256,7 +256,11 @@ export function summary(snap: Snapshot, labelOf: (id: number) => string): { titl
       : ["At your pace, ", b(active.label), first.at_limit ? " reaches its swap point around " : " gives way around ", b(when(first.to * 1000, now)), "."]
     : [
         b(active.label),
-        active.windows.some((w) => w.applies && w.pct >= w.threshold) ? " is at its swap point, so " : " gives way to an account without a weekly limit: ",
+        active.windows.some((w) => w.applies && w.pct >= w.threshold)
+          ? " is at its swap point, so "
+          : snap.accounts.find((a) => a.id === first.account_id)?.weekly.effective === "none"
+            ? " gives way to an account without a weekly limit: "
+            : " gives way to use weekly budget before it resets: ",
         b(labelOf(first.account_id)),
         " takes over now.",
       ];

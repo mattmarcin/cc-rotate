@@ -11,6 +11,7 @@ export const REASONS: Record<string, string> = {
   threshold_7d: "at the weekly limit",
   threshold_other: "at a usage limit",
   preferred_available: "now that it's ready again",
+  weekly_expiring: "to use its weekly budget before it resets",
   stop_failure: "after Claude Code hit a limit",
   avoid_extra_usage: "so sessions wait instead of paying for extra usage",
   dead_login: "because the login stopped working",

@@ -302,7 +302,7 @@ fn pick_order(prefer_no_weekly_limit: bool, use_expiring_weekly: bool, strict: b
         groups.push("accounts without a weekly limit");
     }
     if use_expiring_weekly {
-        groups.push("accounts whose weekly budget would go unused");
+        groups.push("accounts included in weekly optimization");
     }
     if prefer_no_weekly_limit {
         groups.push("accounts whose weekly limit is not known yet");
@@ -311,6 +311,9 @@ fn pick_order(prefer_no_weekly_limit: bool, use_expiring_weekly: bool, strict: b
         groups.push("every other account");
     }
     let mut within: Vec<&str> = Vec::new();
+    if use_expiring_weekly {
+        within.push("earlier weekly resets for included accounts");
+    }
     if !strict {
         within.push("the account in use");
         within.push("accounts whose 5-hour window is already running, the soonest reset first");
@@ -599,16 +602,16 @@ mod tests {
     fn pick_order_names_the_groups_then_the_order_within_each() {
         assert_eq!(
             pick_order(true, true, false),
-            "accounts without a weekly limit, then accounts whose weekly budget would go unused, \
+            "accounts without a weekly limit, then accounts included in weekly optimization, \
              then accounts whose weekly limit is not known yet, then accounts with a weekly limit. \
-             Within each: the account in use, then accounts whose 5-hour window is already \
+             Within each: earlier weekly resets for included accounts, then the account in use, then accounts whose 5-hour window is already \
              running, the soonest reset first, then your order, then running windows close to a \
              limit, then the most room."
         );
         assert_eq!(
             pick_order(false, true, true),
-            "accounts whose weekly budget would go unused, then every other account. Within each: \
-             your order, then the most room."
+            "accounts included in weekly optimization, then every other account. Within each: \
+             earlier weekly resets for included accounts, then your order, then the most room."
         );
         assert_eq!(
             pick_order(false, false, true),

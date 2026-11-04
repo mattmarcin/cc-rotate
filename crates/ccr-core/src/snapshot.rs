@@ -217,6 +217,7 @@ pub fn snapshot_at(store: &Store, paths: &Paths, now_ms: i64) -> Result<Snapshot
     let forecast = match active_id {
         Some(_) => {
             let rates = crate::budget::cached_rates(store)?;
+            let promoted = crate::budget::promoted(store, &pool)?;
             // Windows are kept running only while warm-ups run.
             let mut pool = pool.clone();
             if crate::usage_check::warm_ups_paused(store, paths)?.is_some() {
@@ -225,7 +226,9 @@ pub fn snapshot_at(store: &Store, paths: &Paths, now_ms: i64) -> Result<Snapshot
                 }
             }
             crate::forecast::pace(store, &rates, now_ms)?
-                .map(|pace| crate::forecast::forecast(&pool, policy, &rates, pace, now_s))
+                .map(|pace| {
+                    crate::forecast::forecast(&pool, policy, &rates, &promoted, pace, now_s)
+                })
                 // Already out: the pool summary says so, with when one frees up.
                 .filter(|f| f.runs_out_at.is_none_or(|t| t > now_s))
         }

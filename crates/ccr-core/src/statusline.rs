@@ -595,7 +595,7 @@ fn is_stale_reading(store: &Store, sample: &Sample, now_ms: i64) -> Result<bool>
 /// does (the desktop app's watcher, `cc-rotate-ctl status`). It also records the usage the
 /// user's other profiles read (`profile_usage`), which the tick leaves out to stay within its
 /// time budget. Returns a swap request when the profile's login turned out to be dead, or when
-/// an account without a weekly limit is ready to switch back to (the same rule and throttling
+/// an account without a weekly limit or an earlier expiring week is ready (the same rules and throttling
 /// as a tick,
 /// but no threshold triggers, since those need a live reading).
 pub fn sync(store: &Store, paths: &Paths) -> Result<Option<SwapRequest>> {

@@ -358,6 +358,7 @@ fn play(
             timing.last_request_ms = timing.now_ms;
             let target = match reason {
                 Reason::PreferredAvailable => scheduler::switch_back_target(&pool, policy, t),
+                Reason::WeeklyExpiring => scheduler::expiring_target(&pool, policy, t),
                 _ => scheduler::pick(&pool, policy, Some(active), t),
             };
             if let Some(target) = target {

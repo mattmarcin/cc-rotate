@@ -1951,6 +1951,104 @@ fn a_weekly_budget_that_would_reset_unused_moves_its_account_ahead() {
     assert!((marked - week_reset).abs() <= 5, "{marked} vs {week_reset}");
 }
 
+/// A ready account's weekly budget must not expire while a later-resetting account keeps
+/// running below its limits.
+#[test]
+fn an_expiring_weekly_budget_takes_over_before_a_limit() {
+    let env = Env::new();
+    let (store, a, b, c) = pool(&env);
+    store.set_state(c, AccountState::Paused).unwrap();
+    store
+        .set_setting("use_expiring_weekly", Some("true"))
+        .unwrap();
+    let now = time::now_ms();
+    for (id, week, reset) in [
+        (a, 10.0, now / 1000 + 6 * 86_400),
+        (b, 96.0, now / 1000 + 3600),
+    ] {
+        store
+            .record_sample(&Sample {
+                windows: vec![
+                    window("five_hour", 10.0, now / 1000 + 3 * 3600),
+                    window("seven_day", week, reset),
+                ],
+                ..sample(id, 0.0, 0.0)
+            })
+            .unwrap();
+    }
+    let request = statusline::sync_at(&store, &env.paths, now)
+        .unwrap()
+        .expect("use the expiring weekly budget without waiting for the current account's limit");
+    assert_eq!(request.reason.as_str(), "weekly_expiring");
+    store.set_use_expiring(b, false).unwrap();
+    assert!(
+        matches!(
+            swap::run(&store, &env.paths, &request).unwrap(),
+            SwapOutcome::Skipped { .. }
+        ),
+        "revalidate the optimization under the swap lock"
+    );
+    store.set_use_expiring(b, true).unwrap();
+    assert_eq!(
+        swap::run(&store, &env.paths, &request).unwrap(),
+        SwapOutcome::Swapped {
+            from: Some(a),
+            to: b
+        }
+    );
+    assert!(
+        statusline::sync_at(&store, &env.paths, now + 180_000)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn a_new_weekly_limit_replaces_unlimited_detection_and_blocks_until_reset() {
+    let env = Env::new();
+    let (store, _, b, _) = pool(&env);
+    let now = time::now_ms();
+    for (ts, reset) in [
+        (now - 6 * 3_600_000, now / 1000 - 3600),
+        (now, now / 1000 + 3600),
+    ] {
+        store.record_sample(&five_only(b, 10.0, reset, ts)).unwrap();
+    }
+    assert_eq!(
+        swap::detect_weekly_limit(&store, b, now / 1000).unwrap(),
+        ccr_core::scheduler::WeeklyLimit::None
+    );
+    let week_reset = now / 1000 + 86_400;
+    let windows = ccr_core::usage_report::windows(&json!({"limits": [
+        {"kind": "session", "percent": 10.0, "resets_at": now / 1000 + 3600},
+        {"kind": "weekly_all", "percent": 98.0, "resets_at": week_reset}
+    ]}));
+    store
+        .record_sample(&Sample {
+            ts: now + 1,
+            profile: "check".into(),
+            windows,
+            ..sample(b, 0.0, 0.0)
+        })
+        .unwrap();
+    let snap = ccr_core::snapshot::snapshot_at(&store, &env.paths, now + 2).unwrap();
+    let account = snap.accounts.iter().find(|a| a.account.id == b).unwrap();
+    assert_eq!(
+        account.weekly.effective,
+        ccr_core::scheduler::WeeklyLimit::Has
+    );
+    assert!(!account.eligible);
+    assert_eq!(account.available_at, Some(week_reset));
+    let snap = ccr_core::snapshot::snapshot_at(&store, &env.paths, week_reset * 1000).unwrap();
+    assert!(
+        snap.accounts
+            .iter()
+            .find(|a| a.account.id == b)
+            .unwrap()
+            .eligible
+    );
+}
+
 /// The pool of the stop tests: a and b without a weekly limit, c with one, b at its limit for 6
 /// hours and a with `a_five` points used in a window that resets in `a_resets_s`, then a stop
 /// on a.

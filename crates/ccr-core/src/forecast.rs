@@ -4,11 +4,14 @@
 //! carries across swaps and plans of different sizes). The pool is then played forward in short
 //! steps the way rotation would run it: the account in use fills its windows, a limit hands over
 //! to the account the scheduler would pick, an account with a weekly limit gives way to one
-//! without that is ready (`scheduler::switch_back_target`), and windows reset when they reset.
+//! without that is ready or an earlier expiring week (`scheduler::proactive_target`), and
+//! weekly urgency is recalculated as budgets are spent and windows reset.
 //! The first moment
 //! no account is left is when the pool runs out, and the earliest reset after it is when an
 //! account frees up again. Play goes on after that, the way sessions woken at a limit carry on
 //! (section 21), and every stretch an account is in use is kept as the plan the app draws.
+
+use std::collections::HashMap;
 
 use anyhow::Result;
 use serde::Serialize;
@@ -163,10 +166,12 @@ pub fn forecast(
     pool: &[Candidate],
     policy: Policy,
     rates: &Rates,
+    promoted: &HashMap<i64, i64>,
     pace: f64,
     now_s: i64,
 ) -> Forecast {
     let mut pool: Vec<Candidate> = pool.to_vec();
+    let mut promoted = promoted.clone();
     let mut current = pool
         .iter()
         .position(|c| c.account.state == AccountState::Active);
@@ -206,11 +211,24 @@ pub fn forecast(
                 start_window(c, t, 0.0, policy);
             }
         }
+        let expiring = if policy.use_expiring_weekly {
+            crate::budget::expiring(&pool, rates, &promoted, policy.thresholds.session, t)
+        } else {
+            HashMap::new()
+        };
+        for c in &mut pool {
+            c.expiring = expiring.get(&c.account.id).copied();
+            if c.account.state == AccountState::Active
+                && let Some(e) = c.expiring
+            {
+                promoted.insert(c.account.id, e.resets_at);
+            }
+        }
         let blocked = current.is_none_or(|i| pool[i].blocking().is_some());
         let next = if blocked {
             scheduler::pick(&pool, policy, None, t)
         } else {
-            scheduler::switch_back_target(&pool, policy, t)
+            scheduler::proactive_target(&pool, policy, t).map(|(_, c)| c)
         }
         .map(|c| c.account.id);
         if blocked || next.is_some() {
@@ -232,7 +250,12 @@ pub fn forecast(
             current = next.and_then(|id| pool.iter().position(|c| c.account.id == id));
             since = t;
             match current {
-                Some(i) => pool[i].account.state = AccountState::Active,
+                Some(i) => {
+                    pool[i].account.state = AccountState::Active;
+                    if let Some(e) = pool[i].expiring {
+                        promoted.insert(pool[i].account.id, e.resets_at);
+                    }
+                }
                 None => {
                     if out.runs_out_at.is_none() {
                         out.runs_out_at = Some(t);
@@ -348,7 +371,7 @@ mod tests {
     /// hold. (A pool already out at `NOW` would start with a gap; the snapshot shows no forecast
     /// then.)
     fn play(pool: &[Candidate], pace: f64) -> Forecast {
-        let f = forecast(pool, POLICY, &same_pace(), pace, NOW);
+        let f = forecast(pool, POLICY, &same_pace(), &HashMap::new(), pace, NOW);
         let plan = &f.plan;
         if let Some(first) = plan.first() {
             assert_eq!(first.from, NOW, "the plan starts now: {plan:?}");
@@ -397,6 +420,110 @@ mod tests {
             );
         }
         rates
+    }
+
+    #[test]
+    fn a_weekly_reset_changes_which_budget_needs_the_time() {
+        let mut pool = [
+            seat(1, AccountState::Active, 0.0, None),
+            seat(2, AccountState::Parked, 0.0, None),
+        ];
+        for (c, hours) in pool.iter_mut().zip([1, 12]) {
+            c.weekly_limit = WeeklyLimit::Has;
+            c.weekly_detected = WeeklyLimit::Has;
+            c.windows.extend(window_usage(
+                Some(&Sample {
+                    ts: NOW * 1000,
+                    account_id: c.account.id,
+                    profile: "check".into(),
+                    session_id: None,
+                    model: None,
+                    windows: vec![SampleWindow {
+                        name: "seven_day".into(),
+                        pct: 70.0,
+                        resets_at: Some(NOW + hours * 3600),
+                    }],
+                }),
+                NOW,
+                T,
+                None,
+            ));
+        }
+        let f = forecast(
+            &pool,
+            Policy {
+                use_expiring_weekly: true,
+                ..POLICY
+            },
+            &same_pace(),
+            &HashMap::new(),
+            1.0,
+            NOW,
+        );
+        assert_eq!(f.plan[0].account_id, 1);
+        assert_eq!(f.plan[0].to, NOW + 3600, "{f:?}");
+        assert!(
+            !f.plan[0].at_limit,
+            "the week reset with room left in the 5-hour window"
+        );
+        assert_eq!(f.plan[1].account_id, 2);
+    }
+
+    #[test]
+    fn seven_weekly_accounts_use_the_one_with_room() {
+        for ready in 1..=7 {
+            let pool: Vec<Candidate> = (1..=7)
+                .map(|id| {
+                    let mut c = seat(
+                        id,
+                        if id == 1 {
+                            AccountState::Active
+                        } else {
+                            AccountState::Parked
+                        },
+                        0.0,
+                        None,
+                    );
+                    c.weekly_limit = WeeklyLimit::Has;
+                    c.weekly_detected = WeeklyLimit::Has;
+                    c.windows.extend(window_usage(
+                        Some(&Sample {
+                            ts: NOW * 1000,
+                            account_id: id,
+                            profile: "check".into(),
+                            session_id: None,
+                            model: None,
+                            windows: vec![SampleWindow {
+                                name: "seven_day".into(),
+                                pct: if id == ready { 10.0 } else { 99.0 },
+                                resets_at: Some(NOW + 86_400),
+                            }],
+                        }),
+                        NOW,
+                        T,
+                        None,
+                    ));
+                    c
+                })
+                .collect();
+            let f = forecast(
+                &pool,
+                Policy {
+                    use_expiring_weekly: true,
+                    ..POLICY
+                },
+                &same_pace(),
+                &HashMap::new(),
+                1.0,
+                NOW,
+            );
+            assert_eq!(f.plan[0].account_id, ready, "{f:?}");
+            assert_eq!(
+                f.plan[0].from, NOW,
+                "no waiting while an account has room: {f:?}"
+            );
+            assert!(f.runs_out_at.is_none_or(|t| t > NOW), "{f:?}");
+        }
     }
 
     #[test]

@@ -2,9 +2,9 @@
 //!
 //! What an account with a weekly limit has left at its weekly reset is lost. Its budget can only
 //! be spent as fast as its 5-hour windows allow, and only while the user is working, so an
-//! account whose budget would otherwise reset unused moves ahead of the others early enough to
-//! spend it. It moves ahead only then: until it has to, its budget stays in reserve for when
-//! every other account is at a limit.
+//! account whose budget would otherwise reset unused can take over from a later weekly
+//! deadline before the current account hits a limit. Ordinary picks already prefer earlier
+//! weekly resets; this module decides when waiting for the next pick risks wasting a budget.
 //!
 //! Three rates, learned from the last `LEARN_DAYS` of readings, each starting from a cautious
 //! guess that the readings outweigh as they come in:
@@ -48,8 +48,6 @@ const MAX_GAP_MS: i64 = 20 * 60_000;
 /// Two changes of the 5-hour window further apart than this are not one stretch of use: the
 /// sessions may have sat open and idle in between.
 const MAX_STRETCH_MS: i64 = 30 * 60_000;
-/// Less weekly budget left than this is not worth moving an account ahead for.
-pub const MIN_LEFT: f64 = 5.0;
 /// An account moves ahead once spending its budget, and that of every account resetting
 /// before it, would take this share of the working hours left before its reset.
 pub const ENTER: f64 = 0.75;
@@ -305,7 +303,7 @@ fn same_reset(a: Option<i64>, b: Option<i64>) -> bool {
 pub struct Expiring {
     /// Weekly points left before the account's weekly threshold (its cap, if lower).
     pub left: f64,
-    /// Hours of use spending them takes, at the account's pace and within its 5-hour limit.
+    /// Earliest elapsed hours to spend them, including waits for 5-hour windows to reset.
     pub hours_needed: f64,
     /// The working hours expected before the weekly reset.
     pub hours_available: f64,
@@ -313,11 +311,53 @@ pub struct Expiring {
     pub resets_at: i64,
 }
 
+struct SpendingTime {
+    active_hours: f64,
+    elapsed_hours: f64,
+}
+
+/// Spend at the learned pace, first with the current window's remaining room, then with
+/// fresh windows five hours apart. Only active hours compete with the other accounts;
+/// the waits can overlap their use, but must still fit before this account's weekly reset.
+fn spending_time(
+    c: &Candidate,
+    left: f64,
+    r: AccountRates,
+    session_threshold: f64,
+    from_s: i64,
+) -> Option<SpendingTime> {
+    if r.weekly_per_5h <= 0.0 || r.five_per_hour <= 0.0 {
+        return None;
+    }
+    let points = left / r.weekly_per_5h;
+    let current = c.five_hour();
+    let reset = current.and_then(|w| w.resets_at).filter(|&t| t > from_s);
+    let room = match current {
+        Some(w) if w.resets_at.is_none() || reset.is_some() => (session_threshold - w.pct).max(0.0),
+        _ => session_threshold,
+    };
+    let first_hours = reset.map_or(5.0, |t| (t - from_s) as f64 / 3600.0);
+    let first_points = room.min(r.five_per_hour * first_hours);
+    let active_hours = points / r.five_per_hour;
+    let elapsed_hours = if points <= first_points {
+        active_hours
+    } else {
+        let remaining = points - first_points;
+        let per_window = session_threshold.min(r.five_per_hour * 5.0);
+        let full_windows = (remaining / per_window).ceil() - 1.0;
+        first_hours + full_windows * 5.0 + (remaining - full_windows * per_window) / r.five_per_hour
+    };
+    Some(SpendingTime {
+        active_hours,
+        elapsed_hours,
+    })
+}
+
 /// The accounts that have to be used now to spend their weekly budget before it resets, by
 /// account id.
 ///
 /// Only one account is in use at a time, so the accounts are taken in the order their weekly
-/// windows reset: an account must be used now when its hours, together with the hours of
+/// windows reset: an account must be used now when its active hours, together with those of
 /// every account resetting before it, take `ENTER` of the working hours it has left before its
 /// reset. An account the user excluded (`Account::use_expiring` off) is never moved ahead,
 /// and its hours do not count, since its budget is not planned to be spent early.
@@ -334,7 +374,7 @@ pub fn expiring(
     session_threshold: f64,
     now_s: i64,
 ) -> HashMap<i64, Expiring> {
-    let mut spendable: Vec<(&Candidate, f64, f64, i64, i64)> = pool
+    let mut spendable: Vec<(&Candidate, f64, SpendingTime, i64, i64)> = pool
         .iter()
         .filter(|c| {
             c.weekly_limit == WeeklyLimit::Has
@@ -346,31 +386,35 @@ pub fn expiring(
             let week = c.weekly()?;
             let resets_at = week.resets_at.filter(|&r| r > now_s)?;
             let left = (week.threshold - week.pct).max(0.0);
-            if left < MIN_LEFT {
+            if left <= 0.0 {
                 return None;
             }
             let from = c.blocked_until().filter(|&u| u > now_s).unwrap_or(now_s);
             if from >= resets_at {
                 return None;
             }
-            let r = rates.account(c.account.id);
-            // The most a 5-hour window lets through, spread over its five hours.
-            let five_per_hour = r.five_per_hour.min(session_threshold / 5.0);
-            let per_hour = r.weekly_per_5h * five_per_hour;
-            (per_hour > 0.0).then(|| (c, left, left / per_hour, from, resets_at))
+            let need = spending_time(
+                c,
+                left,
+                rates.account(c.account.id),
+                session_threshold,
+                from,
+            )?;
+            Some((c, left, need, from, resets_at))
         })
         .collect();
     spendable.sort_by_key(|&(c, _, _, _, resets_at)| (resets_at, c.account.id));
 
     let mut out = HashMap::new();
     let mut needed = 0.0;
-    for (c, left, hours, from, resets_at) in spendable {
-        needed += hours;
+    for (c, left, need, from, resets_at) in spendable {
+        needed += need.active_hours;
         let available = rates.working_hours(from, resets_at);
         if available <= 0.0 {
             continue;
         }
-        let share = needed / available;
+        let elapsed_available = (resets_at - from) as f64 / 3600.0;
+        let share = (needed / available).max(need.elapsed_hours / elapsed_available);
         let taken = promoted
             .get(&c.account.id)
             .is_some_and(|&r| same_reset(Some(r), Some(resets_at)));
@@ -380,7 +424,7 @@ pub fn expiring(
                 c.account.id,
                 Expiring {
                     left,
-                    hours_needed: hours,
+                    hours_needed: need.elapsed_hours,
                     hours_available: available,
                     resets_at,
                 },
@@ -523,11 +567,13 @@ mod tests {
     }
 
     #[test]
-    fn little_left_or_no_weekly_limit_is_never_moved_ahead() {
+    fn even_a_small_weekly_balance_is_used_before_its_reset() {
         let mut unlimited = weekly(2, AccountState::Parked, 0.0, 10);
         unlimited.weekly_limit = WeeklyLimit::None;
         let pool = [weekly(1, AccountState::Parked, 95.0, 1), unlimited];
-        assert!(expiring(&pool, &always_working(), &none(), 98.0, NOW).is_empty());
+        let out = expiring(&pool, &always_working(), &none(), 98.0, NOW);
+        assert!(out.contains_key(&1));
+        assert!(!out.contains_key(&2));
     }
 
     #[test]
@@ -539,6 +585,50 @@ mod tests {
         let y = weekly(2, AccountState::Parked, 50.0, 124);
         let out = expiring(&[x, y], &always_working(), &none(), 98.0, NOW);
         assert!(out.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn weekly_spending_needs_enough_five_hour_resets() {
+        let mut account = weekly(1, AccountState::Parked, 0.0, 14);
+        let mut rates = always_working();
+        rates.accounts.insert(
+            1,
+            AccountRates {
+                weekly_per_5h: 0.5,
+                five_per_hour: 100.0,
+            },
+        );
+        // 98 weekly points need 196 five-hour points. A fresh window can finish in
+        // 5.98 hours, but one with only a point left needs resets at +5h and +10h.
+        assert!(expiring(&[account.clone()], &rates, &none(), 98.0, NOW).is_empty());
+        account.windows[0].pct = 97.0;
+        account.windows[0].resets_at = Some(NOW + 5 * 3600);
+        let urgent = expiring(&[account], &rates, &none(), 98.0, NOW);
+        let need = urgent
+            .get(&1)
+            .expect("start before the remaining five-hour windows run out");
+        assert!((need.hours_needed - 10.97).abs() < 1e-6, "{need:?}");
+    }
+
+    #[test]
+    fn accounts_can_spend_while_another_five_hour_window_recovers() {
+        let pool = [
+            weekly(1, AccountState::Parked, 0.0, 10),
+            weekly(2, AccountState::Parked, 0.0, 12),
+        ];
+        let mut rates = always_working();
+        for id in 1..=2 {
+            rates.accounts.insert(
+                id,
+                AccountRates {
+                    weekly_per_5h: 0.5,
+                    five_per_hour: 100.0,
+                },
+            );
+        }
+        // Each needs two windows but only 1.96 hours of actual use. Their 5-hour waits
+        // overlap; adding two 10-hour averaged durations would mark both urgent.
+        assert!(expiring(&pool, &rates, &none(), 98.0, NOW).is_empty());
     }
 
     #[test]

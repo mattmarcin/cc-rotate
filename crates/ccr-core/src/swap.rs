@@ -1504,7 +1504,7 @@ enum Choice {
     Done(SwapOutcome),
 }
 
-/// The account a request swaps to: the one it names, the switch-back target, or the pick.
+/// The account a request swaps to: the one it names, a proactive target, or the pick.
 fn choose(
     store: &Store,
     req: &SwapRequest,
@@ -1533,6 +1533,18 @@ fn choose(
                     ));
                 }
                 AccountState::Parked | AccountState::Paused => account,
+            }
+        }
+        None if req.reason == Reason::WeeklyExpiring => {
+            match scheduler::expiring_target(pool, policy, now_s) {
+                Some(c) => c.account.clone(),
+                None => {
+                    return Ok(Choice::Done(skip(
+                        store,
+                        req,
+                        "no earlier expiring weekly budget needs to take over",
+                    )?));
+                }
             }
         }
         None if req.reason == Reason::PreferredAvailable => {

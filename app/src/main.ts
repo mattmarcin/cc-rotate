@@ -461,16 +461,18 @@ function grip(a: AccountView, at: number, count: number, where: "side" | "plan")
 function orderNote(s: Settings): string {
   const first =
     s.prefer_no_weekly_limit && s.use_expiring_weekly
-      ? "Accounts without a weekly limit go first, then weekly budget that would go unused."
+      ? "Accounts without a weekly limit go first, then accounts included in weekly optimization."
       : s.prefer_no_weekly_limit
         ? "Accounts without a weekly limit go first."
         : s.use_expiring_weekly
-          ? "Weekly budget that would go unused goes first."
+          ? "Accounts included in weekly optimization go first."
           : "";
   const within = s.strict_order
     ? "top to bottom"
     : "the account in use stays until a limit, then one whose 5-hour window is already running comes first, then the rest top to bottom";
-  const note = first ? `${first} Within each group, ${within}.` : `${within[0].toUpperCase()}${within.slice(1)}.`;
+  const deadline = s.use_expiring_weekly ? " Earlier weekly resets come first for accounts included in weekly optimization. An at-risk earlier week can take over before the current account hits a limit." : "";
+  const grouping = s.use_expiring_weekly ? "With equal weekly resets" : "Within each group";
+  const note = first ? `${first}${deadline} ${grouping}, ${within}.` : `${within[0].toUpperCase()}${within.slice(1)}.`;
   return s.prefer_no_weekly_limit ? `${note} An account with a weekly limit gives way as soon as one without is ready.` : note;
 }
 
