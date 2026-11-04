@@ -606,6 +606,10 @@ const PROCESS_START_LATER_MS: i64 = 20_000;
 /// The start of a `session_costs` process key Claude Code named (`CLAUDE_PID`, F25), as
 /// `statusline::process_key` makes it.
 pub const NAMED_PROCESS_PREFIX: &str = "pid:";
+/// How far (ms) a status line run's reckoning of when its process started may come after the
+/// last one's, when it reports less run time, and still be a run that read the numbers before
+/// that one did and finished after it: a status line can start tens of seconds late (F25).
+const LATE_RUN_MS: i64 = 120_000;
 /// A session whose process has run less than this (ms) started then, unless it was resumed or
 /// forked, which restores the run time it had (`Store::note_session_cost`).
 const NEW_SESSION_MS: i64 = 60_000;
@@ -2074,11 +2078,15 @@ impl Store {
     /// process's first total counts from the highest of theirs not above it (a resumed process
     /// counts what it adds), and a process told only by when it started
     /// (`Store::session_process`) also counts each later tick from the highest they reported
-    /// since its own last, since its ticks may have been taken for two processes'.
+    /// since its own last, since its ticks may have been taken for two processes'. A process
+    /// Claude Code names (`pid:` keys, `statusline::process_key`) is exactly one, so only what
+    /// keys of the other kind reported counts against it (a build that keyed it by when it
+    /// started ran in between).
     ///
-    /// A process Claude Code names (`pid:` keys, `statusline::process_key`) is exactly one, whose
-    /// run time only grows: a tick that reports less run time than its last was taken before it
-    /// and finished after it (two status line runs at once), and changes nothing.
+    /// A tick that reports less run time than its process's last, from about the same start
+    /// (`now - ran_ms`, within `LATE_RUN_MS`), was read before that one and finished after it
+    /// (two status line runs at once), and changes nothing. `/login` also restarts the run time,
+    /// from its own moment, so the next tick is taken for a drop to the new total.
     pub fn note_session_cost(
         &self,
         session_id: &str,
@@ -2103,8 +2111,9 @@ impl Store {
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
                 .optional()?;
-            if let (true, Some((_, _, Some(last_ran))), Some(ran)) = (named, last, ran_ms)
+            if let (Some((_, last_at, Some(last_ran))), Some(ran)) = (last, ran_ms)
                 && ran < last_ran
+                && (now_ms - ran) - (last_at - last_ran) < LATE_RUN_MS
             {
                 return Ok(0.0);
             }
@@ -2114,23 +2123,22 @@ impl Store {
                 |r| r.get(0),
             )?;
             // The highest total another process of the session reported (since this one's last),
-            // that is not above this total.
-            let others: Option<f64> = if named && last.is_some() {
-                None
-            } else {
-                s.conn.query_row(
-                    "SELECT max(total_usd) FROM session_costs
-                     WHERE session_id = ?1 AND process <> ?2 AND total_usd <= ?3
-                       AND updated_at >= ?4",
-                    params![
-                        session_id,
-                        process,
-                        total_usd,
-                        last.map_or(i64::MIN, |(_, at, _)| at)
-                    ],
-                    |r| r.get(0),
-                )?
-            };
+            // that is not above this total; for a named process's later ticks, only from keys
+            // that are not named.
+            let others: Option<f64> = s.conn.query_row(
+                "SELECT max(total_usd) FROM session_costs
+                 WHERE session_id = ?1 AND process <> ?2 AND total_usd <= ?3 AND updated_at >= ?4
+                   AND (?5 = 0 OR substr(process, 1, length(?6)) <> ?6)",
+                params![
+                    session_id,
+                    process,
+                    total_usd,
+                    last.map_or(i64::MIN, |(_, at, _)| at),
+                    named && last.is_some(),
+                    NAMED_PROCESS_PREFIX
+                ],
+                |r| r.get(0),
+            )?;
             let added = match (last, others) {
                 (Some((last, _, _)), _) if total_usd < last => 0.0,
                 (Some((last, _, _)), others) => total_usd - others.map_or(last, |o| o.max(last)),

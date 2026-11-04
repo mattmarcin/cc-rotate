@@ -55,7 +55,8 @@ pub struct StatusInput {
 #[derive(Debug, Default, Deserialize)]
 pub struct CostInfo {
     pub total_cost_usd: Option<f64>,
-    /// How long the session's process has run, restored with its cost on `--resume`: `now -
+    /// How long the session's process has run, restored with its cost on `--resume` and restarted
+    /// with it by `/login`: `now -
     /// total_duration_ms` is about when the process started, give or take how late the status
     /// line started, and it falls minutes behind the clock over days (F25).
     pub total_duration_ms: Option<f64>,
@@ -506,11 +507,11 @@ fn names_its_process(version: Option<&str>) -> bool {
         .is_some_and(|v| v >= CLAUDE_PID_SINCE)
 }
 
-/// The first Claude Code release seen setting `CLAUDE_PID` for its status line (F25).
-const CLAUDE_PID_SINCE: (u64, u64, u64) = (2, 1, 318);
+/// The oldest Claude Code release seen setting `CLAUDE_PID` for its status line (F25).
+const CLAUDE_PID_SINCE: (u64, u64, u64) = (2, 1, 316);
 
 /// The Claude Code process a status line or hook runs for: Claude Code sets `CLAUDE_PID` to its
-/// own process id for every command it runs, replacing one it inherited (Claude Code 2.1.318).
+/// own process id for every command it runs, replacing one it inherited (seen on Claude Code 2.1.316 and 2.1.318).
 pub fn claude_pid_from_env() -> Option<u32> {
     claude_pid(std::env::var("CLAUDE_PID").ok().as_deref())
 }
@@ -878,11 +879,12 @@ mod tests {
     #[test]
     fn only_a_claude_code_that_sets_claude_pid_is_keyed_by_it() {
         for (version, named) in [
+            (Some("2.1.316"), true),
             (Some("2.1.318"), true),
             (Some("2.1.319 (Claude Code)"), true),
             (Some("2.2.0"), true),
             (Some("3.0.0"), true),
-            (Some("2.1.317"), false),
+            (Some("2.1.315"), false),
             (Some("1.9.999"), false),
             (Some("garbage"), false),
             (None, false),

@@ -198,7 +198,8 @@ fn the_status_line_counts_cost_for_the_account_that_served_it() {
     )
     .unwrap();
     // Its request started on a's login before the swap: the reading is still a's.
-    let later = time::now_ms() + 1_000;
+    // After the swap, and after the last tick: run time only grows.
+    let later = time::now_ms().max(start + 20_000) + 1_000;
     tick(1.40, later, 22.0, a_resets);
     // Then it works on b.
     tick(2.00, later + 30_000, 5.0, start / 1000 + 9_000);
@@ -331,7 +332,8 @@ fn two_named_processes_each_count_their_own() {
     let counted = count(&e.store, e.a, &ticks);
     assert!((counted - 20.0).abs() < 1e-9, "{counted}");
 
-    // Another session: the second process at $45 while the first, at $50, is signed in again.
+    // Another session: the second process at $45 while the first, at $50, is signed in again,
+    // which restarts its total and its run time.
     let e = env();
     let t = |process, total, ran: i64, at| (process, total, Some(ran), now + at);
     let counted = count(
@@ -340,10 +342,10 @@ fn two_named_processes_each_count_their_own() {
         &[
             t("pid:1", 50.0, 600_000, 0),
             t("pid:2", 45.0, 600_000, 1_000),
-            t("pid:1", 0.0, 630_000, 30_000),
-            t("pid:1", 10.0, 660_000, 60_000),
+            t("pid:1", 0.0, 1_000, 30_000),
+            t("pid:1", 10.0, 31_000, 60_000),
             t("pid:2", 46.0, 661_000, 61_000),
-            t("pid:1", 47.0, 690_000, 90_000),
+            t("pid:1", 47.0, 61_000, 90_000),
         ],
     );
     assert!((counted - 48.0).abs() < 1e-9, "{counted}");
@@ -351,24 +353,65 @@ fn two_named_processes_each_count_their_own() {
 
 /// Two status line runs of one process at once: the one that read its numbers first finishes
 /// last, with less run time and an older total. It changes nothing, so the spend between the two
-/// totals is not counted twice.
+/// totals is not counted twice, whether Claude Code names the process or not.
 #[test]
-fn a_late_tick_of_a_named_process_changes_nothing() {
+fn a_late_tick_changes_nothing() {
+    for process in ["pid:1", "100"] {
+        let e = env();
+        let now = time::now_ms();
+        let t = |total, ran: i64, at| (process, total, Some(ran), now + at);
+        let counted = count(
+            &e.store,
+            e.a,
+            &[
+                t(100.0, 600_000, 0),
+                t(120.0, 630_000, 30_000),
+                t(140.0, 661_000, 61_000),
+                t(130.0, 650_000, 62_000),
+                t(150.0, 690_000, 90_000),
+            ],
+        );
+        assert!((counted - 50.0).abs() < 1e-9, "{process}: {counted}");
+    }
+}
+
+/// `/login` restarts a process's total and its run time: what it spends after counts from $0,
+/// however long it ran before.
+#[test]
+fn a_login_in_a_long_running_named_process_counts_from_zero() {
     let e = env();
     let now = time::now_ms();
-    let t = |total, ran: i64, at| ("pid:1", total, Some(ran), now + at);
+    let hour = 3_600_000;
     let counted = count(
         &e.store,
         e.a,
         &[
-            t(100.0, 600_000, 0),
-            t(120.0, 630_000, 30_000),
-            t(140.0, 661_000, 61_000),
-            t(130.0, 650_000, 62_000),
-            t(150.0, 690_000, 90_000),
+            ("pid:1", 0.0, Some(1_000), now),
+            ("pid:1", 40.0, Some(3 * hour), now + 3 * hour),
+            ("pid:1", 0.0, Some(500), now + 3 * hour + 60_000),
+            ("pid:1", 20.0, Some(hour), now + 4 * hour),
+            ("pid:1", 25.0, Some(hour + 60_000), now + 4 * hour + 60_000),
         ],
     );
-    assert!((counted - 50.0).abs() < 1e-9, "{counted}");
+    assert!((counted - 65.0).abs() < 1e-9, "{counted}");
+}
+
+/// A build that keys processes by when they started ran in between (installed, then upgraded
+/// again): what it counted for a named process is not counted again.
+#[test]
+fn a_named_process_counts_nothing_an_older_build_counted() {
+    let e = env();
+    let now = time::now_ms();
+    let counted = count(
+        &e.store,
+        e.a,
+        &[
+            ("pid:7", 10.0, Some(600_000), now),
+            ("1000", 30.0, Some(660_000), now + 60_000),
+            ("pid:7", 31.0, Some(690_000), now + 90_000),
+        ],
+    );
+    assert!((counted - 21.0).abs() < 1e-9, "{counted}");
 }
 
 /// A resumed process Claude Code names starts a key of its own, from the total its session had:
