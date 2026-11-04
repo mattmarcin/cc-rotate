@@ -14,12 +14,12 @@ use serde_json::{Value, json};
 use crate::paths::Paths;
 use crate::profile_account;
 use crate::scheduler::{self, Reason, Timing};
-use crate::store::{Account, Sample, SampleWindow, Store, kind};
+use crate::store::{Account, NAMED_PROCESS_PREFIX, Sample, SampleWindow, Store, kind};
 use crate::swap::{
     self, META_CRED_SEEN, META_LAST_SWAP_AT, META_PROFILE_FOREIGN, META_PROFILE_MODEL,
     STALE_SAMPLE_GUARD_MS, SwapRequest,
 };
-use crate::{credfile, time};
+use crate::{credfile, herdr, time};
 
 pub const META_LAST_TICK_AT: &str = "statusline_last_tick_at";
 /// When a tick last asked for a usage check of the account in use (`confirm_due`).
@@ -46,17 +46,19 @@ pub struct StatusInput {
     /// is only present while the API reports it and its reset has not passed.
     #[serde(default, deserialize_with = "lenient_windows")]
     pub rate_limits: Option<BTreeMap<String, Window>>,
+    /// The Claude Code process the status line runs for, from its `CLAUDE_PID` environment
+    /// variable (`claude_pid_from_env`), not the JSON.
+    #[serde(skip)]
+    pub claude_pid: Option<u32>,
 }
-
-/// A session whose process has run this long or less started then, unless it was resumed or
-/// forked, which restores the run time it had (`Store::note_session_cost`).
-const NEW_SESSION_MS: f64 = 60_000.0;
 
 #[derive(Debug, Default, Deserialize)]
 pub struct CostInfo {
     pub total_cost_usd: Option<f64>,
-    /// How long the session's process has run (wall time), restored with its cost on `--resume`:
-    /// `now - total_duration_ms` is the same for every tick of one process.
+    /// How long the session's process has run, restored with its cost on `--resume` and restarted
+    /// with it by `/login`: `now -
+    /// total_duration_ms` is about when the process started, give or take how late the status
+    /// line started, and it falls minutes behind the clock over days (F25).
     pub total_duration_ms: Option<f64>,
 }
 
@@ -465,21 +467,57 @@ pub fn observe(
     Ok(Some(account))
 }
 
-/// The Claude Code process that runs the session (`Store::session_process`): two can run one
-/// session (resumed twice), each with its own numbers and cost. Told by when it started, from how
-/// long it has run: the status line runs under a process of its own each time, so its parent is
-/// no guide. A process that does not say how long it has run shares one key with its session.
+/// The Claude Code process that runs the session: two can run one session (resumed twice), each
+/// with its own numbers and cost. Claude Code names itself to the commands it runs
+/// (`CLAUDE_PID`, `StatusInput::claude_pid`), which tells its processes apart exactly. Without
+/// that, it is told by when it started, from how long it has run (`Store::session_process`): the
+/// status line runs under a process of its own each time, so its parent is no guide. A process
+/// that says neither shares one key with its session.
 fn process_key(store: &Store, input: &StatusInput, now_ms: i64) -> Result<String> {
-    let session = input.session_id.as_deref().filter(|s| !s.is_empty());
-    let ran = input
+    let Some(session) = input.session_id.as_deref().filter(|s| !s.is_empty()) else {
+        return Ok(String::new());
+    };
+    if let Some(pid) = input
+        .claude_pid
+        .filter(|_| names_its_process(input.version.as_deref()))
+    {
+        return Ok(format!("{NAMED_PROCESS_PREFIX}{pid}"));
+    }
+    match ran_ms(input) {
+        Some(ran) => store.session_process(session, now_ms - ran, now_ms),
+        None => Ok(String::new()),
+    }
+}
+
+/// How long the session's process has run (`CostInfo::total_duration_ms`), in ms.
+fn ran_ms(input: &StatusInput) -> Option<i64> {
+    input
         .cost
         .as_ref()
         .and_then(|c| c.total_duration_ms)
-        .filter(|d| d.is_finite() && *d >= 0.0);
-    match (session, ran) {
-        (Some(session), Some(ran)) => store.session_process(session, now_ms - ran as i64, now_ms),
-        _ => Ok(String::new()),
-    }
+        .filter(|d| d.is_finite() && *d >= 0.0)
+        .map(|d| d as i64)
+}
+
+/// Whether a Claude Code of this version sets `CLAUDE_PID` itself (F25), so the one the status
+/// line sees is its own and not one an older Claude Code inherited from where it was started.
+fn names_its_process(version: Option<&str>) -> bool {
+    version
+        .and_then(herdr::parse_version)
+        .is_some_and(|v| v >= CLAUDE_PID_SINCE)
+}
+
+/// The oldest Claude Code release seen setting `CLAUDE_PID` for its status line (F25).
+const CLAUDE_PID_SINCE: (u64, u64, u64) = (2, 1, 316);
+
+/// The Claude Code process a status line or hook runs for: Claude Code sets `CLAUDE_PID` to its
+/// own process id for every command it runs, replacing one it inherited (seen on Claude Code 2.1.316 and 2.1.318).
+pub fn claude_pid_from_env() -> Option<u32> {
+    claude_pid(std::env::var("CLAUDE_PID").ok().as_deref())
+}
+
+fn claude_pid(value: Option<&str>) -> Option<u32> {
+    value?.trim().parse().ok().filter(|pid| *pid > 0)
 }
 
 /// Whether the session has reported these numbers unchanged since before the account in use
@@ -526,10 +564,7 @@ fn note_cost(
     }
     // Two processes can run one session (resumed twice, each restoring the same total): each
     // keeps its own count (`process_key`).
-    let new_session = cost
-        .total_duration_ms
-        .is_some_and(|d| d.is_finite() && (0.0..NEW_SESSION_MS).contains(&d));
-    store.note_session_cost(session, process, total, new_session, account_id, now_ms)?;
+    store.note_session_cost(session, process, total, ran_ms(input), account_id, now_ms)?;
     Ok(())
 }
 
@@ -821,6 +856,41 @@ mod tests {
                 .sample_for(1, "rotate", 0)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn claude_pid_is_a_process_id() {
+        assert_eq!(claude_pid(Some("39004")), Some(39004));
+        assert_eq!(claude_pid(Some(" 7 ")), Some(7));
+        for bad in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("-5"),
+            Some("abc"),
+            Some("1.5"),
+        ] {
+            assert_eq!(claude_pid(bad), None, "{bad:?}");
+        }
+        // Never read from the JSON.
+        assert_eq!(StatusInput::parse(r#"{"claude_pid":5}"#).claude_pid, None);
+    }
+
+    #[test]
+    fn only_a_claude_code_that_sets_claude_pid_is_keyed_by_it() {
+        for (version, named) in [
+            (Some("2.1.316"), true),
+            (Some("2.1.318"), true),
+            (Some("2.1.319 (Claude Code)"), true),
+            (Some("2.2.0"), true),
+            (Some("3.0.0"), true),
+            (Some("2.1.315"), false),
+            (Some("1.9.999"), false),
+            (Some("garbage"), false),
+            (None, false),
+        ] {
+            assert_eq!(names_its_process(version), named, "{version:?}");
+        }
     }
 
     #[test]

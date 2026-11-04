@@ -109,7 +109,7 @@ fn a_session_counts_only_what_it_adds() {
     let hour = 1_000_000 * 3_600_000;
     let s = &e.store;
     let s1 = |total: f64, new: bool, account: i64, at: i64| {
-        s.note_session_cost("s1", "100:1", total, new, account, at)
+        s.note_session_cost("s1", "100:1", total, new.then_some(1_000), account, at)
             .unwrap()
     };
     // The status line runs as a session starts, at $0: counting starts there.
@@ -125,20 +125,20 @@ fn a_session_counts_only_what_it_adds() {
     assert_eq!(s1(-1.0, true, e.a, hour), 0.0);
     // A new session first seen moments after it started counts its first total whole.
     let fresh = s
-        .note_session_cost("fresh", "200:1", 0.30, true, e.c, hour + 3_620_000)
+        .note_session_cost("fresh", "200:1", 0.30, Some(1_000), e.c, hour + 3_620_000)
         .unwrap();
     assert_eq!(fresh, 0.30);
     // A session that ran a while before it was first seen (running before cc-rotate counted,
     // resumed or forked with the run time it had) carries what it spent before.
     let old = |total: f64, at: i64| {
-        s.note_session_cost("old", "300:1", total, false, e.a, at)
+        s.note_session_cost("old", "300:1", total, None, e.a, at)
             .unwrap()
     };
     assert_eq!(old(80.0, hour), 0.0);
     assert_eq!(old(80.5, hour + 60_000), 0.5);
     // A second process of a session already seen is a resume, however short: a starting point.
     let resumed = s
-        .note_session_cost("s1", "400:1", 0.70, true, e.a, hour + 3_700_000)
+        .note_session_cost("s1", "400:1", 0.70, Some(1_000), e.a, hour + 3_700_000)
         .unwrap();
     assert_eq!(resumed, 0.0);
 
@@ -198,7 +198,8 @@ fn the_status_line_counts_cost_for_the_account_that_served_it() {
     )
     .unwrap();
     // Its request started on a's login before the swap: the reading is still a's.
-    let later = time::now_ms() + 1_000;
+    // After the swap, and after the last tick: run time only grows.
+    let later = time::now_ms().max(start + 20_000) + 1_000;
     tick(1.40, later, 22.0, a_resets);
     // Then it works on b.
     tick(2.00, later + 30_000, 5.0, start / 1000 + 9_000);
@@ -269,10 +270,219 @@ fn two_processes_on_one_session_each_keep_their_own_count() {
     ] {
         counted += e
             .store
-            .note_session_cost("s1", process, total, false, e.a, at)
+            .note_session_cost("s1", process, total, None, e.a, at)
             .unwrap();
     }
     assert!((counted - 0.90).abs() < 1e-9, "{counted}");
+}
+
+/// One Claude Code process whose ticks land on several keys, as when its reckoned start drifted
+/// past what tells two processes apart: a key left behind keeps an old total, and a tick that
+/// lands on it again counts only what the session had not reported yet.
+#[test]
+fn one_process_split_across_keys_counts_its_cost_once() {
+    let e = env();
+    let now = time::now_ms();
+    let mut counted = 0.0;
+    for (process, total, at) in [
+        ("k1", 100.0, now),
+        ("k1", 110.0, now + 60_000),
+        ("k2", 120.0, now + 120_000),
+        ("k1", 130.0, now + 180_000),
+        ("k3", 135.0, now + 240_000),
+        ("k2", 150.0, now + 300_000),
+        ("k1", 150.0, now + 360_000),
+    ] {
+        counted += e
+            .store
+            .note_session_cost("s1", process, total, None, e.a, at)
+            .unwrap();
+    }
+    assert!((counted - 50.0).abs() < 1e-9, "{counted}");
+}
+
+fn count(store: &Store, account: i64, ticks: &[(&str, f64, Option<i64>, i64)]) -> f64 {
+    ticks
+        .iter()
+        .map(|&(process, total, ran, at)| {
+            store
+                .note_session_cost("s1", process, total, ran, account, at)
+                .unwrap()
+        })
+        .sum()
+}
+
+/// Two processes Claude Code names (`pid:` keys) are two, however their totals cross: each counts
+/// what it adds, also when their ticks alternate and when one is signed in again (`/login`).
+#[test]
+fn two_named_processes_each_count_their_own() {
+    let e = env();
+    let now = time::now_ms();
+    // Both resumed from $100, each spending $10 a dollar at a time, ticking in turn.
+    let mut ticks = vec![
+        ("pid:1", 100.0, Some(600_000), now),
+        ("pid:2", 100.0, Some(600_000), now + 1_000),
+    ];
+    for i in 1..=10 {
+        let at = now + i * 30_000;
+        let ran = Some(600_000 + i * 30_000);
+        ticks.push(("pid:1", 100.0 + i as f64, ran, at));
+        ticks.push(("pid:2", 100.0 + i as f64, ran, at + 1_000));
+    }
+    let counted = count(&e.store, e.a, &ticks);
+    assert!((counted - 20.0).abs() < 1e-9, "{counted}");
+
+    // Another session: the second process at $45 while the first, at $50, is signed in again,
+    // which restarts its total and its run time.
+    let e = env();
+    let t = |process, total, ran: i64, at| (process, total, Some(ran), now + at);
+    let counted = count(
+        &e.store,
+        e.a,
+        &[
+            t("pid:1", 50.0, 600_000, 0),
+            t("pid:2", 45.0, 600_000, 1_000),
+            t("pid:1", 0.0, 1_000, 30_000),
+            t("pid:1", 10.0, 31_000, 60_000),
+            t("pid:2", 46.0, 661_000, 61_000),
+            t("pid:1", 47.0, 61_000, 90_000),
+        ],
+    );
+    assert!((counted - 48.0).abs() < 1e-9, "{counted}");
+}
+
+/// Two status line runs of one process at once: the one that read its numbers first finishes
+/// last, with less run time and an older total. It changes nothing, so the spend between the two
+/// totals is not counted twice, whether Claude Code names the process or not.
+#[test]
+fn a_late_tick_changes_nothing() {
+    for process in ["pid:1", "100"] {
+        let e = env();
+        let now = time::now_ms();
+        let t = |total, ran: i64, at| (process, total, Some(ran), now + at);
+        let counted = count(
+            &e.store,
+            e.a,
+            &[
+                t(100.0, 600_000, 0),
+                t(120.0, 630_000, 30_000),
+                t(140.0, 661_000, 61_000),
+                t(130.0, 650_000, 62_000),
+                t(150.0, 690_000, 90_000),
+            ],
+        );
+        assert!((counted - 50.0).abs() < 1e-9, "{process}: {counted}");
+    }
+}
+
+/// `/login` restarts a process's total and its run time: what it spends after counts from $0,
+/// however long it ran before.
+#[test]
+fn a_login_in_a_long_running_named_process_counts_from_zero() {
+    let e = env();
+    let now = time::now_ms();
+    let hour = 3_600_000;
+    let counted = count(
+        &e.store,
+        e.a,
+        &[
+            ("pid:1", 0.0, Some(1_000), now),
+            ("pid:1", 40.0, Some(3 * hour), now + 3 * hour),
+            ("pid:1", 0.0, Some(500), now + 3 * hour + 60_000),
+            ("pid:1", 20.0, Some(hour), now + 4 * hour),
+            ("pid:1", 25.0, Some(hour + 60_000), now + 4 * hour + 60_000),
+        ],
+    );
+    assert!((counted - 65.0).abs() < 1e-9, "{counted}");
+}
+
+/// A build that keys processes by when they started ran in between (installed, then upgraded
+/// again): what it counted for a named process is not counted again.
+#[test]
+fn a_named_process_counts_nothing_an_older_build_counted() {
+    let e = env();
+    let now = time::now_ms();
+    let counted = count(
+        &e.store,
+        e.a,
+        &[
+            ("pid:7", 10.0, Some(600_000), now),
+            ("1000", 30.0, Some(660_000), now + 60_000),
+            ("pid:7", 31.0, Some(690_000), now + 90_000),
+        ],
+    );
+    assert!((counted - 21.0).abs() < 1e-9, "{counted}");
+}
+
+/// A resumed process Claude Code names starts a key of its own, from the total its session had:
+/// it counts what it adds, including what the session spent after its last tick before.
+#[test]
+fn a_resumed_named_process_counts_what_it_adds() {
+    let e = env();
+    let now = time::now_ms();
+    let counted = count(
+        &e.store,
+        e.a,
+        &[
+            ("pid:1", 5.0, Some(2_000), now),
+            ("pid:1", 7.0, Some(600_000), now + 600_000),
+            // The first process spent $0.50 more after its last tick, then exited.
+            ("pid:2", 7.5, Some(900_000), now + 3_600_000),
+            ("pid:2", 8.0, Some(930_000), now + 3_630_000),
+        ],
+    );
+    assert!((counted - 8.0).abs() < 1e-9, "{counted}");
+}
+
+/// What a session spent over days in one Claude Code process, as the status line reports it: the
+/// run time it gives (`total_duration_ms`) falls minutes behind the clock over days, and a status
+/// line can take tens of seconds to start on a busy machine, so `now - total_duration_ms` wanders
+/// well past the 20 s that tell a session's processes apart. Seen live: one process's cost
+/// counted about 15 times over (2026-11-04). It is counted once, whether Claude Code names its
+/// process (`CLAUDE_PID`, one key) or not (told by when it started).
+#[test]
+fn a_process_running_for_days_counts_its_cost_once() {
+    for pid in [Some(4242), None] {
+        let e = env();
+        let start = time::now_ms();
+        let tick_every = 300_000;
+        let ticks = 3 * 24 * 12;
+        for i in 0..=ticks {
+            let at = start + i * tick_every;
+            // About 170 s behind the clock after three days, as seen live.
+            let behind = (at - start) * 65 / 100_000;
+            // Status lines starting up to 25 s late, and now and then 45 s late.
+            let late = if i % 37 == 0 {
+                45_000
+            } else {
+                (i * 7_919) % 25_000
+            };
+            let mut input = tick_input(
+                "s1",
+                i as f64 * 0.10,
+                at - start - behind - late,
+                20.0,
+                at / 1000 + 3_600,
+            );
+            input.claude_pid = pid;
+            input.version = Some("2.1.318".into());
+            statusline::tick(&e.store, &e.paths, &input, at).unwrap();
+        }
+        let counted = e
+            .store
+            .account_cost_between(
+                e.a,
+                start / 1000 - 3_600,
+                (start + ticks * tick_every) / 1000 + 7_200,
+            )
+            .unwrap()
+            .unwrap();
+        let spent = ticks as f64 * 0.10;
+        assert!(
+            (counted - spent).abs() < 1e-6,
+            "{pid:?}: counted {counted}, spent {spent}"
+        );
+    }
 }
 
 #[test]
