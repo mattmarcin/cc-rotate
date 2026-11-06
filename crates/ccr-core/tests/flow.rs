@@ -2021,7 +2021,7 @@ fn a_new_weekly_limit_replaces_unlimited_detection_and_blocks_until_reset() {
     let week_reset = now / 1000 + 86_400;
     let windows = ccr_core::usage_report::windows(&json!({"limits": [
         {"kind": "session", "percent": 10.0, "resets_at": now / 1000 + 3600},
-        {"kind": "weekly_all", "percent": 98.0, "resets_at": week_reset}
+        {"kind": "weekly_all", "percent": 100.0, "resets_at": week_reset}
     ]}));
     store
         .record_sample(&Sample {

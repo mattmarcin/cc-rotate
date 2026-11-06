@@ -41,6 +41,12 @@ pub struct StatusInput {
     /// What the session's use would have cost at API prices so far, as Claude Code estimates it.
     pub cost: Option<CostInfo>,
     pub model: Option<ModelInfo>,
+    /// Where the session was started (`workspace.project_dir`), falling back to the working
+    /// directory when that field is absent (`launch_dir`).
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub workspace: Option<WorkspaceInfo>,
     /// Every usage window Claude Code reports, by name (`five_hour`, `seven_day`, ...). Kept
     /// generic so a window Claude Code adds later is recorded without a code change; a window
     /// is only present while the API reports it and its reset has not passed.
@@ -50,6 +56,14 @@ pub struct StatusInput {
     /// variable (`claude_pid_from_env`), not the JSON.
     #[serde(skip)]
     pub claude_pid: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct WorkspaceInfo {
+    #[serde(default)]
+    pub project_dir: Option<String>,
+    #[serde(default)]
+    pub current_dir: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -117,6 +131,23 @@ impl StatusInput {
             .as_ref()
             .and_then(|m| m.id.as_deref())
             .filter(|m| !m.is_empty())
+    }
+
+    /// The folder Claude Code was launched in, or the working directory when the launch folder
+    /// was not sent. Blank strings are absent.
+    pub fn launch_dir(&self) -> Option<&str> {
+        fn nonempty(s: &Option<String>) -> Option<&str> {
+            s.as_deref().filter(|p| !p.trim().is_empty())
+        }
+        self.workspace
+            .as_ref()
+            .and_then(|w| nonempty(&w.project_dir))
+            .or_else(|| nonempty(&self.cwd))
+            .or_else(|| {
+                self.workspace
+                    .as_ref()
+                    .and_then(|w| nonempty(&w.current_dir))
+            })
     }
 
     fn sample_for(&self, account_id: i64, profile: &str, now_ms: i64) -> Option<Sample> {
@@ -564,7 +595,20 @@ fn note_cost(
     }
     // Two processes can run one session (resumed twice, each restoring the same total): each
     // keeps its own count (`process_key`).
-    store.note_session_cost(session, process, total, ran_ms(input), account_id, now_ms)?;
+    match input.launch_dir() {
+        Some(dir) => store.note_session_cost_for_project(
+            session,
+            process,
+            total,
+            ran_ms(input),
+            account_id,
+            now_ms,
+            dir,
+        )?,
+        None => {
+            store.note_session_cost(session, process, total, ran_ms(input), account_id, now_ms)?
+        }
+    };
     Ok(())
 }
 
@@ -831,6 +875,20 @@ mod tests {
         assert_eq!(rl["five_hour"].used_percentage, Some(41.5));
         assert_eq!(rl["five_hour"].resets_at, Some(1_792_890_000));
         assert_eq!(rl["seven_day"].resets_at, Some(1_793_318_400));
+    }
+
+    #[test]
+    fn launch_dir_is_the_folder_claude_code_was_started_in() {
+        let launched = StatusInput::parse(
+            r#"{"cwd":"/now","workspace":{"project_dir":"/work/app","current_dir":"/now"}}"#,
+        );
+        assert_eq!(launched.launch_dir(), Some("/work/app"));
+        let cwd_only = StatusInput::parse(r#"{"cwd":"/work/app"}"#);
+        assert_eq!(cwd_only.launch_dir(), Some("/work/app"));
+        let current = StatusInput::parse(r#"{"workspace":{"current_dir":"/work/app"}}"#);
+        assert_eq!(current.launch_dir(), Some("/work/app"));
+        let blank = StatusInput::parse(r#"{"cwd":"  ","workspace":{"project_dir":""}}"#);
+        assert_eq!(blank.launch_dir(), None);
     }
 
     #[test]

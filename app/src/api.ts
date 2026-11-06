@@ -48,6 +48,26 @@ export interface HourlyCost {
   usd: number;
 }
 
+/** The same estimate for one hour, filed under the folder Claude Code was launched in. */
+export interface ProjectSpend {
+  path: string;
+  account_id: number;
+  /** When the hour starts (epoch ms). */
+  ts: number;
+  usd: number;
+}
+
+/** A session that reported a launch folder. */
+export interface ProjectTouch {
+  path: string;
+  seen_ms: number;
+}
+
+export interface ProjectUsage {
+  costs: ProjectSpend[];
+  touches: ProjectTouch[];
+}
+
 export interface Account {
   id: number;
   label: string;
@@ -317,6 +337,7 @@ export const api = {
   /** Samples since `sinceMs`, after each account's last sample before it. */
   series: (sinceMs: number) => invoke<Sample[]>("series", { sinceMs }),
   costs: (sinceMs: number) => invoke<HourlyCost[]>("costs", { sinceMs }),
+  projectUsage: (sinceMs: number) => invoke<ProjectUsage>("project_usage", { sinceMs }),
   swaps: (sinceMs: number) => invoke<EventRow[]>("swaps", { sinceMs }),
   events: (limit: number) => invoke<EventRow[]>("events", { limit }),
   usageHistory: (id: number) => invoke<AccountHistory>("usage_history", { id }),

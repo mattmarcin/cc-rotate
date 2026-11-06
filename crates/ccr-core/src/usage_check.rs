@@ -2740,7 +2740,7 @@ mod tests {
 
         record(&[
             ("five_hour", 0.0, now_s - 60),
-            ("seven_day", 99.0, now_s + 86_400),
+            ("seven_day", 100.0, now_s + 86_400),
         ]);
         assert_eq!(due(now), None, "its weekly limit keeps it out of use");
 

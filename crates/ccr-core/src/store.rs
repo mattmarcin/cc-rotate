@@ -31,7 +31,9 @@ use crate::{credfile, time};
 ///    reported and since when (`session_readings`).
 /// 10: each recorded window's usage as of its reading (`sample_windows.high`).
 /// 11: how long each session's process had run at its last total (`session_costs.ran_ms`).
-const SCHEMA_VERSION: i64 = 11;
+/// 12: the same API-price cost filed under the folder Claude Code was launched in
+/// (`projects`, `project_costs`, `project_sessions`).
+const SCHEMA_VERSION: i64 = 12;
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE accounts (
@@ -234,6 +236,33 @@ ALTER TABLE sample_windows ADD COLUMN high REAL;
 
 const SCHEMA_V11: &str = r#"
 ALTER TABLE session_costs ADD COLUMN ran_ms INTEGER;
+"#;
+
+/// Schema 12. The increase `note_session_cost` counts for an account and hour is also counted
+/// for the folder Claude Code was launched in (`project_costs`). `projects` keeps the path's
+/// last spelling. `project_sessions` is which sessions reported that folder, so a row can say
+/// how many. Dollars with no folder stay on `account_costs` only.
+/// `IF NOT EXISTS` keeps an upgrade test that rewinds `user_version` on a store this build
+/// already created from running the new statements again.
+const SCHEMA_V12: &str = r#"
+CREATE TABLE IF NOT EXISTS projects (
+    key     TEXT PRIMARY KEY,
+    path    TEXT NOT NULL,
+    seen_ms INTEGER NOT NULL
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS project_costs (
+    project_key TEXT NOT NULL,
+    account_id  INTEGER NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
+    hour        INTEGER NOT NULL,
+    usd         REAL NOT NULL,
+    PRIMARY KEY (project_key, account_id, hour)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS project_sessions (
+    session_id  TEXT NOT NULL,
+    project_key TEXT NOT NULL,
+    seen_ms     INTEGER NOT NULL,
+    PRIMARY KEY (session_id, project_key)
+) WITHOUT ROWID;
 "#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -458,6 +487,101 @@ pub struct HourlyCost {
     /// When the hour starts (epoch ms, a whole epoch hour).
     pub ts: i64,
     pub usd: f64,
+}
+
+/// What one account's use in one hour would have cost, filed under the folder Claude Code was
+/// launched in (`project_costs`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ProjectSpend {
+    pub path: String,
+    pub account_id: i64,
+    /// When the hour starts (epoch ms, a whole epoch hour).
+    pub ts: i64,
+    pub usd: f64,
+}
+
+/// A session that reported a launch folder at `seen_ms` (`project_sessions`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ProjectTouch {
+    pub path: String,
+    pub seen_ms: i64,
+}
+
+/// The identity of a launch folder and the spelling last shown for it.
+///
+/// The key compares equal for a trailing separator, and on Windows for letter case. A path that
+/// exists is canonicalized (`dunce`), so a `\\?\` prefix does not split a row. A drive root keeps
+/// its slash.
+pub(crate) fn project_identity(raw: &str) -> Option<(String, String)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let path = Path::new(trimmed);
+    let canon = dunce::canonicalize(path).unwrap_or_else(|_| dunce::simplified(path).to_path_buf());
+    let text = canon.to_string_lossy();
+    let display = strip_trailing_sep(&text);
+    if display.is_empty() {
+        return None;
+    }
+    let display = display.to_string();
+    let key = if cfg!(windows) {
+        display.to_lowercase()
+    } else {
+        display.clone()
+    };
+    Some((key, display))
+}
+
+/// Record `session_id` under `path` and, when `added` is above zero, the same dollars
+/// `account_costs` just took. A path that is blank after trimming is skipped.
+fn write_project(
+    conn: &Connection,
+    session_id: &str,
+    path: &str,
+    account_id: i64,
+    added: f64,
+    now_ms: i64,
+) -> Result<()> {
+    let Some((key, display)) = project_identity(path) else {
+        return Ok(());
+    };
+    conn.execute(
+        "INSERT INTO projects (key, path, seen_ms) VALUES (?1, ?2, ?3)
+         ON CONFLICT (key) DO UPDATE SET path = excluded.path, seen_ms = excluded.seen_ms
+         WHERE excluded.seen_ms >= projects.seen_ms",
+        params![key, display, now_ms],
+    )?;
+    conn.execute(
+        "INSERT INTO project_sessions (session_id, project_key, seen_ms) VALUES (?1, ?2, ?3)
+         ON CONFLICT (session_id, project_key) DO UPDATE SET seen_ms = excluded.seen_ms
+         WHERE excluded.seen_ms >= project_sessions.seen_ms",
+        params![session_id, key, now_ms],
+    )?;
+    if added > 0.0 && added.is_finite() {
+        conn.execute(
+            "INSERT INTO project_costs (project_key, account_id, hour, usd) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (project_key, account_id, hour) DO UPDATE SET usd = usd + excluded.usd",
+            params![key, account_id, now_ms.div_euclid(3_600_000), added],
+        )?;
+    }
+    Ok(())
+}
+
+/// Drop a trailing separator, but keep a root (`/` or `C:\`).
+fn strip_trailing_sep(path: &str) -> &str {
+    let bytes = path.as_bytes();
+    if bytes.len() <= 1 {
+        return path;
+    }
+    if cfg!(windows)
+        && bytes.len() == 3
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+    {
+        return path;
+    }
+    path.trim_end_matches(['\\', '/'])
 }
 
 /// The highest reading recorded for one usage window (one reset time) of an account.
@@ -951,6 +1075,10 @@ impl Store {
                 s.conn.execute_batch(SCHEMA_V11)?;
                 s.conn.pragma_update(None, "user_version", 11)?;
             }
+            if version < 12 {
+                s.conn.execute_batch(SCHEMA_V12)?;
+                s.conn.pragma_update(None, "user_version", 12)?;
+            }
             Ok(())
         })
     }
@@ -1123,7 +1251,11 @@ impl Store {
         let text = |k: &str| -> Result<Option<String>> { Ok(get(k)?.filter(|v| !v.is_empty())) };
         Ok(Settings {
             swap_threshold_5h: num("swap_threshold_5h", 98.0)?,
-            swap_threshold_7d: num("swap_threshold_7d", 98.0)?,
+            // 100 is the nominal weekly cap Claude Code shows. It keeps serving past that
+            // while `anthropic-ratelimit-unified-grace-7d-utilization` is above zero, so the
+            // displayed 100 is not the refusal. A 5-hour window stays at 98: one turn can
+            // spend the last of it, and its grace buffer is only a wrap-up.
+            swap_threshold_7d: num("swap_threshold_7d", 100.0)?,
             // Clamped as written (`validate_setting`): an older version stored anything.
             swap_cooldown_s: int("swap_cooldown_s", 120)?.clamp(0, DAY_S),
             prefer_no_weekly_limit: get("prefer_no_weekly_limit")?
@@ -1937,9 +2069,17 @@ impl Store {
             .execute("DELETE FROM session_readings WHERE seen_ms < ?1", [cutoff])?;
         self.conn
             .execute("DELETE FROM session_processes WHERE seen_ms < ?1", [cutoff])?;
+        let hour_cutoff = cutoff.div_euclid(3_600_000);
+        self.conn
+            .execute("DELETE FROM account_costs WHERE hour < ?1", [hour_cutoff])?;
+        self.conn
+            .execute("DELETE FROM project_costs WHERE hour < ?1", [hour_cutoff])?;
+        self.conn
+            .execute("DELETE FROM project_sessions WHERE seen_ms < ?1", [cutoff])?;
         self.conn.execute(
-            "DELETE FROM account_costs WHERE hour < ?1",
-            [cutoff.div_euclid(3_600_000)],
+            "DELETE FROM projects WHERE key NOT IN (SELECT project_key FROM project_costs)
+                 AND key NOT IN (SELECT project_key FROM project_sessions)",
+            [],
         )?;
         self.set_meta("last_prune_at", now_ms)
     }
@@ -2067,6 +2207,32 @@ impl Store {
     /// `account_id`, in the hour of `now_ms`; returns that. `ran_ms` is how long the process has
     /// run (`cost.total_duration_ms`), when the status line says.
     ///
+    /// `note_session_cost_for_project` files that same increase under `project`, the folder
+    /// Claude Code was launched in. A tick that adds nothing still records the session there.
+    pub fn note_session_cost_for_project(
+        &self,
+        session_id: &str,
+        process: &str,
+        total_usd: f64,
+        ran_ms: Option<i64>,
+        account_id: i64,
+        now_ms: i64,
+        project: &str,
+    ) -> Result<f64> {
+        self.record_session_cost(
+            session_id,
+            process,
+            total_usd,
+            ran_ms,
+            account_id,
+            now_ms,
+            Some(project),
+        )
+    }
+
+    /// A session's cost when the status line named no launch folder. The counting rules below are
+    /// the same ones `note_session_cost_for_project` uses.
+    ///
     /// A process's first total counts whole only when it is a new session's (it ran under a
     /// minute) that was never seen before; otherwise it carries what the session spent before (a
     /// resumed or forked one, given the total and run time it had, or one running before cc-rotate
@@ -2095,6 +2261,21 @@ impl Store {
         ran_ms: Option<i64>,
         account_id: i64,
         now_ms: i64,
+    ) -> Result<f64> {
+        self.record_session_cost(
+            session_id, process, total_usd, ran_ms, account_id, now_ms, None,
+        )
+    }
+
+    fn record_session_cost(
+        &self,
+        session_id: &str,
+        process: &str,
+        total_usd: f64,
+        ran_ms: Option<i64>,
+        account_id: i64,
+        now_ms: i64,
+        project: Option<&str>,
     ) -> Result<f64> {
         if !total_usd.is_finite() || total_usd < 0.0 {
             return Ok(0.0);
@@ -2161,8 +2342,49 @@ impl Store {
                     params![account_id, now_ms.div_euclid(3_600_000), added],
                 )?;
             }
+            if let Some(path) = project {
+                write_project(&s.conn, session_id, path, account_id, added, now_ms)?;
+            }
             Ok(added)
         })
+    }
+
+    /// What each launch folder's use would have cost at API prices, hour by hour, from the hour
+    /// holding `since_ms` on: by path, then hour, then account. Hours with nothing counted are
+    /// left out.
+    pub fn project_spend_since(&self, since_ms: i64) -> Result<Vec<ProjectSpend>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT p.path, c.account_id, c.hour, c.usd
+             FROM project_costs c JOIN projects p ON p.key = c.project_key
+             WHERE c.hour >= ?1
+             ORDER BY p.path, c.hour, c.account_id",
+        )?;
+        let rows = stmt.query_map([since_ms.div_euclid(3_600_000)], |r| {
+            Ok(ProjectSpend {
+                path: r.get(0)?,
+                account_id: r.get(1)?,
+                ts: r.get::<_, i64>(2)? * 3_600_000,
+                usd: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Sessions that reported a launch folder at or after `since_ms`, oldest first.
+    pub fn project_touches_since(&self, since_ms: i64) -> Result<Vec<ProjectTouch>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT p.path, s.seen_ms
+             FROM project_sessions s JOIN projects p ON p.key = s.project_key
+             WHERE s.seen_ms >= ?1
+             ORDER BY s.seen_ms, p.path",
+        )?;
+        let rows = stmt.query_map([since_ms], |r| {
+            Ok(ProjectTouch {
+                path: r.get(0)?,
+                seen_ms: r.get(1)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// What an account's use from `from_s` to `to_s` (epoch seconds, by whole hours) would have
@@ -3575,6 +3797,7 @@ mod tests {
     fn settings_defaults_and_validation() {
         let s = Store::open_in_memory().unwrap();
         assert_eq!(s.settings().unwrap().swap_threshold_5h, 98.0);
+        assert_eq!(s.settings().unwrap().swap_threshold_7d, 100.0);
         s.set_setting("swap_threshold_5h", Some("90")).unwrap();
         assert_eq!(s.settings().unwrap().swap_threshold_5h, 90.0);
         assert!(s.set_setting("swap_threshold_5h", Some("150")).is_err());
@@ -3679,6 +3902,93 @@ mod tests {
         assert_eq!(
             s.hourly_costs_since(h0).unwrap(),
             vec![cost(a, h0, 2.0), cost(a, h0 + hour, 0.5)]
+        );
+    }
+
+    #[test]
+    fn project_cost_matches_the_account_and_a_missing_folder_does_not() {
+        let s = Store::open_in_memory().unwrap();
+        let a = s
+            .insert_account("a", &ident("u1"), AccountState::Active)
+            .unwrap();
+        let hour = 3_600_000;
+        let h0 = 500_000 * hour;
+        let path = if cfg!(windows) {
+            r"C:\work\cc-rotate"
+        } else {
+            "/work/cc-rotate"
+        };
+        // A resumed session's first total is not counted. The folder is still remembered.
+        s.note_session_cost_for_project("old", "p", 9.0, Some(5_000_000), a, h0, path)
+            .unwrap();
+        assert!(s.project_spend_since(0).unwrap().is_empty());
+        assert_eq!(s.project_touches_since(0).unwrap().len(), 1);
+        assert!(s.hourly_costs_since(0).unwrap().is_empty());
+
+        s.note_session_cost_for_project("old", "p", 9.25, Some(5_100_000), a, h0 + 1_000, path)
+            .unwrap();
+        // No folder: the account still counts, and the project table does not.
+        s.note_session_cost("bare", "p", 1.0, Some(1_000), a, h0 + 2_000)
+            .unwrap();
+        let spend = s.project_spend_since(0).unwrap();
+        assert_eq!(spend.len(), 1);
+        assert_eq!(spend[0].path, path);
+        assert!((spend[0].usd - 0.25).abs() < 1e-9, "{}", spend[0].usd);
+        assert!(
+            (s.hourly_costs_since(0)
+                .unwrap()
+                .iter()
+                .map(|c| c.usd)
+                .sum::<f64>()
+                - 1.25)
+                .abs()
+                < 1e-9
+        );
+
+        let again = if cfg!(windows) {
+            r"c:\work\cc-rotate\"
+        } else {
+            "/work/cc-rotate/"
+        };
+        s.note_session_cost_for_project("old", "p", 9.5, Some(5_200_000), a, h0 + 3_000, again)
+            .unwrap();
+        let spend = s.project_spend_since(0).unwrap();
+        assert_eq!(spend.len(), 1, "a trailing separator is the same folder");
+        assert!((spend[0].usd - 0.5).abs() < 1e-9, "{}", spend[0].usd);
+        assert_eq!(s.project_touches_since(0).unwrap().len(), 1);
+
+        s.note_session_cost_for_project("other", "p", 0.4, Some(1_000), a, h0 + hour, path)
+            .unwrap();
+        assert_eq!(s.project_touches_since(0).unwrap().len(), 2);
+        assert_eq!(s.project_spend_since(h0 + hour).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn old_project_costs_are_pruned_with_the_samples() {
+        let s = Store::open_in_memory().unwrap();
+        let a = s
+            .insert_account("a", &ident("u1"), AccountState::Active)
+            .unwrap();
+        let day = 86_400_000;
+        let now = 2_000 * day;
+        let path = if cfg!(windows) {
+            r"C:\work\old"
+        } else {
+            "/work/old"
+        };
+        s.note_session_cost_for_project("s", "p", 1.0, Some(1_000), a, now - 200 * day, path)
+            .unwrap();
+        s.note_session_cost_for_project("t", "p", 2.0, Some(1_000), a, now - day, "/work/new")
+            .unwrap();
+        s.prune(now).unwrap();
+        let spend = s.project_spend_since(0).unwrap();
+        assert_eq!(spend.len(), 1);
+        assert_eq!(spend[0].path, "/work/new");
+        assert!(
+            s.project_touches_since(0)
+                .unwrap()
+                .iter()
+                .all(|t| t.path == "/work/new")
         );
     }
 }

@@ -38,6 +38,7 @@ fn main() {
             commands::snapshot,
             commands::series,
             commands::costs,
+            commands::project_usage,
             commands::swaps,
             commands::events,
             commands::usage_history,

@@ -12,6 +12,7 @@ import {
   type EventRow,
   type ExtraUsage,
   type LoginProgress,
+  type ProjectUsage,
   type Settings,
   type Snapshot,
   type WeeklyLimitSetting,
@@ -24,7 +25,8 @@ import { ChartPanel } from "./panel";
 import { dragRow, keyMove } from "./sortable";
 import { axis, fitLabels, laneEl, lanes, nextUp, overlay, planView, stateLine, summary } from "./timeline";
 
-type Page = "overview" | "activity" | "cost" | "settings";
+type Page = "overview" | "activity" | "cost" | "projects" | "settings";
+type ProjectSpan = "hour" | "day" | "week" | "month";
 type Route = { page: Page } | { page: "account"; id: number };
 
 interface UiState {
@@ -32,6 +34,7 @@ interface UiState {
   events: EventRow[];
   route: Route;
   showRoutine: boolean;
+  projectSpan: ProjectSpan;
   busy: boolean;
   /** A row is being dragged; renders wait until it is dropped. */
   dragging: boolean;
@@ -44,6 +47,7 @@ const state: UiState = {
   events: [],
   route: { page: "overview" },
   showRoutine: false,
+  projectSpan: "week",
   busy: false,
   dragging: false,
   focus: null,
@@ -134,6 +138,7 @@ const ICONS: Record<Page, () => SVGSVGElement> = {
   overview: () => icon("M2 4h12", "M2 8h7", "M2 12h10", "M11.5 6.5v3"),
   activity: () => icon("M2 8h3l2-5 2 10 2-5h3"),
   cost: () => icon("M3 13V9", "M8 13V3", "M13 13V6"),
+  projects: () => icon("M2 4.2h4l1.3 1.6H14V13H2z"),
   settings: () => icon("M8 5.8a2.2 2.2 0 1 0 0 4.4 2.2 2.2 0 0 0 0-4.4Z", "M8 1.8v2", "M8 12.2v2", "M1.8 8h2", "M12.2 8h2", "M3.6 3.6 5 5", "M11 11l1.4 1.4", "M3.6 12.4 5 11", "M11 5l1.4-1.4"),
 };
 
@@ -365,6 +370,7 @@ function go(route: Route) {
     costChart.refresh();
     loadCostTable();
   }
+  if (route.page === "projects") loadProjectTable();
   if (route.page === "overview") overviewChart.refresh();
 }
 
@@ -514,6 +520,7 @@ function renderNav() {
       item("overview", "Overview"),
       item("activity", "Activity", snap ? `${snap.pool.swaps_24h} ${snap.pool.swaps_24h === 1 ? "swap" : "swaps"}` : null),
       item("cost", "API cost"),
+      item("projects", "Projects"),
       item("settings", "Settings"),
     ),
     h(
@@ -617,6 +624,26 @@ function renderHead() {
     rerender(head, title("Activity", snap ? `${snap.pool.swaps_24h} ${snap.pool.swaps_24h === 1 ? "swap" : "swaps"} in the last 24 hours` : null), h("label", { class: "check", for: "routine" }, toggle, "Show renewals and other routine events"));
   } else if (r.page === "cost") {
     rerender(head, title("API cost", "What your use would have cost at API prices, as Claude Code estimates it"));
+  } else if (r.page === "projects") {
+    const pick = (span: ProjectSpan, label: string) =>
+      h(
+        "button",
+        {
+          class: state.projectSpan === span ? "btn small primary" : "btn small",
+          "data-focus": `projects-${span}`,
+          onclick: () => {
+            state.projectSpan = span;
+            renderHead();
+            renderProjectTable();
+          },
+        },
+        label,
+      );
+    rerender(
+      head,
+      title("Projects", "API value of sessions, by the folder Claude Code was started in"),
+      h("div", { class: "page-actions" }, pick("hour", "Last hour"), pick("day", "24 hours"), pick("week", "7 days"), pick("month", "30 days")),
+    );
   } else {
     rerender(head, title("Settings"));
   }
@@ -929,7 +956,7 @@ function accountSettings(a: AccountView): HTMLElement {
       ] as const
     ).map(([value, text]) => h("option", { value, selected: a.weekly.setting === value }, text)),
   );
-  const weeklyThreshold = state.snap?.settings.swap_threshold_7d ?? 98;
+  const weeklyThreshold = state.snap?.settings.swap_threshold_7d ?? 100;
   const cap = h("input", { type: "number", min: 1, max: 100, step: "any", value: a.weekly_cap === null ? "" : String(a.weekly_cap), placeholder: String(weeklyThreshold) });
   const useExpiring = h("input", { type: "checkbox", checked: a.use_expiring });
   const keepRunning = h("input", { type: "checkbox", checked: a.keep_running });
@@ -1079,6 +1106,103 @@ function loadCostTable() {
     .catch((e) => read === costReads && replace(costTable, h("h2", null, "By account"), h("p", { class: "muted" }, `Couldn't read API cost: ${e}`)));
 }
 
+/** The Projects page: API value by the folder Claude Code was launched in. */
+const projectTable = h("section", { class: "card" }, h("h2", null, "By folder"), h("p", { class: "muted" }, "Loading…"));
+let projectReads = 0;
+let projectData: ProjectUsage | null = null;
+
+const PROJECT_SPANS: Record<ProjectSpan, number> = { hour: 3_600_000, day: 86_400_000, week: 7 * 86_400_000, month: 30 * 86_400_000 };
+const LIVE_MS = 2 * 60_000;
+
+function folderName(path: string): string {
+  const parts = path.split(/[\\/]/).filter(Boolean);
+  return parts[parts.length - 1] ?? path;
+}
+
+function hourLabel(ts: number): string {
+  const d = new Date(ts);
+  const now = new Date();
+  if (d.toDateString() === now.toDateString()) return d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  const yest = new Date(now);
+  yest.setDate(now.getDate() - 1);
+  if (d.toDateString() === yest.toDateString()) return "Yesterday";
+  return d.toLocaleDateString([], { month: "short", day: "numeric" });
+}
+
+function renderProjectTable() {
+  const data = projectData;
+  if (!data) return;
+  const since = Date.now() - PROJECT_SPANS[state.projectSpan];
+  // An hour that started before the span counts in full, same as the API cost table.
+  const costs = data.costs.filter((c) => c.ts + 3_600_000 > since);
+  const byPath = new Map<string, { usd: number; last: number; accounts: Set<number> }>();
+  for (const c of costs) {
+    const row = byPath.get(c.path) ?? { usd: 0, last: 0, accounts: new Set<number>() };
+    row.usd += c.usd;
+    row.last = Math.max(row.last, c.ts);
+    row.accounts.add(c.account_id);
+    byPath.set(c.path, row);
+  }
+  const total = [...byPath.values()].reduce((s, r) => s + r.usd, 0);
+  const rows = [...byPath.entries()].sort((a, b) => b[1].usd - a[1].usd || a[0].localeCompare(b[0]));
+  const touchesIn = (path: string) => data.touches.filter((t) => t.path === path && t.seen_ms + 3_600_000 > since);
+  const noneYet = data.costs.length === 0;
+  replace(
+    projectTable,
+    h("h2", null, "By folder"),
+    noneYet
+      ? h("p", { class: "muted" }, "No project usage yet. cc-rotate starts counting a folder when a session's status line runs after this update. Earlier use stays on API cost, by account.")
+      : rows.length === 0
+        ? h("p", { class: "muted" }, "No project usage in this span.")
+        : h(
+            "table",
+            { class: "cost-table" },
+            h("thead", null, h("tr", null, h("th", null, "Project"), h("th", { class: "num" }, "API value"), h("th", { class: "num" }, "Share"), h("th", { class: "num" }, "Last spend"))),
+            h(
+              "tbody",
+              null,
+              rows.map(([path, row]) => {
+                const share = total > 0 ? (row.usd / total) * 100 : 0;
+                const touches = touchesIn(path);
+                const live = touches.some((t) => Date.now() - t.seen_ms < LIVE_MS);
+                const sessions = touches.length;
+                const names = [...row.accounts].map((id) => labelOf(id)).sort((a, b) => a.localeCompare(b));
+                const detail = [path, sessions === 1 ? "1 session" : `${sessions} sessions`, names.join(", ")].filter(Boolean).join(" · ");
+                return h(
+                  "tr",
+                  null,
+                  h(
+                    "td",
+                    null,
+                    h("span", { class: "name" }, folderName(path)),
+                    live && h("span", { class: "live", title: "A session in this folder reported in the last few minutes" }, "In use"),
+                    h("span", { class: "proj-path", title: path }, detail),
+                    h("span", { class: "share-bar" }, h("i", { style: { width: `${share}%` } })),
+                  ),
+                  h("td", { class: "num" }, usd(row.usd)),
+                  h("td", { class: "num" }, `${Math.round(share * 10) / 10}%`),
+                  h("td", { class: "num" }, hourLabel(row.last)),
+                );
+              }),
+            ),
+            h("tfoot", null, h("tr", null, h("td", null, "Total"), h("td", { class: "num" }, usd(total)), h("td"), h("td"))),
+          ),
+    !noneYet && h("p", { class: "muted cost-note" }, "Same estimate as API cost. An hour that started before the span counts in full. A session that reports no folder stays on API cost only."),
+  );
+}
+
+function loadProjectTable() {
+  const read = ++projectReads;
+  api
+    .projectUsage(Date.now() - PROJECT_SPANS.month)
+    .then((usage) => {
+      if (read !== projectReads) return;
+      projectData = usage;
+      renderProjectTable();
+    })
+    .catch((e) => read === projectReads && replace(projectTable, h("h2", null, "By folder"), h("p", { class: "muted" }, `Couldn't read project usage: ${e}`)));
+}
+
 function buildSettings(snap: Snapshot): HTMLElement {
   const checks = h("ul", { class: "checks" }, h("li", { class: "muted" }, "Running checks…"));
   const info = h("dl", { class: "facts" });
@@ -1132,7 +1256,7 @@ function buildSettings(snap: Snapshot): HTMLElement {
         "div",
         { class: "fields" },
         field("swap_threshold_5h", "Swap at 5-hour usage (%)", snap.settings.swap_threshold_5h, "Swap before a 5-hour limit is reached.", 1, 100),
-        field("swap_threshold_7d", "Swap at weekly usage (%)", snap.settings.swap_threshold_7d, "Also applies to weekly limits on a single model.", 1, 100),
+        field("swap_threshold_7d", "Swap at weekly usage (%)", snap.settings.swap_threshold_7d, "Also applies to weekly limits on a single model. 100 is the cap Claude Code shows; it keeps serving for a bit past that.", 1, 100),
         field("swap_cooldown_s", "Minimum time between swaps (seconds)", snap.settings.swap_cooldown_s, "Applies to swaps at a limit and swaps back.", 0, 3600),
       ),
     ),
@@ -1199,6 +1323,9 @@ function renderPage() {
       break;
     case "cost":
       mount(costChart.el, costTable);
+      break;
+    case "projects":
+      mount(projectTable);
       break;
     case "settings":
       if (!settingsPage && state.snap) settingsPage = buildSettings(state.snap);
@@ -1452,6 +1579,7 @@ async function refresh(): Promise<void> {
         loadCostTable();
         await costChart.render();
       }
+      if (state.route.page === "projects") loadProjectTable();
     } catch (e) {
       say(`Couldn't load cc-rotate's data: ${e}`, "error");
     } finally {

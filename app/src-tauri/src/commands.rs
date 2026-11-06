@@ -5,7 +5,7 @@ use ccr_core::doctor::{self, Check};
 use ccr_core::history::{self, AccountHistory};
 use ccr_core::profiles::{self, FoundProfile};
 use ccr_core::scheduler::Reason;
-use ccr_core::snapshot::{self, Snapshot};
+use ccr_core::snapshot::{self, ProjectUsage, Snapshot};
 use ccr_core::store::{AccountState, Event, HourlyCost, Sample, WeeklyLimitSetting, kind};
 use ccr_core::swap::{self, SwapOutcome, SwapRequest};
 use ccr_core::usage_check::{self, CheckOutcome, Trigger};
@@ -53,6 +53,13 @@ pub async fn swaps(since_ms: i64) -> CmdResult<Vec<Event>> {
 #[tauri::command]
 pub async fn costs(since_ms: i64) -> CmdResult<Vec<HourlyCost>> {
     blocking(move |s, _| snapshot::costs(s, since_ms)).await
+}
+
+/// API value by the folder Claude Code was launched in, and the sessions that reported one,
+/// from `since_ms` on.
+#[tauri::command]
+pub async fn project_usage(since_ms: i64) -> CmdResult<ProjectUsage> {
+    blocking(move |s, _| snapshot::project_usage(s, since_ms)).await
 }
 
 #[tauri::command]

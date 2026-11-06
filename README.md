@@ -22,7 +22,7 @@ Because every session lives in one profile, sessions can see and message each ot
 - A dedicated profile (`~/.claude-rotate`) holds the account in use.
   cc-rotate copies your existing settings, hooks, skills and plugins into it.
 - Every Claude Code session in that profile runs `cc-rotate-ctl statusline` after every reply and every 30 seconds.
-  It records every usage limit Claude Code reports for the account, copies renewed logins back into the store, and starts a swap at 98% of any limit.
+  It records every usage limit Claude Code reports for the account, copies renewed logins back into the store, and starts a swap at 98% of a 5-hour limit or at 100% of a weekly limit.
 - A swap takes the same lock Claude Code uses when it renews a login, saves the outgoing account's latest login, and writes the next account's login into the profile.
   Claude Code notices the change and uses the new account on its next request.
 - A turn that already hit a limit stops, and keeps the login it started with, so a swap alone would leave it waiting until that account resets.
@@ -277,6 +277,9 @@ A week with few readings is marked, since the account may have used more than cc
 The app shows the same numbers for the last 4 weeks as **Recent weeks** and **API value** on each account's page.
 Its **API cost** chart, a tab next to **Usage limits** below the plan, shows the API value of the last 24 hours by hour or of the last 7 days by day, stacked per account, with the total for the period.
 The **API cost** page in the sidebar has the same chart and each account's total over the last 24 hours, 7 days and 30 days.
+The **Projects** page splits that same estimate by the folder Claude Code was started in.
+It can show the last hour, 24 hours, 7 days, or 30 days.
+It counts from the update that added the page, so earlier use stays on API cost.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/charts-dark.png">
@@ -296,8 +299,8 @@ Each account's page in the app shows whether extra usage is on and how much it s
 
 ### Unattended runs
 
-cc-rotate swaps at 98%, so a session rarely reaches a limit.
-It still can: when one turn uses up an account's last 2%, when the account was used up somewhere cc-rotate couldn't see, or when every account is at a limit.
+cc-rotate swaps at 98% of a 5-hour limit and at 100% of a weekly limit, so a session rarely reaches a hard stop.
+It still can: when one turn uses up an account's last 2% of a 5-hour window, when a turn spends the grace buffer past a nominal weekly 100%, when the account was used up somewhere cc-rotate couldn't see, or when every account is at a limit.
 Claude Code then stops the turn and keeps the login it started with, so a swap alone doesn't get it going again.
 cc-rotate takes care of that:
 
@@ -356,7 +359,7 @@ When its input or output isn't a terminal, it prints the status once and exits.
 | Setting | Default | Meaning |
 |---|---|---|
 | `swap_threshold_5h` | 98 | Swap when a 5-hour limit reaches this percentage. |
-| `swap_threshold_7d` | 98 | Swap when a weekly limit, for all models or for one, reaches this percentage. Limits of a kind cc-rotate does not know use the lower of the two thresholds. |
+| `swap_threshold_7d` | 100 | Swap when a weekly limit, for all models or for one, reaches this percentage. 100 is the cap Claude Code shows; it keeps serving through a grace buffer past that. Limits of a kind cc-rotate does not know use the lower of the two thresholds. |
 | `swap_cooldown_s` | 120 | Minimum seconds between swaps at a limit and swaps back (up to a day). |
 | `prefer_no_weekly_limit` | true | Use accounts without a weekly limit before the ones with one, and swap back to one as soon as it is ready. |
 | `use_expiring_weekly` | true | Move an account ahead when its weekly budget would otherwise reset unused. |

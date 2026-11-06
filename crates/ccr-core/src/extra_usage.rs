@@ -26,8 +26,8 @@ const AVOID_GRACE_MS: i64 = 2 * 60_000;
 /// A paying account's extra usage is read again at most this often.
 const REFRESH_EVERY_MS: i64 = 10 * 60_000;
 
-/// A window this full is used up: requests beyond it bill extra usage. cc-rotate's thresholds
-/// (98% by default, lower with a weekly cap) stop rotating onto an account before that.
+/// A window this full is used up: requests beyond it bill extra usage. The 5-hour threshold
+/// (98% by default) stops rotating onto an account before that, and a weekly cap can too.
 const USED_UP_PCT: f64 = 99.5;
 
 /// Whether the account in use runs on paid extra usage: no other account can be picked, a limit

@@ -6,7 +6,8 @@ use serde::Serialize;
 use crate::paths::Paths;
 use crate::scheduler::{self, Ranked, WeeklyLimit, WindowUsage};
 use crate::store::{
-    Account, AccountState, Event, HourlyCost, Sample, Settings, Store, WeeklyLimitSetting, kind,
+    Account, AccountState, Event, HourlyCost, ProjectSpend, ProjectTouch, Sample, Settings, Store,
+    WeeklyLimitSetting, kind,
 };
 use crate::swap::{self, META_PROFILE_MODEL};
 use crate::usage_check::{self, CheckState};
@@ -305,6 +306,21 @@ pub fn swaps(store: &Store, since_ms: i64) -> Result<Vec<Event>> {
 /// `since_ms` on, for the app's cost chart.
 pub fn costs(store: &Store, since_ms: i64) -> Result<Vec<HourlyCost>> {
     store.hourly_costs_since(since_ms)
+}
+
+/// Launch-folder API value and the sessions that reported a folder, from `since_ms` on.
+/// Read-only. The Projects page asks for the last 30 days and filters shorter spans itself.
+#[derive(Debug, Serialize)]
+pub struct ProjectUsage {
+    pub costs: Vec<ProjectSpend>,
+    pub touches: Vec<ProjectTouch>,
+}
+
+pub fn project_usage(store: &Store, since_ms: i64) -> Result<ProjectUsage> {
+    Ok(ProjectUsage {
+        costs: store.project_spend_since(since_ms)?,
+        touches: store.project_touches_since(since_ms)?,
+    })
 }
 
 #[cfg(test)]
