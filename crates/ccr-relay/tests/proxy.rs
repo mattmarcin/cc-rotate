@@ -7,7 +7,12 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use ccr_core::relay::RelayConfig;
-use ccr_relay::{Choice, Logins, RelayEvents, Upstream};
+use ccr_core::store::{AccountIdentity, AccountState, kind};
+use ccr_core::swap::{SwapOutcome, SwapRequest};
+use ccr_core::{Paths, Store};
+use ccr_relay::{
+    Choice, Logins, RelayEvents, StoreEvents, StoreLogins, StoreSwaps, Swapped, Swaps, Upstream,
+};
 use http::{HeaderMap, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::body::{Frame, Incoming};
@@ -35,7 +40,26 @@ struct FakeState {
     seen: Mutex<Vec<Seen>>,
     release: Notify,
     cancelled_at: Mutex<Option<Instant>>,
+    /// Tokens whose model requests are refused at a usage limit.
+    limited: Mutex<Vec<String>>,
+    /// Holds each refusal until as many requests reached it.
+    limit_barrier: Mutex<Option<Arc<tokio::sync::Barrier>>>,
 }
+
+impl FakeState {
+    fn limit(&self, tokens: &[&str]) {
+        *self.limited.lock().unwrap() = tokens.iter().map(|t| t.to_string()).collect();
+    }
+}
+
+/// Epoch seconds an hour and a day from now, for reset headers.
+fn resets() -> (i64, i64) {
+    let now = ccr_core::time::now_s();
+    (now + 3600, now + 86_400)
+}
+
+const LIMIT_BODY: &str =
+    r#"{"type":"error","error":{"type":"rate_limit_error","message":"limit reached"}}"#;
 
 struct Fake {
     addr: SocketAddr,
@@ -77,6 +101,12 @@ async fn fake_handle(
         .map(|p| p.as_str().to_string())
         .unwrap_or_default();
     let headers = req.headers().clone();
+    let token = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("")
+        .to_string();
     let body = req.into_body().collect().await.unwrap().to_bytes();
     state.seen.lock().unwrap().push(Seen {
         method,
@@ -84,6 +114,34 @@ async fn fake_handle(
         headers,
         body,
     });
+    let (r5h, r7d) = resets();
+    if state.limited.lock().unwrap().contains(&token) {
+        let barrier = state.limit_barrier.lock().unwrap().clone();
+        if let Some(barrier) = barrier {
+            barrier.wait().await;
+        }
+        return Ok(Response::builder()
+            .status(429)
+            .header("content-type", "application/json")
+            .header("request-id", "req_limit")
+            .header("retry-after", "60")
+            .header("x-token", token.as_str())
+            .header("anthropic-ratelimit-unified-status", "rejected")
+            .header("anthropic-ratelimit-unified-5h-utilization", "1.0")
+            .header("anthropic-ratelimit-unified-5h-reset", r5h.to_string())
+            .body(BodyExt::boxed(Full::new(Bytes::from(LIMIT_BODY))))
+            .unwrap());
+    }
+    for code in [529u16, 429] {
+        if path.contains(&format!("status={code}")) {
+            return Ok(Response::builder()
+                .status(code)
+                .header("request-id", "req_err")
+                .header("x-token", token.as_str())
+                .body(BodyExt::boxed(Full::new(Bytes::from("{\"error\":1}"))))
+                .unwrap());
+        }
+    }
     let sse = |body: FakeBody| {
         Response::builder()
             .status(200)
@@ -134,7 +192,12 @@ async fn fake_handle(
         .status(200)
         .header("content-type", "application/json")
         .header("request-id", "req_1")
+        .header("x-token", token.as_str())
+        .header("anthropic-ratelimit-unified-status", "allowed")
         .header("anthropic-ratelimit-unified-5h-utilization", "0.25")
+        .header("anthropic-ratelimit-unified-5h-reset", r5h.to_string())
+        .header("anthropic-ratelimit-unified-7d-utilization", "0.5")
+        .header("anthropic-ratelimit-unified-7d-reset", r7d.to_string())
         .header("connection", "keep-alive")
         .body(BodyExt::boxed(Full::new(Bytes::from("{\"ok\":true}"))))
         .unwrap())
@@ -198,10 +261,37 @@ type ResponseCall = (
     Vec<(String, String)>,
 );
 
+type OnRefusal = Box<dyn Fn(i64) -> Swapped + Send + Sync>;
+
 #[derive(Default)]
 struct Recorder {
     responses: Mutex<Vec<ResponseCall>>,
     lines: Mutex<Vec<String>>,
+    /// What `refused_at_limit` does; `Swapped::No` when unset.
+    on_refusal: Mutex<Option<OnRefusal>>,
+    refusals: Mutex<Vec<i64>>,
+    resent: Mutex<Vec<(i64, i64)>>,
+    unreachable: Mutex<Vec<String>>,
+}
+
+impl Recorder {
+    fn on_refusal(&self, f: impl Fn(i64) -> Swapped + Send + Sync + 'static) {
+        *self.on_refusal.lock().unwrap() = Some(Box::new(f));
+    }
+    fn refusals(&self) -> Vec<i64> {
+        self.refusals.lock().unwrap().clone()
+    }
+    fn resent(&self) -> Vec<(i64, i64)> {
+        self.resent.lock().unwrap().clone()
+    }
+    fn statuses(&self) -> Vec<(i64, u16)> {
+        self.responses
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| (r.0, r.3))
+            .collect()
+    }
 }
 
 impl RelayEvents for Recorder {
@@ -224,21 +314,30 @@ impl RelayEvents for Recorder {
     fn log(&self, line: &str) {
         self.lines.lock().unwrap().push(line.to_string());
     }
+    fn refused_at_limit(&self, account: i64) -> Swapped {
+        self.refusals.lock().unwrap().push(account);
+        match &*self.on_refusal.lock().unwrap() {
+            Some(f) => f(account),
+            None => Swapped::No,
+        }
+    }
+    fn resent(&self, from: i64, to: i64) {
+        self.resent.lock().unwrap().push((from, to));
+    }
+    fn unreachable(&self, kind: &str) {
+        self.unreachable.lock().unwrap().push(kind.to_string());
+    }
 }
 
-struct Relay {
+struct Relay<E = Recorder> {
     cfg: RelayConfig,
-    events: Arc<Recorder>,
+    events: Arc<E>,
     client: Client<HttpConnector, Full<Bytes>>,
 }
 
-impl Relay {
+impl<E> Relay<E> {
     fn url(&self, path: &str) -> String {
         format!("http://127.0.0.1:{}/r/{S}{path}", self.cfg.port)
-    }
-
-    fn lines(&self) -> Vec<String> {
-        self.events.lines.lock().unwrap().clone()
     }
 
     async fn send(&self, req: Request<Full<Bytes>>) -> Response<Incoming> {
@@ -246,13 +345,26 @@ impl Relay {
     }
 }
 
+impl Relay<Recorder> {
+    fn lines(&self) -> Vec<String> {
+        self.events.lines.lock().unwrap().clone()
+    }
+}
+
 async fn relay_to(addr: SocketAddr, logins: Arc<dyn Logins>) -> Relay {
+    relay_with(addr, logins, Arc::new(Recorder::default())).await
+}
+
+async fn relay_with<E: RelayEvents + 'static>(
+    addr: SocketAddr,
+    logins: Arc<dyn Logins>,
+    events: Arc<E>,
+) -> Relay<E> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let cfg = RelayConfig {
         port: listener.local_addr().unwrap().port(),
         secret: S.into(),
     };
-    let events = Arc::new(Recorder::default());
     let upstream = Upstream::for_test(format!("http://{addr}").parse().unwrap()).unwrap();
     tokio::spawn(ccr_relay::serve(
         listener,
@@ -269,7 +381,7 @@ async fn relay_to(addr: SocketAddr, logins: Arc<dyn Logins>) -> Relay {
     }
 }
 
-fn model_request(relay: &Relay, query: &str, auth: Option<&str>) -> Request<Full<Bytes>> {
+fn model_request<E>(relay: &Relay<E>, query: &str, auth: Option<&str>) -> Request<Full<Bytes>> {
     let mut b = Request::post(relay.url(&format!("/v1/messages{query}")))
         .header("content-type", "application/json")
         .header("anthropic-beta", "oauth-2025-04-20")
@@ -351,7 +463,16 @@ async fn model_request_gets_pool_token() {
     let lines = relay.lines();
     assert_eq!(lines.len(), 1, "{lines:?}");
     let line = &lines[0];
-    for part in ["POST", "/v1/messages", "200", "req_1", "account=2"] {
+    for part in [
+        "POST",
+        "/v1/messages",
+        "200",
+        "req_1",
+        "account=2",
+        "5h-utilization=0.25",
+        "7d-utilization=0.5",
+        "status=allowed",
+    ] {
         assert!(line.contains(part), "{line}");
     }
     for secret in ["tok-b", "home", S, "beta=true", "claude-x", "sess-1"] {
@@ -516,6 +637,7 @@ async fn upstream_down_is_a_bad_gateway() {
     let lines = relay.lines();
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert!(lines[0].contains("502") && !lines[0].contains("tok-b"));
+    assert_eq!(*relay.events.unreachable.lock().unwrap(), vec!["connect"]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -708,4 +830,375 @@ async fn two_authorization_headers_get_no_pool_token() {
     );
     assert_same_headers_except(&sent_headers, &seen[0].headers, &["host"]);
     assert!(relay.events.responses.lock().unwrap().is_empty());
+}
+
+/// The authorization values the fake upstream got, in order.
+fn tokens_seen(fake: &Fake) -> Vec<String> {
+    fake.seen()
+        .iter()
+        .map(|s| {
+            s.headers
+                .get("authorization")
+                .map(|v| v.to_str().unwrap().to_string())
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resend_on_limit() {
+    let fake = fake_upstream().await;
+    fake.state.limit(&["tok-b"]);
+    let logins = Switch::new(token(2, "tok-b"));
+    let events = Arc::new(Recorder::default());
+    let to_c = logins.clone();
+    events.on_refusal(move |account| {
+        assert_eq!(account, 2);
+        to_c.set(token(3, "tok-c"));
+        Swapped::To(3)
+    });
+    let relay = relay_with(fake.addr, logins, events.clone()).await;
+    let resp = relay
+        .send(model_request(&relay, "", Some("Bearer home")))
+        .await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["x-token"], "tok-c");
+    assert_eq!(&body_of(resp).await[..], b"{\"ok\":true}");
+
+    assert_eq!(tokens_seen(&fake), vec!["Bearer tok-b", "Bearer tok-c"]);
+    let seen = fake.seen();
+    assert_eq!(seen[0].body, seen[1].body);
+    assert_eq!(seen[0].path, seen[1].path);
+    assert_eq!(events.refusals(), vec![2]);
+    assert_eq!(events.resent(), vec![(2, 3)]);
+    // Both responses' readings were reported, each for the account that served it.
+    assert_eq!(events.statuses(), vec![(2, 429), (3, 200)]);
+    let lines = relay.lines();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(
+        lines[0].contains("429")
+            && lines[0].contains("account=2")
+            && lines[0].contains("status=rejected")
+    );
+    assert!(lines[1].contains("200") && lines[1].contains("account=3"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn no_swap_returns_refusal() {
+    let fake = fake_upstream().await;
+    fake.state.limit(&["tok-b"]);
+    let relay = relay_to(fake.addr, Switch::new(token(2, "tok-b"))).await;
+    let resp = relay
+        .send(model_request(&relay, "", Some("Bearer home")))
+        .await;
+    assert_eq!(resp.status(), 429);
+    let h = resp.headers();
+    assert_eq!(h["anthropic-ratelimit-unified-status"], "rejected");
+    assert_eq!(h["retry-after"], "60");
+    assert_eq!(h["request-id"], "req_limit");
+    assert_eq!(h["x-token"], "tok-b");
+    assert_eq!(&body_of(resp).await[..], LIMIT_BODY.as_bytes());
+    assert_eq!(fake.seen().len(), 1);
+    assert_eq!(relay.events.refusals(), vec![2]);
+    assert!(relay.events.resent().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn each_account_once() {
+    let fake = fake_upstream().await;
+    fake.state.limit(&["tok-b", "tok-c"]);
+    let logins = Switch::new(token(2, "tok-b"));
+    let events = Arc::new(Recorder::default());
+    let switch = logins.clone();
+    events.on_refusal(move |account| {
+        if account == 2 {
+            switch.set(token(3, "tok-c"));
+            Swapped::To(3)
+        } else {
+            switch.set(token(2, "tok-b"));
+            Swapped::To(2)
+        }
+    });
+    let relay = relay_with(fake.addr, logins, events.clone()).await;
+    let resp = relay
+        .send(model_request(&relay, "", Some("Bearer home")))
+        .await;
+    assert_eq!(resp.status(), 429);
+    assert_eq!(resp.headers()["x-token"], "tok-c");
+    assert_eq!(&body_of(resp).await[..], LIMIT_BODY.as_bytes());
+    assert_eq!(tokens_seen(&fake), vec!["Bearer tok-b", "Bearer tok-c"]);
+    assert_eq!(events.refusals(), vec![2, 3]);
+    assert_eq!(events.resent(), vec![(2, 3)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resend_stops_when_the_login_is_one_already_tried() {
+    let fake = fake_upstream().await;
+    fake.state.limit(&["tok-b"]);
+    let events = Arc::new(Recorder::default());
+    // The swap says it moved to 3, but the login is still 2's by the time it is read.
+    events.on_refusal(|_| Swapped::To(3));
+    let relay = relay_with(fake.addr, Switch::new(token(2, "tok-b")), events.clone()).await;
+    let resp = relay
+        .send(model_request(&relay, "", Some("Bearer home")))
+        .await;
+    assert_eq!(resp.status(), 429);
+    assert_eq!(&body_of(resp).await[..], LIMIT_BODY.as_bytes());
+    assert_eq!(fake.seen().len(), 1);
+    assert!(events.resent().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn other_errors_pass() {
+    let fake = fake_upstream().await;
+    let relay = relay_to(fake.addr, Switch::new(token(2, "tok-b"))).await;
+    for (query, status) in [("?status=529", 529), ("?status=429", 429)] {
+        let resp = relay
+            .send(model_request(&relay, query, Some("Bearer home")))
+            .await;
+        assert_eq!(resp.status(), status);
+        assert_eq!(&body_of(resp).await[..], b"{\"error\":1}");
+    }
+    assert_eq!(fake.seen().len(), 2);
+    assert!(relay.events.refusals().is_empty());
+    assert_eq!(relay.events.statuses(), vec![(2, 529), (2, 429)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_without_a_pool_login_is_never_resent() {
+    let fake = fake_upstream().await;
+    fake.state.limit(&["tok-b"]);
+    let relay = relay_to(fake.addr, Switch::new(token(3, "tok-c"))).await;
+    relay.events.on_refusal(|_| Swapped::To(3));
+    // A request that keeps the session's own login (two of them here) was refused on no pool
+    // account: there is nothing to swap away from.
+    let req = Request::post(relay.url("/v1/messages"))
+        .header("authorization", "Bearer tok-b")
+        .header("authorization", "Bearer tok-b")
+        .body(Full::new(Bytes::from("{}")))
+        .unwrap();
+    assert_eq!(relay.send(req).await.status(), 429);
+    assert_eq!(fake.seen().len(), 1);
+    assert!(relay.events.refusals().is_empty());
+}
+
+/// Counts swaps and runs each with the real `swap::run`, on a store of its own.
+struct CountingSwaps {
+    inner: StoreSwaps,
+    calls: Mutex<Vec<SwapRequest>>,
+}
+
+impl Swaps for CountingSwaps {
+    fn run(&self, req: &SwapRequest) -> anyhow::Result<SwapOutcome> {
+        self.calls.lock().unwrap().push(req.clone());
+        self.inner.run(req)
+    }
+}
+
+/// A pool in a store file in a scratch folder: `b` active, `c` parked, `a` the home account, in
+/// that order, each with a stored login whose token is `tok-<name>`. Relay mode is on.
+struct Pool {
+    _root: tempfile::TempDir,
+    paths: Paths,
+    a: i64,
+    b: i64,
+    c: i64,
+}
+
+impl Pool {
+    fn new() -> Pool {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("data");
+        let profile = root.path().join("profile");
+        let home = root.path().join("home");
+        for dir in [&data, &profile, &home] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let paths = Paths::new(data.clone(), profile).with_home(home);
+        let store = Store::open(&paths.store_db()).unwrap();
+        // No check may run a real Claude Code.
+        store.set_setting("usage_checks", Some("false")).unwrap();
+        store
+            .set_setting("use_expiring_weekly", Some("false"))
+            .unwrap();
+        let nowhere = data.join("no-claude-here").display().to_string();
+        store.set_setting("claude_path", Some(&nowhere)).unwrap();
+        let mut ids = Vec::new();
+        for (name, state) in [
+            ("b", AccountState::Active),
+            ("c", AccountState::Parked),
+            ("a", AccountState::Parked),
+        ] {
+            let ident = AccountIdentity {
+                account_uuid: Some(format!("u{name}")),
+                email: Some(format!("{name}@x.test")),
+                org_uuid: Some("org-x".into()),
+                ..Default::default()
+            };
+            let id = store.insert_account(name, &ident, state).unwrap();
+            store
+                .save_credential(
+                    id,
+                    &serde_json::json!({
+                        "accessToken": format!("tok-{name}"),
+                        "refreshToken": format!("ref-{name}"),
+                        "expiresAt": ccr_core::time::now_ms() + 3_600_000,
+                        "scopes": ["user:inference"],
+                        "subscriptionType": "max",
+                    }),
+                    "login",
+                )
+                .unwrap();
+            ids.push(id);
+        }
+        let (b, c, a) = (ids[0], ids[1], ids[2]);
+        ccr_core::relay::set_mode(&store, Some(a)).unwrap();
+        Pool {
+            _root: root,
+            paths,
+            a,
+            b,
+            c,
+        }
+    }
+
+    fn open(&self) -> Store {
+        Store::open(&self.paths.store_db()).unwrap()
+    }
+
+    fn counting_swaps(&self) -> Arc<CountingSwaps> {
+        Arc::new(CountingSwaps {
+            inner: StoreSwaps::new(self.paths.clone()),
+            calls: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn events(&self, swaps: Arc<dyn Swaps>) -> Arc<StoreEvents> {
+        Arc::new(StoreEvents::new(
+            self.open(),
+            swaps,
+            Arc::new(Recorder::default()),
+        ))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn records_reading_for_serving_account() {
+    let fake = fake_upstream().await;
+    let pool = Pool::new();
+    let swaps = pool.counting_swaps();
+    let events = pool.events(swaps.clone());
+    let relay = relay_with(fake.addr, Switch::new(token(pool.b, "tok-b")), events).await;
+    let resp = relay
+        .send(model_request(&relay, "", Some("Bearer home")))
+        .await;
+    assert_eq!(resp.status(), 200);
+    body_of(resp).await;
+
+    let store = pool.open();
+    let samples = store.account_samples_since(pool.b, 0).unwrap();
+    assert_eq!(samples.len(), 1, "{samples:?}");
+    let s = &samples[0];
+    assert_eq!(s.profile, "relay");
+    assert_eq!(s.session_id.as_deref(), Some("sess-1"));
+    assert_eq!(s.model.as_deref(), Some("claude-x"));
+    let (r5h, r7d) = resets();
+    let five = s.window("five_hour").unwrap();
+    assert!((five.pct - 25.0).abs() < 1e-9);
+    assert!(five.resets_at.is_some_and(|r| (r - r5h).abs() <= 5));
+    let seven = s.window("seven_day").unwrap();
+    assert!((seven.pct - 50.0).abs() < 1e-9);
+    assert!(seven.resets_at.is_some_and(|r| (r - r7d).abs() <= 5));
+    assert!(store.account_samples_since(pool.c, 0).unwrap().is_empty());
+    // Below every threshold: no swap.
+    assert!(swaps.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_refusals_swap_once() {
+    let fake = fake_upstream().await;
+    fake.state.limit(&["tok-b"]);
+    *fake.state.limit_barrier.lock().unwrap() = Some(Arc::new(tokio::sync::Barrier::new(2)));
+    let pool = Pool::new();
+    let swaps = pool.counting_swaps();
+    let events = pool.events(swaps.clone());
+    let logins = Arc::new(StoreLogins::new(pool.open()));
+    let relay = Arc::new(relay_with(fake.addr, logins, events).await);
+
+    let mut set = tokio::task::JoinSet::new();
+    for _ in 0..2 {
+        let relay = relay.clone();
+        set.spawn(async move {
+            let resp = relay
+                .send(model_request(&relay, "", Some("Bearer home")))
+                .await;
+            let token = resp.headers()["x-token"].to_str().unwrap().to_string();
+            (resp.status(), token, body_of(resp).await)
+        });
+    }
+    while let Some(r) = set.join_next().await {
+        let (status, token, body) = r.unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(token, "tok-c");
+        assert_eq!(&body[..], b"{\"ok\":true}");
+    }
+
+    let calls = swaps.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(calls[0].from, Some(pool.b));
+    assert_eq!(calls[0].to, None);
+    assert_eq!(calls[0].reason, ccr_core::scheduler::Reason::LimitRefused);
+    assert!(calls[0].wait);
+
+    let mut seen = tokens_seen(&fake);
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec![
+            "Bearer tok-b",
+            "Bearer tok-b",
+            "Bearer tok-c",
+            "Bearer tok-c"
+        ]
+    );
+    let store = pool.open();
+    assert_eq!(store.active_account().unwrap().unwrap().id, pool.c);
+    let swapped = store.events_of_kind_since(kind::SWAP, 0).unwrap();
+    assert_eq!(swapped.len(), 1);
+    assert_eq!(swapped[0].account_from, Some(pool.b));
+    assert_eq!(swapped[0].account_to, Some(pool.c));
+    assert_eq!(swapped[0].reason.as_deref(), Some("rate_limit"));
+    let resends = store.events_of_kind_since(kind::RELAY_RESEND, 0).unwrap();
+    assert_eq!(resends.len(), 2);
+    for e in &resends {
+        assert_eq!((e.account_from, e.account_to), (Some(pool.b), Some(pool.c)));
+    }
+    // The refusals' readings went to b, the answers' to c.
+    assert!(!store.account_samples_since(pool.b, 0).unwrap().is_empty());
+    assert!(!store.account_samples_since(pool.c, 0).unwrap().is_empty());
+    let _ = pool.a;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn upstream_down_logs_once() {
+    let closed = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap()
+    };
+    let pool = Pool::new();
+    let events = pool.events(pool.counting_swaps());
+    let relay = relay_with(closed, Switch::new(token(pool.b, "tok-b")), events).await;
+    for _ in 0..2 {
+        let resp = relay
+            .send(model_request(&relay, "", Some("Bearer home")))
+            .await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+    let errors = pool
+        .open()
+        .events_of_kind_since(kind::RELAY_ERROR, 0)
+        .unwrap();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    let detail = errors[0].detail.clone().unwrap();
+    assert_eq!(detail, serde_json::json!({"kind": "connect"}));
 }

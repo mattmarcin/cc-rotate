@@ -750,7 +750,7 @@ fn relay_run() -> Result<()> {
     use ccr_relay::RelayEvents;
     use std::sync::Arc;
 
-    // The relay reads only the data folder, so it needs no profile.
+    // The lock and `relay.json` are in the data folder; the profile is resolved below.
     let paths = Paths::new(Paths::default_data_dir()?, PathBuf::new());
     // An OS file lock, held for the life of the process: however the process ends (a crash,
     // SIGKILL, SIGTERM from its service), the system releases it and the next relay can start.
@@ -767,13 +767,22 @@ fn relay_run() -> Result<()> {
             return Err(e).with_context(|| format!("listening on 127.0.0.1:{}", cfg.port));
         }
     };
-    let store = Store::open(&paths.store_db())?;
+    // The relay runs swaps, which need the profile as any swap does: the one every other command
+    // resolves (`CC_ROTATE_PROFILE`, the `profile_dir` setting, `~/.claude-rotate`).
+    let (store, paths) = ccr_core::open(None)?;
     let upstream = relay_upstream()?;
-    let events = Arc::new(ccr_relay::FileLog::new(paths.relay_log()));
-    events.log(&format!(
+    let log = Arc::new(ccr_relay::FileLog::new(paths.relay_log()));
+    log.log(&format!(
         "started, version {}, port {}",
         env!("CARGO_PKG_VERSION"),
         cfg.port
+    ));
+    // Readings, threshold swaps and swaps at a refused limit (spec 7 and 8). Each part has a
+    // store connection of its own, and every swap opens another.
+    let events = Arc::new(ccr_relay::StoreEvents::new(
+        Store::open(&paths.store_db())?,
+        Arc::new(ccr_relay::StoreSwaps::new(paths.clone())),
+        log,
     ));
     ccr_relay::run_blocking(
         listener,

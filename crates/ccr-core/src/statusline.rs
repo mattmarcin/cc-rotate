@@ -31,7 +31,8 @@ const CONFIRM_QUIET_MS: i64 = 10 * 60_000;
 pub const META_LAST_TICK_HAD_USAGE: &str = "statusline_last_tick_had_usage";
 const META_CONFIG_MTIME_SEEN: &str = "profile_config_mtime_seen";
 const META_PROFILE_UUID_SEEN: &str = "profile_account_uuid_seen";
-const META_SWAP_REQUESTED_AT: &str = "swap_requested_at";
+/// When a swap was last asked for, which throttles asking again (`scheduler::Timing`).
+pub const META_SWAP_REQUESTED_AT: &str = "swap_requested_at";
 /// The credentials change marker a dead login was last reported for, so it is logged once.
 const META_DEAD_LOGIN_SEEN: &str = "dead_login_seen";
 
@@ -488,7 +489,7 @@ fn confirm_due(store: &Store, sample: &Sample, active_id: i64, now_ms: i64) -> R
 
 /// The throttling state a decision needs: the last swap, the last request, and whether the
 /// active account was already over a threshold when it became active.
-fn timing(store: &Store, active_id: i64, now_ms: i64) -> Result<Timing> {
+pub fn timing(store: &Store, active_id: i64, now_ms: i64) -> Result<Timing> {
     let settings = store.settings()?;
     let mut timing = Timing {
         now_ms,

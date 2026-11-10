@@ -802,6 +802,11 @@ pub mod kind {
     /// Relay mode was turned on (`on`, `detail.home` names the home account) or off (`off`);
     /// `account_from` and `account_to` are the accounts whose login the profile had and has.
     pub const RELAY_MODE: &str = "relay_mode";
+    /// The relay sent a request again on another account after Anthropic refused it at a usage
+    /// limit; `account_from` is the refused account, `account_to` the one it went to.
+    pub const RELAY_RESEND: &str = "relay_resend";
+    /// The relay could not reach Anthropic; `detail.kind` says what failed. At most one a minute.
+    pub const RELAY_ERROR: &str = "relay_error";
 }
 
 /// Typed view of the `settings` table with defaults applied.

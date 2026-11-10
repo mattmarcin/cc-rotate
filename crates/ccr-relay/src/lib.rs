@@ -4,6 +4,7 @@
 //! The design is in `docs/specs/2026-11-10-relay-mode.md`, sections 5 and 13.
 //! The rules for which requests pass and which headers go on are in `ccr_core::relay_proto`.
 
+pub mod events;
 pub mod login;
 
 use std::borrow::Cow;
@@ -29,6 +30,7 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use zeroize::Zeroizing;
 
+pub use events::{StoreEvents, StoreSwaps, Swaps};
 pub use login::StoreLogins;
 
 /// The only address the relay sends requests to in a release build.
@@ -47,6 +49,15 @@ pub enum Choice {
         account: i64,
         token: Zeroizing<String>,
     },
+}
+
+impl Choice {
+    /// The account the request goes out on.
+    pub fn account(&self) -> i64 {
+        match self {
+            Choice::PassThrough { account } | Choice::Token { account, .. } => *account,
+        }
+    }
 }
 
 impl std::fmt::Debug for Choice {
@@ -81,6 +92,32 @@ pub trait RelayEvents: Send + Sync {
     /// One line for the relay's log.
     /// It never holds a token, a body, a query or a request header's value.
     fn log(&self, _line: &str) {}
+
+    /// Anthropic refused a model request sent with `account`'s login at a usage limit, before
+    /// anything of the response went back to the session (spec 8).
+    /// Swaps away from `account` if it is still the active one, waiting for a swap already
+    /// running, and says which account is active now.
+    /// Called on a thread that may block.
+    fn refused_at_limit(&self, _account: i64) -> Swapped {
+        Swapped::No
+    }
+
+    /// A request refused at a limit on `from` is being sent again on `to`.
+    /// Called on a thread that may block.
+    fn resent(&self, _from: i64, _to: i64) {}
+
+    /// Anthropic could not be reached; `kind` names what failed, never a value.
+    /// Called on a thread that may block.
+    fn unreachable(&self, _kind: &str) {}
+}
+
+/// What became of a swap away from an account refused at a limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Swapped {
+    /// Another account is active now.
+    To(i64),
+    /// The refused account is still the active one, or none is.
+    No,
 }
 
 /// Events that only write the log lines to a file: `relay.log`, rotated at 1 MB like cc-rotate's
@@ -332,6 +369,61 @@ fn loggable(value: Option<&HeaderValue>) -> String {
     if v.is_empty() { "-".into() } else { v }
 }
 
+/// The usage headers of a response, for the log (spec 13): `<name>=<value>` for each
+/// `anthropic-ratelimit-unified-*` header, the prefix left out. They are usage numbers, reset
+/// times and states, not secrets; any other character is dropped.
+fn usage_note(headers: &HeaderMap) -> String {
+    fn clean(s: &str) -> String {
+        s.chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '+'))
+            .take(64)
+            .collect()
+    }
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            let name = clean(name.as_str().strip_prefix(USAGE_PREFIX)?);
+            let value = clean(value.to_str().unwrap_or(""));
+            Some(format!(
+                "{name}={}",
+                if value.is_empty() { "-" } else { &value }
+            ))
+        })
+        .take(16)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+const USAGE_PREFIX: &str = "anthropic-ratelimit-unified-";
+
+/// The login for a model request, from `Logins` on a thread that may block; the error is a note
+/// for the log.
+async fn login(st: &State) -> Result<Choice, String> {
+    let logins = st.logins.clone();
+    match tokio::task::spawn_blocking(move || logins.for_model()).await {
+        Ok(Ok(choice)) => Ok(choice),
+        Ok(Err(e)) => Err(format!("no login: {e:#}")),
+        Err(_) => Err("no login: the lookup failed".into()),
+    }
+}
+
+/// The response for the session: the upstream's status, headers but the hop-by-hop ones, and
+/// its body as it arrives.
+fn respond(rparts: http::response::Parts, rbody: Incoming, head: bool) -> Response<RelayBody> {
+    let mut back = Response::new(rbody.boxed());
+    *back.status_mut() = rparts.status;
+    let headers = back.headers_mut();
+    for (name, value) in &rparts.headers {
+        // A HEAD response has no body, so its length is the one the upstream states.
+        if relay_proto::forward_response_header(name.as_str())
+            || (head && name == header::CONTENT_LENGTH)
+        {
+            headers.append(name.clone(), value.clone());
+        }
+    }
+    back
+}
+
 async fn handle(req: Request<Incoming>, st: &State) -> Response<RelayBody> {
     let route = match req.uri().path_and_query() {
         Some(target) => relay_proto::route(
@@ -379,69 +471,74 @@ async fn handle(req: Request<Incoming>, st: &State) -> Response<RelayBody> {
     };
 
     // Read the login last, so a swap while the body arrived still reaches this request.
-    let mut account = None;
-    let mut token = None;
+    let mut choice = None;
     if model && has_bearer(&parts.headers) {
-        let logins = st.logins.clone();
-        match tokio::task::spawn_blocking(move || logins.for_model()).await {
-            Ok(Ok(Choice::PassThrough { account: a })) => account = Some(a),
-            Ok(Ok(Choice::Token {
-                account: a,
-                token: t,
-            })) => {
-                account = Some(a);
-                token = Some(t);
-            }
-            Ok(Err(e)) => {
-                log(503, "-", None, &format!("no login: {e:#}"));
-                return bare(StatusCode::SERVICE_UNAVAILABLE);
-            }
-            Err(_) => {
-                log(503, "-", None, "no login: the lookup failed");
+        match login(st).await {
+            Ok(c) => choice = Some(c),
+            Err(note) => {
+                log(503, "-", None, &note);
                 return bare(StatusCode::SERVICE_UNAVAILABLE);
             }
         }
     }
+    let session = parts
+        .headers
+        .get(SESSION_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let head = parts.method == Method::HEAD;
 
-    let mut out = Request::new(Full::new(body.clone()));
-    *out.method_mut() = parts.method.clone();
-    *out.uri_mut() = uri;
-    let headers = out.headers_mut();
-    for (name, value) in &parts.headers {
-        if relay_proto::forward_request_header(name.as_str(), token.is_some()) {
-            headers.append(name.clone(), value.clone());
-        }
-    }
-    if let Some(token) = &token {
-        let bearer = Zeroizing::new(format!("Bearer {}", token.as_str()));
-        let Ok(mut value) = HeaderValue::from_str(&bearer) else {
-            log(503, "-", account, "the stored login is not a valid header");
-            return bare(StatusCode::SERVICE_UNAVAILABLE);
+    // Each pool account is tried at most once (spec 8).
+    let mut tried: Vec<i64> = Vec::new();
+    loop {
+        let (account, token) = match choice.take() {
+            Some(Choice::PassThrough { account }) => (Some(account), None),
+            Some(Choice::Token { account, token }) => (Some(account), Some(token)),
+            None => (None, None),
         };
-        value.set_sensitive(true);
-        headers.insert(header::AUTHORIZATION, value);
-    }
-    drop(token);
+        tried.extend(account);
 
-    let resp = match st.upstream.client.request(out).await {
-        Ok(r) => r,
-        Err(e) => {
-            log(502, "-", account, &format!("upstream: {e}"));
-            return bare(StatusCode::BAD_GATEWAY);
+        let mut out = Request::new(Full::new(body.clone()));
+        *out.method_mut() = parts.method.clone();
+        *out.uri_mut() = uri.clone();
+        let headers = out.headers_mut();
+        for (name, value) in &parts.headers {
+            if relay_proto::forward_request_header(name.as_str(), token.is_some()) {
+                headers.append(name.clone(), value.clone());
+            }
         }
-    };
-    let (rparts, rbody) = resp.into_parts();
-    let request_id = loggable(rparts.headers.get("request-id"));
-    log(rparts.status.as_u16(), &request_id, account, "");
+        if let Some(token) = &token {
+            let bearer = Zeroizing::new(format!("Bearer {}", token.as_str()));
+            let Ok(mut value) = HeaderValue::from_str(&bearer) else {
+                log(503, "-", account, "the stored login is not a valid header");
+                return bare(StatusCode::SERVICE_UNAVAILABLE);
+            };
+            value.set_sensitive(true);
+            headers.insert(header::AUTHORIZATION, value);
+        }
+        drop(token);
 
-    if let Some(account) = account {
-        let events = st.events.clone();
-        let session = parts
-            .headers
-            .get(SESSION_HEADER)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
+        let resp = match st.upstream.client.request(out).await {
+            Ok(r) => r,
+            Err(e) => {
+                // The kind only: the error's text names addresses and causes, not for the store.
+                let failure = if e.is_connect() { "connect" } else { "other" };
+                log(502, "-", account, &format!("upstream: {failure}"));
+                let events = st.events.clone();
+                let _ = tokio::task::spawn_blocking(move || events.unreachable(failure)).await;
+                return bare(StatusCode::BAD_GATEWAY);
+            }
+        };
+        let (rparts, rbody) = resp.into_parts();
         let status = rparts.status.as_u16();
+        let request_id = loggable(rparts.headers.get("request-id"));
+        log(status, &request_id, account, &usage_note(&rparts.headers));
+
+        let Some(account) = account else {
+            return respond(rparts, rbody, head);
+        };
+        let events = st.events.clone();
+        let reported_session = session.clone();
         let headers: Vec<(String, String)> = rparts
             .headers
             .iter()
@@ -452,30 +549,47 @@ async fn handle(req: Request<Incoming>, st: &State) -> Response<RelayBody> {
                 )
             })
             .collect();
+        let model_body = body.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            let model_name = model_of(&body);
+            let model_name = model_of(&model_body);
             events.response(
                 account,
-                session.as_deref(),
+                reported_session.as_deref(),
                 model_name.as_deref(),
                 status,
                 &headers,
             );
         })
         .await;
-    }
 
-    let mut back = Response::new(rbody.boxed());
-    *back.status_mut() = rparts.status;
-    let head = parts.method == Method::HEAD;
-    let headers = back.headers_mut();
-    for (name, value) in &rparts.headers {
-        // A HEAD response has no body, so its length is the one the upstream states.
-        if relay_proto::forward_response_header(name.as_str())
-            || (head && name == header::CONTENT_LENGTH)
-        {
-            headers.append(name.clone(), value.clone());
+        // Refused at a usage limit, and nothing sent back yet: swap, and send it again on the
+        // account that is active now (spec 8).
+        let unified = rparts
+            .headers
+            .get("anthropic-ratelimit-unified-status")
+            .and_then(|v| v.to_str().ok());
+        if !relay_proto::is_limit_refusal(status, unified) {
+            return respond(rparts, rbody, head);
         }
+        let events = st.events.clone();
+        let swapped = tokio::task::spawn_blocking(move || events.refused_at_limit(account))
+            .await
+            .unwrap_or(Swapped::No);
+        let Swapped::To(next) = swapped else {
+            return respond(rparts, rbody, head);
+        };
+        if tried.contains(&next) {
+            return respond(rparts, rbody, head);
+        }
+        // Another swap may come between: the login read now decides, and it too is tried once.
+        let next = match login(st).await {
+            Ok(c) if !tried.contains(&c.account()) => c,
+            _ => return respond(rparts, rbody, head),
+        };
+        let events = st.events.clone();
+        let to = next.account();
+        let _ = tokio::task::spawn_blocking(move || events.resent(account, to)).await;
+        drop(rbody);
+        choice = Some(next);
     }
-    back
 }
