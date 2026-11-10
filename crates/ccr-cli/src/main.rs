@@ -796,6 +796,15 @@ const RELAY_START_FAILED_WAIT: Duration = Duration::from_secs(10);
 /// Another relay holding the lock, or already listening on the port, means there is nothing to
 /// do. A relay that cannot start says why in `relay.log` and exits with an error after a wait.
 fn relay_run() -> ExitCode {
+    // The program as it is now, before any wait: an upgrade while this relay waits for the lock
+    // is still one, and it leaves at its first check.
+    let program = std::env::current_exe().ok();
+    let program_at_start = program.as_deref().and_then(ccr_relay::fingerprint);
+    // Read once, and not passed on to what the relay starts (Claude Code for renewals).
+    let from_service =
+        std::env::var_os(ccr_core::relay_service::SERVICE_MARK_ENV).is_some_and(|v| !v.is_empty());
+    // SAFETY: no other thread runs yet, so none reads the environment meanwhile.
+    unsafe { std::env::remove_var(ccr_core::relay_service::SERVICE_MARK_ENV) };
     // The lock and `relay.json` are in the data folder; the profile is resolved below.
     let data = match Paths::default_data_dir() {
         Ok(dir) => Paths::new(dir, PathBuf::new()),
@@ -805,14 +814,12 @@ fn relay_run() -> ExitCode {
     // SIGKILL, SIGTERM from its service), the system releases it and the next relay can start.
     // One the service started waits for it, and takes over when the relay a launcher started
     // ends: exiting would only have the service start it again and again.
-    let from_service =
-        std::env::var_os(ccr_core::relay_service::SERVICE_MARK_ENV).is_some_and(|v| !v.is_empty());
     let _lock = match relay_lock(&data, from_service) {
         Ok(Some(lock)) => lock,
         Ok(None) => return ExitCode::SUCCESS,
         Err(e) => return relay_start_failed(Some(&data), &e),
     };
-    let ready = match relay_ready(&data) {
+    let ready = match relay_ready(&data, program, program_at_start) {
         Ok(Some(ready)) => ready,
         // Another relay (one from another data folder, say) already serves this port.
         Ok(None) => return ExitCode::SUCCESS,
@@ -827,7 +834,11 @@ fn relay_run() -> ExitCode {
 
 /// Everything the relay needs, resolved before it takes the port, and then the port: what
 /// serves until the relay leaves. `None` when something else listens on the port.
-fn relay_ready(data: &Paths) -> Result<Option<impl FnOnce() -> Result<()> + use<>>> {
+fn relay_ready(
+    data: &Paths,
+    program: Option<PathBuf>,
+    program_at_start: Option<ccr_relay::Fingerprint>,
+) -> Result<Option<impl FnOnce() -> Result<()> + use<>>> {
     use ccr_relay::RelayEvents;
     use std::sync::Arc;
 
@@ -862,6 +873,8 @@ fn relay_ready(data: &Paths) -> Result<Option<impl FnOnce() -> Result<()> + use<
         // Renewals run a check on a store of their own (spec 9).
         let renewals = Arc::new(ccr_relay::StoreRenewals::new(paths.clone(), log));
         let options = ccr_relay::Options {
+            program,
+            program_at_start,
             lifecycle: Arc::new(RelayLifecycle {
                 paths: paths.clone(),
             }),

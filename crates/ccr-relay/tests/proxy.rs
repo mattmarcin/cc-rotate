@@ -1688,7 +1688,11 @@ async fn exits_after_upgrade_when_idle() {
 
     // An upgrade replaces the program while the stream is open.
     std::fs::write(&program, "version 2, longer").unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let until = Instant::now() + Duration::from_secs(5);
+    while !relay.lines().iter().any(|l| l.contains("program replaced")) {
+        assert!(Instant::now() < until, "the upgrade was never noticed");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     assert!(
         !relay.task.is_finished(),
         "left while a request was in flight"
@@ -1780,4 +1784,32 @@ async fn idle_exit_when_off() {
     ended.unwrap().unwrap();
     assert_eq!(mode.retired.load(Ordering::SeqCst), 1);
     assert!(!answers(port).await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upgrade_before_serving_still_counts() {
+    let fake = fake_upstream().await;
+    let dir = tempfile::tempdir().unwrap();
+    let program = dir.path().join("cc-rotate-ctl");
+    std::fs::write(&program, "version 1").unwrap();
+    // Taken when the process started; the upgrade lands while it waits for the relay lock.
+    let at_start = ccr_relay::fingerprint(&program).unwrap();
+    std::fs::write(&program, "version 2, longer").unwrap();
+    let options = Options {
+        check_every: Duration::from_millis(30),
+        program: Some(program.clone()),
+        program_at_start: Some(at_start),
+        ..Options::default()
+    };
+    let relay = relay_holding(
+        fake.addr,
+        Switch::new(token(2, "tok-b")),
+        Arc::new(Recorder::default()),
+        options,
+    )
+    .await;
+    let ended = tokio::time::timeout(Duration::from_secs(5), relay.task)
+        .await
+        .expect("kept running the old program");
+    ended.unwrap().unwrap();
 }

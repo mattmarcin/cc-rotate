@@ -42,7 +42,8 @@ const SESSION_HEADER: &str = "x-claude-code-session-id";
 
 /// How long a leaving relay waits for its connections to close: a request still running then is
 /// cut off.
-const CLOSE_WITHIN: Duration = Duration::from_secs(300);
+/// Above Claude Code's own request timeout (600 s), so a request it still waits for is never cut.
+const CLOSE_WITHIN: Duration = Duration::from_secs(660);
 
 /// How often a request held after a 401 reads the stored login again (spec 9).
 const REFRESH_EVERY: Duration = Duration::from_millis(500);
@@ -60,6 +61,9 @@ pub struct Options {
     pub idle_exit: Duration,
     /// The program file whose replacement is an upgrade: the running executable when `None`.
     pub program: Option<PathBuf>,
+    /// `program`'s fingerprint when the process started, so an upgrade while it waited to serve
+    /// (for the relay lock) still counts; taken when serving starts when `None`.
+    pub program_at_start: Option<Fingerprint>,
     /// Says whether relay mode is on, and removes the relay's service when it leaves for good.
     pub lifecycle: Arc<dyn Lifecycle>,
 }
@@ -71,6 +75,7 @@ impl Default for Options {
             check_every: Duration::from_secs(60),
             idle_exit: Duration::from_secs(3600),
             program: None,
+            program_at_start: None,
             lifecycle: Arc::new(Stays),
         }
     }
@@ -83,6 +88,7 @@ impl std::fmt::Debug for Options {
             .field("check_every", &self.check_every)
             .field("idle_exit", &self.idle_exit)
             .field("program", &self.program)
+            .field("program_at_start", &self.program_at_start)
             .finish_non_exhaustive()
     }
 }
@@ -417,17 +423,22 @@ enum Leave {
     Idle,
 }
 
-/// What tells a replaced program file from the one the relay started from.
-fn fingerprint(path: &Path) -> Option<(std::time::SystemTime, u64)> {
+/// What tells a replaced program file from the one the relay started from: its modification
+/// time and size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fingerprint(std::time::SystemTime, u64);
+
+/// The fingerprint of the program file at `path`, `None` when it cannot be read.
+pub fn fingerprint(path: &Path) -> Option<Fingerprint> {
     let meta = std::fs::metadata(path).ok()?;
-    Some((meta.modified().ok()?, meta.len()))
+    Some(Fingerprint(meta.modified().ok()?, meta.len()))
 }
 
 /// Whether the relay should leave now.
 async fn check(
     st: &Arc<State>,
     program: Option<&Path>,
-    started: Option<(std::time::SystemTime, u64)>,
+    started: Option<Fingerprint>,
 ) -> Option<Leave> {
     if let (Some(program), Some(started)) = (program, started)
         && fingerprint(program) != Some(started)
@@ -475,7 +486,9 @@ pub async fn serve(
         .program
         .clone()
         .or_else(|| std::env::current_exe().ok());
-    let started = program.as_deref().and_then(fingerprint);
+    let started = options
+        .program_at_start
+        .or_else(|| program.as_deref().and_then(fingerprint));
     let mut ticks = tokio::time::interval(options.check_every);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // The first tick is at once.

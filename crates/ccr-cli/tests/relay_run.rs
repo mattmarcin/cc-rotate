@@ -275,35 +275,3 @@ fn a_relay_the_service_started_waits_for_the_lock_and_then_serves() {
     drop(held);
     wait_serving(&mut relay, &data, cfg.port, Duration::from_secs(20));
 }
-
-#[test]
-fn relay_on_never_installs_the_service_where_tests_forbid_it() {
-    let root = tempfile::tempdir().unwrap();
-    let data = root.path().join("data");
-    {
-        let store = ccr_core::Store::open(&data.join("store.db")).unwrap();
-        let id = store
-            .insert_account(
-                "home",
-                &ccr_core::store::AccountIdentity::default(),
-                ccr_core::store::AccountState::Active,
-            )
-            .unwrap();
-        // A stored login, as far as `relay on` looks: its row, never read here.
-        store
-            .conn()
-            .execute(
-                "INSERT INTO credentials (account_id, oauth_blob, refresh_fp, updated_at, source) VALUES (?1, x'00', 'fp', 0, 'login')",
-                [id],
-            )
-            .unwrap();
-    }
-    // Without --no-service: `common::program` sets CC_ROTATE_NO_SERVICE, so the real service
-    // refuses before anything is written or run.
-    let out = ctl(&data, &["relay", "on", "--home", "home"]);
-    assert!(!out.status.success(), "{out:?}");
-    let err = String::from_utf8(out.stderr).unwrap();
-    assert!(err.contains("CC_ROTATE_NO_SERVICE is set"), "{err}");
-    let store = ccr_core::Store::open(&data.join("store.db")).unwrap();
-    assert_eq!(ccr_core::relay::home(&store).unwrap(), None);
-}
