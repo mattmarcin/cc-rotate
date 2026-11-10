@@ -91,7 +91,10 @@ export function describe(e: EventRow, labelOf: (id: number | null) => string): {
     case "pool_exhausted":
       return { parts: ["No other account was ready to take over"], tone: "warn" };
     case "adopted_login":
-      return { parts: ["Now using ", to, " after a /login in the profile"] };
+      // In relay mode a /login changes the home account, not the account in use.
+      return e.detail?.home
+        ? { parts: ["Made ", to, " the home account after a /login in the profile"] }
+        : { parts: ["Now using ", to, " after a /login in the profile"] };
     case "relay_mode": {
       const home = e.detail?.home as number | null | undefined;
       return e.reason === "on"

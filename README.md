@@ -490,7 +490,8 @@ It is off until you turn it on, and covers every session in the cc-rotate profil
    The account in use stays in use, now through the relay.
 2. Start sessions with `cc-rotate`, or from the app with **Desktop app sessions** set up.
    Both give new sessions the relay's address.
-   Sessions that were already running keep the login and address they started with until you restart them; those started before relay mode was on run on the home account directly, off the pool.
+   Sessions that were already running keep the address they started with until you restart them.
+   Those started before relay mode was on read the profile's login, now the home account's, so they run on the home account directly, off the pool.
 3. `cc-rotate-ctl relay` shows whether relay mode is on, the home account, the relay's address and whether it answers, and how many sessions ran without the relay lately.
    `cc-rotate-ctl doctor` checks it on its **Relay** line.
 

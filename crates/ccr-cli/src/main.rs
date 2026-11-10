@@ -937,20 +937,31 @@ impl ccr_relay::Lifecycle for RelayLifecycle {
 
 /// The home account's label while relay mode is on, for `desktop`, which otherwise reads system
 /// settings only: `None` when relay mode is off, or the store isn't there or can't be read.
+/// Read-only: `desktop` never writes to, or migrates, the store.
 fn relay_home_label() -> Option<String> {
-    let store = Paths::default_data_dir().ok()?.join("store.db");
-    if !store.exists() {
+    use ccr_core::relay::{SETTING_HOME, SETTING_MODE};
+    let path = Paths::default_data_dir().ok()?.join("store.db");
+    if !path.exists() {
         return None;
     }
-    let store = Store::open(&store).ok()?;
-    let id = ccr_core::relay::home(&store).ok()??;
-    Some(
-        store
-            .account(id)
-            .ok()
-            .flatten()
-            .map_or_else(|| format!("account {id}"), |a| a.label),
-    )
+    if Store::read_setting_any_schema(&path, SETTING_MODE)
+        .ok()??
+        .as_str()
+        != "on"
+    {
+        return None;
+    }
+    let id: i64 = Store::read_setting_any_schema(&path, SETTING_HOME)
+        .ok()??
+        .trim()
+        .parse()
+        .ok()?;
+    // The label needs this build's schema; without it, the id still says which account.
+    let label = Store::open_read_only(&path)
+        .ok()
+        .and_then(|store| store.account(id).ok().flatten())
+        .map(|a| a.label);
+    Some(label.unwrap_or_else(|| format!("account {id}")))
 }
 
 /// What `cc-rotate-ctl relay` shows.

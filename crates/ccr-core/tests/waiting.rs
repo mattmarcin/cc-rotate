@@ -665,6 +665,29 @@ fn the_wake_waits_for_claude_codes_keychain_cache() {
     assert!(!waiting::keychain_wait(active + 1, active, false));
 }
 
+/// In relay mode a swap writes no login (relay spec, section 8), so a wake never waits for the
+/// Keychain cache; with relay mode off it does after a swap.
+#[test]
+fn a_relay_swap_is_no_reason_to_wait_for_the_keychain() {
+    let e = env();
+    let now = time::now_ms();
+    reading(&e.store, e.a, 100.0, now - 1_000);
+    reading(&e.store, e.b, 10.0, now - 60_000);
+    ccr_core::relay::set_mode(&e.store, Some(e.a)).unwrap();
+    let ws = stop(&e, "s1", now);
+    swap_to_b(&e);
+    let now = time::now_ms();
+    assert!(!waiting::waits_for_keychain(&e.store, now, || true).unwrap());
+    let (account, _) = woken(waiting::decide(&e.store, &e.paths, &ws, now).unwrap());
+    assert_eq!(account, e.b);
+
+    let off = env();
+    swap_to_b(&off);
+    let now = time::now_ms();
+    assert!(waiting::waits_for_keychain(&off.store, now, || true).unwrap());
+    assert!(!waiting::waits_for_keychain(&off.store, now, || false).unwrap());
+}
+
 /// The Keychain wait counts from when the swap's write of the login returned, not from the swap's
 /// start, which can be up to three lock waits earlier.
 #[test]

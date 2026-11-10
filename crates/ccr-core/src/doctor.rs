@@ -122,7 +122,7 @@ pub fn run(store: &Store, paths: &Paths) -> Vec<Check> {
     checks.push(relay_check(
         store,
         paths,
-        crate::relay_service::status(),
+        crate::relay_service::status,
         |port| {
             crate::relay::RelayConfig::read(&paths.relay_config())
                 .ok()
@@ -245,77 +245,8 @@ pub fn run(store: &Store, paths: &Paths) -> Vec<Check> {
     checks.push(encryption_check(store));
     checks.push(credential_storage_check(paths));
 
-    // In relay mode the profile keeps the home account's login, whichever account is active.
-    let profile_owner = crate::relay::profile_account(store).ok().flatten();
-    if let Some(account) = profile_owner.as_ref() {
-        let locked_away = !paths.credentials().complete().unwrap_or(true);
-        let file_fp = paths
-            .credentials()
-            .read_oauth()
-            .ok()
-            .flatten()
-            .as_ref()
-            .and_then(credfile::oauth_fingerprint);
-        let stored_fp = store
-            .credential_meta(account.id)
-            .ok()
-            .flatten()
-            .map(|m| m.refresh_fp);
-        let foreign = store
-            .meta(swap::META_PROFILE_FOREIGN)
-            .ok()
-            .flatten()
-            .as_deref()
-            == Some("1");
-        let identifies = usage_check::identifies_logins(store, paths).unwrap_or(false);
-        // How long Claude Code has not been able to say whose the profile's login is.
-        let unidentified_ms = store
-            .meta(swap::META_LOGIN_UNIDENTIFIED)
-            .ok()
-            .flatten()
-            .and_then(|v| serde_json::from_str::<swap::Unidentified>(&v).ok())
-            .map(|u| time::now_ms() - u.at);
-        checks.push(match (file_fp, stored_fp) {
-            (Some(f), Some(s)) if f == s => check("Profile login", Status::Ok, format!("Matches {}", account.label)),
-            (Some(_), Some(_)) if foreign => check(
-                "Profile login",
-                Status::Warn,
-                "The profile is signed in to an account that isn't in cc-rotate (from a /login). Nothing is saved from it until the next swap or sign-in.",
-            ),
-            (Some(_), Some(_)) if !identifies => check(
-                "Profile login",
-                Status::Warn,
-                "The profile has a newer login than cc-rotate saved. It's saved on the next status line update.",
-            ),
-            (Some(_), Some(_)) => match unidentified_ms.filter(|ms| *ms >= 2 * 60_000) {
-                None => check(
-                    "Profile login",
-                    Status::Ok,
-                    format!("The profile has a newer login. It's saved once Claude Code confirms it belongs to {}.", account.label),
-                ),
-                Some(ms) => check(
-                    "Profile login",
-                    Status::Warn,
-                    format!(
-                        "Claude Code hasn't confirmed for {} min which account the profile's login belongs to. Swaps wait until it does. After {} min, the login is saved as {}'s.",
-                        ms / 60_000,
-                        swap::UNIDENTIFIED_FOR_AT_MOST_MS / 60_000,
-                        account.label
-                    ),
-                ),
-            },
-            (None, _) if locked_away => check(
-                "Profile login",
-                Status::Warn,
-                "Can't be read from this session (see Claude Code login storage)",
-            ),
-            (None, _) => check("Profile login", Status::Fail, "The profile has no usable login"),
-            (_, None) => check(
-                "Profile login",
-                Status::Fail,
-                format!("{} is in use but has no saved login. Sign in to it again.", account.label),
-            ),
-        });
+    if let Some(c) = profile_login_check(store, paths) {
+        checks.push(c);
     }
 
     for lock in [
@@ -422,6 +353,103 @@ pub fn run(store: &Store, paths: &Paths) -> Vec<Check> {
     }
 
     checks
+}
+
+/// Whether the profile's login is the one cc-rotate saved for the account the profile belongs
+/// to: the active account, or in relay mode the home account, whichever account is active.
+/// `None` when the profile belongs to no account.
+fn profile_login_check(store: &Store, paths: &Paths) -> Option<Check> {
+    let relay_mode = crate::relay::home(store).ok().flatten().is_some();
+    let account = crate::relay::profile_account(store).ok().flatten()?;
+    let locked_away = !paths.credentials().complete().unwrap_or(true);
+    let file_fp = paths
+        .credentials()
+        .read_oauth()
+        .ok()
+        .flatten()
+        .as_ref()
+        .and_then(credfile::oauth_fingerprint);
+    let stored_fp = store
+        .credential_meta(account.id)
+        .ok()
+        .flatten()
+        .map(|m| m.refresh_fp);
+    let foreign = store
+        .meta(swap::META_PROFILE_FOREIGN)
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("1");
+    let identifies = usage_check::identifies_logins(store, paths).unwrap_or(false);
+    // How long Claude Code has not been able to say whose the profile's login is.
+    let unidentified_ms = store
+        .meta(swap::META_LOGIN_UNIDENTIFIED)
+        .ok()
+        .flatten()
+        .and_then(|v| serde_json::from_str::<swap::Unidentified>(&v).ok())
+        .map(|u| time::now_ms() - u.at);
+    Some(match (file_fp, stored_fp) {
+        (Some(f), Some(s)) if f == s => check(
+            "Profile login",
+            Status::Ok,
+            format!("Matches {}", account.label),
+        ),
+        (Some(_), Some(_)) if foreign => check(
+            "Profile login",
+            Status::Warn,
+            "The profile is signed in to an account that isn't in cc-rotate (from a /login). Nothing is saved from it until the next swap or sign-in.",
+        ),
+        (Some(_), Some(_)) if !identifies => check(
+            "Profile login",
+            Status::Warn,
+            "The profile has a newer login than cc-rotate saved. It's saved on the next status line update.",
+        ),
+        (Some(_), Some(_)) => match unidentified_ms.filter(|ms| *ms >= 2 * 60_000) {
+            None => check(
+                "Profile login",
+                Status::Ok,
+                format!(
+                    "The profile has a newer login. It's saved once Claude Code confirms it belongs to {}.",
+                    account.label
+                ),
+            ),
+            Some(ms) => check(
+                "Profile login",
+                Status::Warn,
+                format!(
+                    "Claude Code hasn't confirmed for {} min which account the profile's login belongs to. Swaps wait until it does. After {} min, the login is saved as {}'s.",
+                    ms / 60_000,
+                    swap::UNIDENTIFIED_FOR_AT_MOST_MS / 60_000,
+                    account.label
+                ),
+            ),
+        },
+        (None, _) if locked_away => check(
+            "Profile login",
+            Status::Warn,
+            "Can't be read from this session (see Claude Code login storage)",
+        ),
+        (None, _) => check(
+            "Profile login",
+            Status::Fail,
+            "The profile has no usable login",
+        ),
+        (_, None) => check(
+            "Profile login",
+            Status::Fail,
+            if relay_mode {
+                format!(
+                    "The profile keeps the login of the home account {}, which has no saved login. Sign in to it again.",
+                    account.label
+                )
+            } else {
+                format!(
+                    "{} is in use but has no saved login. Sign in to it again.",
+                    account.label
+                )
+            },
+        ),
+    })
 }
 
 /// Whether usage checks of the accounts not in use work (section 20).
@@ -863,13 +891,13 @@ const RELAY_ENV_OVERRIDES: &[&str] = &[
 /// Relay mode (relay spec, section 11): off, or on with the relay answering with this program's
 /// version, or what is wrong with it.
 ///
-/// `service` is whether the relay's service is installed (`relay_service::status`), and `version`
-/// asks whatever answers on a port for its version (`relay::running_version`), `None` when
-/// nothing answers or not with a version. Neither is asked while relay mode is off.
+/// `service` says whether the relay's service is installed (`relay_service::status`), and
+/// `version` asks whatever answers on a port for its version (`relay::running_version`), `None`
+/// when nothing answers or not with a version. Neither is asked while relay mode is off.
 pub fn relay_check(
     store: &Store,
     paths: &Paths,
-    service: crate::relay_service::ServiceState,
+    service: impl FnOnce() -> crate::relay_service::ServiceState,
     version: impl Fn(u16) -> Option<String>,
 ) -> Check {
     use crate::relay::{self, RelayConfig};
@@ -883,21 +911,27 @@ pub fn relay_check(
     let label = home
         .as_ref()
         .map_or_else(|| format!("account {home_id}"), |a| a.label.clone());
+    // What `relay on --home` takes to put things right: the home account again, or another one
+    // when it is gone.
+    let again = home
+        .as_ref()
+        .map_or_else(|| "<another account>".to_string(), |a| a.label.clone());
     // Each problem is a clause; failures come first.
     let mut fails = Vec::new();
     let mut warns = Vec::new();
 
-    if home
-        .as_ref()
-        .is_none_or(|a| a.state == AccountState::NeedsLogin)
-    {
-        fails.push(format!(
+    match &home {
+        None => fails.push(format!(
+            "the home account ({label}) is no longer in cc-rotate, so it can't be signed in again: name another with `cc-rotate-ctl relay on --home <another account>`"
+        )),
+        Some(a) if a.state == AccountState::NeedsLogin => fails.push(format!(
             "the home account {label} is signed out: every session fails until it signs in again (`cc-rotate-ctl login --relogin {label}`)"
-        ));
+        )),
+        Some(_) => {}
     }
-    if service == crate::relay_service::ServiceState::Missing {
+    if service() == crate::relay_service::ServiceState::Missing {
         fails.push(format!(
-            "the relay's service is not installed, so nothing restarts the relay when it ends (`cc-rotate-ctl relay on --home {label}` installs it)"
+            "the relay's service is not installed, so nothing restarts the relay when it ends (`cc-rotate-ctl relay on --home {again}` installs it)"
         ));
     }
     let mut ok = None;
@@ -910,7 +944,7 @@ pub fn relay_check(
                 ));
             }
             Some(v) => warns.push(format!(
-                "the relay on 127.0.0.1:{} is version {v}, not this cc-rotate's {}: it changes over by itself within a minute or two, once no request is in flight",
+                "the relay on 127.0.0.1:{} is version {v}, not this cc-rotate's {}: it changes over by itself within about 12 minutes (it looks for an upgrade every minute, then waits up to 11 minutes for the requests in flight)",
                 cfg.port,
                 env!("CARGO_PKG_VERSION")
             )),
@@ -921,7 +955,7 @@ pub fn relay_check(
             )),
         },
         Ok(None) => fails.push(format!(
-            "relay mode is on but {} is not there, so new sessions start without the relay (`cc-rotate-ctl relay on --home {label}` writes it)",
+            "relay mode is on but {} is not there, so new sessions start without the relay (`cc-rotate-ctl relay on --home {again}` writes it)",
             paths.relay_config().display()
         )),
         Err(e) => fails.push(format!("{e:#}")),
@@ -1191,7 +1225,7 @@ mod tests {
             _dir: tempfile::TempDir,
         }
 
-        /// Relay mode on with `home` (parked) as the home account and `b` active, `relay.json`
+        /// Relay mode on with `Haven` (parked) as the home account and `b` active, `relay.json`
         /// written, and an empty profile.
         fn on() -> Fixture {
             let dir = tempfile::tempdir().unwrap();
@@ -1199,7 +1233,7 @@ mod tests {
             std::fs::create_dir_all(&paths.profile_dir).unwrap();
             let store = Store::open_in_memory().unwrap();
             let home = store
-                .insert_account("home", &AccountIdentity::default(), AccountState::Parked)
+                .insert_account(HOME, &AccountIdentity::default(), AccountState::Parked)
                 .unwrap();
             store
                 .insert_account("b", &AccountIdentity::default(), AccountState::Active)
@@ -1215,6 +1249,8 @@ mod tests {
             }
         }
 
+        const HOME: &str = "Haven";
+
         fn this_version(_: u16) -> Option<String> {
             Some(env!("CARGO_PKG_VERSION").to_string())
         }
@@ -1224,7 +1260,7 @@ mod tests {
             service: ServiceState,
             version: impl Fn(u16) -> Option<String>,
         ) -> Check {
-            relay_check(&f.store, &f.paths, service, version)
+            relay_check(&f.store, &f.paths, || service, version)
         }
 
         #[test]
@@ -1232,9 +1268,12 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let paths = Paths::new(dir.path().join("data"), dir.path().join("profile"));
             let store = Store::open_in_memory().unwrap();
-            let c = relay_check(&store, &paths, ServiceState::Missing, |_| {
-                panic!("relay mode is off: nothing to ask")
-            });
+            let c = relay_check(
+                &store,
+                &paths,
+                || panic!("relay mode is off: no service to ask about"),
+                |_| panic!("relay mode is off: nothing to ask"),
+            );
             assert_eq!(c.name, "Relay");
             assert_eq!(c.status, Status::Ok);
             assert_eq!(c.detail, "relay mode is off");
@@ -1249,7 +1288,12 @@ mod tests {
                 this_version(p)
             });
             assert_eq!(c.status, Status::Ok, "{}", c.detail);
-            assert!(c.detail.contains("home"), "{}", c.detail);
+            assert!(
+                c.detail
+                    .contains(&format!("with {HOME} as the home account")),
+                "{}",
+                c.detail
+            );
             assert!(c.detail.contains(&port.to_string()), "{}", c.detail);
             assert!(!c.detail.contains(&f.cfg.secret), "{}", c.detail);
         }
@@ -1302,7 +1346,7 @@ mod tests {
             assert_eq!(c.status, Status::Fail, "{}", c.detail);
             assert!(
                 c.detail.contains(
-                    "the home account home is signed out: every session fails until it signs in again"
+                    "the home account Haven is signed out: every session fails until it signs in again (`cc-rotate-ctl login --relogin Haven`)"
                 ),
                 "{}",
                 c.detail
@@ -1313,9 +1357,69 @@ mod tests {
                 .conn()
                 .execute("DELETE FROM accounts WHERE id = ?1", [f.home])
                 .unwrap();
-            let c = run(&f, ServiceState::Installed, this_version);
+            let c = run(&f, ServiceState::Missing, this_version);
             assert_eq!(c.status, Status::Fail, "{}", c.detail);
-            assert!(c.detail.contains("signed out"), "{}", c.detail);
+            assert!(c.detail.contains("no longer in cc-rotate"), "{}", c.detail);
+            // Nothing suggests signing in to, or reinstalling for, an account that is gone.
+            assert!(!c.detail.contains("--relogin"), "{}", c.detail);
+            assert!(
+                !c.detail.contains(&format!("--home account {}", f.home)),
+                "{}",
+                c.detail
+            );
+            assert!(
+                c.detail.contains("relay on --home <another account>"),
+                "{}",
+                c.detail
+            );
+        }
+
+        fn oauth(refresh: &str) -> serde_json::Value {
+            serde_json::json!({
+                "accessToken": format!("access-{refresh}"),
+                "refreshToken": refresh,
+                "expiresAt": time::now_ms() + 3_600_000,
+            })
+        }
+
+        /// In relay mode the profile's login is the home account's, whichever account is active.
+        #[test]
+        fn profile_login_is_the_home_accounts_in_relay_mode() {
+            let f = on();
+            let active = f.store.active_account().unwrap().unwrap().id;
+            f.store
+                .save_credential(f.home, &oauth("refresh-home"), "login")
+                .unwrap();
+            f.store
+                .save_credential(active, &oauth("refresh-b"), "login")
+                .unwrap();
+            std::fs::write(
+                f.paths.credentials_file(),
+                serde_json::json!({ "claudeAiOauth": oauth("refresh-home") }).to_string(),
+            )
+            .unwrap();
+            let c = profile_login_check(&f.store, &f.paths).unwrap();
+            assert_eq!(c.status, Status::Ok, "{}", c.detail);
+            assert_eq!(c.detail, format!("Matches {HOME}"));
+
+            // With relay mode off the profile belongs to the active account: no match.
+            relay_mode::set_mode(&f.store, None).unwrap();
+            let c = profile_login_check(&f.store, &f.paths).unwrap();
+            assert!(!c.detail.contains("Matches"), "{}", c.detail);
+        }
+
+        #[test]
+        fn home_without_a_saved_login_is_not_called_in_use() {
+            let f = on();
+            std::fs::write(
+                f.paths.credentials_file(),
+                serde_json::json!({ "claudeAiOauth": oauth("refresh-home") }).to_string(),
+            )
+            .unwrap();
+            let c = profile_login_check(&f.store, &f.paths).unwrap();
+            assert_eq!(c.status, Status::Fail, "{}", c.detail);
+            assert!(c.detail.contains("home account Haven"), "{}", c.detail);
+            assert!(!c.detail.contains("in use"), "{}", c.detail);
         }
 
         #[test]

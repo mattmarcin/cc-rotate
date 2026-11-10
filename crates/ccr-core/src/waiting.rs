@@ -48,6 +48,23 @@ pub fn keychain_wait(now_ms: i64, active_since_ms: i64, keychain: bool) -> bool 
     keychain && now_ms - active_since_ms < KEYCHAIN_CACHE_MS
 }
 
+/// Whether a wake now waits for Claude Code's Keychain cache to pass the login the last swap
+/// wrote (spec 24.3). `keychain` says whether the profile's login is a Keychain item; it is only
+/// asked in the 31 s after a swap wrote the login.
+/// Never in relay mode: a swap writes no login there, so there is nothing to wait for (relay
+/// spec, section 8).
+pub fn waits_for_keychain(
+    store: &Store,
+    now_ms: i64,
+    keychain: impl FnOnce() -> bool,
+) -> Result<bool> {
+    if crate::relay::home(store)?.is_some() {
+        return Ok(false);
+    }
+    let written_at = swap::login_written_at(store)?;
+    Ok(now_ms - written_at < KEYCHAIN_CACHE_MS && keychain_wait(now_ms, written_at, keychain()))
+}
+
 /// What the hook does next.
 #[derive(Debug, Clone)]
 pub enum Decision {
@@ -86,12 +103,7 @@ pub fn decide(store: &Store, paths: &Paths, ws: &WaitingSession, now_ms: i64) ->
     // which it only does while the account has room.
     let active_since = swap::active_since(store)?;
     if ws.account_id != Some(active.id) || active_since > ws.since_ms {
-        // Only looked at in the 31 s after a swap wrote the login, and only on macOS, where it
-        // asks the Keychain.
-        let written_at = swap::login_written_at(store)?;
-        if now_ms - written_at < KEYCHAIN_CACHE_MS
-            && keychain_wait(now_ms, written_at, login_in_keychain(paths))
-        {
+        if waits_for_keychain(store, now_ms, || login_in_keychain(paths))? {
             return Ok(Decision::Wait);
         }
         let (pool, _) = swap::load_pool(store, now_ms / 1000)?;

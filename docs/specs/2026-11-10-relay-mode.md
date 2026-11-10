@@ -68,7 +68,7 @@ A `claude` started in the profile some other way (plain `claude` with `CLAUDE_CO
 1. Under the swap lock, when the active account is not the home account, writes the active account's login into the profile with the main spec's locks and steps (main 6, steps 4 to 6 and 8, the home account's login saved to its row first), so the main spec's invariant holds again (main 5.1).
    The transaction that commits it sets `relay_mode` to `off`; when the home account is active, that transaction is all there is.
    New sessions then start without the variables.
-2. Leaves the relay running for sessions started with it; it exits after an hour without requests and then removes its service and `relay.json` (section 10).
+2. Leaves the relay running for sessions started with it; after an hour without requests it deletes `relay.json`, removes its service and exits (section 10).
 
 Sessions running when relay mode changes keep the environment they started with until they are restarted.
 Turning it on leaves earlier sessions on the profile's login, now the home account's, off the pool.
@@ -106,7 +106,7 @@ Triggers, the pick, the cooldown and the checks before a swap are the main spec'
 Steps 4 to 8 become:
 
 4. Make sure the target's access token is valid for at least `relay_renew_margin_s` (section 9): if not, renew it with a check first, within the swap's 25 s budget for checks; a target that cannot be renewed is passed over like a busy one.
-5. In one transaction, set the outgoing account to `parked` and the target to `active`, and log the `swap` event as before.
+5. In one transaction, set the outgoing account to `parked` (`needs_login` for a dead-login swap, trigger 3, as in main 6 step 7) and the target to `active`, record the outgoing account as left at a limit for a `rate_limit` swap (section 8) as for a `stop_failure` one (main 7.2), and log the `swap` event as before.
 6. Release the swap lock.
 
 No login is written into the profile, Claude Code's locks are not taken, and no swap is ever pending (main 6, step 4), so `settle-login` has nothing to settle in relay mode.
@@ -137,6 +137,7 @@ When Anthropic refuses a model request at a usage limit, a 429 with `anthropic-r
 
 1. The relay records the reading (section 7).
 2. It runs the swap itself (`--from` the refused account, reason `rate_limit`) and waits for it, up to the swap's own budget; when another swap holds the swap lock, it waits for that one instead and then reads which account is active.
+   Like a swap at a stopped turn (main 7.2), it records the refused account as left at a limit (`left_at_stop`), so its room is not trusted for a switch back until a newer reading says so.
 3. When another account became active, it sends the same request again, with that account's login.
 4. It repeats this at most once per pool account for one request.
    When no swap happens (the pool is used up, or the swap was skipped), it returns the last refusal unchanged, and Claude Code stops the turn as before.
