@@ -340,6 +340,8 @@ pub enum Reason {
     /// Spend an at-risk weekly budget before its earlier reset, without waiting for a limit.
     WeeklyExpiring,
     StopFailure,
+    /// The relay saw Anthropic refuse a request because the login is at a limit.
+    LimitRefused,
     DeadLogin,
     Manual,
     Login,
@@ -357,6 +359,7 @@ impl Reason {
             Self::PreferredAvailable => "preferred_available",
             Self::WeeklyExpiring => "weekly_expiring",
             Self::StopFailure => "stop_failure",
+            Self::LimitRefused => "rate_limit",
             Self::DeadLogin => "dead_login",
             Self::Manual => "manual",
             Self::Login => "login",
@@ -372,6 +375,7 @@ impl Reason {
             "preferred_available" => Self::PreferredAvailable,
             "weekly_expiring" => Self::WeeklyExpiring,
             "stop_failure" => Self::StopFailure,
+            "rate_limit" => Self::LimitRefused,
             "dead_login" => Self::DeadLogin,
             "manual" => Self::Manual,
             "login" => Self::Login,

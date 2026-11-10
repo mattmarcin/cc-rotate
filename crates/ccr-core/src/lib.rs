@@ -22,6 +22,7 @@ pub mod profile_account;
 pub mod profile_usage;
 pub mod profiles;
 pub mod relay;
+pub mod relay_proto;
 pub mod scheduler;
 pub mod secret;
 pub mod setup;
