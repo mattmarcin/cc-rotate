@@ -799,6 +799,9 @@ pub mod kind {
     /// A warm-up started an account's 5-hour window (`usage_check::warm_up`);
     /// `detail.cost_usd` is what Claude Code reported it cost at API prices.
     pub const WARM_UP: &str = "warm_up";
+    /// Relay mode was turned on (`on`, `detail.home` names the home account) or off (`off`);
+    /// `account_from` and `account_to` are the accounts whose login the profile had and has.
+    pub const RELAY_MODE: &str = "relay_mode";
 }
 
 /// Typed view of the `settings` table with defaults applied.

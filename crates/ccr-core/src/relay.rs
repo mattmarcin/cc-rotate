@@ -8,7 +8,10 @@ use anyhow::{Context, Result, anyhow};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
-use crate::store::{Account, Store};
+use crate::lock::{DirLock, LockOptions};
+use crate::paths::Paths;
+use crate::store::{Account, AccountState, Store, kind};
+use crate::swap::{self, RelayChange, Settle};
 
 /// Setting that holds `on` while relay mode is on. Written only by `set_mode`.
 pub const SETTING_MODE: &str = "relay_mode";
@@ -41,17 +44,25 @@ pub fn profile_account(store: &Store) -> Result<Option<Account>> {
 /// Turn relay mode on with `home` as the home account, or off with `None`.
 ///
 /// Both settings are written in one transaction, straight to the table: neither is a setting
-/// the user can change with `config`.
+/// the user can change with `config`. Inside a transaction already (a swap's commit), they are
+/// written as part of it.
 pub fn set_mode(store: &Store, home: Option<i64>) -> Result<()> {
+    if store.conn().is_autocommit() {
+        store.immediate(|s| write_mode(s, home))
+    } else {
+        write_mode(store, home)
+    }
+}
+
+fn write_mode(store: &Store, home: Option<i64>) -> Result<()> {
     let conn = store.conn();
-    let tx = conn.unchecked_transaction()?;
     match home {
         Some(id) => {
             for (key, value) in [
                 (SETTING_MODE, "on".to_string()),
                 (SETTING_HOME, id.to_string()),
             ] {
-                tx.execute(
+                conn.execute(
                     "INSERT INTO settings (key, value) VALUES (?1, ?2)
                      ON CONFLICT (key) DO UPDATE SET value = excluded.value",
                     params![key, value],
@@ -59,13 +70,111 @@ pub fn set_mode(store: &Store, home: Option<i64>) -> Result<()> {
             }
         }
         None => {
-            tx.execute(
+            conn.execute(
                 "DELETE FROM settings WHERE key IN (?1, ?2)",
                 params![SETTING_MODE, SETTING_HOME],
             )?;
         }
     }
-    tx.commit()?;
+    Ok(())
+}
+
+/// Turn relay mode on with `home` as the home account (spec 4, step 4): under the swap lock, make
+/// its login the profile's, without changing which account is active.
+///
+/// Refused unless the account is in the pool, signed in and not held back by a check, while a
+/// swap is pending, and while the profile's login is not identified. When another account's
+/// login is in the profile (the active one's, or the previous home account's), it is saved to
+/// that account's row and the home account's written in its place (`swap::move_profile_login`).
+pub fn turn_on(store: &Store, paths: &Paths, home_id: i64) -> Result<()> {
+    let _swap_lock = swap_lock(store, paths)?;
+    let account = store
+        .account(home_id)?
+        .ok_or_else(|| anyhow!("account {home_id} does not exist"))?;
+    if account.state == AccountState::NeedsLogin || store.credential_meta(home_id)?.is_none() {
+        return Err(anyhow!(
+            "{} is signed out. Sign in to it again first.",
+            account.label
+        ));
+    }
+    if crate::usage_check::state(store, home_id)?.held_back {
+        return Err(anyhow!(
+            "{} is on hold until a usage check confirms its login. Check its usage first.",
+            account.label
+        ));
+    }
+    settled(store, paths)?;
+    let profile = profile_account(store)?.ok_or_else(|| {
+        anyhow!("no account is in use, so cc-rotate can't tell whose login the profile has")
+    })?;
+    let change = RelayChange::On { home: home_id };
+    if profile.id != home_id {
+        return swap::move_profile_login(store, paths, profile.id, home_id, change);
+    }
+    store.immediate(|s| {
+        set_mode(s, Some(home_id))?;
+        log_mode(s, home_id, change)
+    })
+}
+
+/// Turn relay mode off (spec 4, `relay off` step 1): under the swap lock, make the active
+/// account's login the profile's again, the home account's saved to its row first.
+///
+/// Nothing to do when it is off. Refused while a swap is pending, and while the profile's login
+/// is not identified.
+pub fn turn_off(store: &Store, paths: &Paths) -> Result<()> {
+    let _swap_lock = swap_lock(store, paths)?;
+    if store.setting(SETTING_MODE)?.as_deref() != Some("on") {
+        return Ok(());
+    }
+    settled(store, paths)?;
+    let active = store.active_account()?;
+    match (home(store)?, active) {
+        (Some(home_id), Some(active)) if active.id != home_id => {
+            swap::move_profile_login(store, paths, home_id, active.id, RelayChange::Off)
+        }
+        (home_id, _) => store.immediate(|s| {
+            set_mode(s, None)?;
+            match home_id {
+                Some(id) => log_mode(s, id, RelayChange::Off),
+                None => Ok(()),
+            }
+        }),
+    }
+}
+
+/// The swap lock, waited for as long as Claude Code's locks are.
+fn swap_lock(store: &Store, paths: &Paths) -> Result<DirLock> {
+    let timeout = std::time::Duration::from_millis(store.settings()?.lock_timeout_ms);
+    DirLock::acquire(&paths.swap_lock(), LockOptions::claude(timeout))
+        .context("waiting for a swap to finish")
+}
+
+/// Refuse while a swap is pending, and identify a login that changed in the profile, so the
+/// profile's login is saved to the right account.
+fn settled(store: &Store, paths: &Paths) -> Result<()> {
+    if swap::pending_swap(store)?.is_some() {
+        return Err(anyhow!(
+            "a swap was interrupted and isn't settled yet. cc-rotate settles it within a minute; try again then."
+        ));
+    }
+    if swap::identify_changed_login(store, paths)? == Settle::Unsure {
+        return Err(anyhow!(
+            "the profile's login changed and isn't identified yet. Try again in a minute."
+        ));
+    }
+    Ok(())
+}
+
+/// Log a change of mode that wrote no login: the profile kept `account`'s.
+fn log_mode(s: &Store, account: i64, change: RelayChange) -> Result<()> {
+    s.log_event(
+        kind::RELAY_MODE,
+        Some(account),
+        Some(account),
+        Some(change.as_str()),
+        Some(serde_json::json!({ "home": change.home() })),
+    )?;
     Ok(())
 }
 
@@ -324,6 +433,118 @@ mod tests {
     fn launch_env_missing_config() {
         let dir = data_dir_with_store(true);
         assert!(launch_env(dir.path()).is_err());
+    }
+
+    mod turning {
+        use super::super::*;
+        use crate::store::AccountState;
+        use crate::swap::tests::{Env, oauth};
+        use crate::swap::{self, META_SWAP_PENDING, PendingSwap};
+
+        #[test]
+        fn turn_on_writes_home() {
+            let env = Env::new();
+            env.activate(env.b);
+            // Claude Code renewed b's login in the profile since it was stored.
+            env.write_profile(&oauth("b2"));
+            turn_on(&env.store, &env.paths, env.a).unwrap();
+            assert_eq!(env.profile_refresh(), "refresh-a1");
+            assert_eq!(env.stored_refresh(env.b), "refresh-b2");
+            assert_eq!(env.state(env.b), AccountState::Active);
+            assert_eq!(env.state(env.a), AccountState::Parked);
+            assert_eq!(home(&env.store).unwrap(), Some(env.a));
+            assert!(swap::pending_swap(&env.store).unwrap().is_none());
+            assert!(!env.paths.refresh_lock().exists());
+            assert!(!env.paths.swap_lock().exists());
+        }
+
+        #[test]
+        fn turn_on_with_home_active_only_sets_the_mode() {
+            let env = Env::new();
+            let before = env.profile_bytes();
+            turn_on(&env.store, &env.paths, env.a).unwrap();
+            assert_eq!(home(&env.store).unwrap(), Some(env.a));
+            assert_eq!(env.profile_bytes(), before);
+            assert_eq!(env.state(env.a), AccountState::Active);
+        }
+
+        #[test]
+        fn turn_off_writes_active() {
+            let env = Env::new();
+            set_mode(&env.store, Some(env.a)).unwrap();
+            env.activate(env.c);
+            // Claude Code renewed the home account's login in the profile.
+            env.write_profile(&oauth("a2"));
+            turn_off(&env.store, &env.paths).unwrap();
+            assert_eq!(env.profile_refresh(), "refresh-c1");
+            assert_eq!(env.stored_refresh(env.a), "refresh-a2");
+            assert_eq!(home(&env.store).unwrap(), None);
+            assert_eq!(env.state(env.c), AccountState::Active);
+            assert!(swap::pending_swap(&env.store).unwrap().is_none());
+        }
+
+        #[test]
+        fn turn_off_with_home_active_only_sets_the_mode() {
+            let env = Env::new();
+            set_mode(&env.store, Some(env.a)).unwrap();
+            let before = env.profile_bytes();
+            turn_off(&env.store, &env.paths).unwrap();
+            assert_eq!(home(&env.store).unwrap(), None);
+            assert_eq!(env.profile_bytes(), before);
+        }
+
+        #[test]
+        fn turn_on_refused_when_pending() {
+            let env = Env::new();
+            env.activate(env.b);
+            let pending = PendingSwap {
+                fp: "x".into(),
+                from: Some(env.b),
+                to: env.c,
+                at: crate::time::now_ms(),
+                relay: None,
+            };
+            env.store
+                .set_meta(META_SWAP_PENDING, serde_json::to_string(&pending).unwrap())
+                .unwrap();
+            assert!(turn_on(&env.store, &env.paths, env.a).is_err());
+            assert_eq!(home(&env.store).unwrap(), None);
+            env.write_profile(&oauth("b1"));
+            assert!(
+                turn_off(&env.store, &env.paths).is_ok(),
+                "off while off is nothing"
+            );
+        }
+
+        #[test]
+        fn turn_on_refuses_a_signed_out_or_held_back_home() {
+            let env = Env::new();
+            env.activate(env.b);
+            env.store
+                .set_state(env.a, AccountState::NeedsLogin)
+                .unwrap();
+            assert!(turn_on(&env.store, &env.paths, env.a).is_err());
+            env.store.set_state(env.a, AccountState::Parked).unwrap();
+            crate::usage_check::hold_back(&env.store, env.a).unwrap();
+            assert!(turn_on(&env.store, &env.paths, env.a).is_err());
+            assert!(turn_on(&env.store, &env.paths, 9999).is_err());
+            assert_eq!(home(&env.store).unwrap(), None);
+            assert_eq!(env.profile_refresh(), "refresh-a1");
+        }
+
+        #[test]
+        fn turn_on_moves_home() {
+            // Already on with home a and c active: the new home b's login replaces a's.
+            let env = Env::new();
+            set_mode(&env.store, Some(env.a)).unwrap();
+            env.activate(env.c);
+            env.write_profile(&oauth("a2"));
+            turn_on(&env.store, &env.paths, env.b).unwrap();
+            assert_eq!(env.profile_refresh(), "refresh-b1");
+            assert_eq!(env.stored_refresh(env.a), "refresh-a2");
+            assert_eq!(home(&env.store).unwrap(), Some(env.b));
+            assert_eq!(env.state(env.c), AccountState::Active);
+        }
     }
 
     #[test]

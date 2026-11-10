@@ -448,6 +448,7 @@ fn a_dead_swap_is_settled_by_asking_claude_code_whose_login_it_is() {
                     from: Some(a),
                     to: b,
                     at: time::now_ms(),
+                    relay: None,
                 })
                 .unwrap(),
             )
@@ -514,6 +515,7 @@ fn no_check_runs_while_a_swap_is_pending() {
                 from: Some(a),
                 to: b,
                 at: time::now_ms(),
+                relay: None,
             })
             .unwrap(),
         )

@@ -1555,6 +1555,7 @@ fn mark_pending(store: &Store, fp: &str, from: Option<i64>, to: i64) {
         from,
         to,
         at: time::now_ms(),
+        relay: None,
     };
     store
         .set_meta(

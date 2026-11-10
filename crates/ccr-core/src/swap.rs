@@ -20,7 +20,7 @@ use crate::lock::{DirLock, LockError, LockOptions};
 use crate::paths::Paths;
 use crate::scheduler::{self, Candidate, Policy, Reason, WeeklyEvidence, WeeklyLimit, WindowKind};
 use crate::store::{Account, AccountState, Sample, SampleWindow, Store, kind};
-use crate::{credfile, secret, time, usage_check};
+use crate::{credfile, relay, secret, time, usage_check};
 
 pub const META_LAST_SWAP_AT: &str = "last_swap_at";
 /// The reset times (comma-separated epoch seconds) of every window in the outgoing account's
@@ -41,6 +41,39 @@ pub struct PendingSwap {
     /// When (epoch ms).
     #[serde(default)]
     pub at: i64,
+    /// A change of relay mode (`move_profile_login`), not a swap: committing it sets the mode
+    /// instead of which account is active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<RelayChange>,
+}
+
+/// A change of relay mode that moves the profile's login from one account to another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum RelayChange {
+    /// Relay mode on, with `home` as the home account.
+    On {
+        home: i64,
+    },
+    Off,
+}
+
+impl RelayChange {
+    /// The home account once the change is made: `None` for off.
+    pub fn home(self) -> Option<i64> {
+        match self {
+            Self::On { home } => Some(home),
+            Self::Off => None,
+        }
+    }
+
+    /// The word events record.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::On { .. } => "on",
+            Self::Off => "off",
+        }
+    }
 }
 
 pub fn pending_swap(store: &Store) -> Result<Option<PendingSwap>> {
@@ -77,7 +110,8 @@ pub enum Settle {
 /// - the profile has exactly the outgoing account's login: the write never happened, and the
 ///   mark is cleared;
 /// - it has exactly the target's: the swap is completed (states only; the outgoing account's
-///   login was stored before the write);
+///   login was stored before the write); for a change of relay mode (`PendingSwap::relay`), the
+///   mode is set and the states are left alone;
 /// - it has no usable login (Anthropic rejected whichever it was, or a `/logout`): with the swap
 ///   lock held, the outgoing account's stored login, which the swap saved before writing, is put
 ///   back, and the target is held back until a check settles whether its login still works;
@@ -170,6 +204,22 @@ pub fn finish_dead_swap(store: &Store, paths: &Paths, settler: Settler) -> Resul
         }
         match verdict {
             Verdict::NeverWritten => {}
+            Verdict::Written if pending.relay.is_some() => {
+                // A change of relay mode: which account is active never changed.
+                if let Some(change) = pending.relay {
+                    relay::set_mode(s, change.home())?;
+                    s.log_event(
+                        kind::RELAY_MODE,
+                        pending.from,
+                        Some(pending.to),
+                        Some(change.as_str()),
+                        Some(json!({
+                            "home": change.home(),
+                            "why": "finished a change of relay mode that was interrupted after writing the login",
+                        })),
+                    )?;
+                }
+            }
             Verdict::Written => {
                 let now = time::now_ms();
                 if let Some(from) = pending.from
@@ -295,21 +345,24 @@ pub struct Unidentified {
 
 /// A login in the profile that cc-rotate did not write and has not identified.
 pub(crate) struct ChangedLogin {
-    active: Account,
+    /// The account the profile's login belongs to (`relay::profile_account`): the active one,
+    /// or the home account in relay mode.
+    account: Account,
     oauth: serde_json::Value,
     fp: String,
     marker: String,
 }
 
-/// The login in the profile when it is neither one stored for the active account nor
-/// identified yet: a renewal of the active account's login, or a `/login` in the profile, which
+/// The login in the profile when it is neither one stored for the profile's account (the active
+/// one, or the home account in relay mode) nor identified yet: a renewal of that account's
+/// login, or a `/login` in the profile, which
 /// `.claude.json` cannot tell apart after a swap (F14). `None` when there is nothing to identify,
 /// or logins are not identified (`usage_check::identifies_logins`).
 pub(crate) fn changed_login(store: &Store, paths: &Paths) -> Result<Option<ChangedLogin>> {
     if pending_swap(store)?.is_some() || store.meta(META_PROFILE_FOREIGN)?.as_deref() == Some("1") {
         return Ok(None);
     }
-    let Some(active) = store.active_account()? else {
+    let Some(account) = relay::profile_account(store)? else {
         return Ok(None);
     };
     let creds = paths.credentials();
@@ -332,11 +385,11 @@ pub(crate) fn changed_login(store: &Store, paths: &Paths) -> Result<Option<Chang
     let Some(fp) = credfile::oauth_fingerprint(&oauth) else {
         return Ok(None);
     };
-    if store.credential_meta(active.id)?.map(|m| m.refresh_fp) == Some(fp.clone()) {
+    if store.credential_meta(account.id)?.map(|m| m.refresh_fp) == Some(fp.clone()) {
         return Ok(None);
     }
     Ok(Some(ChangedLogin {
-        active,
+        account,
         oauth,
         fp,
         marker,
@@ -345,8 +398,10 @@ pub(crate) fn changed_login(store: &Store, paths: &Paths) -> Result<Option<Chang
 
 /// Identify a login that changed in the profile without cc-rotate writing it (`changed_login`),
 /// with the swap lock held, by asking Claude Code whose it is with a copy it cannot renew:
-/// - the active account's (a renewal) is stored as its login;
-/// - another pool account's (a `/login` in the profile) makes that account active;
+/// - the profile's account's (a renewal) is stored as its login: the active account's, or the
+///   home account's in relay mode;
+/// - another pool account's (a `/login` in the profile) makes that account active, or the home
+///   account in relay mode (`adopt_login`);
 /// - any other account's (a `/login` with an account outside the pool) marks the profile
 ///   foreign, so its login is never stored.
 ///
@@ -379,12 +434,12 @@ pub fn identify_changed_login(store: &Store, paths: &Paths) -> Result<Settle> {
         Foreign(Option<String>),
     }
     let verdict = match who {
-        Some(who) => match who.is(&changed.active) {
+        Some(who) => match who.is(&changed.account) {
             Some(true) => Verdict::Own,
             active_is => match store
                 .accounts()?
                 .into_iter()
-                .find(|a| a.id != changed.active.id && who.is(a) == Some(true))
+                .find(|a| a.id != changed.account.id && who.is(a) == Some(true))
             {
                 Some(account) => Verdict::Adopt(Box::new(account)),
                 // Nothing to compare the active account with: stored as before.
@@ -399,12 +454,12 @@ pub fn identify_changed_login(store: &Store, paths: &Paths) -> Result<Settle> {
             Verdict::Own
         }
     };
-    let active = &changed.active;
+    let active = &changed.account;
     store.immediate(|s| {
         // Only the login identified: the write-back, a swap or a `/login` may have dealt with
         // it meanwhile.
         if s.meta(META_CRED_SEEN)?.as_deref() == Some(changed.marker.as_str())
-            || s.active_account()?.map(|a| a.id) != Some(active.id)
+            || relay::profile_account(s)?.map(|a| a.id) != Some(active.id)
         {
             s.delete_meta(META_LOGIN_TO_IDENTIFY)?;
             return s.delete_meta(META_LOGIN_CHANGED_AT);
@@ -460,10 +515,10 @@ fn unidentified_for_long(store: &Store, changed: &ChangedLogin) -> Result<bool> 
     }
     store.log_event(
         kind::ERROR,
-        Some(changed.active.id),
+        Some(changed.account.id),
         None,
         Some("login"),
-        Some(json!({ "message": format!("The profile's login changed and Claude Code couldn't confirm its account for 10 minutes, so cc-rotate saved it as {}'s. Confirming needs the `claude` command and a network connection.", changed.active.label) })),
+        Some(json!({ "message": format!("The profile's login changed and Claude Code couldn't confirm its account for 10 minutes, so cc-rotate saved it as {}'s. Confirming needs the `claude` command and a network connection.", changed.account.label) })),
     )?;
     Ok(true)
 }
@@ -478,6 +533,10 @@ fn set_active_since(s: &Store, at: i64) -> Result<()> {
 /// Make `account` active because the profile holds its login (a `/login` in the profile), and
 /// store that login as its own. `changed_at` is when the profile's login changed (epoch ms), as
 /// near as is known: the account has been in use since. Call inside a transaction.
+///
+/// In relay mode the profile's login is the home account's, so `account` becomes the home
+/// account instead, and which account is active does not change: its login stays where Claude
+/// Code renews it, and nothing else keeps a copy that renewal would retire.
 pub(crate) fn adopt_login(
     s: &Store,
     active: Option<&Account>,
@@ -485,11 +544,16 @@ pub(crate) fn adopt_login(
     oauth: Option<&serde_json::Value>,
     changed_at: i64,
 ) -> Result<()> {
-    if let Some(a) = active {
-        s.set_state(a.id, AccountState::Parked)?;
+    let relay_mode = relay::home(s)?.is_some();
+    if relay_mode {
+        relay::set_mode(s, Some(account.id))?;
+    } else {
+        if let Some(a) = active {
+            s.set_state(a.id, AccountState::Parked)?;
+        }
+        s.set_state(account.id, AccountState::Active)?;
+        set_active_since(s, changed_at)?;
     }
-    s.set_state(account.id, AccountState::Active)?;
-    set_active_since(s, changed_at)?;
     if let Some(o) = oauth.filter(|o| !credfile::is_dead(o)) {
         s.save_credential(account.id, o, "sync")?;
     }
@@ -498,7 +562,7 @@ pub(crate) fn adopt_login(
         active.map(|a| a.id),
         Some(account.id),
         Some("login_in_profile"),
-        None,
+        relay_mode.then(|| json!({ "home": true })),
     )?;
     Ok(())
 }
@@ -1051,6 +1115,28 @@ pub fn active_since(store: &Store) -> Result<i64> {
 }
 
 pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcome> {
+    run_with(store, paths, req, &usage_check::renew)
+}
+
+/// Whether a stored login whose access token expires at `expires_at` (epoch ms) must be renewed
+/// before the relay uses it: it expires within the margin, or when is unknown.
+fn needs_renewal(expires_at: Option<i64>, now_ms: i64, margin_s: i64) -> bool {
+    expires_at.is_none_or(|at| crate::relay_proto::renew_due(at, now_ms, margin_s))
+}
+
+/// `run`, with what renews a login in relay mode (`usage_check::renew`) given.
+///
+/// In relay mode (spec 6) a swap only changes which account is active: the profile keeps the
+/// home account's login, so it is not read, identified or written, and Claude Code's locks are
+/// not taken. A target whose stored access token is not valid for `relay_renew_margin_s` is
+/// renewed first, within the checks' time budget, and passed over like a busy one when that
+/// leaves it no valid login.
+fn run_with(
+    store: &Store,
+    paths: &Paths,
+    req: &SwapRequest,
+    renew: &dyn Fn(&Store, &Paths, i64) -> Result<usage_check::CheckOutcome>,
+) -> Result<SwapOutcome> {
     let settings = store.settings()?;
     let lock_timeout = Duration::from_millis(settings.lock_timeout_ms);
 
@@ -1066,16 +1152,18 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
     };
     // A session the macOS Keychain is locked to (started over SSH) cannot write the profile's
     // login where Claude Code reads it: the file instead would leave the desktop session's
-    // sessions on the old account.
-    if !paths.credentials().complete().unwrap_or(true) {
-        return skip(
-            store,
-            req,
-            "this session can't use the macOS Keychain, which holds the profile's login (it was started over SSH). Swap from the Mac's desktop session.",
-        );
+    // sessions on the old account. A relay-mode swap writes no login.
+    const KEYCHAIN_LOCKED: &str = "this session can't use the macOS Keychain, which holds the profile's login (it was started over SSH). Swap from the Mac's desktop session.";
+    let mut keychain_checked = false;
+    if relay::home(store)?.is_none() {
+        if !paths.credentials().complete().unwrap_or(true) {
+            return skip(store, req, KEYCHAIN_LOCKED);
+        }
+        keychain_checked = true;
     }
     // An earlier swap that stopped half way. While the profile's login is unidentified, no swap
     // runs: it would overwrite the only copy of that login, or file it under the wrong account.
+    // A change of relay mode that stopped half way is settled here too, before the mode is read.
     if finish_dead_swap(store, paths, Settler::Locked)? == Settle::Unsure {
         return skip(
             store,
@@ -1083,14 +1171,20 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
             "an earlier swap was interrupted and the profile's login isn't identified yet",
         );
     }
-    // A login that changed in the profile is identified first, so the swap below never stores
-    // another account's login as the outgoing account's.
-    if identify_changed_login(store, paths)? == Settle::Unsure {
-        return skip(
-            store,
-            req,
-            "the profile's login changed and isn't identified yet",
-        );
+    let relay_home = relay::home(store)?;
+    if relay_home.is_none() {
+        if !keychain_checked && !paths.credentials().complete().unwrap_or(true) {
+            return skip(store, req, KEYCHAIN_LOCKED);
+        }
+        // A login that changed in the profile is identified first, so the swap below never
+        // stores another account's login as the outgoing account's.
+        if identify_changed_login(store, paths)? == Settle::Unsure {
+            return skip(
+                store,
+                req,
+                "the profile's login changed and isn't identified yet",
+            );
+        }
     }
 
     let now = time::now_ms();
@@ -1128,7 +1222,10 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
     // Checks and the confirmation share one time budget: sessions may be waiting at a limit.
     let check_deadline = Instant::now() + PRE_SWAP_CHECK_BUDGET;
     let mut confirmed = None;
-    if req.reason.is_threshold()
+    // In relay mode readings are the relay's own, read from each response for the account it
+    // used (spec 7): nothing to confirm.
+    if relay_home.is_none()
+        && req.reason.is_threshold()
         && let Some(account) = &active
         && needs_confirmation(store, account.id, now)?
     {
@@ -1165,6 +1262,8 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
     let mut checked: Vec<serde_json::Value> = Vec::new();
     let mut checked_ids: Vec<i64> = Vec::new();
     let mut passed_over: Vec<i64> = Vec::new();
+    let mut renewed_ids: Vec<i64> = Vec::new();
+    let mut unrenewable = false;
     let mut attempts = 0;
     let (target, _target_lock, pool, policy) = loop {
         attempts += 1;
@@ -1182,7 +1281,11 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
             return skip(
                 store,
                 req,
-                "the accounts that could take over are being checked",
+                if unrenewable {
+                    "the accounts that could take over are being checked, or their logins couldn't be renewed"
+                } else {
+                    "the accounts that could take over are being checked"
+                },
             );
         }
         let target = match choose(store, req, &pool, policy, active.as_ref(), now_s)? {
@@ -1247,6 +1350,42 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
                         target.label
                     ));
                 }
+                // In relay mode the relay sends requests with the target's stored access token
+                // (the home account's is the profile's, which Claude Code renews), so it must
+                // stay valid a while. Renewal runs a check, which takes the account lock.
+                if relay_home.is_some_and(|home| home != target.id)
+                    && needs_renewal(
+                        store.credential_meta(target.id)?.and_then(|m| m.expires_at),
+                        time::now_ms(),
+                        settings.relay_renew_margin_s,
+                    )
+                {
+                    if !renewed_ids.contains(&target.id) && Instant::now() < check_deadline {
+                        drop(lock);
+                        let outcome = renew(store, paths, target.id).unwrap_or_else(|e| {
+                            usage_check::CheckOutcome::Failed {
+                                why: format!("{e:#}"),
+                            }
+                        });
+                        checked.push(usage_check::summary(store, target.id, &outcome));
+                        renewed_ids.push(target.id);
+                        continue;
+                    }
+                    if !last_try {
+                        passed_over.push(target.id);
+                        unrenewable = true;
+                        continue;
+                    }
+                    return Err(log_error(
+                        store,
+                        req,
+                        &target,
+                        format!(
+                            "{}'s login expires soon and couldn't be renewed. Check its usage to renew it.",
+                            target.label
+                        ),
+                    ));
+                }
                 break (settled, lock, pool, policy);
             }
             Choice::Target(_) if !last_try => continue,
@@ -1286,6 +1425,40 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
     let trigger_window = outgoing
         .and_then(Candidate::blocking)
         .map(|w| w.name.clone());
+
+    if relay_home.is_some() {
+        // Spec 6, steps 5 and 6: the relay sends every request after this commit with the
+        // target's login. The profile and Claude Code's locks are left alone.
+        let outgoing_state = match (&active, req.reason) {
+            (Some(_), Reason::DeadLogin) => AccountState::NeedsLogin,
+            _ => AccountState::Parked,
+        };
+        let from_sample = match active_id {
+            Some(id) => store.current_usage(id)?,
+            None => None,
+        };
+        let commit = SwapCommit {
+            active: active.as_ref(),
+            outgoing_state,
+            target: &target,
+            reason: req.reason,
+            now,
+            promoted_until: promoted_until(&pool, policy, target.id),
+            previous_swap: store.meta_i64(META_LAST_SWAP_AT)?,
+            from_sample,
+            pick: json!(reason_for(target.id)),
+            trigger_window,
+            why,
+            arrived_full,
+            checked,
+            confirmed,
+        };
+        store.immediate(|s| record_swap(s, &commit))?;
+        return Ok(SwapOutcome::Swapped {
+            from: active_id,
+            to: target.id,
+        });
+    }
 
     let target_login = store
         .credential(target.id)?
@@ -1375,6 +1548,7 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
         from: active_id,
         to: target.id,
         at: now,
+        relay: None,
     };
     store.set_meta(META_SWAP_PENDING, serde_json::to_string(&pending)?)?;
     if let Err(e) = creds.write_oauth(&target_login.oauth) {
@@ -1389,82 +1563,30 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
     let written_at = time::now_ms();
     let marker = creds.change_marker().ok().flatten();
 
-    // Taken for its expiring budget: it stays ahead after its 5-hour limit this week.
-    let promoted_until = pool
-        .iter()
-        .find(|c| c.account.id == target.id)
-        .and_then(|c| policy.expiring(c))
-        .map(|e| e.resets_at);
+    let commit = SwapCommit {
+        active: active.as_ref(),
+        outgoing_state,
+        target: &target,
+        reason: req.reason,
+        now,
+        promoted_until: promoted_until(&pool, policy, target.id),
+        previous_swap,
+        from_sample,
+        pick: json!(reason_for(target.id)),
+        trigger_window,
+        why,
+        arrived_full,
+        checked,
+        confirmed,
+    };
     let committed = store.immediate(|s| {
-        if let Some(account) = &active {
-            s.set_state(account.id, outgoing_state)?;
-            if req.reason == Reason::StopFailure {
-                // At the commit: a reading of the account taken while it was still in use,
-                // during the swap's lock waits, is older and so not news (`stop_hold_until`).
-                s.set_meta(&left_at_stop_key(account.id), time::now_ms())?;
-            }
-        }
-        s.set_state(target.id, AccountState::Active)?;
-        if let Some(reset) = promoted_until {
-            s.set_meta(&crate::budget::promoted_key(target.id), reset)?;
-        }
-        s.set_meta(META_LAST_SWAP_AT, now)?;
         s.set_meta(META_PROFILE_FOREIGN, "0")?;
-        s.set_meta(META_ACTIVE_SINCE, now)?;
         s.set_meta(META_LOGIN_WRITTEN_AT, written_at)?;
-        let mut resets: Vec<i64> = match previous_swap {
-            Some(last) if now - last <= STALE_SAMPLE_GUARD_MS => left_resets(s)?,
-            _ => Vec::new(),
-        };
-        resets.extend(
-            from_sample
-                .iter()
-                .flat_map(|x| &x.windows)
-                .filter_map(|w| w.resets_at),
-        );
-        resets.sort_unstable();
-        resets.dedup();
-        let resets: Vec<String> = resets.iter().map(i64::to_string).collect();
-        s.set_meta(META_LAST_SWAP_FROM_RESETS, resets.join(","))?;
         if let Some(marker) = &marker {
             s.set_meta(META_CRED_SEEN, marker)?;
         }
-        let from_windows: serde_json::Map<String, serde_json::Value> = from_sample
-            .iter()
-            .flat_map(|x| &x.windows)
-            .map(|w| (w.name.clone(), json!(w.pct)))
-            .collect();
-        let mut detail = json!({
-            "from_label": active.as_ref().map(|a| a.label.clone()),
-            "to_label": target.label,
-            "from_state": outgoing_state.as_str(),
-            "from_windows": from_windows,
-            "pick": reason_for(target.id),
-        });
-        if let Some(window) = &trigger_window {
-            detail["window"] = json!(window);
-        }
-        if let Some(why) = &why {
-            detail["why"] = json!(why);
-        }
-        if arrived_full {
-            detail["arrived_over_limit"] = json!(true);
-        }
-        if !checked.is_empty() {
-            detail["checked"] = json!(checked);
-        }
-        if let Some(outcome) = confirmed {
-            detail["confirmed"] = json!(outcome);
-        }
         s.delete_meta(META_SWAP_PENDING)?;
-        s.log_event(
-            kind::SWAP,
-            active_id,
-            Some(target.id),
-            Some(req.reason.as_str()),
-            Some(detail),
-        )?;
-        Ok(())
+        record_swap(s, &commit)
     });
 
     if let Err(e) = committed {
@@ -1491,6 +1613,228 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
         from: active_id,
         to: target.id,
     })
+}
+
+/// What a swap records when it commits (`record_swap`).
+struct SwapCommit<'a> {
+    /// The account that was active.
+    active: Option<&'a Account>,
+    /// What the outgoing account becomes: parked, or signed out.
+    outgoing_state: AccountState,
+    target: &'a Account,
+    reason: Reason,
+    /// When the swap started (epoch ms).
+    now: i64,
+    /// The reset of the expiring weekly budget the target was taken for.
+    promoted_until: Option<i64>,
+    /// When the swap before this one committed (epoch ms).
+    previous_swap: Option<i64>,
+    /// The outgoing account's latest reading.
+    from_sample: Option<Sample>,
+    /// Why the scheduler ranks the target where it does (section 7.3).
+    pick: serde_json::Value,
+    /// The outgoing account's window that triggered the swap.
+    trigger_window: Option<String>,
+    why: Option<String>,
+    arrived_full: bool,
+    /// The checks run before the swap.
+    checked: Vec<serde_json::Value>,
+    /// What the confirmation of the account in use found.
+    confirmed: Option<&'static str>,
+}
+
+/// The reset of the expiring weekly budget `target` is taken for, if it is: it stays ahead after
+/// its 5-hour limit this week.
+fn promoted_until(pool: &[Candidate], policy: Policy, target: i64) -> Option<i64> {
+    pool.iter()
+        .find(|c| c.account.id == target)
+        .and_then(|c| policy.expiring(c))
+        .map(|e| e.resets_at)
+}
+
+/// Record a swap, inside its commit's transaction: the states, the outgoing account left at a
+/// limit, the target's promotion, when it happened, the stale-reading guard's reset times, and
+/// the `swap` event. Shared by swaps that write the profile's login and relay-mode swaps.
+fn record_swap(s: &Store, c: &SwapCommit) -> Result<()> {
+    if let Some(account) = c.active {
+        s.set_state(account.id, c.outgoing_state)?;
+        if matches!(c.reason, Reason::StopFailure | Reason::LimitRefused) {
+            // At the commit: a reading of the account taken while it was still in use,
+            // during the swap's lock waits, is older and so not news (`stop_hold_until`).
+            s.set_meta(&left_at_stop_key(account.id), time::now_ms())?;
+        }
+    }
+    s.set_state(c.target.id, AccountState::Active)?;
+    if let Some(reset) = c.promoted_until {
+        s.set_meta(&crate::budget::promoted_key(c.target.id), reset)?;
+    }
+    s.set_meta(META_LAST_SWAP_AT, c.now)?;
+    s.set_meta(META_ACTIVE_SINCE, c.now)?;
+    let mut resets: Vec<i64> = match c.previous_swap {
+        Some(last) if c.now - last <= STALE_SAMPLE_GUARD_MS => left_resets(s)?,
+        _ => Vec::new(),
+    };
+    resets.extend(
+        c.from_sample
+            .iter()
+            .flat_map(|x| &x.windows)
+            .filter_map(|w| w.resets_at),
+    );
+    resets.sort_unstable();
+    resets.dedup();
+    let resets: Vec<String> = resets.iter().map(i64::to_string).collect();
+    s.set_meta(META_LAST_SWAP_FROM_RESETS, resets.join(","))?;
+    let from_windows: serde_json::Map<String, serde_json::Value> = c
+        .from_sample
+        .iter()
+        .flat_map(|x| &x.windows)
+        .map(|w| (w.name.clone(), json!(w.pct)))
+        .collect();
+    let mut detail = json!({
+        "from_label": c.active.map(|a| a.label.clone()),
+        "to_label": c.target.label,
+        "from_state": c.outgoing_state.as_str(),
+        "from_windows": from_windows,
+        "pick": c.pick,
+    });
+    if let Some(window) = &c.trigger_window {
+        detail["window"] = json!(window);
+    }
+    if let Some(why) = &c.why {
+        detail["why"] = json!(why);
+    }
+    if c.arrived_full {
+        detail["arrived_over_limit"] = json!(true);
+    }
+    if !c.checked.is_empty() {
+        detail["checked"] = json!(c.checked);
+    }
+    if let Some(outcome) = c.confirmed {
+        detail["confirmed"] = json!(outcome);
+    }
+    s.log_event(
+        kind::SWAP,
+        c.active.map(|a| a.id),
+        Some(c.target.id),
+        Some(c.reason.as_str()),
+        Some(detail),
+    )?;
+    Ok(())
+}
+
+/// Move the profile's login from `outgoing`'s to `incoming`'s for a change of relay mode (spec 4),
+/// with the swap lock held: main 6 steps 4 to 6 and 8. Under Claude Code's locks the profile's
+/// login is saved to `outgoing`'s row, then `incoming`'s stored login is written in its place,
+/// with a pending mark that carries `change` so `finish_dead_swap` settles a crash in between as
+/// a change of mode. The commit sets the mode; which account is active does not change.
+pub fn move_profile_login(
+    store: &Store,
+    paths: &Paths,
+    outgoing: i64,
+    incoming: i64,
+    change: RelayChange,
+) -> Result<()> {
+    if outgoing == incoming {
+        return Err(anyhow!("the profile already has that account's login"));
+    }
+    let incoming_account = store
+        .account(incoming)?
+        .ok_or_else(|| anyhow!("account {incoming} does not exist"))?;
+    let incoming_login = store
+        .credential(incoming)?
+        .ok_or_else(|| anyhow!("{} has no saved login", incoming_account.label))?;
+    // A removed account: the profile's login is nobody's in the pool, so it is not kept.
+    let outgoing_account = store.account(outgoing)?;
+    let now = time::now_ms();
+
+    let timeout = Duration::from_millis(store.settings()?.lock_timeout_ms);
+    let opts = LockOptions::claude(timeout);
+    let refresh_lock = DirLock::acquire(&paths.refresh_lock(), opts)
+        .context("taking Claude Code's refresh lock")?;
+    let legacy_lock = DirLock::acquire(&paths.legacy_refresh_lock(), opts)
+        .context("taking Claude Code's legacy refresh lock")?;
+    let storage_lock =
+        DirLock::acquire(&paths.storage_lock(), LockOptions::claude_storage(timeout))
+            .context("taking Claude Code's credentials write lock")?;
+
+    let creds = paths.credentials();
+    let previous = creds.read_oauth()?;
+    let foreign = store.meta(META_PROFILE_FOREIGN)?.as_deref() == Some("1");
+    // Like a swap: a login that changed unseen since it was identified is identified first.
+    if let (Some(account), Some(oauth)) = (&outgoing_account, &previous) {
+        let fp = credfile::oauth_fingerprint(oauth);
+        if !foreign
+            && !credfile::is_dead(oauth)
+            && fp.is_some()
+            && fp != store.credential_meta(account.id)?.map(|m| m.refresh_fp)
+            && creds.change_marker()? != store.meta(META_CRED_SEEN)?
+            && usage_check::identifies_logins(store, paths)?
+        {
+            return Err(anyhow!(
+                "the profile's login changed and needs identifying first. Try again in a minute."
+            ));
+        }
+    }
+    // A dead login is not stored over the one the account has.
+    if let Some(account) = outgoing_account.as_ref().filter(|_| !foreign)
+        && let Some(oauth) = previous.as_ref().filter(|o| !credfile::is_dead(o))
+    {
+        store.save_credential(account.id, oauth, "swap_out")?;
+    }
+
+    backup_daily(store, paths, now).context("backing up the profile's credentials")?;
+    let pending = PendingSwap {
+        fp: incoming_login.refresh_fp.clone(),
+        from: Some(outgoing),
+        to: incoming,
+        at: now,
+        relay: Some(change),
+    };
+    store.set_meta(META_SWAP_PENDING, serde_json::to_string(&pending)?)?;
+    if let Err(e) = creds.write_oauth(&incoming_login.oauth) {
+        if restore_outgoing(&creds, previous.as_ref(), &incoming_login.refresh_fp) {
+            let _ = store.delete_meta(META_SWAP_PENDING);
+        }
+        return Err(e);
+    }
+    let written_at = time::now_ms();
+    let marker = creds.change_marker().ok().flatten();
+
+    let committed = store.immediate(|s| {
+        relay::set_mode(s, change.home())?;
+        s.set_meta(META_PROFILE_FOREIGN, "0")?;
+        s.set_meta(META_LOGIN_WRITTEN_AT, written_at)?;
+        if let Some(marker) = &marker {
+            s.set_meta(META_CRED_SEEN, marker)?;
+        }
+        s.delete_meta(META_SWAP_PENDING)?;
+        s.log_event(
+            kind::RELAY_MODE,
+            Some(outgoing),
+            Some(incoming),
+            Some(change.as_str()),
+            Some(json!({ "home": change.home() })),
+        )?;
+        Ok(())
+    });
+    if let Err(e) = committed {
+        let restored = restore_outgoing(&creds, previous.as_ref(), &incoming_login.refresh_fp);
+        if restored {
+            let _ = store.delete_meta(META_SWAP_PENDING);
+        }
+        drop(storage_lock);
+        drop(legacy_lock);
+        drop(refresh_lock);
+        return Err(e.context(if restored {
+            "couldn't record the change of relay mode, so the previous login was put back"
+        } else {
+            "couldn't record the change of relay mode"
+        }));
+    }
+    drop(storage_lock);
+    drop(legacy_lock);
+    drop(refresh_lock);
+    Ok(())
 }
 
 /// What became of a fresh login of the active account (`install_active_login`).
@@ -1735,5 +2079,402 @@ pub(crate) fn convert_legacy_backups(files: &[std::path::PathBuf], key: &secret:
         if converted.is_ok() {
             let _ = std::fs::remove_file(file);
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+    use crate::relay;
+    use crate::store::AccountIdentity;
+
+    /// A pool of `a`, `b` and `c` in an in-memory store, with a scratch profile and data folder.
+    /// `a` is active and its login is in the profile, next to an MCP login.
+    pub(crate) struct Env {
+        _root: tempfile::TempDir,
+        pub paths: Paths,
+        pub store: Store,
+        pub a: i64,
+        pub b: i64,
+        pub c: i64,
+    }
+
+    /// A login whose access token expires `expires_in_ms` from now.
+    pub(crate) fn oauth_expiring(tag: &str, expires_in_ms: i64) -> serde_json::Value {
+        json!({
+            "accessToken": format!("access-{tag}"),
+            "refreshToken": format!("refresh-{tag}"),
+            "expiresAt": time::now_ms() + expires_in_ms,
+            "scopes": ["user:inference"],
+            "subscriptionType": "max",
+        })
+    }
+
+    pub(crate) fn oauth(tag: &str) -> serde_json::Value {
+        oauth_expiring(tag, 3_600_000)
+    }
+
+    impl Env {
+        pub(crate) fn new() -> Env {
+            let root = tempfile::tempdir().unwrap();
+            let data = root.path().join("data");
+            let profile = root.path().join("profile");
+            let home = root.path().join("home");
+            for dir in [&data, &profile, &home] {
+                std::fs::create_dir_all(dir).unwrap();
+            }
+            let paths = Paths::new(data.clone(), profile).with_home(home);
+            let store = Store::open_in_memory().unwrap();
+            // No check may run a real Claude Code.
+            store.set_setting("usage_checks", Some("false")).unwrap();
+            store
+                .set_setting("use_expiring_weekly", Some("false"))
+                .unwrap();
+            let nowhere = data.join("no-claude-here");
+            store
+                .set_setting("claude_path", Some(&nowhere.display().to_string()))
+                .unwrap();
+            let ident = |u: &str| AccountIdentity {
+                account_uuid: Some(u.into()),
+                email: Some(format!("{u}@x.test")),
+                org_uuid: Some("org-x".into()),
+                ..Default::default()
+            };
+            let a = store
+                .insert_account("a", &ident("ua"), AccountState::Active)
+                .unwrap();
+            let b = store
+                .insert_account("b", &ident("ub"), AccountState::Parked)
+                .unwrap();
+            let c = store
+                .insert_account("c", &ident("uc"), AccountState::Parked)
+                .unwrap();
+            store.save_credential(a, &oauth("a1"), "login").unwrap();
+            store.save_credential(b, &oauth("b1"), "login").unwrap();
+            store.save_credential(c, &oauth("c1"), "login").unwrap();
+            let env = Env {
+                _root: root,
+                paths,
+                store,
+                a,
+                b,
+                c,
+            };
+            env.write_profile(&oauth("a1"));
+            env
+        }
+
+        /// Put `oauth` in the profile, next to an MCP login.
+        pub(crate) fn write_profile(&self, oauth: &serde_json::Value) {
+            std::fs::write(
+                self.paths.credentials_file(),
+                serde_json::to_string(
+                    &json!({"mcpOAuth": {"srv|1": {"accessToken": "mcp"}}, "claudeAiOauth": oauth}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        }
+
+        pub(crate) fn profile_bytes(&self) -> Vec<u8> {
+            std::fs::read(self.paths.credentials_file()).unwrap()
+        }
+
+        pub(crate) fn profile_refresh(&self) -> String {
+            let doc: serde_json::Value = serde_json::from_slice(&self.profile_bytes()).unwrap();
+            assert_eq!(doc["mcpOAuth"], json!({"srv|1": {"accessToken": "mcp"}}));
+            doc["claudeAiOauth"]["refreshToken"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        }
+
+        pub(crate) fn stored_refresh(&self, id: i64) -> String {
+            self.store.credential(id).unwrap().unwrap().oauth["refreshToken"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        }
+
+        pub(crate) fn state(&self, id: i64) -> AccountState {
+            self.store.account(id).unwrap().unwrap().state
+        }
+
+        /// Make `active` the active account and the others parked.
+        pub(crate) fn activate(&self, active: i64) {
+            for id in [self.a, self.b, self.c] {
+                let state = if id == active {
+                    AccountState::Active
+                } else {
+                    AccountState::Parked
+                };
+                self.store.set_state(id, state).unwrap();
+            }
+        }
+
+        /// Relay mode on with `a` as home, `b` active, `a`'s login in the profile.
+        fn relay_on_b_active(&self) {
+            relay::set_mode(&self.store, Some(self.a)).unwrap();
+            self.activate(self.b);
+        }
+    }
+
+    fn manual(to: Option<i64>) -> SwapRequest {
+        SwapRequest {
+            from: None,
+            to,
+            reason: Reason::Manual,
+            wait: true,
+        }
+    }
+
+    fn no_renewal(_: &Store, _: &Paths, _: i64) -> Result<usage_check::CheckOutcome> {
+        panic!("no renewal expected")
+    }
+
+    #[test]
+    fn relay_swap_leaves_profile() {
+        let env = Env::new();
+        env.relay_on_b_active();
+        let before = env.profile_bytes();
+        let out = run_with(&env.store, &env.paths, &manual(Some(env.c)), &no_renewal).unwrap();
+        assert_eq!(
+            out,
+            SwapOutcome::Swapped {
+                from: Some(env.b),
+                to: env.c
+            }
+        );
+        assert_eq!(env.state(env.c), AccountState::Active);
+        assert_eq!(env.state(env.b), AccountState::Parked);
+        assert_eq!(env.state(env.a), AccountState::Parked);
+        assert_eq!(env.profile_bytes(), before, "the profile is not written");
+        assert_eq!(
+            env.stored_refresh(env.b),
+            "refresh-b1",
+            "nothing saved as b's"
+        );
+        let event = env.store.last_event_of(kind::SWAP).unwrap().unwrap();
+        assert_eq!(
+            (event.account_from, event.account_to),
+            (Some(env.b), Some(env.c))
+        );
+        assert!(pending_swap(&env.store).unwrap().is_none());
+        assert!(env.store.meta(META_SWAP_PENDING).unwrap().is_none());
+        assert!(env.store.meta(META_LOGIN_WRITTEN_AT).unwrap().is_none());
+        assert_eq!(relay::home(&env.store).unwrap(), Some(env.a));
+        assert!(!env.paths.refresh_lock().exists());
+    }
+
+    #[test]
+    fn relay_swap_renews_target() {
+        let env = Env::new();
+        env.relay_on_b_active();
+        // Within the 900 s margin.
+        env.store
+            .save_credential(env.c, &oauth_expiring("c1", 300_000), "login")
+            .unwrap();
+        let before = env.profile_bytes();
+        let calls = Cell::new(0);
+        let renew = |s: &Store, _: &Paths, id: i64| -> Result<usage_check::CheckOutcome> {
+            calls.set(calls.get() + 1);
+            assert_eq!(id, env.c);
+            assert_eq!(s.active_account()?.unwrap().id, env.b, "before the commit");
+            s.save_credential(id, &oauth("c2"), "renew")?;
+            Ok(usage_check::CheckOutcome::Read {
+                windows: Vec::new(),
+            })
+        };
+        let out = run_with(&env.store, &env.paths, &manual(Some(env.c)), &renew).unwrap();
+        assert_eq!(
+            out,
+            SwapOutcome::Swapped {
+                from: Some(env.b),
+                to: env.c
+            }
+        );
+        assert_eq!(calls.get(), 1);
+        assert_eq!(env.stored_refresh(env.c), "refresh-c2");
+        assert_eq!(env.profile_bytes(), before);
+    }
+
+    #[test]
+    fn relay_swap_refused_when_renewal_fails() {
+        let env = Env::new();
+        env.relay_on_b_active();
+        env.store
+            .save_credential(env.c, &oauth_expiring("c1", 300_000), "login")
+            .unwrap();
+        let calls = Cell::new(0);
+        let renew = |_: &Store, _: &Paths, _: i64| -> Result<usage_check::CheckOutcome> {
+            calls.set(calls.get() + 1);
+            Ok(usage_check::CheckOutcome::Failed {
+                why: "no network".into(),
+            })
+        };
+        assert!(run_with(&env.store, &env.paths, &manual(Some(env.c)), &renew).is_err());
+        assert_eq!(calls.get(), 1);
+        assert_eq!(env.state(env.b), AccountState::Active);
+        assert_eq!(env.state(env.c), AccountState::Parked);
+    }
+
+    #[test]
+    fn relay_swap_passes_over_an_account_it_cannot_renew() {
+        let env = Env::new();
+        env.relay_on_b_active();
+        // The home account is paused, so only c could take over, and its login can't be renewed.
+        env.store.set_state(env.a, AccountState::Paused).unwrap();
+        env.store
+            .save_credential(env.c, &oauth_expiring("c1", 300_000), "login")
+            .unwrap();
+        let renew = |_: &Store, _: &Paths, _: i64| -> Result<usage_check::CheckOutcome> {
+            Ok(usage_check::CheckOutcome::Failed {
+                why: "no network".into(),
+            })
+        };
+        let out = run_with(&env.store, &env.paths, &manual(None), &renew).unwrap();
+        let SwapOutcome::Skipped { why } = out else {
+            panic!("{out:?}");
+        };
+        assert!(why.contains("couldn't be renewed"), "{why}");
+        assert_eq!(env.state(env.b), AccountState::Active);
+        assert_eq!(env.state(env.c), AccountState::Parked);
+    }
+
+    #[test]
+    fn relay_swap_to_home() {
+        let env = Env::new();
+        env.relay_on_b_active();
+        // The home account's stored login is not what the relay uses: never renewed for a swap.
+        env.store
+            .save_credential(env.a, &oauth_expiring("a1", 60_000), "login")
+            .unwrap();
+        let before = env.profile_bytes();
+        let out = run_with(&env.store, &env.paths, &manual(Some(env.a)), &no_renewal).unwrap();
+        assert_eq!(
+            out,
+            SwapOutcome::Swapped {
+                from: Some(env.b),
+                to: env.a
+            }
+        );
+        assert_eq!(env.state(env.a), AccountState::Active);
+        assert_eq!(env.state(env.b), AccountState::Parked);
+        assert_eq!(env.profile_bytes(), before);
+    }
+
+    #[test]
+    fn relay_swap_at_a_refused_limit_holds_the_account_back() {
+        let env = Env::new();
+        env.relay_on_b_active();
+        let req = SwapRequest {
+            from: Some(env.b),
+            to: Some(env.c),
+            reason: Reason::LimitRefused,
+            wait: true,
+        };
+        run_with(&env.store, &env.paths, &req, &no_renewal).unwrap();
+        assert!(
+            env.store
+                .meta_i64(&left_at_stop_key(env.b))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn relay_changed_login_compares_with_home() {
+        let env = Env::new();
+        env.relay_on_b_active();
+        env.store.set_setting("usage_checks", Some("true")).unwrap();
+        if !usage_check::identifies_logins(&env.store, &env.paths).unwrap() {
+            eprintln!("skipped: a Keychain this test can't use");
+            return;
+        }
+        // The home account's stored login is the profile's: nothing changed.
+        assert!(changed_login(&env.store, &env.paths).unwrap().is_none());
+        // Claude Code renewed it in the profile: a change of the home account's login.
+        env.write_profile(&oauth("a2"));
+        let changed = changed_login(&env.store, &env.paths).unwrap().unwrap();
+        assert_eq!(changed.account.id, env.a);
+    }
+
+    fn pending_relay(env: &Env, from: i64, to: i64, change: RelayChange) {
+        let pending = PendingSwap {
+            fp: env.store.credential_meta(to).unwrap().unwrap().refresh_fp,
+            from: Some(from),
+            to,
+            at: time::now_ms(),
+            relay: Some(change),
+        };
+        env.store
+            .set_meta(META_SWAP_PENDING, serde_json::to_string(&pending).unwrap())
+            .unwrap();
+    }
+
+    #[test]
+    fn dead_relay_on_settles_mode() {
+        // `relay on` with home a, b active, stopped after writing a's login into the profile.
+        let env = Env::new();
+        env.activate(env.b);
+        pending_relay(&env, env.b, env.a, RelayChange::On { home: env.a });
+        env.write_profile(&oauth("a1"));
+        let settled = finish_dead_swap(&env.store, &env.paths, Settler::Locked).unwrap();
+        assert_eq!(settled, Settle::Settled);
+        assert_eq!(relay::home(&env.store).unwrap(), Some(env.a));
+        assert_eq!(env.state(env.b), AccountState::Active, "states left alone");
+        assert_eq!(env.state(env.a), AccountState::Parked);
+        assert!(pending_swap(&env.store).unwrap().is_none());
+        assert!(env.store.last_event_of(kind::SWAP).unwrap().is_none());
+
+        // Stopped before the write: the profile still has b's login.
+        let env = Env::new();
+        env.activate(env.b);
+        pending_relay(&env, env.b, env.a, RelayChange::On { home: env.a });
+        env.write_profile(&oauth("b1"));
+        let settled = finish_dead_swap(&env.store, &env.paths, Settler::Locked).unwrap();
+        assert_eq!(settled, Settle::Settled);
+        assert!(pending_swap(&env.store).unwrap().is_none());
+        assert_eq!(relay::home(&env.store).unwrap(), None);
+        assert_eq!(env.state(env.b), AccountState::Active);
+    }
+
+    #[test]
+    fn dead_relay_off_settles_mode() {
+        // `relay off` with home a, c active, stopped after writing c's login into the profile.
+        let env = Env::new();
+        relay::set_mode(&env.store, Some(env.a)).unwrap();
+        env.activate(env.c);
+        pending_relay(&env, env.a, env.c, RelayChange::Off);
+        env.write_profile(&oauth("c1"));
+        let settled = finish_dead_swap(&env.store, &env.paths, Settler::Tick).unwrap();
+        assert_eq!(settled, Settle::Settled);
+        assert_eq!(relay::home(&env.store).unwrap(), None);
+        assert_eq!(env.state(env.c), AccountState::Active);
+        assert!(pending_swap(&env.store).unwrap().is_none());
+    }
+
+    #[test]
+    fn an_old_pending_mark_still_reads() {
+        let raw = r#"{"fp":"x","from":1,"to":2,"at":5}"#;
+        let pending: PendingSwap = serde_json::from_str(raw).unwrap();
+        assert!(pending.relay.is_none());
+    }
+
+    #[test]
+    fn a_swap_with_relay_mode_off_still_writes_the_profile() {
+        let env = Env::new();
+        let out = run_with(&env.store, &env.paths, &manual(Some(env.b)), &no_renewal).unwrap();
+        assert_eq!(
+            out,
+            SwapOutcome::Swapped {
+                from: Some(env.a),
+                to: env.b
+            }
+        );
+        assert_eq!(env.profile_refresh(), "refresh-b1");
+        assert!(env.store.meta(META_LOGIN_WRITTEN_AT).unwrap().is_some());
     }
 }
