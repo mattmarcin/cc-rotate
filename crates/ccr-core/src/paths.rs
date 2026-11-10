@@ -81,6 +81,20 @@ impl Paths {
         self.data_dir.join("logs")
     }
 
+    /// Relay mode's port and secret: `<data dir>/relay.json`.
+    pub fn relay_config(&self) -> PathBuf {
+        self.data_dir.join("relay.json")
+    }
+
+    /// Held by the running relay: `<data dir>/relay.lock`.
+    pub fn relay_lock(&self) -> PathBuf {
+        self.data_dir.join("relay.lock")
+    }
+
+    pub fn relay_log(&self) -> PathBuf {
+        self.logs_dir().join("relay.log")
+    }
+
     pub fn credentials_file(&self) -> PathBuf {
         self.profile_dir.join(".credentials.json")
     }

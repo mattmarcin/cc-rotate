@@ -832,6 +832,8 @@ pub struct Settings {
     /// When every account is at a limit and the one in use has extra usage on, move to one
     /// without, so sessions wait for a reset instead of paying (`extra_usage`).
     pub avoid_extra_usage: bool,
+    /// Relay mode renews the home account's access token when it ends within this many seconds.
+    pub relay_renew_margin_s: i64,
 }
 
 pub const SETTING_KEYS: &[&str] = &[
@@ -851,6 +853,7 @@ pub const SETTING_KEYS: &[&str] = &[
     "login_warning_days",
     "strict_order",
     "avoid_extra_usage",
+    "relay_renew_margin_s",
 ];
 
 pub struct Store {
@@ -1299,6 +1302,7 @@ impl Store {
             avoid_extra_usage: get("avoid_extra_usage")?
                 .and_then(|v| parse_bool(&v))
                 .unwrap_or(false),
+            relay_renew_margin_s: int("relay_renew_margin_s", 900)?.clamp(60, 3600),
         })
     }
 
@@ -2754,6 +2758,7 @@ fn validate_setting(key: &str, value: &str) -> Result<Option<String>> {
             whole_in(value, MIN_CHECK_INTERVAL_S, 7 * DAY_S)?;
         }
         "usage_check_max_age_s" => whole_in(value, 0, 7 * DAY_S)?,
+        "relay_renew_margin_s" => whole_in(value, 60, 3600)?,
         // A relative path would be looked up from wherever cc-rotate runs, such as a project.
         "claude_path" | "profile_dir" => {
             if !std::path::Path::new(value).is_absolute() {
@@ -2832,6 +2837,22 @@ pub fn sanitize_label(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relay_settings() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(store.settings().unwrap().relay_renew_margin_s, 900);
+        assert!(
+            store
+                .set_setting("relay_renew_margin_s", Some("10"))
+                .is_err()
+        );
+        store
+            .set_setting("relay_renew_margin_s", Some("600"))
+            .unwrap();
+        assert_eq!(store.settings().unwrap().relay_renew_margin_s, 600);
+        assert!(store.set_setting("relay_mode", Some("on")).is_err());
+    }
 
     #[test]
     fn settings_are_bounded_and_paths_are_full() {
