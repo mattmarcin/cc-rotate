@@ -565,6 +565,18 @@ pub fn renew(store: &Store, paths: &Paths, account_id: i64) -> Result<CheckOutco
     check(store, paths, account_id, Trigger::Renew)
 }
 
+/// `renew` for a swap about to use the account: Claude Code gets a before-swap check's time, so
+/// a swap at a limit stays near its budget.
+pub fn renew_before_swap(store: &Store, paths: &Paths, account_id: i64) -> Result<CheckOutcome> {
+    check_with(store, paths, account_id, Trigger::Renew, &|scratch| {
+        run_claude(
+            &login::claude_executable(store)?,
+            scratch,
+            BEFORE_SWAP_TIMEOUT,
+        )
+    })
+}
+
 /// Check one account's usage with Claude Code's `/usage`.
 pub fn check(
     store: &Store,

@@ -1115,7 +1115,17 @@ pub fn active_since(store: &Store) -> Result<i64> {
 }
 
 pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcome> {
-    run_with(store, paths, req, &usage_check::renew)
+    run_with(store, paths, req, &usage_check::renew_before_swap)
+}
+
+/// Why a session the macOS Keychain is locked to (started over SSH) may not write the profile's
+/// login.
+pub const KEYCHAIN_LOCKED: &str = "this session can't use the macOS Keychain, which holds the profile's login (it was started over SSH). Swap from the Mac's desktop session.";
+
+/// Whether the profile's credentials can't be used in full (`Credentials::complete`): a Keychain
+/// locked to this session, where the file may hold a stale login.
+fn keychain_locked(complete: Result<bool>) -> bool {
+    !complete.unwrap_or(true)
 }
 
 /// Whether a stored login whose access token expires at `expires_at` (epoch ms) must be renewed
@@ -1124,7 +1134,7 @@ fn needs_renewal(expires_at: Option<i64>, now_ms: i64, margin_s: i64) -> bool {
     expires_at.is_none_or(|at| crate::relay_proto::renew_due(at, now_ms, margin_s))
 }
 
-/// `run`, with what renews a login in relay mode (`usage_check::renew`) given.
+/// `run`, with what renews a login in relay mode (`usage_check::renew_before_swap`) given.
 ///
 /// In relay mode (spec 6) a swap only changes which account is active: the profile keeps the
 /// home account's login, so it is not read, identified or written, and Claude Code's locks are
@@ -1153,10 +1163,9 @@ fn run_with(
     // A session the macOS Keychain is locked to (started over SSH) cannot write the profile's
     // login where Claude Code reads it: the file instead would leave the desktop session's
     // sessions on the old account. A relay-mode swap writes no login.
-    const KEYCHAIN_LOCKED: &str = "this session can't use the macOS Keychain, which holds the profile's login (it was started over SSH). Swap from the Mac's desktop session.";
     let mut keychain_checked = false;
     if relay::home(store)?.is_none() {
-        if !paths.credentials().complete().unwrap_or(true) {
+        if keychain_locked(paths.credentials().complete()) {
             return skip(store, req, KEYCHAIN_LOCKED);
         }
         keychain_checked = true;
@@ -1173,7 +1182,7 @@ fn run_with(
     }
     let relay_home = relay::home(store)?;
     if relay_home.is_none() {
-        if !keychain_checked && !paths.credentials().complete().unwrap_or(true) {
+        if !keychain_checked && keychain_locked(paths.credentials().complete()) {
             return skip(store, req, KEYCHAIN_LOCKED);
         }
         // A login that changed in the profile is identified first, so the swap below never
@@ -1737,17 +1746,40 @@ pub fn move_profile_login(
     if outgoing == incoming {
         return Err(anyhow!("the profile already has that account's login"));
     }
+    if keychain_locked(paths.credentials().complete()) {
+        return Err(anyhow!(KEYCHAIN_LOCKED));
+    }
     let incoming_account = store
         .account(incoming)?
         .ok_or_else(|| anyhow!("account {incoming} does not exist"))?;
-    let incoming_login = store
-        .credential(incoming)?
-        .ok_or_else(|| anyhow!("{} has no saved login", incoming_account.label))?;
     // A removed account: the profile's login is nobody's in the pool, so it is not kept.
     let outgoing_account = store.account(outgoing)?;
     let now = time::now_ms();
 
     let timeout = Duration::from_millis(store.settings()?.lock_timeout_ms);
+    // Like a swap's target: a check of the incoming account (or the relay's renewal of it) may
+    // be renewing its login in a scratch profile, which would leave the copy written into the
+    // profile dead. Its lock waits for that, and is held through the commit.
+    let account_lock =
+        DirLock::acquire(&paths.account_lock(incoming), LockOptions::claude(timeout))
+            .map_err(|e| anyhow!("couldn't lock {}'s login: {e}", incoming_account.label))?;
+    if let usage_check::Recovery::Busy(why) = usage_check::recover(store, paths, incoming)? {
+        return Err(anyhow!(
+            "{} can't be used now: {why}",
+            incoming_account.label
+        ));
+    }
+    if usage_check::state(store, incoming)?.held_back {
+        return Err(anyhow!(
+            "{} is on hold until a usage check confirms its login. Check its usage first.",
+            incoming_account.label
+        ));
+    }
+    // Read under the lock: a check that finished while it was awaited may have renewed it.
+    let incoming_login = store
+        .credential(incoming)?
+        .ok_or_else(|| anyhow!("{} has no saved login", incoming_account.label))?;
+
     let opts = LockOptions::claude(timeout);
     let refresh_lock = DirLock::acquire(&paths.refresh_lock(), opts)
         .context("taking Claude Code's refresh lock")?;
@@ -1825,6 +1857,7 @@ pub fn move_profile_login(
         drop(storage_lock);
         drop(legacy_lock);
         drop(refresh_lock);
+        drop(account_lock);
         return Err(e.context(if restored {
             "couldn't record the change of relay mode, so the previous login was put back"
         } else {
@@ -1834,6 +1867,7 @@ pub fn move_profile_login(
     drop(storage_lock);
     drop(legacy_lock);
     drop(refresh_lock);
+    drop(account_lock);
     Ok(())
 }
 
@@ -1848,11 +1882,17 @@ pub enum ActiveLogin {
     /// Not written: settling a swap that stopped half way made another account active, so the
     /// profile's login is that account's.
     NoLongerActive,
+    /// Not written: relay mode is on and the account is not the home account, whose login the
+    /// profile keeps. The relay uses the stored login.
+    NotHome,
 }
 
 /// Write a fresh login for the account that is already active (a re-login of the active
 /// account), under Claude Code's refresh locks like any swap. The fresh login is stored for the
 /// account before this is called, so when it is not written, nothing is lost.
+///
+/// In relay mode the profile's login is the home account's: only the home account's fresh login
+/// is written, whether or not it is active.
 pub fn install_active_login(
     store: &Store,
     paths: &Paths,
@@ -1864,8 +1904,15 @@ pub fn install_active_login(
     if finish_dead_swap(store, paths, Settler::Locked)? == Settle::Unsure {
         return Ok(ActiveLogin::Unidentified);
     }
-    if store.active_account()?.map(|a| a.id) != Some(account_id) {
-        return Ok(ActiveLogin::NoLongerActive);
+    match relay::home(store)? {
+        // Not stored again either: a check may have renewed it since the caller stored it.
+        Some(home) if home != account_id => return Ok(ActiveLogin::NotHome),
+        Some(_) => {}
+        None => {
+            if store.active_account()?.map(|a| a.id) != Some(account_id) {
+                return Ok(ActiveLogin::NoLongerActive);
+            }
+        }
     }
     // Stored again under the swap lock: an identification of the profile's previous login may
     // have stored that one over it meanwhile, and the profile and the store must agree.
@@ -2454,6 +2501,41 @@ pub(crate) mod tests {
         assert_eq!(relay::home(&env.store).unwrap(), None);
         assert_eq!(env.state(env.c), AccountState::Active);
         assert!(pending_swap(&env.store).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_locked_keychain_is_refused() {
+        assert!(keychain_locked(Ok(false)));
+        assert!(!keychain_locked(Ok(true)));
+        // As before: a Keychain that can't be asked is not taken for a locked one.
+        assert!(!keychain_locked(Err(anyhow!("security failed"))));
+    }
+
+    #[test]
+    fn relay_install_active_login_writes_only_home() {
+        let env = Env::new();
+        env.relay_on_b_active();
+        let before = env.profile_bytes();
+        env.store
+            .save_credential(env.b, &oauth("b-fresh"), "login")
+            .unwrap();
+        let out = install_active_login(&env.store, &env.paths, env.b, &oauth("b-fresh")).unwrap();
+        assert_eq!(out, ActiveLogin::NotHome);
+        assert_eq!(
+            env.profile_bytes(),
+            before,
+            "the home account's login stays"
+        );
+        assert_eq!(env.stored_refresh(env.b), "refresh-b-fresh");
+
+        // The home account's fresh login goes into the profile, though it isn't active.
+        env.store
+            .save_credential(env.a, &oauth("a-fresh"), "login")
+            .unwrap();
+        let out = install_active_login(&env.store, &env.paths, env.a, &oauth("a-fresh")).unwrap();
+        assert_eq!(out, ActiveLogin::Written);
+        assert_eq!(env.profile_refresh(), "refresh-a-fresh");
+        assert_eq!(env.state(env.b), AccountState::Active);
     }
 
     #[test]

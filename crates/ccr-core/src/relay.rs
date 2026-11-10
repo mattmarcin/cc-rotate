@@ -533,6 +533,29 @@ mod tests {
         }
 
         #[test]
+        fn turn_on_refused_while_home_is_locked() {
+            let env = Env::new();
+            env.activate(env.b);
+            env.write_profile(&oauth("b2"));
+            env.store
+                .set_setting("lock_timeout_ms", Some("200"))
+                .unwrap();
+            // A check of the home account is renewing its login.
+            let _check = crate::lock::DirLock::acquire(
+                &env.paths.account_lock(env.a),
+                crate::lock::LockOptions::claude(std::time::Duration::ZERO),
+            )
+            .unwrap();
+            let before = env.profile_bytes();
+            assert!(turn_on(&env.store, &env.paths, env.a).is_err());
+            assert_eq!(env.profile_bytes(), before);
+            assert_eq!(env.stored_refresh(env.b), "refresh-b1", "nothing saved");
+            assert_eq!(home(&env.store).unwrap(), None);
+            assert!(swap::pending_swap(&env.store).unwrap().is_none());
+            assert!(!env.paths.refresh_lock().exists());
+        }
+
+        #[test]
         fn turn_on_moves_home() {
             // Already on with home a and c active: the new home b's login replaces a's.
             let env = Env::new();
