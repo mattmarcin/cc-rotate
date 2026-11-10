@@ -178,6 +178,58 @@ fn log_mode(s: &Store, account: i64, change: RelayChange) -> Result<()> {
     Ok(())
 }
 
+/// Meta key prefix of a session whose status line runs without the relay's address.
+pub const META_BYPASS_PREFIX: &str = "relay_bypass:";
+
+/// How long a session's report without the relay's address counts (spec 4).
+pub const BYPASS_WINDOW_MS: i64 = 10 * 60_000;
+
+/// Record that `session_id`'s status line ran at `now_ms` without the relay's address: the session
+/// bypasses the relay and runs on the home account directly.
+pub fn note_bypass(store: &Store, session_id: &str, now_ms: i64) -> Result<()> {
+    store.set_meta(&format!("{META_BYPASS_PREFIX}{session_id}"), now_ms)
+}
+
+/// How many sessions reported without the relay's address in the 10 minutes before `now_ms`.
+pub fn bypass_count(store: &Store, now_ms: i64) -> Result<usize> {
+    let count: i64 = store.conn().query_row(
+        "SELECT COUNT(*) FROM meta WHERE substr(key, 1, ?1) = ?2
+             AND CAST(value AS INTEGER) > ?3 AND CAST(value AS INTEGER) <= ?4",
+        params![
+            META_BYPASS_PREFIX.len() as i64,
+            META_BYPASS_PREFIX,
+            now_ms - BYPASS_WINDOW_MS,
+            now_ms
+        ],
+        |r| r.get(0),
+    )?;
+    Ok(count as usize)
+}
+
+/// Forget the sessions that last reported without the relay's address 10 minutes or more before
+/// `now_ms` (`Store::prune`).
+pub(crate) fn prune_bypass(store: &Store, now_ms: i64) -> Result<()> {
+    store.conn().execute(
+        "DELETE FROM meta WHERE substr(key, 1, ?1) = ?2 AND CAST(value AS INTEGER) <= ?3",
+        params![
+            META_BYPASS_PREFIX.len() as i64,
+            META_BYPASS_PREFIX,
+            now_ms - BYPASS_WINDOW_MS
+        ],
+    )?;
+    Ok(())
+}
+
+/// Whether a session with this environment bypasses the relay: its `ANTHROPIC_BASE_URL` is not
+/// the relay's address. Without a readable `relay.json`, only a session without the variable does.
+pub fn bypasses(cfg: Option<&RelayConfig>, base_url: Option<&str>) -> bool {
+    match (cfg, base_url) {
+        (_, None) => true,
+        (Some(cfg), Some(url)) => url != cfg.base_url(),
+        (None, Some(_)) => false,
+    }
+}
+
 /// What `relay.json` holds: the port the relay listens on and the secret in its address.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelayConfig {
@@ -365,6 +417,43 @@ mod tests {
         set_mode(&store, None).unwrap();
         assert_eq!(home(&store).unwrap(), None);
         assert_eq!(store.setting(SETTING_HOME).unwrap(), None);
+    }
+
+    #[test]
+    fn bypass_counted_and_pruned() {
+        let store = Store::open_in_memory().unwrap();
+        let now = 1_800_000_000_000;
+        note_bypass(&store, "s1", now - BYPASS_WINDOW_MS).unwrap();
+        note_bypass(&store, "s2", now - 60_000).unwrap();
+        note_bypass(&store, "s3", now).unwrap();
+        note_bypass(&store, "s3", now).unwrap();
+        assert_eq!(bypass_count(&store, now).unwrap(), 2);
+        store.prune(now).unwrap();
+        assert_eq!(
+            store.meta(&format!("{META_BYPASS_PREFIX}s1")).unwrap(),
+            None
+        );
+        assert!(
+            store
+                .meta(&format!("{META_BYPASS_PREFIX}s2"))
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(bypass_count(&store, now + BYPASS_WINDOW_MS).unwrap(), 0);
+    }
+
+    #[test]
+    fn bypass_rule() {
+        let cfg = RelayConfig {
+            port: 50000,
+            secret: "s".repeat(64),
+        };
+        let url = cfg.base_url();
+        assert!(!bypasses(Some(&cfg), Some(&url)));
+        assert!(bypasses(Some(&cfg), None));
+        assert!(bypasses(Some(&cfg), Some("https://api.anthropic.com")));
+        assert!(bypasses(None, None));
+        assert!(!bypasses(None, Some(&url)));
     }
 
     #[test]

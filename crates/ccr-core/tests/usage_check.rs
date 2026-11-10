@@ -585,6 +585,7 @@ fn a_second_login_of_the_account_the_config_names_is_not_stored_as_the_active_ac
         &e.paths,
         &statusline::StatusInput::default(),
         time::now_ms(),
+        |_| None,
     )
     .unwrap();
     assert!(

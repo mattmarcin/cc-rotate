@@ -483,6 +483,7 @@ fn a_woken_session_reporting_usage_is_resumed_and_a_silent_one_is_stuck() {
         &e.paths,
         &input("busy", 12.0, b_resets),
         time::now_ms(),
+        |_| None,
     )
     .unwrap();
     let busy = e.store.waiting_session("busy").unwrap().unwrap();

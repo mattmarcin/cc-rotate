@@ -1003,7 +1003,9 @@ fn statusline_entry(profile: Option<PathBuf>, observe: bool, then: Option<String
             statusline::observe(&store, &dir, &paths.home, &input, time::now_ms())?;
             return Ok(None);
         }
-        let result = statusline::tick(&store, &paths, &input, time::now_ms())?;
+        let result = statusline::tick(&store, &paths, &input, time::now_ms(), |name| {
+            std::env::var(name).ok()
+        })?;
         if let Some(req) = &result.swap {
             process::spawn_swap(req, profile.as_deref())?;
         } else if result.settle_login {

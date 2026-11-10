@@ -2119,6 +2119,7 @@ impl Store {
                  AND key NOT IN (SELECT project_key FROM project_sessions)",
             [],
         )?;
+        crate::relay::prune_bypass(self, now_ms)?;
         self.set_meta("last_prune_at", now_ms)
     }
 

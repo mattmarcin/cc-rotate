@@ -13,8 +13,11 @@ use serde_json::{Value, json};
 
 use crate::paths::Paths;
 use crate::profile_account;
+use crate::relay::{self, RelayConfig};
 use crate::scheduler::{self, Reason, Timing};
-use crate::store::{Account, NAMED_PROCESS_PREFIX, Sample, SampleWindow, Store, kind};
+use crate::store::{
+    Account, AccountState, NAMED_PROCESS_PREFIX, Sample, SampleWindow, Store, kind,
+};
 use crate::swap::{
     self, META_CRED_SEEN, META_LAST_SWAP_AT, META_PROFILE_FOREIGN, META_PROFILE_MODEL,
     STALE_SAMPLE_GUARD_MS, SwapRequest,
@@ -193,7 +196,15 @@ pub struct TickResult {
 }
 
 /// One statusline tick in the rotation profile.
-pub fn tick(store: &Store, paths: &Paths, input: &StatusInput, now_ms: i64) -> Result<TickResult> {
+///
+/// `env` looks up a variable of the session's environment, which the status line inherits.
+pub fn tick(
+    store: &Store,
+    paths: &Paths,
+    input: &StatusInput,
+    now_ms: i64,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<TickResult> {
     let mut result = TickResult::default();
     let mut dead_login = false;
     let mut unidentified = false;
@@ -208,6 +219,12 @@ pub fn tick(store: &Store, paths: &Paths, input: &StatusInput, now_ms: i64) -> R
             "0"
         },
     )?;
+
+    // In relay mode the relay records usage and asks for threshold swaps (spec 7).
+    let relay_mode = relay::home(store)?.is_some();
+    if relay_mode {
+        note_relay_bypass(store, paths, input, &env, now_ms)?;
+    }
 
     let process = process_key(store, input, now_ms)?;
     if !sync_profile_login(store, paths, &mut dead_login, &mut unidentified)? {
@@ -238,9 +255,13 @@ pub fn tick(store: &Store, paths: &Paths, input: &StatusInput, now_ms: i64) -> R
     }
     // What the session added to its cost since its last reading was spent on the account in
     // use, unless its reading is another account's: then the request still carried that one's
-    // login.
+    // login. In relay mode the readings are not recorded: a session's own tracker mixes
+    // accounts after a swap, since its login never changes.
     let mut cost_account = active.id;
-    if let Some(sample) = input.sample_for(active.id, crate::store::ROTATION_PROFILE, now_ms) {
+    let reading = input
+        .sample_for(active.id, crate::store::ROTATION_PROFILE, now_ms)
+        .filter(|_| !relay_mode);
+    if let Some(sample) = reading {
         if idle_since_swap(store, input, &process, &sample, now_ms)? {
             // The numbers of the account the session used before; it has not had a response
             // since.
@@ -283,7 +304,7 @@ pub fn tick(store: &Store, paths: &Paths, input: &StatusInput, now_ms: i64) -> R
         store.set_meta(META_SWAP_REQUESTED_AT, now_ms)?;
         result.pool_exhausted = true;
         result.swap = Some(req);
-    } else if let Some(reason) = scheduler::decide(&pool, policy, timing, dead_login, true) {
+    } else if let Some(reason) = scheduler::decide(&pool, policy, timing, dead_login, !relay_mode) {
         if reason != Reason::PreferredAvailable {
             result.pool_exhausted =
                 scheduler::pick(&pool, policy, Some(active.id), now_ms / 1000).is_none();
@@ -322,6 +343,25 @@ pub fn tick(store: &Store, paths: &Paths, input: &StatusInput, now_ms: i64) -> R
     crate::health::scan_from_tick(store, now_ms)?;
     result.active = store.active_account()?;
     Ok(result)
+}
+
+/// In relay mode, record a session whose `ANTHROPIC_BASE_URL` is not the relay's address: it
+/// runs on the home account directly (spec 4). An unreadable `relay.json` does not fail the tick.
+fn note_relay_bypass(
+    store: &Store,
+    paths: &Paths,
+    input: &StatusInput,
+    env: &impl Fn(&str) -> Option<String>,
+    now_ms: i64,
+) -> Result<()> {
+    let Some(session) = input.session_id.as_deref().filter(|s| !s.is_empty()) else {
+        return Ok(());
+    };
+    let cfg = RelayConfig::read(&paths.relay_config()).ok().flatten();
+    if relay::bypasses(cfg.as_ref(), env(relay::ENV_BASE_URL).as_deref()) {
+        relay::note_bypass(store, session, now_ms)?;
+    }
+    Ok(())
 }
 
 /// A fresh reading of the account in use from a session stopped at a usage limit, with room,
@@ -711,8 +751,13 @@ pub fn sync_at(store: &Store, paths: &Paths, now_ms: i64) -> Result<Option<SwapR
     }))
 }
 
-/// Keep the store's copy of the active login current, and notice when the login in the
-/// profile changed for reasons other than our own swaps.
+/// Keep the store's copy of the profile's login current, and notice when the login in the
+/// profile changed for reasons other than our own swaps. The profile's login is the active
+/// account's, or the home account's in relay mode (`relay::profile_account`).
+///
+/// A dead login sets `dead_login`, so the tick asks for a swap away from the account. In relay
+/// mode, when the dead login is the home account's and another account is active, the home
+/// account is marked signed out instead: no swap can fix it, since every session needs it.
 /// Returns false when nothing could be synced because a swap stopped half way and the profile's
 /// login is not identified yet. Sets `unidentified` when the login changed without cc-rotate
 /// writing it and waits for Claude Code to say whose it is (`swap::identify_changed_login`).
@@ -748,24 +793,34 @@ fn sync_profile_login(
     if file_fp.is_some() && swap::pending_swap(store)?.map(|p| p.fp) == file_fp {
         return Ok(true);
     }
-    let Some(active) = store.active_account()? else {
+    let Some(owner) = relay::profile_account(store)? else {
         store.set_meta(META_CRED_SEEN, &marker)?;
         return Ok(true);
     };
 
     if credfile::is_dead(&oauth) {
-        *dead_login = true;
+        let home_only = relay::home(store)?.is_some()
+            && store.active_account()?.is_none_or(|a| a.id != owner.id);
         if store.meta(META_DEAD_LOGIN_SEEN)?.as_deref() != Some(marker.as_str()) {
             store.log_event(
                 kind::DEAD_LOGIN,
-                Some(active.id),
+                Some(owner.id),
                 None,
                 Some("refresh_rejected"),
                 None,
             )?;
             store.set_meta(META_DEAD_LOGIN_SEEN, &marker)?;
         }
-        // Leave the change unseen so every tick keeps requesting a swap until one lands.
+        if home_only {
+            // `doctor` reports it until the home account is signed in again.
+            if owner.state != AccountState::NeedsLogin {
+                store.set_state(owner.id, AccountState::NeedsLogin)?;
+            }
+        } else {
+            *dead_login = true;
+        }
+        // Leave the change unseen so every tick keeps requesting a swap until one lands, or, for
+        // the home account, until it is signed in again.
         return Ok(true);
     }
 
@@ -774,9 +829,9 @@ fn sync_profile_login(
     if creds.change_marker()?.as_deref() != Some(marker.as_str()) {
         return Ok(true);
     }
-    let stored_fp = store.credential_meta(active.id)?.map(|m| m.refresh_fp);
+    let stored_fp = store.credential_meta(owner.id)?.map(|m| m.refresh_fp);
     if file_fp.is_some() && file_fp != stored_fp {
-        // A login cc-rotate did not write: a renewal of the active account's, or a `/login` that
+        // A login cc-rotate did not write: a renewal of the profile's account's, or a `/login` that
         // `.claude.json` does not reveal after a swap (F14). Left unseen until Claude Code says
         // whose it is, unless logins are not identified.
         if crate::usage_check::identifies_logins(store, paths)? {
@@ -789,16 +844,17 @@ fn sync_profile_login(
             }
             return Ok(true);
         }
-        store.save_credential(active.id, &oauth, "sync")?;
-        store.log_event(kind::SYNC, Some(active.id), None, Some("refreshed"), None)?;
+        store.save_credential(owner.id, &oauth, "sync")?;
+        store.log_event(kind::SYNC, Some(owner.id), None, Some("refreshed"), None)?;
     }
     store.set_meta(META_CRED_SEEN, &marker)?;
     Ok(true)
 }
 
 /// If someone ran `/login` inside the rotation profile, `.claude.json` names a different
-/// account. When that account is in the pool, make it active and store its new login; when it
-/// is not, record the foreign login once and stop syncing until it changes back.
+/// account than the profile's (`relay::profile_account`). When that account is in the pool, make
+/// it active (the home account in relay mode, `swap::adopt_login`) and store its new login; when
+/// it is not, record the foreign login once and stop syncing until it changes back.
 ///
 /// Returns true when the tick must not sync the credentials this time.
 fn adopt_manual_login(store: &Store, paths: &Paths) -> Result<bool> {
@@ -825,8 +881,8 @@ fn adopt_manual_login(store: &Store, paths: &Paths) -> Result<bool> {
         return Ok(false);
     }
 
-    let active = store.active_account()?;
-    if active.as_ref().and_then(|a| a.account_uuid.as_deref()) == Some(uuid.as_str()) {
+    let owner = relay::profile_account(store)?;
+    if owner.as_ref().and_then(|a| a.account_uuid.as_deref()) == Some(uuid.as_str()) {
         return Ok(false);
     }
 
@@ -837,7 +893,7 @@ fn adopt_manual_login(store: &Store, paths: &Paths) -> Result<bool> {
             // `/login` wrote `.claude.json` when it changed the login.
             let changed_at = mtime.min(crate::time::now_ms());
             store.immediate(|s| {
-                swap::adopt_login(s, active.as_ref(), &account, oauth.as_ref(), changed_at)
+                swap::adopt_login(s, owner.as_ref(), &account, oauth.as_ref(), changed_at)
             })?;
             if let Some(marker) = creds.change_marker()? {
                 store.set_meta(META_CRED_SEEN, &marker)?;
@@ -847,7 +903,7 @@ fn adopt_manual_login(store: &Store, paths: &Paths) -> Result<bool> {
         None => {
             store.log_event(
                 kind::FOREIGN_LOGIN,
-                active.as_ref().map(|a| a.id),
+                owner.as_ref().map(|a| a.id),
                 None,
                 Some("login_in_profile"),
                 Some(json!({ "account_uuid": uuid })),
@@ -954,5 +1010,304 @@ mod tests {
     fn tolerates_garbage() {
         assert!(StatusInput::parse("not json").rate_limits.is_none());
         assert!(StatusInput::parse("{}").rate_limits.is_none());
+    }
+
+    mod relay_mode {
+        use super::super::*;
+        use crate::relay::{self, RelayConfig};
+        use crate::store::AccountState;
+        use crate::swap::tests::{Env, oauth};
+
+        const PORT: u16 = 51234;
+        const SECRET: &str = "0123456789abcdef0123456789abcdef";
+
+        /// Relay mode on with `a` as home and `b` active, `a`'s login in the profile, and
+        /// `relay.json` written.
+        fn relay_env() -> Env {
+            let env = home_active_env();
+            env.activate(env.b);
+            env
+        }
+
+        /// Relay mode on with `a` as home and active, and `relay.json` written.
+        fn home_active_env() -> Env {
+            let env = Env::new();
+            relay::set_mode(&env.store, Some(env.a)).unwrap();
+            std::fs::write(
+                env.paths.relay_config(),
+                serde_json::to_vec(&RelayConfig {
+                    port: PORT,
+                    secret: SECRET.into(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            env
+        }
+
+        /// The environment of a session started through the relay.
+        fn through_relay(name: &str) -> Option<String> {
+            let cfg = RelayConfig {
+                port: PORT,
+                secret: SECRET.into(),
+            };
+            (name == relay::ENV_BASE_URL).then(|| cfg.base_url())
+        }
+
+        fn no_env(_: &str) -> Option<String> {
+            None
+        }
+
+        fn input(session: &str, five_hour: f64, cost: f64) -> StatusInput {
+            StatusInput::parse(&format!(
+                r#"{{"session_id":"{session}","model":{{"id":"claude-opus-4-1"}},
+                    "version":"2.1.320","cost":{{"total_cost_usd":{cost}}},
+                    "rate_limits":{{"five_hour":{{"used_percentage":{five_hour},"resets_at":{}}}}}}}"#,
+                crate::time::now_s() + 3600
+            ))
+        }
+
+        #[test]
+        fn relay_tick_records_no_windows() {
+            let env = relay_env();
+            let now = crate::time::now_ms();
+            tick(
+                &env.store,
+                &env.paths,
+                &input("s1", 40.0, 1.0),
+                now,
+                through_relay,
+            )
+            .unwrap();
+            tick(
+                &env.store,
+                &env.paths,
+                &input("s1", 41.0, 3.0),
+                now + 1000,
+                through_relay,
+            )
+            .unwrap();
+            assert!(env.store.last_sample(env.a).unwrap().is_none());
+            assert!(env.store.last_sample(env.b).unwrap().is_none());
+            // The model and the cost are still recorded, the cost for the active account.
+            assert_eq!(
+                env.store.meta(META_PROFILE_MODEL).unwrap().as_deref(),
+                Some("claude-opus-4-1")
+            );
+            let (from, to) = (now / 1000 - 7200, now / 1000 + 7200);
+            assert!(
+                env.store
+                    .account_cost_between(env.b, from, to)
+                    .unwrap()
+                    .is_some_and(|c| c > 0.0)
+            );
+            assert_eq!(
+                env.store.account_cost_between(env.a, from, to).unwrap(),
+                None
+            );
+        }
+
+        #[test]
+        fn relay_tick_no_threshold_swap() {
+            let env = relay_env();
+            let now = crate::time::now_ms();
+            env.store
+                .record_sample(&Sample {
+                    ts: now - 1000,
+                    account_id: env.b,
+                    profile: "relay".into(),
+                    session_id: None,
+                    model: None,
+                    windows: vec![SampleWindow {
+                        name: "five_hour".into(),
+                        pct: 99.0,
+                        resets_at: Some(now / 1000 + 3600),
+                    }],
+                })
+                .unwrap();
+            let r = tick(
+                &env.store,
+                &env.paths,
+                &input("s1", 99.0, 1.0),
+                now,
+                through_relay,
+            )
+            .unwrap();
+            assert!(r.swap.is_none(), "{:?}", r.swap);
+            assert!(!r.confirm);
+        }
+
+        #[test]
+        fn relay_dead_home_login_marks_home() {
+            let env = relay_env();
+            let now = crate::time::now_ms();
+            env.write_profile(&serde_json::json!({
+                "accessToken": "", "refreshToken": "", "expiresAt": 0
+            }));
+            let r = tick(
+                &env.store,
+                &env.paths,
+                &StatusInput::default(),
+                now,
+                through_relay,
+            )
+            .unwrap();
+            assert!(r.swap.is_none(), "{:?}", r.swap);
+            assert_eq!(env.state(env.a), AccountState::NeedsLogin);
+            assert_eq!(env.state(env.b), AccountState::Active);
+            let event = env.store.last_event_of(kind::DEAD_LOGIN).unwrap().unwrap();
+            assert_eq!(event.account_from, Some(env.a));
+            // The next tick neither asks for a swap nor logs it again.
+            let r = tick(
+                &env.store,
+                &env.paths,
+                &StatusInput::default(),
+                now + 1000,
+                through_relay,
+            )
+            .unwrap();
+            assert!(r.swap.is_none());
+            assert_eq!(env.state(env.b), AccountState::Active);
+        }
+
+        #[test]
+        fn relay_dead_login_of_an_active_home_asks_for_a_swap() {
+            let env = home_active_env();
+            env.write_profile(&serde_json::json!({
+                "accessToken": "", "refreshToken": "", "expiresAt": 0
+            }));
+            let r = tick(
+                &env.store,
+                &env.paths,
+                &StatusInput::default(),
+                crate::time::now_ms(),
+                through_relay,
+            )
+            .unwrap();
+            let req = r
+                .swap
+                .expect("a dead login of the account in use asks for a swap");
+            assert_eq!(req.reason, Reason::DeadLogin);
+            assert_eq!(req.from, Some(env.a));
+        }
+
+        #[test]
+        fn relay_writeback_to_home() {
+            let env = relay_env();
+            let now = crate::time::now_ms();
+            tick(
+                &env.store,
+                &env.paths,
+                &StatusInput::default(),
+                now,
+                through_relay,
+            )
+            .unwrap();
+            // Claude Code renewed the home account's login in the profile.
+            env.write_profile(&oauth("a2"));
+            tick(
+                &env.store,
+                &env.paths,
+                &StatusInput::default(),
+                now + 1000,
+                through_relay,
+            )
+            .unwrap();
+            assert_eq!(env.stored_refresh(env.a), "refresh-a2");
+            assert_eq!(env.stored_refresh(env.b), "refresh-b1");
+            assert_eq!(env.state(env.b), AccountState::Active);
+        }
+
+        #[test]
+        fn relay_login_of_the_active_account_makes_it_home() {
+            let env = relay_env();
+            let config = env.paths.profile_config();
+            let write_config = |uuid: &str| {
+                std::fs::write(
+                    &config,
+                    serde_json::json!({"oauthAccount": {"accountUuid": uuid}}).to_string(),
+                )
+                .unwrap();
+            };
+            write_config("ua");
+            let now = crate::time::now_ms();
+            tick(
+                &env.store,
+                &env.paths,
+                &StatusInput::default(),
+                now,
+                through_relay,
+            )
+            .unwrap();
+            // A `/login` as `b`, the active account, inside the profile.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            env.write_profile(&oauth("b-manual"));
+            write_config("ub");
+            tick(
+                &env.store,
+                &env.paths,
+                &StatusInput::default(),
+                now + 1000,
+                through_relay,
+            )
+            .unwrap();
+            assert_eq!(relay::home(&env.store).unwrap(), Some(env.b));
+            assert_eq!(env.stored_refresh(env.b), "refresh-b-manual");
+            assert_eq!(env.stored_refresh(env.a), "refresh-a1");
+            assert_eq!(env.state(env.b), AccountState::Active);
+            let event = env
+                .store
+                .last_event_of(kind::ADOPTED_LOGIN)
+                .unwrap()
+                .unwrap();
+            assert_eq!(event.account_from, Some(env.a));
+        }
+
+        #[test]
+        fn relay_bypass_counted() {
+            let env = relay_env();
+            let now = crate::time::now_ms();
+            tick(
+                &env.store,
+                &env.paths,
+                &input("through", 10.0, 1.0),
+                now,
+                through_relay,
+            )
+            .unwrap();
+            assert_eq!(relay::bypass_count(&env.store, now).unwrap(), 0);
+            tick(
+                &env.store,
+                &env.paths,
+                &input("bypass", 10.0, 1.0),
+                now,
+                no_env,
+            )
+            .unwrap();
+            let other_url = |name: &str| {
+                (name == relay::ENV_BASE_URL).then(|| "https://api.anthropic.com".to_string())
+            };
+            tick(
+                &env.store,
+                &env.paths,
+                &input("elsewhere", 10.0, 1.0),
+                now,
+                other_url,
+            )
+            .unwrap();
+            assert_eq!(relay::bypass_count(&env.store, now).unwrap(), 2);
+            assert_eq!(
+                relay::bypass_count(&env.store, now + 10 * 60_000).unwrap(),
+                0
+            );
+        }
+
+        #[test]
+        fn no_bypass_counted_outside_relay_mode() {
+            let env = Env::new();
+            let now = crate::time::now_ms();
+            tick(&env.store, &env.paths, &input("s1", 10.0, 1.0), now, no_env).unwrap();
+            assert_eq!(relay::bypass_count(&env.store, now).unwrap(), 0);
+        }
     }
 }
