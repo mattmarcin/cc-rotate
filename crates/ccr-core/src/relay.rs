@@ -412,6 +412,43 @@ pub fn answers(port: u16) -> bool {
     .is_ok()
 }
 
+/// The version of the relay that answers on `cfg`'s port, from its answer to
+/// `GET /r/<secret>/__ccr/version` (`relay_proto::Route::Version`): `None` when nothing answers
+/// within a second, or something does but not with a version.
+pub fn running_version(cfg: &RelayConfig) -> Option<String> {
+    use std::io::{Read, Write};
+    use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+    use std::time::Duration;
+    let timeout = Duration::from_secs(1);
+    let mut tcp =
+        TcpStream::connect_timeout(&SocketAddr::from((Ipv4Addr::LOCALHOST, cfg.port)), timeout)
+            .ok()?;
+    tcp.set_read_timeout(Some(timeout)).ok()?;
+    tcp.set_write_timeout(Some(timeout)).ok()?;
+    let request = format!(
+        "GET /r/{}{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+        cfg.secret,
+        crate::relay_proto::VERSION_PATH,
+        cfg.port
+    );
+    tcp.write_all(request.as_bytes()).ok()?;
+    let mut answer = Vec::new();
+    tcp.take(4096).read_to_end(&mut answer).ok()?;
+    version_from_answer(&String::from_utf8_lossy(&answer))
+}
+
+/// The version in a raw HTTP/1.1 answer: a 200 whose body is one short line of plain text.
+fn version_from_answer(answer: &str) -> Option<String> {
+    let (head, body) = answer.split_once("\r\n\r\n")?;
+    let status = head.lines().next()?;
+    if !status.starts_with("HTTP/1.1 200 ") {
+        return None;
+    }
+    let version = body.trim();
+    (!version.is_empty() && version.len() <= 64 && !version.contains(char::is_whitespace))
+        .then(|| version.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -766,5 +803,46 @@ mod tests {
         assert!(answers(port));
         drop(l);
         assert!(!answers(port));
+    }
+
+    #[test]
+    fn running_version_asks_with_the_secret() {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let cfg = RelayConfig {
+            port: l.local_addr().unwrap().port(),
+            secret: "s".repeat(64),
+        };
+        let expected = format!("GET /r/{}/__ccr/version HTTP/1.1\r\n", cfg.secret);
+        let server = std::thread::spawn(move || {
+            let (mut tcp, _) = l.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let n = tcp.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+            tcp.write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 6\r\n\r\n1.2.3\n",
+            )
+            .unwrap();
+            request
+        });
+        assert_eq!(running_version(&cfg).as_deref(), Some("1.2.3"));
+        let request = server.join().unwrap();
+        assert!(request.starts_with(&expected), "{request}");
+        assert!(request.contains(&format!("Host: 127.0.0.1:{}\r\n", cfg.port)));
+    }
+
+    #[test]
+    fn version_answers() {
+        assert_eq!(
+            version_from_answer("HTTP/1.1 200 OK\r\nx: y\r\n\r\n0.1.0").as_deref(),
+            Some("0.1.0")
+        );
+        assert_eq!(version_from_answer("HTTP/1.1 404 Not Found\r\n\r\n"), None);
+        assert_eq!(version_from_answer("HTTP/1.1 200 OK\r\n\r\n"), None);
+        assert_eq!(
+            version_from_answer("HTTP/1.1 200 OK\r\n\r\n<html> page"),
+            None
+        );
+        assert_eq!(version_from_answer("garbage"), None);
     }
 }

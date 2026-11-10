@@ -606,6 +606,15 @@ pub fn run_blocking(
     runtime.block_on(serve(listener, cfg, options, upstream, logins, events))
 }
 
+/// This relay's version, as text: the answer to `GET /r/<secret>/__ccr/version` (spec 11).
+fn version() -> Response<RelayBody> {
+    let body = Full::new(Bytes::from_static(env!("CARGO_PKG_VERSION").as_bytes()));
+    let mut resp = Response::new(body.map_err(|n| match n {}).boxed());
+    resp.headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+    resp
+}
+
 fn bare(status: StatusCode) -> Response<RelayBody> {
     let mut resp = Response::new(Empty::<Bytes>::new().map_err(|n| match n {}).boxed());
     *resp.status_mut() = status;
@@ -786,6 +795,8 @@ async fn handle(req: Request<Incoming>, st: &State) -> Response<RelayBody> {
             st.events.log("refused 404");
             return bare(StatusCode::NOT_FOUND);
         }
+        // Answered here, before the idle clock: `doctor` asking is not a session's request.
+        Route::Version => return version(),
         Route::Model { path } => (true, path),
         Route::Pass { path } => (false, path),
     };

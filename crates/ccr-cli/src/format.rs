@@ -645,8 +645,13 @@ pub fn relay(v: &RelayView) -> String {
     out
 }
 
-/// `cc-rotate-ctl desktop` (spec section 24.2).
-pub fn desktop(setup: &ccr_core::desktop::Setup, ctl: &std::path::Path) -> String {
+/// `cc-rotate-ctl desktop` (spec section 24.2). `relay_home` is the home account's label while
+/// relay mode is on (relay spec, section 1).
+pub fn desktop(
+    setup: &ccr_core::desktop::Setup,
+    ctl: &std::path::Path,
+    relay_home: Option<&str>,
+) -> String {
     use ccr_core::desktop::{self, Launcher, Platform, Policy};
     use std::fmt::Write as _;
     let mut out = String::new();
@@ -746,9 +751,18 @@ pub fn desktop(setup: &ccr_core::desktop::Setup, ctl: &std::path::Path) -> Strin
             let _ = writeln!(out, "{note}");
         }
     }
-    out.push_str(
-        "\nArtifacts published while another account is in use don't open in the app's artifact pane.\n",
-    );
+    match relay_home {
+        Some(home) => {
+            let _ = writeln!(
+                out,
+                "\nRelay mode is on, with {home} as the home account: every session publishes with {home}'s login, so artifacts open in the app's artifact pane when the app is signed in to {home}."
+            );
+        }
+        None => out.push_str(
+            "\nRelay mode is off: artifacts published while another account is in use don't open in the app's artifact pane.\n\
+             To have every session publish with the app's account, run `cc-rotate-ctl relay on --home <the account the app is signed in to>`.\n",
+        ),
+    }
     if setup.platform == Platform::Windows {
         out.push_str("This has not been tried in the Windows app yet.\n");
     }
@@ -963,5 +977,36 @@ mod tests {
              Service: installed\nSessions without the relay's address (last 10 minutes): 2\n\
              Those run on the home account directly, off the pool: restart them to move them onto the relay.\n"
         );
+    }
+
+    #[test]
+    fn desktop_names_relay_mode_and_the_home_account() {
+        use ccr_core::desktop::{Launcher, Platform, Policy, Setup};
+        let setup = Setup {
+            platform: Platform::MacOs,
+            policy: Policy::On,
+            policy_foreign: false,
+            launcher: Launcher::Ours,
+            launcher_foreign: false,
+        };
+        let ctl = std::path::Path::new("/usr/local/bin/cc-rotate-ctl");
+        let on = desktop(&setup, ctl, Some("work"));
+        assert!(
+            on.contains("Relay mode is on, with work as the home account"),
+            "{on}"
+        );
+        assert!(
+            on.contains("open in the app's artifact pane when the app is signed in to work"),
+            "{on}"
+        );
+        assert!(!on.contains("don't open"), "{on}");
+
+        let off = desktop(&setup, ctl, None);
+        assert!(off.contains("Relay mode is off"), "{off}");
+        assert!(
+            off.contains("don't open in the app's artifact pane"),
+            "{off}"
+        );
+        assert!(off.contains("cc-rotate-ctl relay on --home"), "{off}");
     }
 }

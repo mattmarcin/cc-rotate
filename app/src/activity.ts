@@ -2,8 +2,8 @@
 import type { EventRow } from "./api";
 import { h, type Child } from "./dom";
 
-/** Events left out unless "Show all" is on: renewals, skipped swaps, version notes, warm-ups, reorders. */
-const ROUTINE = new Set(["sync", "swap_skipped", "claude_version", "warm_up"]);
+/** Events left out unless "Show all" is on: renewals, skipped swaps, version notes, warm-ups, resends, reorders. */
+const ROUTINE = new Set(["sync", "swap_skipped", "claude_version", "warm_up", "relay_resend"]);
 export const routine = (e: EventRow) => ROUTINE.has(e.kind) || (e.kind === "state" && e.reason === "order");
 
 export const REASONS: Record<string, string> = {
@@ -14,6 +14,7 @@ export const REASONS: Record<string, string> = {
   weekly_expiring: "to use its weekly budget before it resets",
   stop_failure: "after Claude Code hit a limit",
   avoid_extra_usage: "so sessions wait instead of paying for extra usage",
+  rate_limit: "after Anthropic refused a request at a usage limit",
   dead_login: "because the login stopped working",
   unauthorized: "because its login was refused and couldn't be renewed",
   manual: "by hand",
@@ -91,6 +92,16 @@ export function describe(e: EventRow, labelOf: (id: number | null) => string): {
       return { parts: ["No other account was ready to take over"], tone: "warn" };
     case "adopted_login":
       return { parts: ["Now using ", to, " after a /login in the profile"] };
+    case "relay_mode": {
+      const home = e.detail?.home as number | null | undefined;
+      return e.reason === "on"
+        ? { parts: ["Turned relay mode on, with ", nb(labelOf(home ?? null)), " as the home account"] }
+        : { parts: ["Turned relay mode off"] };
+    }
+    case "relay_resend":
+      return { parts: ["Sent a request again on ", to, " after ", from, " was at a usage limit"] };
+    case "relay_error":
+      return { parts: ["The relay couldn't reach Anthropic"], tone: "warn" };
     case "foreign_login":
       return { parts: ["The cc-rotate profile was signed in to an account that isn't in cc-rotate"], tone: "warn" };
     case "state":

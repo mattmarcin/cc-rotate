@@ -119,6 +119,19 @@ pub fn run(store: &Store, paths: &Paths) -> Vec<Check> {
             .is_some_and(|s| crate::setup::stop_hook_present(&s)),
     ));
 
+    checks.push(relay_check(
+        store,
+        paths,
+        crate::relay_service::status(),
+        |port| {
+            crate::relay::RelayConfig::read(&paths.relay_config())
+                .ok()
+                .flatten()
+                .filter(|cfg| cfg.port == port)
+                .and_then(|cfg| crate::relay::running_version(&cfg))
+        },
+    ));
+
     let legacy = crate::setup::legacy_alias_files();
     if !legacy.is_empty() {
         let files: Vec<String> = legacy.iter().map(|p| p.display().to_string()).collect();
@@ -232,7 +245,9 @@ pub fn run(store: &Store, paths: &Paths) -> Vec<Check> {
     checks.push(encryption_check(store));
     checks.push(credential_storage_check(paths));
 
-    if let Some(account) = active.first() {
+    // In relay mode the profile keeps the home account's login, whichever account is active.
+    let profile_owner = crate::relay::profile_account(store).ok().flatten();
+    if let Some(account) = profile_owner.as_ref() {
         let locked_away = !paths.credentials().complete().unwrap_or(true);
         let file_fp = paths
             .credentials()
@@ -835,6 +850,148 @@ fn environment_check(paths: &Paths, var: impl Fn(&str) -> Option<String>) -> Che
     }
 }
 
+/// Variables in the profile's `env` that take a session off the relay (a base URL or socket of
+/// its own) or off the home account's login (a key or login of its own).
+const RELAY_ENV_OVERRIDES: &[&str] = &[
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_UNIX_SOCKET",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+];
+
+/// Relay mode (relay spec, section 11): off, or on with the relay answering with this program's
+/// version, or what is wrong with it.
+///
+/// `service` is whether the relay's service is installed (`relay_service::status`), and `version`
+/// asks whatever answers on a port for its version (`relay::running_version`), `None` when
+/// nothing answers or not with a version. Neither is asked while relay mode is off.
+pub fn relay_check(
+    store: &Store,
+    paths: &Paths,
+    service: crate::relay_service::ServiceState,
+    version: impl Fn(u16) -> Option<String>,
+) -> Check {
+    use crate::relay::{self, RelayConfig};
+    let name = "Relay";
+    let home_id = match relay::home(store) {
+        Ok(None) => return check(name, Status::Ok, "relay mode is off"),
+        Ok(Some(id)) => id,
+        Err(e) => return check(name, Status::Fail, format!("can't read relay mode: {e:#}")),
+    };
+    let home = store.account(home_id).ok().flatten();
+    let label = home
+        .as_ref()
+        .map_or_else(|| format!("account {home_id}"), |a| a.label.clone());
+    // Each problem is a clause; failures come first.
+    let mut fails = Vec::new();
+    let mut warns = Vec::new();
+
+    if home
+        .as_ref()
+        .is_none_or(|a| a.state == AccountState::NeedsLogin)
+    {
+        fails.push(format!(
+            "the home account {label} is signed out: every session fails until it signs in again (`cc-rotate-ctl login --relogin {label}`)"
+        ));
+    }
+    if service == crate::relay_service::ServiceState::Missing {
+        fails.push(format!(
+            "the relay's service is not installed, so nothing restarts the relay when it ends (`cc-rotate-ctl relay on --home {label}` installs it)"
+        ));
+    }
+    let mut ok = None;
+    match RelayConfig::read(&paths.relay_config()) {
+        Ok(Some(cfg)) => match version(cfg.port) {
+            Some(v) if v == env!("CARGO_PKG_VERSION") => {
+                ok = Some(format!(
+                    "on, with {label} as the home account; the relay answers on 127.0.0.1:{} (version {v})",
+                    cfg.port
+                ));
+            }
+            Some(v) => warns.push(format!(
+                "the relay on 127.0.0.1:{} is version {v}, not this cc-rotate's {}: it changes over by itself within a minute or two, once no request is in flight",
+                cfg.port,
+                env!("CARGO_PKG_VERSION")
+            )),
+            None => fails.push(format!(
+                "the relay doesn't answer on 127.0.0.1:{}, so sessions get connection errors; {}",
+                cfg.port,
+                last_relay_log_line(paths)
+            )),
+        },
+        Ok(None) => fails.push(format!(
+            "relay mode is on but {} is not there, so new sessions start without the relay (`cc-rotate-ctl relay on --home {label}` writes it)",
+            paths.relay_config().display()
+        )),
+        Err(e) => fails.push(format!("{e:#}")),
+    }
+
+    let settings: Value = std::fs::read_to_string(paths.settings_file())
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or(Value::Null);
+    let set: Vec<&str> = RELAY_ENV_OVERRIDES
+        .iter()
+        .copied()
+        .filter(|n| {
+            settings
+                .pointer(&format!("/env/{n}"))
+                .and_then(Value::as_str)
+                .is_some_and(|v| !v.trim().is_empty())
+        })
+        .collect();
+    if !set.is_empty() {
+        warns.push(format!(
+            "the profile's settings.json sets {} in env, which takes sessions off the relay or off the home account's login",
+            set.join(" and ")
+        ));
+    }
+    match relay::bypass_count(store, time::now_ms()) {
+        Ok(0) | Err(_) => {}
+        Ok(n) => warns.push(format!(
+            "{n} {} without the relay's address in the last 10 minutes: they run on the home account directly, off the pool, until restarted",
+            if n == 1 { "session ran" } else { "sessions ran" }
+        )),
+    }
+
+    let status = if !fails.is_empty() {
+        Status::Fail
+    } else if !warns.is_empty() {
+        Status::Warn
+    } else {
+        Status::Ok
+    };
+    let problems: Vec<String> = fails.into_iter().chain(warns).collect();
+    let detail = match (problems.is_empty(), ok) {
+        (true, Some(ok)) => ok,
+        (_, Some(ok)) => format!("{ok}, but {}", problems.join("; ")),
+        (_, None) => problems.join("; "),
+    };
+    check(name, status, detail)
+}
+
+/// The relay log's last line, without its time stamp, for when the relay doesn't answer.
+fn last_relay_log_line(paths: &Paths) -> String {
+    let path = paths.relay_log();
+    let last = std::fs::read_to_string(&path).ok().and_then(|text| {
+        text.lines().rev().find(|l| !l.trim().is_empty()).map(|l| {
+            // Each line starts with the time in milliseconds.
+            let stamped = l
+                .split_once(' ')
+                .and_then(|(ts, rest)| Some((ts.parse::<i64>().ok()?, rest)));
+            match stamped {
+                Some((ts, rest)) => format!("{} ({})", rest.trim(), age(time::now_ms() - ts)),
+                None => l.trim().to_string(),
+            }
+        })
+    });
+    match last {
+        Some(line) => format!("the last line of {}: {line}", path.display()),
+        None => format!("{} has nothing in it", path.display()),
+    }
+}
+
 /// herdr is optional: this only warns when herdr is here but would resume cc-rotate sessions
 /// with plain `claude` (spec section 19).
 fn herdr_check(paths: &Paths, detected: Result<herdr::Detected, crate::paths::NotFound>) -> Check {
@@ -1018,6 +1175,190 @@ mod tests {
         assert_eq!(c.status, Status::Fail);
         assert!(c.detail.contains("apiKeyHelper"));
         assert!(!c.detail.contains(RETRY_WATCHDOG));
+    }
+
+    mod relay {
+        use super::super::*;
+        use crate::relay::{self as relay_mode, RelayConfig};
+        use crate::relay_service::ServiceState;
+        use crate::store::AccountIdentity;
+
+        struct Fixture {
+            store: Store,
+            paths: Paths,
+            home: i64,
+            cfg: RelayConfig,
+            _dir: tempfile::TempDir,
+        }
+
+        /// Relay mode on with `home` (parked) as the home account and `b` active, `relay.json`
+        /// written, and an empty profile.
+        fn on() -> Fixture {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = Paths::new(dir.path().join("data"), dir.path().join("profile"));
+            std::fs::create_dir_all(&paths.profile_dir).unwrap();
+            let store = Store::open_in_memory().unwrap();
+            let home = store
+                .insert_account("home", &AccountIdentity::default(), AccountState::Parked)
+                .unwrap();
+            store
+                .insert_account("b", &AccountIdentity::default(), AccountState::Active)
+                .unwrap();
+            relay_mode::set_mode(&store, Some(home)).unwrap();
+            let cfg = RelayConfig::create(&paths.relay_config()).unwrap();
+            Fixture {
+                store,
+                paths,
+                home,
+                cfg,
+                _dir: dir,
+            }
+        }
+
+        fn this_version(_: u16) -> Option<String> {
+            Some(env!("CARGO_PKG_VERSION").to_string())
+        }
+
+        fn run(
+            f: &Fixture,
+            service: ServiceState,
+            version: impl Fn(u16) -> Option<String>,
+        ) -> Check {
+            relay_check(&f.store, &f.paths, service, version)
+        }
+
+        #[test]
+        fn relay_off_ok() {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = Paths::new(dir.path().join("data"), dir.path().join("profile"));
+            let store = Store::open_in_memory().unwrap();
+            let c = relay_check(&store, &paths, ServiceState::Missing, |_| {
+                panic!("relay mode is off: nothing to ask")
+            });
+            assert_eq!(c.name, "Relay");
+            assert_eq!(c.status, Status::Ok);
+            assert_eq!(c.detail, "relay mode is off");
+        }
+
+        #[test]
+        fn relay_ok() {
+            let f = on();
+            let port = f.cfg.port;
+            let c = run(&f, ServiceState::Installed, |p| {
+                assert_eq!(p, port);
+                this_version(p)
+            });
+            assert_eq!(c.status, Status::Ok, "{}", c.detail);
+            assert!(c.detail.contains("home"), "{}", c.detail);
+            assert!(c.detail.contains(&port.to_string()), "{}", c.detail);
+            assert!(!c.detail.contains(&f.cfg.secret), "{}", c.detail);
+        }
+
+        #[test]
+        fn relay_other_version_warns() {
+            let f = on();
+            let c = run(&f, ServiceState::Installed, |_| Some("0.0.1-old".into()));
+            assert_eq!(c.status, Status::Warn, "{}", c.detail);
+            assert!(c.detail.contains("0.0.1-old"), "{}", c.detail);
+        }
+
+        #[test]
+        fn relay_not_answering_fails() {
+            let f = on();
+            std::fs::create_dir_all(f.paths.logs_dir()).unwrap();
+            std::fs::write(
+                f.paths.relay_log(),
+                "1800000000000 GET /v1/models 200 req_1 account=-\n1800000000001 cannot start: the port is taken\n",
+            )
+            .unwrap();
+            let c = run(&f, ServiceState::Installed, |_| None);
+            assert_eq!(c.status, Status::Fail, "{}", c.detail);
+            assert!(
+                c.detail.contains("cannot start: the port is taken"),
+                "{}",
+                c.detail
+            );
+            assert!(!c.detail.contains("/v1/models"), "{}", c.detail);
+
+            // No log at all: still a failure, said plainly.
+            std::fs::remove_file(f.paths.relay_log()).unwrap();
+            let c = run(&f, ServiceState::Installed, |_| None);
+            assert_eq!(c.status, Status::Fail, "{}", c.detail);
+        }
+
+        #[test]
+        fn relay_service_missing_fails() {
+            let f = on();
+            let c = run(&f, ServiceState::Missing, this_version);
+            assert_eq!(c.status, Status::Fail, "{}", c.detail);
+            assert!(c.detail.contains("service"), "{}", c.detail);
+        }
+
+        #[test]
+        fn home_signed_out_fails() {
+            let f = on();
+            f.store.set_state(f.home, AccountState::NeedsLogin).unwrap();
+            let c = run(&f, ServiceState::Installed, this_version);
+            assert_eq!(c.status, Status::Fail, "{}", c.detail);
+            assert!(
+                c.detail.contains(
+                    "the home account home is signed out: every session fails until it signs in again"
+                ),
+                "{}",
+                c.detail
+            );
+
+            // Removed from cc-rotate while relay mode stays on.
+            f.store
+                .conn()
+                .execute("DELETE FROM accounts WHERE id = ?1", [f.home])
+                .unwrap();
+            let c = run(&f, ServiceState::Installed, this_version);
+            assert_eq!(c.status, Status::Fail, "{}", c.detail);
+            assert!(c.detail.contains("signed out"), "{}", c.detail);
+        }
+
+        #[test]
+        fn relay_env_override_warns() {
+            let f = on();
+            for name in [
+                "ANTHROPIC_BASE_URL",
+                "ANTHROPIC_UNIX_SOCKET",
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_AUTH_TOKEN",
+                "CLAUDE_CODE_OAUTH_TOKEN",
+            ] {
+                std::fs::write(
+                    f.paths.settings_file(),
+                    serde_json::json!({ "env": { name: "x" } }).to_string(),
+                )
+                .unwrap();
+                let c = run(&f, ServiceState::Installed, this_version);
+                assert_eq!(c.status, Status::Warn, "{name}: {}", c.detail);
+                assert!(c.detail.contains(name), "{}", c.detail);
+            }
+            // Other variables are none of the relay's business.
+            std::fs::write(
+                f.paths.settings_file(),
+                r#"{"env":{"CLAUDE_CODE_MAX_OUTPUT_TOKENS":"1"}}"#,
+            )
+            .unwrap();
+            assert_eq!(
+                run(&f, ServiceState::Installed, this_version).status,
+                Status::Ok
+            );
+        }
+
+        #[test]
+        fn relay_bypass_warns() {
+            let f = on();
+            let now = time::now_ms();
+            relay_mode::note_bypass(&f.store, "s1", now - 1000).unwrap();
+            relay_mode::note_bypass(&f.store, "s2", now - 2000).unwrap();
+            let c = run(&f, ServiceState::Installed, this_version);
+            assert_eq!(c.status, Status::Warn, "{}", c.detail);
+            assert!(c.detail.contains('2'), "{}", c.detail);
+        }
     }
 
     #[test]

@@ -1,8 +1,8 @@
 # cc-rotate relay mode: every session on the app's account, model requests on the pool
 
-Status: draft for review, 2026-11-10.
+Status: built, 2026-11-10; this text follows what was built.
+The end-to-end tests and the check in the app (section 16) are still to run.
 Builds on the main spec (`2026-10-24-cc-rotate.md`), whose section numbers are cited as "main 24.1" and so on.
-Findings F34 to F36 were seen with Claude Code 2.1.322 on macOS, with real accounts.
 
 ## 1. Goal
 
@@ -18,12 +18,13 @@ With it off, everything works as in the main spec.
 
 ## 2. Findings
 
-| # | Behavior | Why it matters |
-|---|---|---|
-| F34 | Anthropic serves and counts a `POST /v1/messages` on the account whose login it carries, whatever account the body names. Three `claude -p` runs in the cc-rotate profile (stored login: account C1) through a test relay that replaced only the `Authorization` header: with C1's own login, with another account of the same organization, and with an account of another organization. Every body's `metadata.user_id` named C1; all three answered 200, the second with the other account's weekly usage in its `anthropic-ratelimit-unified-7d-utilization`, the third with the other organization in `anthropic-organization-id`. | The relay can leave the body alone and only swap the login (section 5). |
-| F35 | `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>/<path>` keeps the session on the profile's stored claude.ai login and keeps the base path: the listener received `HEAD /api/hello` (no login) and `POST /v1/messages?beta=true` (the claude.ai login as a bearer) at `/<path>/...`. Only the model client uses the base URL; artifacts, usage, the account profile and claude.ai connectors go to Anthropic's own address with the session's login. A base URL whose host is not `api.anthropic.com` fails Claude Code's first-party check (about 60 places: which models it offers, experimental betas, fast mode's eligibility, reason `custom_base_url`) unless `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL` is set; with it set the session still logs in and runs. `metadata.user_id` is `{device_id, account_uuid, session_id}`, the account being the one Claude Code stamped for its token, else `.claude.json`'s `oauthAccount`. | How sessions reach the relay (section 4). The variable is internal to Claude Code, so it is checked on every new version (section 16). |
-| F36 | `ANTHROPIC_UNIX_SOCKET` cannot carry the relay: with it set, a `-p` session says "Not logged in" ("another auth source is set"), although `claude auth status` reports the claude.ai login. Over the socket Claude Code speaks TLS for `api.anthropic.com`, or plain HTTP when the base URL is `http://api.anthropic.com`. | The relay listens on loopback TCP, not on a socket file. |
-| F37 | Each model response carries the serving account's usage: `anthropic-ratelimit-unified-status`, `-5h-utilization` and `-7d-utilization` (fractions), `-5h-reset` and `-7d-reset` (epoch seconds), `-representative-claim`, `-overage-status`, and `anthropic-organization-id`. | The relay reads usage for the account it used, desktop sessions included (section 7). |
+Findings F34 to F37 are in the main spec's findings table (main 3), where they were seen with Claude Code 2.1.322 on macOS, with real accounts.
+What each one means here:
+
+- F34: Anthropic serves and counts a model request on the account whose login it carries, whatever account its body names, so the relay leaves the body alone and only swaps the login (section 5).
+- F35: `ANTHROPIC_BASE_URL` with a path keeps a session on the profile's claude.ai login and sends only model requests there, which is how sessions reach the relay (section 4); `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL` is internal to Claude Code, so it is checked on every new version (section 16).
+- F36: `ANTHROPIC_UNIX_SOCKET` signs a session out, so the relay listens on loopback TCP, not on a socket file.
+- F37: every model response carries the serving account's usage, so the relay reads usage for the account it used, desktop sessions included (section 7).
 
 ## 3. Overview
 
@@ -124,7 +125,8 @@ After each model response, the relay records a sample (`profile = relay`) for th
 These readings are certain: the relay knows which account served each one.
 In relay mode the status line therefore records no usage windows (main 8, step 2): after a swap a session's own tracker mixes accounts, since its login, and with it Claude Code's account epoch (main F5), never changes.
 The status line still records the model, cost, project and Claude Code version (main 22.1), and still does the write-back (main 8, step 3) for the home account's login.
-The threshold trigger moves to the relay: after recording a sample of the active account, the relay spawns the same detached `cc-rotate-ctl swap --from <account> --reason <r>` the status line spawns (main 6), and the status line evaluates only triggers 3 and 5.
+The threshold trigger moves to the relay: after recording a sample of the active account, the relay decides as the status line would (main 6 and 7: the thresholds, and the proactive swaps, switching back and a weekly budget that would reset unused), at most once every 30 s, and runs the swap in its own process, in the background, as `cc-rotate-ctl swap` would.
+The status line still evaluates triggers 3 and 5 (main 6).
 The confirmation of the account in use (main 20.4) is not needed in relay mode, since every reading names its account.
 
 Desktop sessions, which run no status line (main F30), are read like any other, so they swap before a limit too.
@@ -153,14 +155,22 @@ Claude Code renews logins; cc-rotate never calls Anthropic's sign-in endpoints i
   If it dies (main F8), every session fails, relay or not, so `login_warning_days` (main 21) matters for it most; `relay` and `doctor` name the home account in that warning.
 - **The active account, when it is not the home account**: no Claude Code holds its login, so the relay asks for a renewal `relay_renew_margin_s` before its access token expires.
   A renewal is a usage check (main 20.1) that sets the copied login's `expiresAt` to 0 so Claude Code renews it at once (as for a held-back account, main 20.1 step 3), and stores the renewed login in the same transaction.
-  The relay starts it in the background (`cc-rotate-ctl check --renew <account>`), at most one at a time per account.
+  The relay runs it in its own process, in the background (`usage_check::renew`), at most one at a time per account.
+  A renewal that ordinary requests started is not started again within 60 s of the last one ending, so a renewal that fails fast does not run Claude Code on every request; one a 401 asks for (below) is not held back by that.
   The old access token keeps working until it expires, so requests are not held.
 - **A 401 on a model request**: the relay reads the stored login again and resends once if it changed; otherwise it asks for a renewal and holds that account's requests for up to 30 s.
-  If no valid login comes, the account is held back (main 20.3) and the relay swaps away from it as in section 8.
+  If no valid login comes, the account is held back (main 20.3) until a check settles whether its login works, and the relay swaps away from it as in section 8, with reason `unauthorized`; it is not marked `needs_login`.
   A login Anthropic rejects outright is marked `needs_login` by the check, as today.
 - **Parked accounts** are renewed only when they become active (section 6, step 4), as today.
 
 In relay mode a check skips the home account instead of the active one (main 20.1, step 2): the home account's stored login is the profile's, which a renewal in a scratch profile would retire.
+
+The profile's login is the home account's, so the status line's write-back (main 8, step 3) watches it as the home account's:
+
+- A dead login in the profile (main F8) marks the home account `needs_login` when the home account is not active, with no swap: a swap cannot fix the login every session needs.
+  When the home account is active, the dead-login swap (trigger 3) runs as before.
+- A `/login` of another pool account in the profile makes that account the home account.
+- A live login of a home account marked `needs_login` (signing it in again) puts it back to `parked`.
 The active account, when it is not the home account, is checked like a parked one.
 Checks remove every `ANTHROPIC_*` variable (main 20.1, step 4), so they never go through the relay.
 
@@ -172,14 +182,17 @@ The relay runs as a per-user service that restarts it when it ends:
 - Linux: a systemd user unit, `cc-rotate-relay.service`, with `Restart=always`.
 - Windows: a Task Scheduler task at logon that restarts on failure (not run yet, like the rest of Windows desktop support, main 24.4).
 
-Only one relay runs: it holds `<data dir>/relay.lock` and binds the fixed port, and a second one exits at once.
+Only one relay runs: it holds an OS file lock on `<data dir>/relay.lock`, which the system releases when the process ends however it ends, and binds the fixed port.
+A relay a launcher started exits quietly when another relay holds the lock; one the service started (its definition sets `CC_ROTATE_RELAY_SERVICE=1`) waits for the lock instead, so the service does not restart it over and over.
+A relay that finds the port taken (`AddrInUse`) exits quietly too.
+A relay that cannot start (the store, the profile or the port cannot be opened) writes one line to `relay.log`, waits 10 s and exits with an error, so the service restarts it at that pace.
 A launcher that finds nothing answering on the port starts `cc-rotate-ctl relay run` detached and starts Claude Code without waiting, keeping its time budget (main 24.1); the session's first request a moment later finds it running.
 
 Every minute the relay checks whether its program file was replaced (an upgrade).
-If so, it stops accepting new connections once no request is in flight, finishes, and exits; the service starts the new program.
+If so, it keeps serving, and exits the moment no request is in flight, closing kept-alive connections gracefully, at most 660 s after it noticed; the service starts the new program.
 Claude Code retries a refused connection (up to 10 times with backoff), so the gap goes unnoticed.
 
-`relay off` (section 4) leaves the relay serving until it has had no request for an hour; it then removes its service and `relay.json` and exits.
+`relay off` (section 4) leaves the relay serving until it has had no request for an hour; it then deletes `relay.json`, removes its service (which stops it) and exits.
 `uninstall` stops the relay, removes its service and `relay.json`, and turns relay mode off first, as in section 4.
 
 ## 11. When the relay is down
@@ -189,8 +202,10 @@ Sessions fail visibly; they never fall back to another way of reaching Anthropic
 - A running session gets connection errors, which Claude Code retries and then reports ("Unable to connect to API").
   The service normally restarts the relay within seconds, inside those retries.
 - A new session gets the relay's address whether or not it answers; the launcher has started it (section 10).
-- `doctor` gains a "Relay" line: off; on and answering with this program's version (ok); on and answering with another version (warn); on and not answering, with the last error from its log (fail); the service missing (fail).
-  It also warns when the profile's `env` sets `ANTHROPIC_BASE_URL`, `ANTHROPIC_UNIX_SOCKET`, an API key or a login variable, any of which would take a session off the relay or off the home account's login.
+- `doctor` gains a "Relay" line: off (ok); on and answering with this program's version (ok); on and answering with another version (warn); on and not answering, with the last line of its log (fail); the service missing (fail); the home account signed out or gone (fail: every session fails until it signs in again).
+  It asks the relay its version with `GET /r/<secret>/__ccr/version`, which the relay answers itself, as plain text, asking Anthropic nothing and attaching no login; any other path, method or query under `__ccr` is forwarded like any request.
+  It also warns when the profile's `env` sets `ANTHROPIC_BASE_URL`, `ANTHROPIC_UNIX_SOCKET`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` or `CLAUDE_CODE_OAUTH_TOKEN`, any of which would take a session off the relay or off the home account's login, and when sessions ran without the relay's address in the last 10 minutes (section 4).
+- `cc-rotate-ctl desktop` says whether relay mode is on and names the home account.
 
 ## 12. Settings and data
 
@@ -198,10 +213,12 @@ Sessions fail visibly; they never fall back to another way of reaching Anthropic
 |---|---|
 | `relay_mode` | `off` |
 | `home_account` | none; set by `relay on` |
-| `relay_renew_margin_s` | 900 |
+| `relay_renew_margin_s` | 900 (60 to 3600) |
 
 `<data dir>/relay.json` holds `{port, secret}`; `<data dir>/relay.lock` is held by the running relay.
-Samples the relay records have `profile = relay`; events gain `relay_resend` (a request resent on another account, with both accounts) and `relay_error`.
+Samples the relay records have `profile = relay`.
+Events gain `relay_mode` (relay mode turned on, naming the home account, or off; with the accounts whose login the profile had and has), `relay_resend` (a request resent on another account, with both accounts) and `relay_error` (the relay could not reach Anthropic, at most one a minute).
+Swaps gain the reasons `rate_limit` (a refusal at a limit, section 8) and `unauthorized` (a refused login that could not be renewed, section 9).
 
 ## 13. Security
 
@@ -219,7 +236,10 @@ The secret also appears in the sessions' environment, which the user's own proce
 
 ## 14. Changes to the main spec
 
+All of these are made in the main spec.
+
 - Main 2 (non-goals): "no HTTP proxy, no `ANTHROPIC_BASE_URL` override" and "cc-rotate never calls Anthropic APIs itself" gain an exception: in relay mode a local relay forwards Claude Code's own requests, and resends a request Anthropic refused at a limit. It still starts no request of its own, and logins are still renewed by Claude Code.
+- Main 3: findings F34 to F37 (section 2).
 - Main 5.1, invariant: in relay mode the home account's newest login lives in the profile, and every other account's in the store.
 - Main 6: relay-mode swaps (section 6).
 - Main 8: the status line records no usage windows in relay mode, and evaluates only triggers 3 and 5 (section 7); its write-back (step 3) compares the profile's login with the home account's row, not the active one's, and stores renewals there.
@@ -249,16 +269,17 @@ The secret also appears in the sessions' environment, which the user's own proce
   - which login: home passes the session's own through, any other account its stored token;
   - usage from response headers, including an unknown window name and a missing reset;
   - the limit refusal (429 with `rejected`) against other 429s and errors, and the resend policy: never after the first byte, at most once per account, the last refusal returned when no swap happens;
-  - the renewal schedule from `expiresAt` and `relay_renew_margin_s`, and the 401 path;
+  - the renewal schedule from `expiresAt` and `relay_renew_margin_s`, the 60 s wait between renewals, the 401 path, and a renewal storing the renewed login;
   - the launcher's environment plan with relay mode on and off, for both launchers, and for a resumed older desktop session;
   - `relay on`/`off`: refusals, `relay.json`, and the profile's login written only when the active account is not the home account.
 - Integration tests: the relay serves a local fake upstream (the upstream is a parameter of the relay's code, fixed to `https://api.anthropic.com` in the program; no flag, variable or setting changes it), with concurrent streamed responses, a session that disconnects mid-stream, a resend, and the refusal rules.
 - `tests/e2e/relay-*.py` run Claude Code headless through the relay against the fake Messages API, with three accounts staged (main 21.4), built with a test-only feature that points the relay at the fake API:
   - a swap mid-session moves the next request to the target, with the profile's login unchanged;
   - a refusal at a limit is resent on the next account, and the turn finishes without `StopFailure`;
-  - an access token near expiry is renewed by a check before it expires;
   - the relay killed mid-session is restarted by the launcher's fallback, and the session's next turn works;
   - the relay down: the session reports a connection error.
+
+  Renewal is covered by the unit tests only: the fake API cannot renew a login.
 - A version check, run like the other end-to-end tests on each new Claude Code: with the relay's two variables, Claude Code logs in with the stored login, sends model requests to the base URL, and treats it as first-party (it offers the same models as without the relay).
 - In the app on macOS, with relay mode on and the home account the app's: a new Code session runs, a swap to another account moves its next turn there (the relay's log), an artifact published while that account is active opens in the artifact pane, and a session at a limit continues on the next account without stopping. Then on Windows.
 

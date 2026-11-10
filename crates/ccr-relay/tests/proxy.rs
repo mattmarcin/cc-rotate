@@ -632,6 +632,34 @@ async fn api_key_session_unchanged() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn version_answered_locally() {
+    let fake = fake_upstream().await;
+    let relay = relay_to(fake.addr, Switch::new(token(2, "tok-b"))).await;
+
+    let req = Request::get(relay.url("/__ccr/version"))
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let resp = relay.send(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["content-type"], "text/plain");
+    assert_eq!(body_of(resp).await, env!("CARGO_PKG_VERSION").as_bytes());
+
+    // Without the secret it is refused like any other request.
+    let port = relay.cfg.port;
+    let req = Request::get(format!(
+        "http://127.0.0.1:{port}/r/{}/__ccr/version",
+        "f".repeat(64)
+    ))
+    .body(Full::new(Bytes::new()))
+    .unwrap();
+    assert_eq!(relay.send(req).await.status(), StatusCode::NOT_FOUND);
+
+    // Anthropic is never asked, and no login is attached to anything.
+    assert!(fake.seen().is_empty());
+    assert!(relay.events.responses.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn refused_never_reaches_upstream() {
     let fake = fake_upstream().await;
     let relay = relay_to(fake.addr, Switch::new(token(2, "tok-b"))).await;

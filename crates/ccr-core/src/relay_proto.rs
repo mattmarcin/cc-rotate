@@ -16,14 +16,20 @@ pub enum Route {
     Model { path: String },
     /// Anything else the relay allows: forwarded with the caller's own headers.
     Pass { path: String },
+    /// Exactly `GET /r/<secret>/__ccr/version`: the relay answers with its own version itself,
+    /// asking Anthropic nothing.
+    Version,
 }
+
+/// The path, after the secret, at which the relay answers with its own version (`doctor` asks).
+pub const VERSION_PATH: &str = "/__ccr/version";
 
 /// Compares two byte slices without stopping at the first difference.
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// Decides what to do with a request (spec 5, steps 1 and 2).
+/// Decides what to do with a request (spec 5, steps 1 and 2; the version request, spec 11).
 pub fn route(
     method: &str,
     path_and_query: &str,
@@ -53,6 +59,9 @@ pub fn route(
     } else {
         rest.to_string()
     };
+    if method == "GET" && path == VERSION_PATH {
+        return Route::Version;
+    }
     let bare = path.split('?').next().unwrap_or("");
     if method == "POST" && matches!(bare, "/v1/messages" | "/v1/messages/count_tokens") {
         Route::Model { path }
@@ -228,6 +237,41 @@ mod tests {
         assert_eq!(route("POST", &ok, None, false, &c), Route::Refuse);
         assert_eq!(route("POST", &ok, host(), true, &c), Route::Refuse);
         assert_eq!(route("PUT", &ok, host(), false, &c), Route::Refuse);
+    }
+
+    #[test]
+    fn route_version() {
+        let c = cfg();
+        let v = format!("/r/{S}/__ccr/version");
+        assert_eq!(route("GET", &v, host(), false, &c), Route::Version);
+        // Only exactly that request; the refusal rules come first.
+        assert_eq!(
+            route("HEAD", &v, host(), false, &c),
+            Route::Pass {
+                path: "/__ccr/version".into()
+            }
+        );
+        assert_eq!(
+            route("GET", &format!("{v}?x=1"), host(), false, &c),
+            Route::Pass {
+                path: "/__ccr/version?x=1".into()
+            }
+        );
+        assert_eq!(
+            route("GET", &format!("{v}/x"), host(), false, &c),
+            Route::Pass {
+                path: "/__ccr/version/x".into()
+            }
+        );
+        assert_eq!(
+            route("GET", "/r/wrong/__ccr/version", host(), false, &c),
+            Route::Refuse
+        );
+        assert_eq!(
+            route("GET", &v, Some("localhost:4455"), false, &c),
+            Route::Refuse
+        );
+        assert_eq!(route("GET", &v, host(), true, &c), Route::Refuse);
     }
 
     #[test]

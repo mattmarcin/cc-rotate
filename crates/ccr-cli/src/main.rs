@@ -355,11 +355,16 @@ fn run(cli: Cli) -> Result<ExitCode> {
             print!("{}", ccr_core::desktop::mobileconfig());
             Ok(ExitCode::SUCCESS)
         }
+        // Reads system settings, and the store only for relay mode.
         Command::Desktop {
             mobileconfig: false,
         } => {
             let setup = ccr_core::desktop::read_setup();
-            print!("{}", format::desktop(&setup, &dunce_exe()?));
+            let home = relay_home_label();
+            print!(
+                "{}",
+                format::desktop(&setup, &dunce_exe()?, home.as_deref())
+            );
             Ok(ExitCode::SUCCESS)
         }
         // Starts Claude Code for the desktop app: nothing here may write to the store.
@@ -928,6 +933,24 @@ impl ccr_relay::Lifecycle for RelayLifecycle {
         let data_dir = std::env::var("CC_ROTATE_DATA_DIR").ok();
         ccr_core::relay_service::retire(&service, &self.paths.relay_config(), data_dir.as_deref())
     }
+}
+
+/// The home account's label while relay mode is on, for `desktop`, which otherwise reads system
+/// settings only: `None` when relay mode is off, or the store isn't there or can't be read.
+fn relay_home_label() -> Option<String> {
+    let store = Paths::default_data_dir().ok()?.join("store.db");
+    if !store.exists() {
+        return None;
+    }
+    let store = Store::open(&store).ok()?;
+    let id = ccr_core::relay::home(&store).ok()??;
+    Some(
+        store
+            .account(id)
+            .ok()
+            .flatten()
+            .map_or_else(|| format!("account {id}"), |a| a.label),
+    )
 }
 
 /// What `cc-rotate-ctl relay` shows.
