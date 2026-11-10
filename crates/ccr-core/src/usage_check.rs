@@ -850,6 +850,9 @@ fn job(
             .is_some_and(|m| m.refresh_fp == stored.refresh_fp)
             && s.account(account_id)?.is_some_and(|a| {
                 matches!(a.state, AccountState::Parked | AccountState::Paused)
+                    // Only relay mode checks an active account (not the home one): it is
+                    // unchanged while it is still active, as when the check started.
+                    || (a.state == AccountState::Active && account.state == AccountState::Active)
             });
         let (renewal, dead, wrong_account) = if unchanged {
             (renewal.clone(), dead, wrong_account.clone())
@@ -2350,6 +2353,60 @@ mod tests {
             panic!("{out:?}")
         };
         assert_eq!(why, "it's in use, so its usage comes from the status line");
+    }
+
+    #[test]
+    fn relay_renewal_of_active_is_stored() {
+        let e = env();
+        let home = account(&e, "a", "ua", AccountState::Parked);
+        let active = account(&e, "b", "ub", AccountState::Active);
+        relay::set_mode(&e.store, Some(home)).unwrap();
+        let home_before = e.store.credential(home).unwrap().unwrap();
+        let run = fake(Fake {
+            stamp: Some("ub".into()),
+            renew: Some(Some(oauth("b-renewed"))),
+            ..Default::default()
+        });
+        check_with(&e.store, &e.paths, active, Trigger::Renew, &run).unwrap();
+        let stored = e.store.credential(active).unwrap().unwrap();
+        assert_eq!(stored.oauth["refreshToken"], "refresh-b-renewed");
+        assert_eq!(stored.source, SOURCE);
+        let home_after = e.store.credential(home).unwrap().unwrap();
+        assert_eq!(home_after.oauth, home_before.oauth);
+        assert_eq!(home_after.source, home_before.source);
+        assert_eq!(
+            e.store.account(home).unwrap().unwrap().state,
+            AccountState::Parked
+        );
+        assert_eq!(
+            e.store.account(active).unwrap().unwrap().state,
+            AccountState::Active
+        );
+    }
+
+    #[test]
+    fn relay_dead_login_of_active_marks_it() {
+        let e = env();
+        let home = account(&e, "a", "ua", AccountState::Parked);
+        let active = account(&e, "b", "ub", AccountState::Active);
+        relay::set_mode(&e.store, Some(home)).unwrap();
+        let mut dead = oauth("b");
+        dead["refreshToken"] = json!("");
+        dead["accessToken"] = json!("");
+        let run = fake(Fake {
+            renew: Some(Some(dead)),
+            ..Default::default()
+        });
+        let out = check_with(&e.store, &e.paths, active, Trigger::Renew, &run).unwrap();
+        assert_eq!(out, CheckOutcome::LoginRejected);
+        assert_eq!(
+            e.store.account(active).unwrap().unwrap().state,
+            AccountState::NeedsLogin
+        );
+        assert_eq!(
+            e.store.account(home).unwrap().unwrap().state,
+            AccountState::Parked
+        );
     }
 
     /// A check's leftover: its start fingerprint, then (optionally) the login it left.
