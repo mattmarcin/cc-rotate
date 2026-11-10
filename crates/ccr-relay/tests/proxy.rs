@@ -1841,3 +1841,159 @@ async fn an_upgrade_before_serving_still_counts() {
         .expect("kept running the old program");
     ended.unwrap().unwrap();
 }
+
+impl Pool {
+    /// Turn relay mode off with `b`'s login in the profile, as `relay off` leaves it.
+    /// Returns the profile's credentials file as written.
+    fn relay_off(&self) -> Vec<u8> {
+        ccr_core::relay::set_mode(&self.open(), None).unwrap();
+        let doc = serde_json::json!({"claudeAiOauth": {
+            "accessToken": "tok-b",
+            "refreshToken": "ref-b",
+            "expiresAt": ccr_core::time::now_ms() + 3_600_000,
+            "scopes": ["user:inference"],
+            "subscriptionType": "max",
+        }});
+        let bytes = serde_json::to_vec(&doc).unwrap();
+        std::fs::write(self.paths.credentials_file(), &bytes).unwrap();
+        bytes
+    }
+
+    fn profile_login(&self) -> Vec<u8> {
+        std::fs::read(self.paths.credentials_file()).unwrap()
+    }
+}
+
+/// With relay mode off the relay only forwards (spec 4): a session started while it was on still
+/// sends the home account's login, which a refusal must not file under the active account.
+#[tokio::test(flavor = "multi_thread")]
+async fn relay_off_limit_refusal_passes_unchanged() {
+    let fake = fake_upstream().await;
+    fake.state.limit(&["home"]);
+    let pool = Pool::new();
+    let profile = pool.relay_off();
+    let swaps = pool.counting_swaps();
+    let events = pool.events(swaps.clone());
+    let renewals = FakeRenewals::new();
+    let logins = Arc::new(StoreLogins::new(pool.open(), renewals.clone()));
+    let relay = relay_with(fake.addr, logins, events).await;
+    let resp = relay
+        .send(model_request(&relay, "", Some("Bearer home")))
+        .await;
+    assert_eq!(resp.status(), 429);
+    assert_eq!(resp.headers()["x-token"], "home");
+    assert_eq!(&body_of(resp).await[..], LIMIT_BODY.as_bytes());
+
+    assert_eq!(tokens_seen(&fake), vec!["Bearer home"]);
+    assert!(swaps.calls.lock().unwrap().is_empty());
+    let store = pool.open();
+    assert!(
+        store
+            .events_of_kind_since(kind::SWAP, 0)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .events_of_kind_since(kind::RELAY_RESEND, 0)
+            .unwrap()
+            .is_empty()
+    );
+    for id in [pool.a, pool.b, pool.c] {
+        assert!(store.account_samples_since(id, 0).unwrap().is_empty());
+    }
+    assert_eq!(store.active_account().unwrap().unwrap().id, pool.b);
+    assert_eq!(pool.profile_login(), profile);
+    assert!(renewals.calls().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn relay_off_401_passes_unchanged() {
+    let fake = fake_upstream().await;
+    fake.state.refuse_login(&["home"]);
+    let pool = Pool::new();
+    let profile = pool.relay_off();
+    let swaps = pool.counting_swaps();
+    let events = pool.events(swaps.clone());
+    let renewals = FakeRenewals::new();
+    let logins = Arc::new(StoreLogins::new(pool.open(), renewals.clone()));
+    let relay = relay_holding(fake.addr, logins, events, holding(2_000)).await;
+    let started = Instant::now();
+    let resp = relay
+        .send(model_request(&relay, "", Some("Bearer home")))
+        .await;
+    assert_eq!(resp.status(), 401);
+    assert_eq!(resp.headers()["x-token"], "home");
+    assert_eq!(&body_of(resp).await[..], UNAUTHORIZED_BODY.as_bytes());
+    // Not held for a renewal.
+    assert!(started.elapsed() < Duration::from_millis(1_000));
+
+    assert_eq!(tokens_seen(&fake), vec!["Bearer home"]);
+    assert!(renewals.calls().is_empty());
+    assert!(swaps.calls.lock().unwrap().is_empty());
+    let store = pool.open();
+    for id in [pool.a, pool.b, pool.c] {
+        assert!(!ccr_core::usage_check::state(&store, id).unwrap().held_back);
+    }
+    assert_eq!(store.active_account().unwrap().unwrap().id, pool.b);
+    assert_eq!(pool.profile_login(), profile);
+}
+
+/// The store's logins, but the first request goes out with `first`: it was chosen just before
+/// relay mode was turned off.
+struct ChosenBefore {
+    first: Mutex<Option<Choice>>,
+    inner: StoreLogins,
+}
+
+impl Logins for ChosenBefore {
+    fn for_model(&self) -> anyhow::Result<Choice> {
+        match self.first.lock().unwrap().take() {
+            Some(c) => Ok(c),
+            None => self.inner.for_model(),
+        }
+    }
+    fn renew(&self, account: i64) {
+        self.inner.renew(account)
+    }
+    fn refresh(&self, account: i64) -> anyhow::Result<Choice> {
+        self.inner.refresh(account)
+    }
+}
+
+/// A request that left with a pool login just before `relay off` and is refused as not signed in
+/// renews nothing, holds nothing back and swaps nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn relay_off_401_of_a_pool_login_renews_and_holds_nothing() {
+    let fake = fake_upstream().await;
+    fake.state.refuse_login(&["tok-c"]);
+    let pool = Pool::new();
+    let profile = pool.relay_off();
+    let swaps = pool.counting_swaps();
+    let events = pool.events(swaps.clone());
+    let renewals = FakeRenewals::new();
+    let logins = Arc::new(ChosenBefore {
+        first: Mutex::new(Some(token(pool.c, "tok-c"))),
+        inner: StoreLogins::new(pool.open(), renewals.clone()),
+    });
+    let relay = relay_holding(fake.addr, logins, events, holding(300)).await;
+    let resp = relay
+        .send(model_request(&relay, "", Some("Bearer home")))
+        .await;
+    assert_eq!(resp.status(), 401);
+    assert_eq!(resp.headers()["x-token"], "tok-c");
+    body_of(resp).await;
+
+    assert_eq!(tokens_seen(&fake), vec!["Bearer tok-c"]);
+    assert!(renewals.calls().is_empty());
+    assert!(swaps.calls.lock().unwrap().is_empty());
+    let store = pool.open();
+    assert!(
+        !ccr_core::usage_check::state(&store, pool.c)
+            .unwrap()
+            .held_back
+    );
+    assert!(store.account_samples_since(pool.c, 0).unwrap().is_empty());
+    assert_eq!(store.active_account().unwrap().unwrap().id, pool.b);
+    assert_eq!(pool.profile_login(), profile);
+}

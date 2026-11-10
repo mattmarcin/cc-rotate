@@ -239,9 +239,11 @@ impl Logins for StoreLogins {
     }
 
     fn renew(&self, account: i64) {
-        let home = ccr_core::relay::profile_account(&self.inner().store);
-        // When the profile's account cannot be read, renewing could retire the profile's login.
-        if home.is_ok_and(|p| p.is_none_or(|p| p.id != account)) {
+        let home = ccr_core::relay::home(&self.inner().store);
+        // Only in relay mode, and never the home account: its login is the profile's.
+        // With relay mode off the relay only forwards, and the profile's login is the active
+        // account's. When the mode cannot be read, renewing could retire the profile's login.
+        if home.is_ok_and(|h| h.is_some_and(|h| h != account)) {
             self.start_renewal(account, false);
         }
     }
@@ -497,6 +499,20 @@ mod tests {
         logins.renew(b);
         settle(&logins);
         assert_eq!(renewals.calls(), vec![b, b]);
+    }
+
+    #[test]
+    fn renew_nothing_with_relay_mode_off() {
+        let (store, a, b) = store();
+        expiring(&store, a, "tok-a", 0);
+        ccr_core::relay::set_mode(&store, None).unwrap();
+        let renewals = Counting::new();
+        let logins = StoreLogins::new(store, renewals.clone());
+        // `b` is active and its login the profile's; `a` is a parked account.
+        logins.renew(a);
+        logins.renew(b);
+        settle(&logins);
+        assert!(renewals.calls().is_empty());
     }
 
     #[test]

@@ -152,6 +152,7 @@ pub trait Logins: Send + Sync {
     /// Start a renewal of `account`'s stored login in the background, unless one is running,
     /// and return at once (spec 9).
     /// Never for the account whose login is the profile's: Claude Code renews that one itself.
+    /// Never with relay mode off: the relay then only forwards.
     fn renew(&self, account: i64);
 
     /// `account`'s stored login as it is now: a renewal may have replaced it.
@@ -161,6 +162,7 @@ pub trait Logins: Send + Sync {
 /// What the relay reports as it works. Every method does nothing unless implemented.
 pub trait RelayEvents: Send + Sync {
     /// A model request that went out with a known account got its response's status and headers.
+    /// With relay mode off nothing is recorded: the status line records the readings then.
     /// Called on a thread that may block, before the response goes back to the session.
     fn response(
         &self,
@@ -180,6 +182,7 @@ pub trait RelayEvents: Send + Sync {
     /// anything of the response went back to the session (spec 8).
     /// Swaps away from `account` if it is still the active one, waiting for a swap already
     /// running, and says which account is active now.
+    /// With relay mode off it does nothing and says `Swapped::No`: the refusal goes back as it is.
     /// Called on a thread that may block.
     fn refused_at_limit(&self, _account: i64) -> Swapped {
         Swapped::No
@@ -189,6 +192,7 @@ pub trait RelayEvents: Send + Sync {
     /// no renewed login came within the hold (spec 9).
     /// Holds the account back until a check settles its login, then swaps away from it as
     /// `refused_at_limit` does (reason `unauthorized`), and says which account is active now.
+    /// With relay mode off it does nothing and says `Swapped::No`.
     /// Called on a thread that may block.
     fn dead_login(&self, _account: i64) -> Swapped {
         Swapped::No

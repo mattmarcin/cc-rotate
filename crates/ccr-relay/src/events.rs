@@ -7,7 +7,7 @@ use anyhow::Result;
 use ccr_core::scheduler::{self, Reason};
 use ccr_core::store::{Sample, kind};
 use ccr_core::swap::{self, SwapOutcome, SwapRequest};
-use ccr_core::{Paths, Store, relay_proto, statusline, time, usage_check, waiting};
+use ccr_core::{Paths, Store, relay, relay_proto, statusline, time, usage_check, waiting};
 use serde_json::json;
 
 use crate::{RelayEvents, Swapped};
@@ -45,6 +45,10 @@ impl Swaps for StoreSwaps {
 /// The relay's events, recorded in the store: a usage reading from every model response for the
 /// account that served it, a threshold swap when the active account's reading asks for one, the
 /// swap at a refused limit, resends and errors.
+/// With relay mode off (a relay still serving until it retires, spec 4) the relay only forwards:
+/// it records no reading, asks for no swap and holds no account back.
+/// The status line does those then, and a swap writes the profile's login, which a session
+/// started in relay mode does not send.
 /// Log lines go on to `log` (a `FileLog` in the relay).
 pub struct StoreEvents {
     /// For readings and events: quick writes, on the request threads.
@@ -84,8 +88,19 @@ impl StoreEvents {
         }
     }
 
+    /// Whether relay mode is on. An error reading it counts as off: the relay then only forwards.
+    fn mode_on(&self, store: &Store) -> bool {
+        match relay::home(store) {
+            Ok(home) => home.is_some(),
+            Err(e) => {
+                self.log(&format!("reading relay mode failed: {e:#}"));
+                false
+            }
+        }
+    }
+
     /// Records the reading in a response's headers (spec 7) and says which threshold swap to ask
-    /// for, if any.
+    /// for, if any. Nothing with relay mode off.
     fn record(
         &self,
         account: i64,
@@ -98,6 +113,10 @@ impl StoreEvents {
         if windows.is_empty() {
             return Ok(None);
         }
+        let store = self.store();
+        if !self.mode_on(&store) {
+            return Ok(None);
+        }
         let now = time::now_ms();
         let session = session.filter(|s| !s.is_empty());
         let sample = Sample {
@@ -108,7 +127,6 @@ impl StoreEvents {
             model: model.map(str::to_string),
             windows,
         };
-        let store = self.store();
         store.record_sample(&sample)?;
         // The status line records no readings in relay mode, so this is how a session stopped
         // at a limit is seen working again (main 21).
@@ -154,8 +172,25 @@ impl StoreEvents {
 impl StoreEvents {
     /// Swaps away from `account` if it is still the active one and says which account is active
     /// now: the swap at a refused limit (spec 8) or at a refused login (spec 9).
-    fn swap_away(&self, account: i64, reason: Reason, why: &str) -> Swapped {
+    /// With relay mode off, `hold` and the swap are skipped and the refusal goes back as it is.
+    fn swap_away(
+        &self,
+        account: i64,
+        reason: Reason,
+        why: &str,
+        hold: impl FnOnce(&Store),
+    ) -> Swapped {
         let _one = self.refusals.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let store = self.store();
+            if !self.mode_on(&store) {
+                self.log(&format!(
+                    "account={account} refused {why}; relay mode is off, so no swap"
+                ));
+                return Swapped::No;
+            }
+            hold(&store);
+        }
         // Another refusal's swap may have moved the pool on already: then there is nothing to
         // swap, and the request goes to the account that is active now.
         if self.active() == Some(account) {
@@ -222,15 +257,21 @@ impl RelayEvents for StoreEvents {
     }
 
     fn refused_at_limit(&self, account: i64) -> Swapped {
-        self.swap_away(account, Reason::LimitRefused, "at a refused limit")
+        self.swap_away(account, Reason::LimitRefused, "at a refused limit", |_| {})
     }
 
     fn dead_login(&self, account: i64) -> Swapped {
-        // Until a check settles it, no swap picks the account again.
-        if let Err(e) = usage_check::hold_back(&self.store(), account) {
-            self.log(&format!("holding back account {account} failed: {e:#}"));
-        }
-        self.swap_away(account, Reason::Unauthorized, "at a refused login")
+        self.swap_away(
+            account,
+            Reason::Unauthorized,
+            "at a refused login",
+            |store| {
+                // Until a check settles it, no swap picks the account again.
+                if let Err(e) = usage_check::hold_back(store, account) {
+                    self.log(&format!("holding back account {account} failed: {e:#}"));
+                }
+            },
+        )
     }
 
     fn resent(&self, from: i64, to: i64) {
@@ -290,7 +331,8 @@ mod tests {
         }
     }
 
-    /// A store file with `b` active and `c` parked, and events over it.
+    /// A store file with `b` active, `c` parked and home account `a` parked, in relay mode, and
+    /// events over it.
     struct Env {
         _root: tempfile::TempDir,
         db: std::path::PathBuf,
@@ -310,6 +352,10 @@ mod tests {
         let c = store
             .insert_account("c", &AccountIdentity::default(), AccountState::Parked)
             .unwrap();
+        let a = store
+            .insert_account("a", &AccountIdentity::default(), AccountState::Parked)
+            .unwrap();
+        ccr_core::relay::set_mode(&store, Some(a)).unwrap();
         let (tx, rx) = mpsc::channel();
         let swaps = Arc::new(FakeSwaps {
             db: db.clone(),
@@ -541,6 +587,59 @@ mod tests {
         env.no_swap();
         assert!(
             ccr_core::usage_check::state(&env.open(), env.b)
+                .unwrap()
+                .held_back
+        );
+    }
+
+    /// With relay mode off the relay only forwards: the status line records readings and asks
+    /// for swaps, and a swap writes the profile's login, which the sessions use.
+    fn relay_off(env: &Env) {
+        ccr_core::relay::set_mode(&env.open(), None).unwrap();
+    }
+
+    #[test]
+    fn relay_off_records_no_reading_and_asks_for_no_swap() {
+        let env = env(swap_to_parked());
+        relay_off(&env);
+        env.events.response(
+            env.b,
+            Some("sess-1"),
+            None,
+            200,
+            &headers("0.995", "allowed_warning"),
+        );
+        env.events.response(
+            env.b,
+            Some("sess-1"),
+            None,
+            429,
+            &headers("1.0", "rejected"),
+        );
+        env.no_swap();
+        assert!(env.open().last_sample(env.b).unwrap().is_none());
+    }
+
+    #[test]
+    fn relay_off_refused_at_limit_swaps_nothing() {
+        let env = env(swap_to_parked());
+        relay_off(&env);
+        assert_eq!(env.events.refused_at_limit(env.b), Swapped::No);
+        env.no_swap();
+        assert_eq!(
+            env.open().active_account().unwrap().map(|a| a.id),
+            Some(env.b)
+        );
+    }
+
+    #[test]
+    fn relay_off_dead_login_holds_nothing_back() {
+        let env = env(swap_to_parked());
+        relay_off(&env);
+        assert_eq!(env.events.dead_login(env.b), Swapped::No);
+        env.no_swap();
+        assert!(
+            !ccr_core::usage_check::state(&env.open(), env.b)
                 .unwrap()
                 .held_back
         );
