@@ -40,6 +40,10 @@ const ANTHROPIC: &str = "https://api.anthropic.com";
 /// The header Claude Code names its session in.
 const SESSION_HEADER: &str = "x-claude-code-session-id";
 
+/// How long a leaving relay waits for its connections to close: a request still running then is
+/// cut off.
+const CLOSE_WITHIN: Duration = Duration::from_secs(300);
+
 /// How often a request held after a 401 reads the stored login again (spec 9).
 const REFRESH_EVERY: Duration = Duration::from_millis(500);
 
@@ -450,8 +454,9 @@ type RelayBody = BoxBody<Bytes, hyper::Error>;
 /// Serve requests from `listener`, which must be bound to 127.0.0.1, until the relay leaves
 /// (spec 10): its program file was replaced, or relay mode is off and no request came for
 /// `Options::idle_exit`.
-/// Either way it stops accepting connections, waits for the requests in flight to finish, and
-/// returns; when idle, it first removes its service (`Lifecycle::retire`).
+/// After an upgrade it serves on, new connections too, until no request is in flight.
+/// Either way it then stops accepting connections, closes the open ones once the request on
+/// each is done, and returns; when idle, it then removes its service (`Lifecycle::retire`).
 pub async fn serve(
     listener: std::net::TcpListener,
     cfg: RelayConfig,
@@ -484,6 +489,10 @@ pub async fn serve(
         in_flight: Arc::new(InFlight::default()),
         last_request: std::sync::Mutex::new(tokio::time::Instant::now()),
     });
+    // Every connection, so leaving can close each one once its request is done.
+    let graceful = hyper_util::server::graceful::GracefulShutdown::new();
+    // Set once the program file was replaced: the relay serves on until nothing is in flight.
+    let mut draining = false;
     let leave = loop {
         let stream = tokio::select! {
             accepted = listener.accept() => match accepted {
@@ -495,15 +504,25 @@ pub async fn serve(
                     continue;
                 }
             },
-            _ = ticks.tick() => {
+            _ = ticks.tick(), if !draining => {
                 match check(&state, program.as_deref(), started).await {
-                    Some(leave) => break leave,
+                    Some(Leave::Upgrade) => {
+                        state.events.log(&format!(
+                            "program replaced; leaving once no request is in flight ({} now)",
+                            state.in_flight.now()
+                        ));
+                        draining = true;
+                        continue;
+                    }
+                    Some(Leave::Idle) => break Leave::Idle,
                     None => continue,
                 }
             }
+            _ = state.in_flight.idle(), if draining => break Leave::Upgrade,
         };
         let _ = stream.set_nodelay(true);
         let state = state.clone();
+        let watcher = graceful.watcher();
         tokio::spawn(async move {
             let service = service_fn(move |req| {
                 let state = state.clone();
@@ -522,28 +541,29 @@ pub async fn serve(
             let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
             // The timer lets hyper drop a connection whose request headers never finish.
             builder.http1().timer(TokioTimer::new());
-            let _ = builder
-                .serve_connection(TokioIo::new(stream), service)
-                .await;
+            let connection = builder.serve_connection(TokioIo::new(stream), service);
+            let _ = watcher.watch(connection).await;
         });
     };
-    // No new connections from here on: a session's next one finds the next relay.
+    // No new connections from here on: a session's next one finds the next relay. Kept-alive
+    // connections close once the request on them, if any, is done, its last frames sent.
     drop(listener);
+    if tokio::time::timeout(CLOSE_WITHIN, graceful.shutdown())
+        .await
+        .is_err()
+    {
+        state.events.log(&format!(
+            "connections still open after {} s; leaving anyway",
+            CLOSE_WITHIN.as_secs()
+        ));
+    }
     match leave {
-        Leave::Upgrade => {
-            state.events.log(&format!(
-                "program replaced; leaving once {} requests in flight finish",
-                state.in_flight.now()
-            ));
-            state.in_flight.idle().await;
-            state.events.log("left for the new program");
-        }
+        Leave::Upgrade => state.events.log("left for the new program"),
         Leave::Idle => {
             state.events.log(&format!(
-                "relay mode is off and no request came for {} s; leaving",
+                "relay mode is off and no request came for {} s; left",
                 state.options.idle_exit.as_secs()
             ));
-            state.in_flight.idle().await;
             let lifecycle = state.options.lifecycle.clone();
             match tokio::task::spawn_blocking(move || lifecycle.retire()).await {
                 Ok(Ok(())) => state.events.log("removed the relay's service"),

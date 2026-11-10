@@ -803,7 +803,11 @@ fn relay_run() -> ExitCode {
     };
     // An OS file lock, held for the life of the process: however the process ends (a crash,
     // SIGKILL, SIGTERM from its service), the system releases it and the next relay can start.
-    let _lock = match relay_lock(&data.relay_lock()) {
+    // One the service started waits for it, and takes over when the relay a launcher started
+    // ends: exiting would only have the service start it again and again.
+    let from_service =
+        std::env::var_os(ccr_core::relay_service::SERVICE_MARK_ENV).is_some_and(|v| !v.is_empty());
+    let _lock = match relay_lock(&data, from_service) {
         Ok(Some(lock)) => lock,
         Ok(None) => return ExitCode::SUCCESS,
         Err(e) => return relay_start_failed(Some(&data), &e),
@@ -816,11 +820,8 @@ fn relay_run() -> ExitCode {
     };
     match ready() {
         Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            // Started detached: nobody reads its output.
-            process::log_error("relay run", &e);
-            ExitCode::FAILURE
-        }
+        // The runtime would not start, or the relay refused its address: before it served.
+        Err(e) => relay_start_failed(Some(&data), &e),
     }
 }
 
@@ -910,20 +911,9 @@ impl ccr_relay::Lifecycle for RelayLifecycle {
         if self.home()?.is_some() {
             bail!("relay mode is on again");
         }
-        // Only the service that runs a relay of this data folder: a relay a test started in a
-        // folder of its own leaves the user's alone.
         let service = ccr_core::relay_service::Service::real()?;
         let data_dir = std::env::var("CC_ROTATE_DATA_DIR").ok();
-        if service.serves(data_dir.as_deref()) {
-            service.remove()?;
-        }
-        match std::fs::remove_file(self.paths.relay_config()) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => {
-                Err(e).with_context(|| format!("deleting {}", self.paths.relay_config().display()))
-            }
-        }
+        ccr_core::relay_service::retire(&service, &self.paths.relay_config(), data_dir.as_deref())
     }
 }
 
@@ -948,7 +938,10 @@ fn relay_view(store: &Store, paths: &Paths) -> Result<format::RelayView> {
 }
 
 /// The relay's lock file, locked: `None` when another process holds it.
-fn relay_lock(path: &std::path::Path) -> Result<Option<std::fs::File>> {
+/// With `wait`, waits for the process that holds it to let go instead.
+fn relay_lock(data: &Paths, wait: bool) -> Result<Option<std::fs::File>> {
+    let path = data.relay_lock();
+    let path = path.as_path();
     if let Some(dir) = path.parent() {
         ccr_core::secret::create_private_dir(dir)?;
     }
@@ -964,6 +957,15 @@ fn relay_lock(path: &std::path::Path) -> Result<Option<std::fs::File>> {
         .with_context(|| format!("opening {}", path.display()))?;
     match file.try_lock() {
         Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) if wait => {
+            ccr_relay::log_now(
+                &data.relay_log(),
+                "another relay runs; waiting for it to end",
+            );
+            file.lock()
+                .with_context(|| format!("locking {}", path.display()))?;
+            Ok(Some(file))
+        }
         Err(std::fs::TryLockError::WouldBlock) => Ok(None),
         Err(std::fs::TryLockError::Error(e)) => {
             Err(e).with_context(|| format!("locking {}", path.display()))

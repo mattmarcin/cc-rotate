@@ -1,10 +1,12 @@
 //! `cc-rotate-ctl relay run` in a scratch data folder. No request here reaches Anthropic: every
 //! one is refused before the relay forwards anything.
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
-use std::process::{Child, Command, ExitStatus};
+use std::process::{Child, ExitStatus};
 use std::time::{Duration, Instant};
 
 use ccr_core::relay::RelayConfig;
@@ -20,7 +22,7 @@ impl Drop for Running {
 }
 
 fn relay_run(data: &Path) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_cc-rotate-ctl"))
+    common::program(env!("CARGO_BIN_EXE_cc-rotate-ctl"))
         .args(["relay", "run"])
         .env("CC_ROTATE_DATA_DIR", data)
         .env("CC_ROTATE_PROFILE", data.join("no profile"))
@@ -162,7 +164,7 @@ fn relay_run_that_cannot_start_says_why_and_waits_before_exiting() {
     std::fs::write(data.join("store.db"), "not a database").unwrap();
     let started = Instant::now();
     let mut child = Running(
-        Command::new(env!("CARGO_BIN_EXE_cc-rotate-ctl"))
+        common::program(env!("CARGO_BIN_EXE_cc-rotate-ctl"))
             .args(["relay", "run"])
             .env("CC_ROTATE_DATA_DIR", &data)
             .env_remove("CC_ROTATE_PROFILE")
@@ -186,7 +188,7 @@ fn relay_run_that_cannot_start_says_why_and_waits_before_exiting() {
 }
 
 fn ctl(data: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_cc-rotate-ctl"))
+    common::program(env!("CARGO_BIN_EXE_cc-rotate-ctl"))
         .args(args)
         .env("CC_ROTATE_DATA_DIR", data)
         .env("CC_ROTATE_PROFILE", data.join("profile"))
@@ -244,4 +246,64 @@ fn relay_on_refuses_an_account_that_cannot_be_home() {
             .unwrap()
             .contains("Relay mode is off")
     );
+}
+
+#[test]
+fn a_relay_the_service_started_waits_for_the_lock_and_then_serves() {
+    let root = tempfile::tempdir().unwrap();
+    let (data, cfg) = data_folder(root.path());
+    // The relay a launcher started holds the lock.
+    let held = std::fs::File::create(data.join("relay.lock")).unwrap();
+    held.try_lock().unwrap();
+    let mut relay = Running(
+        common::program(env!("CARGO_BIN_EXE_cc-rotate-ctl"))
+            .args(["relay", "run"])
+            .env("CC_ROTATE_DATA_DIR", &data)
+            .env("CC_ROTATE_PROFILE", data.join("no profile"))
+            .env("CC_ROTATE_RELAY_SERVICE", "1")
+            .env_remove("CC_ROTATE_RELAY_TEST_UPSTREAM")
+            .spawn()
+            .unwrap(),
+    );
+    let log = log_with(&data, "waiting", 1);
+    assert!(log.contains("another relay runs; waiting"), "{log}");
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(relay.0.try_wait().unwrap().is_none(), "it exited");
+    assert!(!ccr_core::relay::answers(cfg.port));
+
+    // The launcher's relay ends: the service's takes over.
+    drop(held);
+    wait_serving(&mut relay, &data, cfg.port, Duration::from_secs(20));
+}
+
+#[test]
+fn relay_on_never_installs_the_service_where_tests_forbid_it() {
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join("data");
+    {
+        let store = ccr_core::Store::open(&data.join("store.db")).unwrap();
+        let id = store
+            .insert_account(
+                "home",
+                &ccr_core::store::AccountIdentity::default(),
+                ccr_core::store::AccountState::Active,
+            )
+            .unwrap();
+        // A stored login, as far as `relay on` looks: its row, never read here.
+        store
+            .conn()
+            .execute(
+                "INSERT INTO credentials (account_id, oauth_blob, refresh_fp, updated_at, source) VALUES (?1, x'00', 'fp', 0, 'login')",
+                [id],
+            )
+            .unwrap();
+    }
+    // Without --no-service: `common::program` sets CC_ROTATE_NO_SERVICE, so the real service
+    // refuses before anything is written or run.
+    let out = ctl(&data, &["relay", "on", "--home", "home"]);
+    assert!(!out.status.success(), "{out:?}");
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.contains("CC_ROTATE_NO_SERVICE is set"), "{err}");
+    let store = ccr_core::Store::open(&data.join("store.db")).unwrap();
+    assert_eq!(ccr_core::relay::home(&store).unwrap(), None);
 }

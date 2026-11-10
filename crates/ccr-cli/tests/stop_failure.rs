@@ -1,9 +1,11 @@
 //! `cc-rotate-ctl hook stop-failure` as Claude Code runs it at a usage limit: in the background,
 //! waking the session (exit code 2, a message on stderr) once its swap lands.
 
+mod common;
+
 use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 use std::time::{Duration, Instant};
 
 use ccr_core::store::{AccountIdentity, AccountState, Sample, SampleWindow, Store, WaitingState};
@@ -72,7 +74,7 @@ fn fixture(root: &Path) -> Store {
 }
 
 fn hook(root: &Path, input: &str) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_cc-rotate-ctl"))
+    let mut child = common::program(env!("CARGO_BIN_EXE_cc-rotate-ctl"))
         .args(["hook", "stop-failure"])
         .env("CC_ROTATE_DATA_DIR", root.join("data"))
         .env("CC_ROTATE_PROFILE", root.join("profile"))

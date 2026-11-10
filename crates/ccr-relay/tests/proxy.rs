@@ -1688,16 +1688,23 @@ async fn exits_after_upgrade_when_idle() {
 
     // An upgrade replaces the program while the stream is open.
     std::fs::write(&program, "version 2, longer").unwrap();
-    let until = Instant::now() + Duration::from_secs(5);
-    while answers(port).await {
-        assert!(Instant::now() < until, "still accepting after the upgrade");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
         !relay.task.is_finished(),
         "left while a request was in flight"
     );
+    // While it is, the relay serves on, new requests too.
+    assert!(
+        answers(port).await,
+        "stopped accepting with a request in flight"
+    );
+    let resp = relay
+        .send(model_request(&relay, "", Some("Bearer home")))
+        .await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(&body_of(resp).await[..], b"{\"ok\":true}");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!relay.task.is_finished(), "left before the stream ended");
 
     fake.state.release.notify_one();
     let mut rest = Vec::new();
@@ -1711,6 +1718,7 @@ async fn exits_after_upgrade_when_idle() {
         .await
         .expect("the relay did not leave once the stream ended");
     ended.unwrap().unwrap();
+    assert!(!answers(port).await, "still accepting after it left");
 }
 
 /// Relay mode as a test sets it, and how often the relay left for good.

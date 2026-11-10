@@ -150,6 +150,14 @@ pub fn run(profile: Option<PathBuf>, dry_run: bool, yes: bool, force: bool) -> R
 
 /// Why the plan cannot be carried out now, if it cannot.
 fn blocked(plan: &Plan, force: bool) -> Option<String> {
+    // Turning relay mode off is refused while a swap is pending; the store must not go before it
+    // is off. `--force` does not change that.
+    if plan.relay_swap_pending {
+        return Some(
+            "relay mode is on and a swap was interrupted and isn't settled yet, so relay mode can't be turned off first. cc-rotate settles it within a minute (or run cc-rotate-ctl status); then run cc-rotate-ctl uninstall again."
+                .into(),
+        );
+    }
     if let KeychainItem::Unreachable(service) = &plan.keychain {
         return Some(format!(
             "this session can't use the macOS Keychain, which holds the cc-rotate profile's login (\"{service}\"). Run cc-rotate-ctl uninstall in Terminal on the Mac itself, not over SSH."
@@ -333,5 +341,20 @@ mod tests {
         );
         let (remove, _) = plan_lines(&Plan::default());
         assert_eq!(remove, ["Quit the cc-rotate app, if it runs"]);
+    }
+
+    #[test]
+    fn a_pending_swap_in_relay_mode_blocks_uninstall_even_forced() {
+        let plan = Plan {
+            relay_home: Some("work".into()),
+            relay_swap_pending: true,
+            ..Default::default()
+        };
+        for force in [false, true] {
+            let why = blocked(&plan, force).expect("not blocked");
+            assert!(why.contains("swap"), "{why}");
+            assert!(why.contains("relay mode"), "{why}");
+        }
+        assert_eq!(blocked(&Plan::default(), false), None);
     }
 }

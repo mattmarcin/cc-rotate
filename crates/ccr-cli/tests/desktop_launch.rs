@@ -1,9 +1,11 @@
 //! `cc-rotate-ctl desktop-launch`, the launcher the desktop app runs (spec section 24.1), against
 //! a program that prints the environment it was started with.
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 
 const REMOVED: [&str; 6] = [
     "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
@@ -33,7 +35,7 @@ fn parse(out: &Output) -> BTreeMap<String, String> {
 }
 
 fn launch(root: &Path, profile: &str, desktop: bool, program: &[String]) -> Output {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_cc-rotate-ctl"));
+    let mut cmd = common::program(env!("CARGO_BIN_EXE_cc-rotate-ctl"));
     cmd.arg("desktop-launch")
         .arg("--")
         .args(program)
@@ -104,7 +106,7 @@ fn a_profile_that_cannot_be_resolved_starts_claude_code_unchanged() {
     // session starts, and fails visibly as not logged in, instead of not starting at all.
     std::fs::create_dir_all(root.path().join("data")).unwrap();
     std::fs::write(root.path().join("data").join("store.db"), "not a database").unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_cc-rotate-ctl"))
+    let out = common::program(env!("CARGO_BIN_EXE_cc-rotate-ctl"))
         .arg("desktop-launch")
         .arg("--")
         .args(print_env())
@@ -188,7 +190,7 @@ fn ending_the_launcher_ends_claude_code() {
         started.display(),
         pid_file.display()
     );
-    let mut launcher = Command::new(env!("CARGO_BIN_EXE_cc-rotate-ctl"))
+    let mut launcher = common::program(env!("CARGO_BIN_EXE_cc-rotate-ctl"))
         .args([
             "desktop-launch",
             "--",
@@ -235,7 +237,7 @@ fn ending_the_launcher_ends_claude_code() {
         ccr_core::process::alive(own),
         "a process Claude Code started was ended with the launcher"
     );
-    let _ = Command::new("taskkill")
+    let _ = std::process::Command::new("taskkill")
         .args(["/F", "/PID", &own.to_string()])
         .output();
 }
@@ -255,7 +257,7 @@ fn a_resumed_older_session_keeps_the_apps_config_dir_unset() {
     std::fs::create_dir_all(&folder).unwrap();
     std::fs::write(folder.join("abc-123.jsonl"), "{}\n").unwrap();
     let profile = root.path().join("rotate profile");
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_cc-rotate-ctl"));
+    let mut cmd = common::program(env!("CARGO_BIN_EXE_cc-rotate-ctl"));
     cmd.args([
         "desktop-launch",
         "--",
@@ -306,7 +308,7 @@ fn a_resumed_desktop_session_only_in_the_app_profile_runs_on_the_pool() {
     )
     .unwrap();
     let profile = root.path().join("rotate profile");
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_cc-rotate-ctl"));
+    let mut cmd = common::program(env!("CARGO_BIN_EXE_cc-rotate-ctl"));
     cmd.args([
         "desktop-launch",
         "--",

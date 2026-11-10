@@ -1,7 +1,8 @@
 //! The `cc-rotate` launcher against a stand-in `claude` that reports what it was given.
 
+mod common;
+
 use std::path::Path;
-use std::process::Command;
 
 /// A fake `claude` on PATH that prints `CLAUDE_CONFIG_DIR` and its arguments, one per line,
 /// and exits with 7.
@@ -39,7 +40,7 @@ fn starts_claude_on_the_rotation_profile_with_every_argument() {
             .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
     )
     .unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_cc-rotate"))
+    let out = common::program(env!("CARGO_BIN_EXE_cc-rotate"))
         .args(["--resume", "abc-123", "--model", "opus"])
         .current_dir(root.path())
         .env("PATH", path)
@@ -81,7 +82,7 @@ fn warns_in_the_home_folder_and_still_starts_claude() {
     let bin = root.path().join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     fake_claude(&bin);
-    let out = Command::new(env!("CARGO_BIN_EXE_cc-rotate"))
+    let out = common::program(env!("CARGO_BIN_EXE_cc-rotate"))
         .current_dir(root.path())
         .env("HOME", root.path())
         .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))

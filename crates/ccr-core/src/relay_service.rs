@@ -18,6 +18,11 @@ pub const LAUNCH_AGENT_LABEL: &str = "cc-rotate.relay";
 pub const SYSTEMD_UNIT: &str = "cc-rotate-relay.service";
 /// The Task Scheduler task's name.
 pub const TASK_NAME: &str = "cc-rotate-relay";
+/// Set (to anything but empty) where the relay's service must never be installed or removed:
+/// every test that runs cc-rotate's programs sets it.
+pub const NO_SERVICE_ENV: &str = "CC_ROTATE_NO_SERVICE";
+/// Set to `1` in the service's environment, so `relay run` knows the service started it.
+pub const SERVICE_MARK_ENV: &str = "CC_ROTATE_RELAY_SERVICE";
 
 /// Whether the relay's service is installed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +73,8 @@ pub struct Service {
     /// task's definition while it is created.
     pub dir: PathBuf,
     pub runner: Arc<dyn Runner>,
+    /// Set by `NO_SERVICE_ENV`: installing and removing refuse, and none is installed.
+    pub disabled: bool,
 }
 
 const LAUNCHCTL: &str = "/bin/launchctl";
@@ -267,6 +274,26 @@ fn service_env_from(
     env
 }
 
+/// What a relay that leaves for good does once relay mode is off (spec 10): delete
+/// `relay_config` (`relay.json`), then remove `service` when it serves this relay's data folder
+/// (`data_dir`, as `Service::serves` takes it).
+///
+/// `relay.json` goes first: removing the service stops the relay that runs this, which may end
+/// before the next step.
+pub fn retire(service: &Service, relay_config: &Path, data_dir: Option<&str>) -> Result<()> {
+    match std::fs::remove_file(relay_config) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("deleting {}", relay_config.display())),
+    }
+    // Only the service that runs a relay of this data folder: a relay a test started in a folder
+    // of its own leaves the user's alone.
+    if service.serves(data_dir) {
+        service.remove()?;
+    }
+    Ok(())
+}
+
 /// Install the relay's service for `ctl`, with the environment `relay on` runs in, and start it.
 pub fn install(ctl: &Path) -> Result<()> {
     Service::real()?.install(ctl, &service_env(None))
@@ -284,11 +311,21 @@ pub fn status() -> ServiceState {
 
 impl Service {
     /// This user's service manager and folder.
-    /// Never in this crate's tests: they use a service of their own.
+    ///
+    /// Two guards keep tests off the real service: in this crate's own tests (`cfg(test)`) there
+    /// is none at all, and where `CC_ROTATE_NO_SERVICE` is set (the tests of other crates, which
+    /// run the built programs) the service it gives refuses to install or remove anything and is
+    /// never installed. `cfg(test)` alone does not cover those programs.
     pub fn real() -> Result<Service> {
         if cfg!(test) {
             bail!("tests never touch the real service");
         }
+        let mut service = Service::for_platform()?;
+        service.disabled = std::env::var_os(NO_SERVICE_ENV).is_some_and(|v| !v.is_empty());
+        Ok(service)
+    }
+
+    fn for_platform() -> Result<Service> {
         let runner: Arc<dyn Runner> = Arc::new(SystemRunner);
         if cfg!(target_os = "macos") {
             Ok(Service {
@@ -297,12 +334,14 @@ impl Service {
                     .join("Library")
                     .join("LaunchAgents"),
                 runner,
+                disabled: false,
             })
         } else if cfg!(windows) {
             Ok(Service {
                 kind: Kind::TaskScheduler,
                 dir: crate::Paths::default_data_dir()?,
                 runner,
+                disabled: false,
             })
         } else {
             let config = dirs::config_dir().context("could not determine the config folder")?;
@@ -310,6 +349,7 @@ impl Service {
                 kind: Kind::Systemd,
                 dir: config.join("systemd").join("user"),
                 runner,
+                disabled: false,
             })
         }
     }
@@ -336,7 +376,12 @@ impl Service {
 
     /// Write the service's definition for `ctl` with `env` and start it; a definition that
     /// changed replaces the running relay.
+    /// `env` gains `SERVICE_MARK_ENV`.
     pub fn install(&self, ctl: &Path, env: &[(&str, String)]) -> Result<()> {
+        self.refuse_when_disabled()?;
+        let mut env = env.to_vec();
+        env.push((SERVICE_MARK_ENV, "1".to_string()));
+        let env = env.as_slice();
         match self.kind {
             Kind::LaunchAgent { uid } => {
                 let text = launch_agent_plist(ctl, env);
@@ -397,6 +442,7 @@ impl Service {
     /// The relay calls this itself when it leaves (spec 10), and stopping the service ends the
     /// relay: so the definition goes first and the stop comes last.
     pub fn remove(&self) -> Result<()> {
+        self.refuse_when_disabled()?;
         match self.kind {
             Kind::LaunchAgent { uid } => {
                 self.delete(&self.file())?;
@@ -436,6 +482,9 @@ impl Service {
     /// another data folder (a test's) never removes it.
     /// A Task Scheduler task carries no environment: it serves the default folder.
     pub fn serves(&self, data_dir: Option<&str>) -> bool {
+        if self.disabled {
+            return false;
+        }
         let defined = match self.kind {
             Kind::TaskScheduler => None,
             Kind::LaunchAgent { .. } | Kind::Systemd => {
@@ -453,17 +502,25 @@ impl Service {
 
     /// Whether the service is installed: its definition is there.
     pub fn status(&self) -> ServiceState {
-        let installed = match self.kind {
-            Kind::LaunchAgent { .. } | Kind::Systemd => self.file().exists(),
-            Kind::TaskScheduler => self
-                .run(SCHTASKS, &["/Query", "/TN", TASK_NAME])
-                .unwrap_or(false),
-        };
+        let installed = !self.disabled
+            && match self.kind {
+                Kind::LaunchAgent { .. } | Kind::Systemd => self.file().exists(),
+                Kind::TaskScheduler => self
+                    .run(SCHTASKS, &["/Query", "/TN", TASK_NAME])
+                    .unwrap_or(false),
+            };
         if installed {
             ServiceState::Installed
         } else {
             ServiceState::Missing
         }
+    }
+
+    fn refuse_when_disabled(&self) -> Result<()> {
+        if self.disabled {
+            bail!("{NO_SERVICE_ENV} is set, so the relay's service is left alone");
+        }
+        Ok(())
     }
 
     fn run(&self, program: &str, args: &[&str]) -> Result<bool> {
@@ -552,12 +609,104 @@ mod tests {
             kind,
             dir: root.path().join("agents"),
             runner: fake.clone(),
+            disabled: false,
         };
         (root, service, fake)
     }
 
     fn env() -> Vec<(&'static str, String)> {
         vec![("CC_ROTATE_DATA_DIR", "/data & <more>".to_string())]
+    }
+
+    /// `env` as `install` writes it: with the mark that the service started the relay.
+    fn marked(mut env: Vec<(&'static str, String)>) -> Vec<(&'static str, String)> {
+        env.push(("CC_ROTATE_RELAY_SERVICE", "1".to_string()));
+        env
+    }
+
+    /// Notes, at each `bootout` or `stop`, whether `watched` is still there.
+    struct Watching {
+        watched: PathBuf,
+        seen: Mutex<Vec<bool>>,
+    }
+
+    impl Runner for Watching {
+        fn run(&self, _program: &str, args: &[String]) -> Result<bool> {
+            if args.iter().any(|a| a == "bootout" || a == "stop") {
+                self.seen.lock().unwrap().push(self.watched.exists());
+            }
+            Ok(true)
+        }
+    }
+
+    #[test]
+    fn retire_deletes_relay_json_before_stopping_the_relay() {
+        for kind in [Kind::LaunchAgent { uid: 501 }, Kind::Systemd] {
+            let root = tempfile::tempdir().unwrap();
+            let config = root.path().join("relay.json");
+            std::fs::write(&config, "{}").unwrap();
+            let watching = Arc::new(Watching {
+                watched: config.clone(),
+                seen: Mutex::new(Vec::new()),
+            });
+            let service = Service {
+                kind,
+                dir: root.path().join("agents"),
+                runner: watching.clone(),
+                disabled: false,
+            };
+            service
+                .install(Path::new("/bin/cc-rotate-ctl"), &[])
+                .unwrap();
+            watching.seen.lock().unwrap().clear();
+            retire(&service, &config, None).unwrap();
+            assert!(!config.exists());
+            assert_eq!(service.status(), ServiceState::Missing);
+            assert_eq!(
+                *watching.seen.lock().unwrap(),
+                [false],
+                "{kind:?}: relay.json was still there when the relay was stopped"
+            );
+        }
+    }
+
+    #[test]
+    fn retire_leaves_another_data_folders_service() {
+        let (root, service, fake) = service(Kind::LaunchAgent { uid: 501 });
+        service
+            .install(Path::new("/bin/cc-rotate-ctl"), &[])
+            .unwrap();
+        let config = root.path().join("relay.json");
+        std::fs::write(&config, "{}").unwrap();
+        fake.calls.lock().unwrap().clear();
+        retire(&service, &config, Some("/tmp/a-test-folder")).unwrap();
+        assert!(!config.exists());
+        assert_eq!(service.status(), ServiceState::Installed);
+        assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+        // Nothing to delete is fine.
+        retire(&service, &config, Some("/tmp/a-test-folder")).unwrap();
+    }
+
+    #[test]
+    fn a_disabled_service_refuses_and_is_never_installed() {
+        let (_root, mut service, fake) = service(Kind::LaunchAgent { uid: 501 });
+        service
+            .install(Path::new("/bin/cc-rotate-ctl"), &[])
+            .unwrap();
+        service.disabled = true;
+        fake.calls.lock().unwrap().clear();
+        let err = service
+            .install(Path::new("/bin/cc-rotate-ctl"), &[])
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("CC_ROTATE_NO_SERVICE"),
+            "{err:#}"
+        );
+        assert!(service.remove().is_err());
+        assert_eq!(service.status(), ServiceState::Missing);
+        assert!(!service.serves(None));
+        assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+        assert!(service.file().exists(), "left alone");
     }
 
     #[test]
@@ -651,7 +800,7 @@ mod tests {
         let plist = service.dir.join("cc-rotate.relay.plist");
         assert_eq!(
             std::fs::read_to_string(&plist).unwrap(),
-            launch_agent_plist(ctl, &env())
+            launch_agent_plist(ctl, &marked(env()))
         );
         assert_eq!(service.status(), ServiceState::Installed);
         let path = plist.display().to_string();
@@ -703,7 +852,7 @@ mod tests {
         let unit = service.dir.join("cc-rotate-relay.service");
         assert_eq!(
             std::fs::read_to_string(&unit).unwrap(),
-            systemd_unit(ctl, &env())
+            systemd_unit(ctl, &marked(env()))
         );
         assert_eq!(service.status(), ServiceState::Installed);
         assert_eq!(

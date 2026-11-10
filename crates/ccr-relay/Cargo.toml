@@ -19,7 +19,7 @@ http = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "rustls-platform-verifier", "ring", "tls12"] }
-hyper-util = { version = "0.1", features = ["client-legacy", "server-auto", "tokio", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "server-auto", "server-graceful", "tokio", "http1", "http2"] }
 # Named directly to pick ring as the TLS crypto, whatever else in a build enables.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.229", features = ["derive"] }

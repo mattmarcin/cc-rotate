@@ -72,6 +72,9 @@ pub struct Plan {
     pub data: PathBuf,
     /// Relay mode is on with this home account: `run` turns it off first (relay spec 10).
     pub relay_home: Option<String>,
+    /// Relay mode is on and a swap is pending, so turning it off would be refused: uninstall
+    /// waits until the swap is settled.
+    pub relay_swap_pending: bool,
     /// The relay's service, described, when it is installed.
     pub relay_service: Option<String>,
     /// `relay.json`, when it is there.
@@ -466,6 +469,7 @@ pub fn plan(
                 .account(home)?
                 .map_or_else(|| format!("account {home}"), |a| a.label),
         );
+        plan.relay_swap_pending = crate::swap::pending_swap(store)?.is_some();
     }
     plan.relay_service = system.relay_service();
     let relay_config = paths.relay_config();
@@ -1562,6 +1566,7 @@ mod tests {
         let p = plan(&fake, &i.paths, Some(&store), &i.ctl, time::now_ms()).unwrap();
         drop(store);
         assert_eq!(p.relay_home.as_deref(), Some("work"));
+        assert!(!p.relay_swap_pending);
         assert_eq!(p.relay_service.as_deref(), Some("the relay's LaunchAgent"));
         assert_eq!(p.relay_config, Some(i.paths.relay_config()));
         assert_eq!(p.data, i.paths.data_dir);
@@ -1604,6 +1609,58 @@ mod tests {
         assert_eq!(again.relay_config, None);
         run(&quiet, &again, &i.ctl);
         assert!(!quiet.calls.borrow().iter().any(|c| c.contains("relay")));
+    }
+
+    #[test]
+    fn a_pending_swap_in_relay_mode_is_noted() {
+        let i = install();
+        {
+            let store = Store::open(&i.paths.store_db()).unwrap();
+            let home = store
+                .insert_account(
+                    "work",
+                    &crate::store::AccountIdentity::default(),
+                    crate::store::AccountState::Active,
+                )
+                .unwrap();
+            let pending = crate::swap::PendingSwap {
+                fp: "x".into(),
+                from: Some(home),
+                to: home,
+                at: time::now_ms(),
+                relay: None,
+            };
+            store
+                .set_meta(
+                    crate::swap::META_SWAP_PENDING,
+                    serde_json::to_string(&pending).unwrap(),
+                )
+                .unwrap();
+            let store_ro = Store::open_read_only(&i.paths.store_db()).unwrap();
+            let p = plan(
+                &Fake::default(),
+                &i.paths,
+                Some(&store_ro),
+                &i.ctl,
+                time::now_ms(),
+            )
+            .unwrap();
+            assert!(
+                !p.relay_swap_pending,
+                "relay mode is off: nothing to turn off"
+            );
+            crate::relay::set_mode(&store, Some(home)).unwrap();
+        }
+        let store = Store::open_read_only(&i.paths.store_db()).unwrap();
+        let p = plan(
+            &Fake::default(),
+            &i.paths,
+            Some(&store),
+            &i.ctl,
+            time::now_ms(),
+        )
+        .unwrap();
+        assert!(p.relay_swap_pending);
     }
 
     /// A profile deleted by hand leaves its Keychain item, which still goes; a profile kept keeps
