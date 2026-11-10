@@ -31,13 +31,32 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use zeroize::Zeroizing;
 
 pub use events::{StoreEvents, StoreSwaps, Swaps};
-pub use login::StoreLogins;
+pub use login::{Renewals, StoreLogins, StoreRenewals};
 
 /// The only address the relay sends requests to in a release build.
 const ANTHROPIC: &str = "https://api.anthropic.com";
 
 /// The header Claude Code names its session in.
 const SESSION_HEADER: &str = "x-claude-code-session-id";
+
+/// How often a request held after a 401 reads the stored login again (spec 9).
+const REFRESH_EVERY: Duration = Duration::from_millis(500);
+
+/// How the relay behaves, apart from where it listens.
+#[derive(Debug, Clone)]
+pub struct Options {
+    /// How long a model request refused as not signed in waits for a renewed login before the
+    /// relay swaps away from its account (spec 9).
+    pub login_hold: Duration,
+}
+
+impl Default for Options {
+    fn default() -> Options {
+        Options {
+            login_hold: Duration::from_secs(30),
+        }
+    }
+}
 
 /// Which login a model request goes out with.
 #[derive(Clone)]
@@ -70,9 +89,18 @@ impl std::fmt::Debug for Choice {
 }
 
 /// Where the relay gets the login for a model request.
-/// Called once per model request, on a thread that may block.
+/// Every method is called on a thread that may block.
 pub trait Logins: Send + Sync {
+    /// The login for a model request, called once per request.
     fn for_model(&self) -> Result<Choice>;
+
+    /// Start a renewal of `account`'s stored login in the background, unless one is running,
+    /// and return at once (spec 9).
+    /// Never for the account whose login is the profile's: Claude Code renews that one itself.
+    fn renew(&self, account: i64);
+
+    /// `account`'s stored login as it is now: a renewal may have replaced it.
+    fn refresh(&self, account: i64) -> Result<Choice>;
 }
 
 /// What the relay reports as it works. Every method does nothing unless implemented.
@@ -102,7 +130,16 @@ pub trait RelayEvents: Send + Sync {
         Swapped::No
     }
 
-    /// A request refused at a limit on `from` is being sent again on `to`.
+    /// Anthropic refused a model request sent with `account`'s stored login as not signed in, and
+    /// no renewed login came within the hold (spec 9).
+    /// Holds the account back until a check settles its login, then swaps away from it as
+    /// `refused_at_limit` does, and says which account is active now.
+    /// Called on a thread that may block.
+    fn dead_login(&self, _account: i64) -> Swapped {
+        Swapped::No
+    }
+
+    /// A request refused on `from` is being sent again on `to`.
     /// Called on a thread that may block.
     fn resent(&self, _from: i64, _to: i64) {}
 
@@ -239,6 +276,7 @@ impl Upstream {
 
 struct State {
     cfg: RelayConfig,
+    options: Options,
     upstream: Upstream,
     logins: Arc<dyn Logins>,
     events: Arc<dyn RelayEvents>,
@@ -250,6 +288,7 @@ type RelayBody = BoxBody<Bytes, hyper::Error>;
 pub async fn serve(
     listener: std::net::TcpListener,
     cfg: RelayConfig,
+    options: Options,
     upstream: Upstream,
     logins: Arc<dyn Logins>,
     events: Arc<dyn RelayEvents>,
@@ -262,6 +301,7 @@ pub async fn serve(
     let listener = tokio::net::TcpListener::from_std(listener)?;
     let state = Arc::new(State {
         cfg,
+        options,
         upstream,
         logins,
         events,
@@ -297,6 +337,7 @@ pub async fn serve(
 pub fn run_blocking(
     listener: std::net::TcpListener,
     cfg: RelayConfig,
+    options: Options,
     upstream: Upstream,
     logins: Arc<dyn Logins>,
     events: Arc<dyn RelayEvents>,
@@ -305,7 +346,7 @@ pub fn run_blocking(
         .enable_all()
         .build()
         .context("starting the relay's runtime")?;
-    runtime.block_on(serve(listener, cfg, upstream, logins, events))
+    runtime.block_on(serve(listener, cfg, options, upstream, logins, events))
 }
 
 fn bare(status: StatusCode) -> Response<RelayBody> {
@@ -407,6 +448,54 @@ async fn login(st: &State) -> Result<Choice, String> {
     }
 }
 
+/// `account`'s stored login read again, when it holds a token other than `old`.
+async fn changed_login(st: &State, account: i64, old: &str) -> Option<Choice> {
+    let logins = st.logins.clone();
+    match tokio::task::spawn_blocking(move || logins.refresh(account)).await {
+        Ok(Ok(choice @ Choice::Token { .. }))
+            if choice.account() == account
+                && matches!(&choice, Choice::Token { token, .. } if token.as_str() != old) =>
+        {
+            Some(choice)
+        }
+        _ => None,
+    }
+}
+
+/// A renewed login for `account`, whose token `old` Anthropic refused as not signed in (spec 9).
+/// Reads the stored login again; when it has not changed, asks for a renewal and reads it every
+/// `REFRESH_EVERY` until the hold ends.
+/// Only this request waits: others, of this account or another, go on as usual.
+async fn renewed_login(st: &State, account: i64, old: &str) -> Option<Choice> {
+    if let Some(choice) = changed_login(st, account, old).await {
+        st.events.log(&format!(
+            "account={account} login refused; a newer one is stored"
+        ));
+        return Some(choice);
+    }
+    let logins = st.logins.clone();
+    let _ = tokio::task::spawn_blocking(move || logins.renew(account)).await;
+    st.events.log(&format!(
+        "account={account} login refused; holding for a renewal"
+    ));
+    let until = tokio::time::Instant::now() + st.options.login_hold;
+    loop {
+        let left = until.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            st.events.log(&format!(
+                "account={account} no renewed login within {} s",
+                st.options.login_hold.as_secs()
+            ));
+            return None;
+        }
+        tokio::time::sleep(left.min(REFRESH_EVERY)).await;
+        if let Some(choice) = changed_login(st, account, old).await {
+            st.events.log(&format!("account={account} login renewed"));
+            return Some(choice);
+        }
+    }
+}
+
 /// The response for the session: the upstream's status, headers but the hop-by-hop ones, and
 /// its body as it arrives.
 fn respond(rparts: http::response::Parts, rbody: Incoming, head: bool) -> Response<RelayBody> {
@@ -488,10 +577,12 @@ async fn handle(req: Request<Incoming>, st: &State) -> Response<RelayBody> {
         .map(str::to_string);
     let head = parts.method == Method::HEAD;
 
-    // Each pool account is tried at most once (spec 8).
+    // Each pool account is tried at most once (spec 8), and a refused login is renewed at most
+    // once per account (spec 9).
     let mut tried: Vec<i64> = Vec::new();
+    let mut renewed: Vec<i64> = Vec::new();
     loop {
-        let (account, token) = match choice.take() {
+        let (account, mut token) = match choice.take() {
             Some(Choice::PassThrough { account }) => (Some(account), None),
             Some(Choice::Token { account, token }) => (Some(account), Some(token)),
             None => (None, None),
@@ -516,7 +607,6 @@ async fn handle(req: Request<Incoming>, st: &State) -> Response<RelayBody> {
             value.set_sensitive(true);
             headers.insert(header::AUTHORIZATION, value);
         }
-        drop(token);
 
         let resp = match st.upstream.client.request(out).await {
             Ok(r) => r,
@@ -568,13 +658,33 @@ async fn handle(req: Request<Incoming>, st: &State) -> Response<RelayBody> {
             .headers
             .get("anthropic-ratelimit-unified-status")
             .and_then(|v| v.to_str().ok());
-        if !relay_proto::is_limit_refusal(status, unified) {
+        let at_limit = relay_proto::is_limit_refusal(status, unified);
+        // Refused as not signed in with the stored login: send it again with a renewed one, or
+        // swap away when none comes (spec 9). A session's own login is Claude Code's to renew.
+        let old = token
+            .take()
+            .filter(|_| status == 401 && !renewed.contains(&account));
+        if !at_limit && old.is_none() {
             return respond(rparts, rbody, head);
         }
+        if let Some(old) = old {
+            renewed.push(account);
+            if let Some(fresh) = renewed_login(st, account, old.as_str()).await {
+                drop(rbody);
+                choice = Some(fresh);
+                continue;
+            }
+        }
         let events = st.events.clone();
-        let swapped = tokio::task::spawn_blocking(move || events.refused_at_limit(account))
-            .await
-            .unwrap_or(Swapped::No);
+        let swapped = tokio::task::spawn_blocking(move || {
+            if at_limit {
+                events.refused_at_limit(account)
+            } else {
+                events.dead_login(account)
+            }
+        })
+        .await
+        .unwrap_or(Swapped::No);
         let Swapped::To(next) = swapped else {
             return respond(rparts, rbody, head);
         };

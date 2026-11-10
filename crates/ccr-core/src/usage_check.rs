@@ -1221,7 +1221,9 @@ pub fn discard_leftovers(paths: &Paths, account_id: i64) {
 }
 
 /// Keep an account out of use until a check settles whether its login still works.
-pub(crate) fn hold_back(store: &Store, account_id: i64) -> Result<()> {
+/// Sets `held_back` in its check state and nothing else; the next routine check settles it.
+/// The relay calls it when Anthropic keeps refusing the account's stored login (relay spec 9).
+pub fn hold_back(store: &Store, account_id: i64) -> Result<()> {
     let mut st = state(store, account_id)?;
     if !st.held_back {
         st.held_back = true;

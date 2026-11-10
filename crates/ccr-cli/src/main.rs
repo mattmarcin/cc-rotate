@@ -782,13 +782,16 @@ fn relay_run() -> Result<()> {
     let events = Arc::new(ccr_relay::StoreEvents::new(
         Store::open(&paths.store_db())?,
         Arc::new(ccr_relay::StoreSwaps::new(paths.clone())),
-        log,
+        log.clone(),
     ));
+    // Renewals run a check on a store of their own (spec 9).
+    let renewals = Arc::new(ccr_relay::StoreRenewals::new(paths.clone(), log));
     ccr_relay::run_blocking(
         listener,
         cfg,
+        ccr_relay::Options::default(),
         upstream,
-        Arc::new(ccr_relay::StoreLogins::new(store)),
+        Arc::new(ccr_relay::StoreLogins::new(store, renewals)),
         events,
     )
 }

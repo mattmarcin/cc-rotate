@@ -1,5 +1,5 @@
-//! What the relay records in the store (spec 7, 8 and 12): usage readings, threshold swaps,
-//! swaps at a refused limit, resends and errors.
+//! What the relay records in the store (spec 7, 8, 9 and 12): usage readings, threshold swaps,
+//! swaps at a refused limit or login, resends and errors.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -7,7 +7,7 @@ use anyhow::Result;
 use ccr_core::scheduler::{self, Reason};
 use ccr_core::store::{Sample, kind};
 use ccr_core::swap::{self, SwapOutcome, SwapRequest};
-use ccr_core::{Paths, Store, relay_proto, statusline, time, waiting};
+use ccr_core::{Paths, Store, relay_proto, statusline, time, usage_check, waiting};
 use serde_json::json;
 
 use crate::{RelayEvents, Swapped};
@@ -51,8 +51,8 @@ pub struct StoreEvents {
     store: Mutex<Store>,
     swaps: Arc<dyn Swaps>,
     log: Arc<dyn RelayEvents>,
-    /// Held while a refusal at a limit is dealt with, so refusals of one account that arrive
-    /// together ask for one swap: the others find the account no longer active.
+    /// Held while a refusal at a limit or a dead login is dealt with, so refusals of one account
+    /// that arrive together ask for one swap: the others find the account no longer active.
     refusals: Mutex<()>,
     /// When the last `relay_error` event was recorded, in epoch ms.
     last_error_ms: Mutex<i64>,
@@ -151,6 +151,33 @@ impl StoreEvents {
     }
 }
 
+impl StoreEvents {
+    /// Swaps away from `account` if it is still the active one and says which account is active
+    /// now: the swap at a refused limit (spec 8) or at a refused login (spec 9).
+    fn swap_away(&self, account: i64, reason: Reason, why: &str) -> Swapped {
+        let _one = self.refusals.lock().unwrap_or_else(|e| e.into_inner());
+        // Another refusal's swap may have moved the pool on already: then there is nothing to
+        // swap, and the request goes to the account that is active now.
+        if self.active() == Some(account) {
+            let req = SwapRequest {
+                from: Some(account),
+                to: None,
+                reason,
+                wait: true,
+            };
+            self.log(&match self.swaps.run(&req) {
+                Ok(outcome) => format!("swap from {account} {why}: {outcome:?}"),
+                Err(e) => format!("swap from {account} {why} failed: {e:#}"),
+            });
+        }
+        // Whatever the swap did, the account active now is the one to try.
+        match self.active() {
+            Some(active) if active != account => Swapped::To(active),
+            _ => Swapped::No,
+        }
+    }
+}
+
 /// The swap the status line would ask for after a reading of `account` (main 6), when it is the
 /// active account: a threshold, or a better account available.
 /// Asking is recorded, so readings that follow within the request interval ask for none.
@@ -195,26 +222,15 @@ impl RelayEvents for StoreEvents {
     }
 
     fn refused_at_limit(&self, account: i64) -> Swapped {
-        let _one = self.refusals.lock().unwrap_or_else(|e| e.into_inner());
-        // Another refusal's swap may have moved the pool on already: then there is nothing to
-        // swap, and the request goes to the account that is active now.
-        if self.active() == Some(account) {
-            let req = SwapRequest {
-                from: Some(account),
-                to: None,
-                reason: Reason::LimitRefused,
-                wait: true,
-            };
-            self.log(&match self.swaps.run(&req) {
-                Ok(outcome) => format!("swap from {account} at a refused limit: {outcome:?}"),
-                Err(e) => format!("swap from {account} at a refused limit failed: {e:#}"),
-            });
+        self.swap_away(account, Reason::LimitRefused, "at a refused limit")
+    }
+
+    fn dead_login(&self, account: i64) -> Swapped {
+        // Until a check settles it, no swap picks the account again.
+        if let Err(e) = usage_check::hold_back(&self.store(), account) {
+            self.log(&format!("holding back account {account} failed: {e:#}"));
         }
-        // Whatever the swap did, the account active now is the one to try.
-        match self.active() {
-            Some(active) if active != account => Swapped::To(active),
-            _ => Swapped::No,
-        }
+        self.swap_away(account, Reason::DeadLogin, "at a refused login")
     }
 
     fn resent(&self, from: i64, to: i64) {
@@ -497,6 +513,37 @@ mod tests {
         let env = env(exhausted());
         env.open().set_state(env.b, AccountState::Parked).unwrap();
         assert_eq!(env.events.refused_at_limit(env.b), Swapped::No);
+    }
+
+    #[test]
+    fn dead_login_holds_back_and_swaps() {
+        let env = env(swap_to_parked());
+        assert_eq!(env.events.dead_login(env.b), Swapped::To(env.c));
+        let req = env.next_swap().unwrap();
+        assert_eq!(req.from, Some(env.b));
+        assert_eq!(req.to, None);
+        assert_eq!(req.reason, Reason::DeadLogin);
+        assert!(req.wait);
+        let st = ccr_core::usage_check::state(&env.open(), env.b).unwrap();
+        assert!(st.held_back);
+        assert!(
+            !ccr_core::usage_check::state(&env.open(), env.c)
+                .unwrap()
+                .held_back
+        );
+    }
+
+    #[test]
+    fn dead_login_after_another_swap_moved_on() {
+        let env = env(exhausted());
+        move_to(&env.open(), env.b, env.c);
+        assert_eq!(env.events.dead_login(env.b), Swapped::To(env.c));
+        env.no_swap();
+        assert!(
+            ccr_core::usage_check::state(&env.open(), env.b)
+                .unwrap()
+                .held_back
+        );
     }
 
     #[test]

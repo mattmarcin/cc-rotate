@@ -9,9 +9,11 @@ use bytes::Bytes;
 use ccr_core::relay::RelayConfig;
 use ccr_core::store::{AccountIdentity, AccountState, kind};
 use ccr_core::swap::{SwapOutcome, SwapRequest};
+use ccr_core::usage_check::CheckOutcome;
 use ccr_core::{Paths, Store};
 use ccr_relay::{
-    Choice, Logins, RelayEvents, StoreEvents, StoreLogins, StoreSwaps, Swapped, Swaps, Upstream,
+    Choice, Logins, Options, RelayEvents, Renewals, StoreEvents, StoreLogins, StoreSwaps, Swapped,
+    Swaps, Upstream,
 };
 use http::{HeaderMap, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
@@ -44,11 +46,16 @@ struct FakeState {
     limited: Mutex<Vec<String>>,
     /// Holds each refusal until as many requests reached it.
     limit_barrier: Mutex<Option<Arc<tokio::sync::Barrier>>>,
+    /// Tokens whose model requests are refused as not signed in.
+    unauthorized: Mutex<Vec<String>>,
 }
 
 impl FakeState {
     fn limit(&self, tokens: &[&str]) {
         *self.limited.lock().unwrap() = tokens.iter().map(|t| t.to_string()).collect();
+    }
+    fn refuse_login(&self, tokens: &[&str]) {
+        *self.unauthorized.lock().unwrap() = tokens.iter().map(|t| t.to_string()).collect();
     }
 }
 
@@ -60,6 +67,9 @@ fn resets() -> (i64, i64) {
 
 const LIMIT_BODY: &str =
     r#"{"type":"error","error":{"type":"rate_limit_error","message":"limit reached"}}"#;
+
+const UNAUTHORIZED_BODY: &str =
+    r#"{"type":"error","error":{"type":"authentication_error","message":"invalid token"}}"#;
 
 struct Fake {
     addr: SocketAddr,
@@ -115,6 +125,15 @@ async fn fake_handle(
         body,
     });
     let (r5h, r7d) = resets();
+    if state.unauthorized.lock().unwrap().contains(&token) {
+        return Ok(Response::builder()
+            .status(401)
+            .header("content-type", "application/json")
+            .header("request-id", "req_401")
+            .header("x-token", token.as_str())
+            .body(BodyExt::boxed(Full::new(Bytes::from(UNAUTHORIZED_BODY))))
+            .unwrap());
+    }
     if state.limited.lock().unwrap().contains(&token) {
         let barrier = state.limit_barrier.lock().unwrap().clone();
         if let Some(barrier) = barrier {
@@ -226,22 +245,58 @@ async fn fake_upstream() -> Fake {
 }
 
 /// Logins whose choice a test can change.
-struct Switch(Mutex<Result<Choice, String>>);
+/// `refresh` gives what `refreshed` holds, or the current choice when it holds nothing.
+struct Switch {
+    choice: Mutex<Result<Choice, String>>,
+    refreshed: Mutex<Option<Choice>>,
+    renewals: Mutex<Vec<i64>>,
+    refreshes: Mutex<Vec<i64>>,
+}
 
 impl Switch {
     fn new(choice: Choice) -> Arc<Switch> {
-        Arc::new(Switch(Mutex::new(Ok(choice))))
+        Arc::new(Switch::with(Ok(choice)))
+    }
+    fn failing(why: &str) -> Arc<Switch> {
+        Arc::new(Switch::with(Err(why.to_string())))
+    }
+    fn with(choice: Result<Choice, String>) -> Switch {
+        Switch {
+            choice: Mutex::new(choice),
+            refreshed: Mutex::new(None),
+            renewals: Mutex::new(Vec::new()),
+            refreshes: Mutex::new(Vec::new()),
+        }
     }
     fn set(&self, choice: Choice) {
-        *self.0.lock().unwrap() = Ok(choice);
+        *self.choice.lock().unwrap() = Ok(choice);
+    }
+    fn set_refreshed(&self, choice: Choice) {
+        *self.refreshed.lock().unwrap() = Some(choice);
+    }
+    fn renewals(&self) -> Vec<i64> {
+        self.renewals.lock().unwrap().clone()
+    }
+    fn refreshes(&self) -> Vec<i64> {
+        self.refreshes.lock().unwrap().clone()
     }
 }
 
 impl Logins for Switch {
     fn for_model(&self) -> anyhow::Result<Choice> {
-        match &*self.0.lock().unwrap() {
+        match &*self.choice.lock().unwrap() {
             Ok(c) => Ok(c.clone()),
             Err(e) => Err(anyhow::anyhow!("{e}")),
+        }
+    }
+    fn renew(&self, account: i64) {
+        self.renewals.lock().unwrap().push(account);
+    }
+    fn refresh(&self, account: i64) -> anyhow::Result<Choice> {
+        self.refreshes.lock().unwrap().push(account);
+        match &*self.refreshed.lock().unwrap() {
+            Some(c) => Ok(c.clone()),
+            None => self.for_model(),
         }
     }
 }
@@ -270,6 +325,9 @@ struct Recorder {
     /// What `refused_at_limit` does; `Swapped::No` when unset.
     on_refusal: Mutex<Option<OnRefusal>>,
     refusals: Mutex<Vec<i64>>,
+    /// What `dead_login` does; `Swapped::No` when unset.
+    on_dead_login: Mutex<Option<OnRefusal>>,
+    dead_logins: Mutex<Vec<i64>>,
     resent: Mutex<Vec<(i64, i64)>>,
     unreachable: Mutex<Vec<String>>,
 }
@@ -280,6 +338,12 @@ impl Recorder {
     }
     fn refusals(&self) -> Vec<i64> {
         self.refusals.lock().unwrap().clone()
+    }
+    fn on_dead_login(&self, f: impl Fn(i64) -> Swapped + Send + Sync + 'static) {
+        *self.on_dead_login.lock().unwrap() = Some(Box::new(f));
+    }
+    fn dead_logins(&self) -> Vec<i64> {
+        self.dead_logins.lock().unwrap().clone()
     }
     fn resent(&self) -> Vec<(i64, i64)> {
         self.resent.lock().unwrap().clone()
@@ -317,6 +381,13 @@ impl RelayEvents for Recorder {
     fn refused_at_limit(&self, account: i64) -> Swapped {
         self.refusals.lock().unwrap().push(account);
         match &*self.on_refusal.lock().unwrap() {
+            Some(f) => f(account),
+            None => Swapped::No,
+        }
+    }
+    fn dead_login(&self, account: i64) -> Swapped {
+        self.dead_logins.lock().unwrap().push(account);
+        match &*self.on_dead_login.lock().unwrap() {
             Some(f) => f(account),
             None => Swapped::No,
         }
@@ -360,6 +431,15 @@ async fn relay_with<E: RelayEvents + 'static>(
     logins: Arc<dyn Logins>,
     events: Arc<E>,
 ) -> Relay<E> {
+    relay_holding(addr, logins, events, Options::default()).await
+}
+
+async fn relay_holding<E: RelayEvents + 'static>(
+    addr: SocketAddr,
+    logins: Arc<dyn Logins>,
+    events: Arc<E>,
+    options: Options,
+) -> Relay<E> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let cfg = RelayConfig {
         port: listener.local_addr().unwrap().port(),
@@ -369,6 +449,7 @@ async fn relay_with<E: RelayEvents + 'static>(
     tokio::spawn(ccr_relay::serve(
         listener,
         cfg.clone(),
+        options,
         upstream,
         logins,
         events.clone(),
@@ -614,7 +695,7 @@ async fn refused_never_reaches_upstream() {
 #[tokio::test(flavor = "multi_thread")]
 async fn no_login_answers_with_an_error_and_forwards_nothing() {
     let fake = fake_upstream().await;
-    let logins = Arc::new(Switch(Mutex::new(Err("no active account".into()))));
+    let logins = Switch::failing("no active account");
     let relay = relay_to(fake.addr, logins).await;
     let resp = relay
         .send(model_request(&relay, "", Some("Bearer home")))
@@ -1122,7 +1203,7 @@ async fn concurrent_refusals_swap_once() {
     let pool = Pool::new();
     let swaps = pool.counting_swaps();
     let events = pool.events(swaps.clone());
-    let logins = Arc::new(StoreLogins::new(pool.open()));
+    let logins = Arc::new(StoreLogins::new(pool.open(), FakeRenewals::new()));
     let relay = Arc::new(relay_with(fake.addr, logins, events).await);
 
     let mut set = tokio::task::JoinSet::new();
@@ -1201,4 +1282,359 @@ async fn upstream_down_logs_once() {
     assert_eq!(errors.len(), 1, "{errors:?}");
     let detail = errors[0].detail.clone().unwrap();
     assert_eq!(detail, serde_json::json!({"kind": "connect"}));
+}
+
+/// Renewals that record each account asked for and take `delay` to finish, changing nothing.
+struct FakeRenewals {
+    calls: Mutex<Vec<i64>>,
+    delay: Duration,
+}
+
+impl FakeRenewals {
+    fn new() -> Arc<FakeRenewals> {
+        FakeRenewals::slow(Duration::ZERO)
+    }
+    fn slow(delay: Duration) -> Arc<FakeRenewals> {
+        Arc::new(FakeRenewals {
+            calls: Mutex::new(Vec::new()),
+            delay,
+        })
+    }
+    fn calls(&self) -> Vec<i64> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+impl Renewals for FakeRenewals {
+    fn renew(&self, account: i64) -> anyhow::Result<CheckOutcome> {
+        self.calls.lock().unwrap().push(account);
+        std::thread::sleep(self.delay);
+        Ok(CheckOutcome::Skipped {
+            why: "a test".into(),
+        })
+    }
+}
+
+impl Pool {
+    /// Store `account`'s login again with `token`, its access token expiring `in_ms` from now.
+    fn expires_in(&self, account: i64, token: &str, in_ms: i64) {
+        self.open()
+            .save_credential(
+                account,
+                &serde_json::json!({
+                    "accessToken": token,
+                    "refreshToken": format!("ref-{token}"),
+                    "expiresAt": ccr_core::time::now_ms() + in_ms,
+                    "scopes": ["user:inference"],
+                    "subscriptionType": "max",
+                }),
+                "login",
+            )
+            .unwrap();
+    }
+}
+
+/// Waits up to 5 s for `cond`.
+async fn wait_for(cond: impl Fn() -> bool) {
+    let until = Instant::now() + Duration::from_secs(5);
+    while !cond() {
+        assert!(Instant::now() < until, "timed out waiting");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn holding(ms: u64) -> Options {
+    Options {
+        login_hold: Duration::from_millis(ms),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn renew_started_before_expiry() {
+    let fake = fake_upstream().await;
+    let pool = Pool::new();
+    // Ten minutes left, inside the default margin of 900 s.
+    pool.expires_in(pool.b, "tok-b", 10 * 60_000);
+    let renewals = FakeRenewals::new();
+    let logins = Arc::new(StoreLogins::new(pool.open(), renewals.clone()));
+    let relay = relay_to(fake.addr, logins).await;
+    let resp = relay
+        .send(model_request(&relay, "", Some("Bearer home")))
+        .await;
+    // The current token still works, so the request is not held.
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["x-token"], "tok-b");
+    body_of(resp).await;
+    wait_for(|| !renewals.calls().is_empty()).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(renewals.calls(), vec![pool.b]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn no_renewal_far_from_expiry() {
+    let fake = fake_upstream().await;
+    let pool = Pool::new();
+    let renewals = FakeRenewals::new();
+    let logins = Arc::new(StoreLogins::new(pool.open(), renewals.clone()));
+    let relay = relay_to(fake.addr, logins).await;
+    let resp = relay
+        .send(model_request(&relay, "", Some("Bearer home")))
+        .await;
+    assert_eq!(resp.status(), 200);
+    body_of(resp).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(renewals.calls().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn renew_once_at_a_time() {
+    let fake = fake_upstream().await;
+    let pool = Pool::new();
+    pool.expires_in(pool.b, "tok-b", 10 * 60_000);
+    let renewals = FakeRenewals::slow(Duration::from_millis(300));
+    let logins = Arc::new(StoreLogins::new(pool.open(), renewals.clone()));
+    let relay = Arc::new(relay_to(fake.addr, logins).await);
+    let mut set = tokio::task::JoinSet::new();
+    for _ in 0..20 {
+        let relay = relay.clone();
+        set.spawn(async move {
+            let resp = relay
+                .send(model_request(&relay, "", Some("Bearer home")))
+                .await;
+            let token = resp.headers()["x-token"].to_str().unwrap().to_string();
+            (resp.status(), token)
+        });
+    }
+    while let Some(r) = set.join_next().await {
+        assert_eq!(r.unwrap(), (StatusCode::OK, "tok-b".to_string()));
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // One that just finished without a new login is not started again at once either.
+    let resp = relay
+        .send(model_request(&relay, "", Some("Bearer home")))
+        .await;
+    assert_eq!(resp.status(), 200);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(renewals.calls(), vec![pool.b]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unauthorized_refreshes_and_resends() {
+    let fake = fake_upstream().await;
+    fake.state.refuse_login(&["tok-old"]);
+    let logins = Switch::new(token(2, "tok-old"));
+    // Something else renewed the login meanwhile.
+    logins.set_refreshed(token(2, "tok-new"));
+    let relay = relay_to(fake.addr, logins.clone()).await;
+    let resp = relay
+        .send(model_request(&relay, "", Some("Bearer home")))
+        .await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["x-token"], "tok-new");
+    assert_eq!(&body_of(resp).await[..], b"{\"ok\":true}");
+    assert_eq!(tokens_seen(&fake), vec!["Bearer tok-old", "Bearer tok-new"]);
+    let seen = fake.seen();
+    assert_eq!(seen[0].body, seen[1].body);
+    assert_eq!(logins.refreshes(), vec![2]);
+    assert!(logins.renewals().is_empty());
+    assert!(relay.events.dead_logins().is_empty());
+    assert!(relay.events.resent().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unauthorized_resent_once() {
+    let fake = fake_upstream().await;
+    fake.state.refuse_login(&["tok-old", "tok-new"]);
+    let logins = Switch::new(token(2, "tok-old"));
+    logins.set_refreshed(token(2, "tok-new"));
+    let relay = relay_to(fake.addr, logins.clone()).await;
+    let resp = relay
+        .send(model_request(&relay, "", Some("Bearer home")))
+        .await;
+    assert_eq!(resp.status(), 401);
+    assert_eq!(resp.headers()["x-token"], "tok-new");
+    assert_eq!(&body_of(resp).await[..], UNAUTHORIZED_BODY.as_bytes());
+    assert_eq!(fake.seen().len(), 2);
+    assert!(logins.renewals().is_empty());
+    assert!(relay.events.dead_logins().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unauthorized_holds_until_renewed() {
+    let fake = fake_upstream().await;
+    fake.state.refuse_login(&["tok-old"]);
+    let logins = Switch::new(token(2, "tok-old"));
+    let relay = relay_holding(
+        fake.addr,
+        logins.clone(),
+        Arc::new(Recorder::default()),
+        holding(5_000),
+    )
+    .await;
+    // The renewal stores a new login a while after it was asked for.
+    let renewer = logins.clone();
+    tokio::spawn(async move {
+        wait_for(|| !renewer.renewals().is_empty()).await;
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        renewer.set_refreshed(token(2, "tok-new"));
+    });
+    let started = Instant::now();
+    let resp = relay
+        .send(model_request(&relay, "", Some("Bearer home")))
+        .await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["x-token"], "tok-new");
+    assert!(started.elapsed() >= Duration::from_millis(700));
+    assert!(started.elapsed() < Duration::from_millis(3_000));
+    assert_eq!(logins.renewals(), vec![2]);
+    assert_eq!(tokens_seen(&fake), vec!["Bearer tok-old", "Bearer tok-new"]);
+    assert!(relay.events.dead_logins().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unauthorized_holds_then_swaps() {
+    let fake = fake_upstream().await;
+    fake.state.refuse_login(&["tok-old"]);
+    let logins = Switch::new(token(2, "tok-old"));
+    let events = Arc::new(Recorder::default());
+    let to_c = logins.clone();
+    events.on_dead_login(move |account| {
+        assert_eq!(account, 2);
+        to_c.set(token(3, "tok-c"));
+        Swapped::To(3)
+    });
+    let relay = relay_holding(fake.addr, logins.clone(), events.clone(), holding(1_200)).await;
+    let started = Instant::now();
+    let resp = relay
+        .send(model_request(&relay, "", Some("Bearer home")))
+        .await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["x-token"], "tok-c");
+    assert_eq!(&body_of(resp).await[..], b"{\"ok\":true}");
+    assert!(started.elapsed() >= Duration::from_millis(1_200));
+    assert_eq!(logins.renewals(), vec![2]);
+    // Read once at the 401, then every 500 ms of the hold.
+    assert!(logins.refreshes().len() >= 3, "{:?}", logins.refreshes());
+    assert_eq!(events.dead_logins(), vec![2]);
+    assert!(events.refusals().is_empty());
+    assert_eq!(events.resent(), vec![(2, 3)]);
+    assert_eq!(tokens_seen(&fake), vec!["Bearer tok-old", "Bearer tok-c"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unauthorized_without_a_swap_returns_the_401() {
+    let fake = fake_upstream().await;
+    fake.state.refuse_login(&["tok-old"]);
+    let logins = Switch::new(token(2, "tok-old"));
+    let relay = relay_holding(
+        fake.addr,
+        logins.clone(),
+        Arc::new(Recorder::default()),
+        holding(600),
+    )
+    .await;
+    let resp = relay
+        .send(model_request(&relay, "", Some("Bearer home")))
+        .await;
+    assert_eq!(resp.status(), 401);
+    assert_eq!(resp.headers()["request-id"], "req_401");
+    assert_eq!(&body_of(resp).await[..], UNAUTHORIZED_BODY.as_bytes());
+    assert_eq!(fake.seen().len(), 1);
+    assert_eq!(relay.events.dead_logins(), vec![2]);
+    assert!(relay.events.resent().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unauthorized_hold_blocks_nothing_else() {
+    let fake = fake_upstream().await;
+    fake.state.refuse_login(&["tok-old"]);
+    let logins = Switch::new(token(2, "tok-old"));
+    logins.set_refreshed(token(2, "tok-old"));
+    let relay = Arc::new(
+        relay_holding(
+            fake.addr,
+            logins.clone(),
+            Arc::new(Recorder::default()),
+            holding(3_000),
+        )
+        .await,
+    );
+    let held = {
+        let relay = relay.clone();
+        tokio::spawn(async move {
+            relay
+                .send(model_request(&relay, "", Some("Bearer home")))
+                .await
+                .status()
+        })
+    };
+    wait_for(|| !logins.renewals().is_empty()).await;
+    // Another request of the same account, and one of another account, go out at once.
+    for choice in [token(2, "tok-other"), token(3, "tok-c")] {
+        logins.set(choice);
+        let started = Instant::now();
+        let resp = relay
+            .send(model_request(&relay, "", Some("Bearer home")))
+            .await;
+        assert_eq!(resp.status(), 200);
+        assert!(started.elapsed() < Duration::from_millis(1_000));
+    }
+    assert!(!held.is_finished());
+    assert_eq!(held.await.unwrap(), 401);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn passthrough_401_unchanged() {
+    let fake = fake_upstream().await;
+    fake.state.refuse_login(&["home"]);
+    let logins = Switch::new(Choice::PassThrough { account: 1 });
+    let relay = relay_to(fake.addr, logins.clone()).await;
+    let resp = relay
+        .send(model_request(&relay, "", Some("Bearer home")))
+        .await;
+    assert_eq!(resp.status(), 401);
+    assert_eq!(resp.headers()["x-token"], "home");
+    assert_eq!(&body_of(resp).await[..], UNAUTHORIZED_BODY.as_bytes());
+    assert_eq!(fake.seen().len(), 1);
+    assert!(logins.refreshes().is_empty());
+    assert!(logins.renewals().is_empty());
+    assert!(relay.events.dead_logins().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unauthorized_holds_back_and_swaps_in_the_store() {
+    let fake = fake_upstream().await;
+    fake.state.refuse_login(&["tok-b"]);
+    let pool = Pool::new();
+    let swaps = pool.counting_swaps();
+    let events = pool.events(swaps.clone());
+    let renewals = FakeRenewals::new();
+    let logins = Arc::new(StoreLogins::new(pool.open(), renewals.clone()));
+    let relay = relay_holding(fake.addr, logins, events, holding(1_000)).await;
+    let resp = relay
+        .send(model_request(&relay, "", Some("Bearer home")))
+        .await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["x-token"], "tok-c");
+    body_of(resp).await;
+
+    assert_eq!(renewals.calls(), vec![pool.b]);
+    let store = pool.open();
+    assert!(
+        ccr_core::usage_check::state(&store, pool.b)
+            .unwrap()
+            .held_back
+    );
+    let calls = swaps.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(calls[0].from, Some(pool.b));
+    assert_eq!(calls[0].reason, ccr_core::scheduler::Reason::DeadLogin);
+    assert!(calls[0].wait);
+    assert_eq!(store.active_account().unwrap().unwrap().id, pool.c);
+    let resends = store.events_of_kind_since(kind::RELAY_RESEND, 0).unwrap();
+    assert_eq!(resends.len(), 1);
+    assert_eq!(
+        (resends[0].account_from, resends[0].account_to),
+        (Some(pool.b), Some(pool.c))
+    );
 }
