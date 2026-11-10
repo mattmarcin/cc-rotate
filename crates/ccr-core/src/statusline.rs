@@ -220,11 +220,17 @@ pub fn tick(
         },
     )?;
 
-    // In relay mode the relay records usage and asks for threshold swaps (spec 7).
+    // In relay mode the relay records usage and asks for threshold swaps (spec 7). A session
+    // that bypasses the relay runs on the home account directly, so its cost is the home
+    // account's.
     let relay_mode = relay::home(store)?.is_some();
-    if relay_mode {
-        note_relay_bypass(store, paths, input, &env, now_ms)?;
-    }
+    let bypasses = relay_mode && note_relay_bypass(store, paths, input, &env, now_ms)?;
+    let cost_for = |active_id: i64| -> Result<i64> {
+        Ok(match bypasses {
+            true => relay::home(store)?.unwrap_or(active_id),
+            false => active_id,
+        })
+    };
 
     let process = process_key(store, input, now_ms)?;
     if !sync_profile_login(store, paths, &mut dead_login, &mut unidentified)? {
@@ -233,7 +239,7 @@ pub fn tick(
         result.settle_login = settle_due(store, now_ms)?;
         result.active = store.active_account()?;
         if let Some(active) = &result.active {
-            note_cost(store, input, &process, active.id, now_ms)?;
+            note_cost(store, input, &process, cost_for(active.id)?, now_ms)?;
         }
         return Ok(result);
     }
@@ -257,7 +263,7 @@ pub fn tick(
     // use, unless its reading is another account's: then the request still carried that one's
     // login. In relay mode the readings are not recorded: a session's own tracker mixes
     // accounts after a swap, since its login never changes.
-    let mut cost_account = active.id;
+    let mut cost_account = cost_for(active.id)?;
     let reading = input
         .sample_for(active.id, crate::store::ROTATION_PROFILE, now_ms)
         .filter(|_| !relay_mode);
@@ -345,23 +351,24 @@ pub fn tick(
     Ok(result)
 }
 
-/// In relay mode, record a session whose `ANTHROPIC_BASE_URL` is not the relay's address: it
-/// runs on the home account directly (spec 4). An unreadable `relay.json` does not fail the tick.
+/// In relay mode, whether the session's `ANTHROPIC_BASE_URL` is not the relay's address, so it
+/// runs on the home account directly (spec 4); such a session with an id is recorded. An
+/// unreadable `relay.json` does not fail the tick.
 fn note_relay_bypass(
     store: &Store,
     paths: &Paths,
     input: &StatusInput,
     env: &impl Fn(&str) -> Option<String>,
     now_ms: i64,
-) -> Result<()> {
-    let Some(session) = input.session_id.as_deref().filter(|s| !s.is_empty()) else {
-        return Ok(());
-    };
+) -> Result<bool> {
     let cfg = RelayConfig::read(&paths.relay_config()).ok().flatten();
-    if relay::bypasses(cfg.as_ref(), env(relay::ENV_BASE_URL).as_deref()) {
+    if !relay::bypasses(cfg.as_ref(), env(relay::ENV_BASE_URL).as_deref()) {
+        return Ok(false);
+    }
+    if let Some(session) = input.session_id.as_deref().filter(|s| !s.is_empty()) {
         relay::note_bypass(store, session, now_ms)?;
     }
-    Ok(())
+    Ok(true)
 }
 
 /// A fresh reading of the account in use from a session stopped at a usage limit, with room,
@@ -844,8 +851,7 @@ fn sync_profile_login(
             }
             return Ok(true);
         }
-        store.save_credential(owner.id, &oauth, "sync")?;
-        store.log_event(kind::SYNC, Some(owner.id), None, Some("refreshed"), None)?;
+        swap::store_profile_login(store, owner.id, &oauth)?;
     }
     store.set_meta(META_CRED_SEEN, &marker)?;
     Ok(true)
@@ -1189,6 +1195,65 @@ mod tests {
                 .expect("a dead login of the account in use asks for a swap");
             assert_eq!(req.reason, Reason::DeadLogin);
             assert_eq!(req.from, Some(env.a));
+        }
+
+        #[test]
+        fn relay_relogin_of_home_clears_needs_login() {
+            let env = relay_env();
+            let now = crate::time::now_ms();
+            env.write_profile(&serde_json::json!({
+                "accessToken": "", "refreshToken": "", "expiresAt": 0
+            }));
+            tick(
+                &env.store,
+                &env.paths,
+                &StatusInput::default(),
+                now,
+                through_relay,
+            )
+            .unwrap();
+            assert_eq!(env.state(env.a), AccountState::NeedsLogin);
+            // The user signs in to the home account again in the profile.
+            env.write_profile(&oauth("a2"));
+            let r = tick(
+                &env.store,
+                &env.paths,
+                &StatusInput::default(),
+                now + 1000,
+                through_relay,
+            )
+            .unwrap();
+            assert!(r.swap.is_none(), "{:?}", r.swap);
+            assert_eq!(env.state(env.a), AccountState::Parked);
+            assert_eq!(env.stored_refresh(env.a), "refresh-a2");
+            assert_eq!(env.state(env.b), AccountState::Active);
+        }
+
+        #[test]
+        fn relay_bypass_cost_goes_to_home() {
+            let env = relay_env();
+            let now = crate::time::now_ms();
+            for (i, cost) in [1.0, 3.0].into_iter().enumerate() {
+                tick(
+                    &env.store,
+                    &env.paths,
+                    &input("bypass", 10.0, cost),
+                    now + i as i64 * 1000,
+                    no_env,
+                )
+                .unwrap();
+            }
+            let (from, to) = (now / 1000 - 7200, now / 1000 + 7200);
+            assert!(
+                env.store
+                    .account_cost_between(env.a, from, to)
+                    .unwrap()
+                    .is_some_and(|c| c > 0.0)
+            );
+            assert_eq!(
+                env.store.account_cost_between(env.b, from, to).unwrap(),
+                None
+            );
         }
 
         #[test]

@@ -406,9 +406,9 @@ pub(crate) fn changed_login(store: &Store, paths: &Paths) -> Result<Option<Chang
 ///   foreign, so its login is never stored.
 ///
 /// `Unsure` while Claude Code cannot tell: the login is not stored and no swap runs, for at most
-/// `UNIDENTIFIED_FOR_AT_MOST_MS`. After that it is stored as the active account's, as it was
-/// before logins were identified, so a Claude Code that cannot identify logins never stops the
-/// rotation.
+/// `UNIDENTIFIED_FOR_AT_MOST_MS`. After that it is stored as the profile's account's (the active
+/// one, or the home account in relay mode), as it was before logins were identified, so a Claude
+/// Code that cannot identify logins never stops the rotation.
 pub fn identify_changed_login(store: &Store, paths: &Paths) -> Result<Settle> {
     let Some(changed) = changed_login(store, paths)? else {
         store.delete_meta(META_LOGIN_UNIDENTIFIED)?;
@@ -465,10 +465,7 @@ pub fn identify_changed_login(store: &Store, paths: &Paths) -> Result<Settle> {
             return s.delete_meta(META_LOGIN_CHANGED_AT);
         }
         match &verdict {
-            Verdict::Own => {
-                s.save_credential(active.id, &changed.oauth, "sync")?;
-                s.log_event(kind::SYNC, Some(active.id), None, Some("refreshed"), None)?;
-            }
+            Verdict::Own => store_profile_login(s, active.id, &changed.oauth)?,
             Verdict::Adopt(account) => {
                 let changed_at = s.meta_i64(META_LOGIN_CHANGED_AT)?.unwrap_or(time::now_ms());
                 adopt_login(s, Some(active), account, Some(&changed.oauth), changed_at)?;
@@ -523,6 +520,30 @@ fn unidentified_for_long(store: &Store, changed: &ChangedLogin) -> Result<bool> 
     Ok(true)
 }
 
+/// Store a renewal or a fresh login of the profile's account (`relay::profile_account`) as its
+/// login, and put it back in the pool when it was signed out: in relay mode, the home account's
+/// login died in the profile and the user signed in to it again.
+pub(crate) fn store_profile_login(
+    s: &Store,
+    account_id: i64,
+    oauth: &serde_json::Value,
+) -> Result<()> {
+    s.save_credential(account_id, oauth, "sync")?;
+    s.log_event(kind::SYNC, Some(account_id), None, Some("refreshed"), None)?;
+    signed_in_again(s, account_id, oauth)
+}
+
+/// A live login of an account marked signed out puts it back in the pool, parked. An account in
+/// use is never marked signed out, so it stays active.
+fn signed_in_again(s: &Store, account_id: i64, oauth: &serde_json::Value) -> Result<()> {
+    if !credfile::is_dead(oauth)
+        && s.account(account_id)?.map(|a| a.state) == Some(AccountState::NeedsLogin)
+    {
+        s.set_state(account_id, AccountState::Parked)?;
+    }
+    Ok(())
+}
+
 /// Record that the active account has been in use since `at` (epoch ms): never before it was
 /// last recorded, which was for the account before it.
 fn set_active_since(s: &Store, at: i64) -> Result<()> {
@@ -556,6 +577,9 @@ pub(crate) fn adopt_login(
     }
     if let Some(o) = oauth.filter(|o| !credfile::is_dead(o)) {
         s.save_credential(account.id, o, "sync")?;
+        if relay_mode {
+            signed_in_again(s, account.id, o)?;
+        }
     }
     s.log_event(
         kind::ADOPTED_LOGIN,
