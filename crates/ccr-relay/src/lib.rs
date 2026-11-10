@@ -482,7 +482,10 @@ pub async fn serve(
 ) -> Result<()> {
     let addr = listener.local_addr()?;
     if addr.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) {
-        bail!("the relay listens on 127.0.0.1 only, not {}", addr.ip());
+        bail!(
+            "the local proxy listens on 127.0.0.1 only, not {}",
+            addr.ip()
+        );
     }
     listener.set_nonblocking(true)?;
     let listener = tokio::net::TcpListener::from_std(listener)?;
@@ -578,16 +581,18 @@ pub async fn serve(
         Leave::Upgrade => state.events.log("left for the new program"),
         Leave::Idle => {
             state.events.log(&format!(
-                "relay mode is off and no request came for {} s; left",
+                "the app account is off and no request came for {} s; left",
                 state.options.idle_exit.as_secs()
             ));
             let lifecycle = state.options.lifecycle.clone();
             match tokio::task::spawn_blocking(move || lifecycle.retire()).await {
-                Ok(Ok(())) => state.events.log("removed the relay's service"),
+                Ok(Ok(())) => state.events.log("removed the local proxy's service"),
                 Ok(Err(e)) => state
                     .events
-                    .log(&format!("removing the relay's service failed: {e:#}")),
-                Err(_) => state.events.log("removing the relay's service failed"),
+                    .log(&format!("removing the local proxy's service failed: {e:#}")),
+                Err(_) => state
+                    .events
+                    .log("removing the local proxy's service failed"),
             }
         }
     }
@@ -606,7 +611,7 @@ pub fn run_blocking(
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .context("starting the relay's runtime")?;
+        .context("starting the local proxy's runtime")?;
     runtime.block_on(serve(listener, cfg, options, upstream, logins, events))
 }
 

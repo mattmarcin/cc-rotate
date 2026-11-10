@@ -106,7 +106,7 @@ pub fn turn_on(store: &Store, paths: &Paths, home_id: i64) -> Result<()> {
     })
 }
 
-/// `cc-rotate-ctl relay on --home <reference>` (spec 4): refuse unless the account can be home,
+/// `cc-rotate-ctl app-account <reference>` (spec 4): refuse unless the account can be home,
 /// write `relay.json` when it is not there, `install` the relay's service, then `turn_on`.
 ///
 /// Nothing changes when the account is refused. The port and secret of a `relay.json` already
@@ -124,7 +124,7 @@ pub fn on(
         Some(cfg) => cfg,
         None => RelayConfig::create(&path)?,
     };
-    install().context("installing the relay's service")?;
+    install().context("installing the local proxy's service")?;
     turn_on(store, paths, account.id)?;
     Ok((account, cfg))
 }
@@ -304,7 +304,7 @@ impl RelayConfig {
     pub fn read(path: &Path) -> Result<Option<RelayConfig>> {
         match std::fs::read(path) {
             Ok(bytes) => serde_json::from_slice(&bytes)
-                .with_context(|| format!("{} is not a valid relay config", path.display()))
+                .with_context(|| format!("{} is not a valid local proxy config", path.display()))
                 .map(Some),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
@@ -378,8 +378,12 @@ pub fn launch_config(data_dir: &Path) -> Result<Option<RelayConfig>> {
         return Ok(None);
     }
     let path = data_dir.join("relay.json");
-    let cfg = RelayConfig::read(&path)?
-        .with_context(|| format!("relay mode is on but {} does not exist", path.display()))?;
+    let cfg = RelayConfig::read(&path)?.with_context(|| {
+        format!(
+            "the app account is on but {} does not exist",
+            path.display()
+        )
+    })?;
     Ok(Some(cfg))
 }
 
@@ -430,7 +434,7 @@ pub fn spawn_relay() -> Result<()> {
         |cmd| {
             cmd.args(["relay", "run"]);
         },
-        "starting the relay",
+        "starting the local proxy",
     )
 }
 

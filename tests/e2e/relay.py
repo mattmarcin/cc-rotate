@@ -20,7 +20,7 @@ Scenarios:
 - relay_restart: the relay is killed between turns; the next turn, started through `cc-rotate`,
   succeeds on the relay the launcher starts.
 - relay_down: the relay is killed and its program made unrunnable; a turn fails with a
-  connection error ("Unable to connect to API", or `api_error: connection_failed`), and `doctor --json` reports the Relay line as failing.
+  connection error ("Unable to connect to API", or `api_error: connection_failed`), and `doctor --json` reports the App account line as failing.
 - version_check: Claude Code with the relay's two variables uses the stored login, its model
   requests come through the relay, and its debug file has no `custom_base_url` line. Two probe
   runs with nonessential traffic on (with and without `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL`)
@@ -340,7 +340,7 @@ def prepare():
     )
     json.dump(config, open(config_file, "w", encoding="utf-8"))
 
-    log(ctl("relay", "on", "--home", "a", "--no-service"))
+    log(ctl("app-account", "a", "--no-service"))
     relay_cfg = json.load(open(os.path.join(data, "relay.json"), encoding="utf-8"))
     relay_port = relay_cfg["port"]
     relay_base = f"http://127.0.0.1:{relay_port}/r/{relay_cfg['secret']}"
@@ -438,10 +438,10 @@ def relay_down():
             fail(f"no request should reach the fake API, it saw {messages_since(m)}")
         doctor = json.loads(ctl("doctor", "--json", ok=False))
         checks = doctor.get("checks", doctor) if isinstance(doctor, dict) else doctor
-        line = next((c for c in checks if c.get("name") == "Relay"), None)
+        line = next((c for c in checks if c.get("name") == "App account"), None)
         if line is None or line.get("status") != "fail" or "doesn't answer" not in line.get("detail", ""):
-            fail(f"doctor's Relay line should fail because the relay doesn't answer: {line}")
-        log(f"doctor: Relay {line['status']}: {line['detail'][:160]}")
+            fail(f"doctor's App account line should fail because the relay doesn't answer: {line}")
+        log(f"doctor: App account {line['status']}: {line['detail'][:160]}")
     finally:
         os.chmod(relay_exe, stat.S_IRWXU)
 

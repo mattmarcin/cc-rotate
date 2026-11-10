@@ -77,7 +77,8 @@ enum Command {
         accounts: Vec<String>,
         #[arg(long)]
         json: bool,
-        /// Renew the one account's login with Claude Code in a scratch profile (used by relay mode).
+        /// Renew the one account's login with Claude Code in a scratch profile (used by the local
+        /// proxy while the app account is on).
         #[arg(long, hide = true)]
         renew: bool,
     },
@@ -279,8 +280,26 @@ enum Command {
         #[arg(long, value_name = "PID")]
         watch_pid: Option<u32>,
     },
-    /// Relay mode: send every session's requests through a local relay that puts the pool's
-    /// account on them. Without an action, shows whether it is on.
+    /// Show the app account, or set it: sessions act as the account the Claude desktop app is
+    /// signed in to (so artifacts open in the app's artifact pane), while usage still rotates
+    /// across the pool through a local proxy.
+    ///
+    /// `cc-rotate-ctl app-account <account>` turns it on, `cc-rotate-ctl app-account off` turns
+    /// it off, and `cc-rotate-ctl app-account` shows it.
+    AppAccount {
+        /// The account the desktop app is signed in to (label, email or id), or `off` to turn the
+        /// app account off. `off` always means off: name an account labelled "off" by its email
+        /// or id.
+        #[arg(value_name = "ACCOUNT")]
+        account: Option<String>,
+        /// Everything but installing the local proxy's service (for tests, which run the local
+        /// proxy themselves).
+        #[arg(long, hide = true, requires = "account")]
+        no_service: bool,
+    },
+    /// The local proxy behind the app account (`relay run`, started by the launchers and its
+    /// service).
+    #[command(hide = true)]
     Relay {
         #[command(subcommand)]
         action: Option<RelayAction>,
@@ -301,19 +320,6 @@ enum Command {
 
 #[derive(Subcommand)]
 enum RelayAction {
-    /// Turn relay mode on, with the account whose login the profile keeps.
-    On {
-        /// The home account (label, email or id): signed in, and not held back by a check.
-        #[arg(long, value_name = "ACCOUNT")]
-        home: String,
-        /// Everything but installing the relay's service (for tests, which run the relay
-        /// themselves).
-        #[arg(long, hide = true)]
-        no_service: bool,
-    },
-    /// Turn relay mode off; the relay serves sessions started with it until an hour without
-    /// requests.
-    Off,
     /// Serve the relay on the port in `relay.json` (started by the launchers and the relay's
     /// service); exits at once when another relay runs.
     #[command(hide = true)]
@@ -355,7 +361,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             print!("{}", ccr_core::desktop::mobileconfig());
             Ok(ExitCode::SUCCESS)
         }
-        // Reads system settings, and the store only for relay mode.
+        // Reads system settings, and the store only for the app account.
         Command::Desktop {
             mobileconfig: false,
         } => {
@@ -412,6 +418,13 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Command::Relay {
             action: Some(RelayAction::Run),
         } => Ok(relay_run()),
+        // `relay` alone is no longer a user command: point at its replacement.
+        Command::Relay { action: None } => {
+            eprintln!(
+                "error: the app account is shown and set with `cc-rotate-ctl app-account` (see `cc-rotate-ctl app-account --help`)."
+            );
+            Ok(ExitCode::from(2))
+        }
         Command::HerdrReport {
             seq,
             timeout_ms,
@@ -746,9 +759,24 @@ fn dispatch(
             println!();
         }
         Command::Dashboard => process::launch_app()?,
-        Command::Relay { action: None } => print!("{}", format::relay(&relay_view(store, paths)?)),
-        Command::Relay {
-            action: Some(RelayAction::On { home, no_service }),
+        Command::AppAccount { account: None, .. } => {
+            print!("{}", format::relay(&relay_view(store, paths)?))
+        }
+        // `off` is a keyword: it always means off, whatever an account is called.
+        Command::AppAccount {
+            account: Some(off), ..
+        } if off == "off" => {
+            ccr_core::relay::turn_off(store, paths)?;
+            println!(
+                "The app account is off. New sessions start without the local proxy; it serves the sessions started while the app account was on until it has had no request for an hour, then removes itself."
+            );
+            println!(
+                "Restart the sessions started while the app account was on within the hour: once the local proxy has removed itself, they get connection errors."
+            );
+        }
+        Command::AppAccount {
+            account: Some(home),
+            no_service,
         } => {
             let ctl = dunce_exe()?;
             let profile_flag = profile_flag.as_deref();
@@ -760,30 +788,18 @@ fn dispatch(
                 ccr_core::relay_service::Service::real()?.install(&ctl, &env)
             })?;
             println!(
-                "Relay mode is on, with {} as the home account. The relay listens on 127.0.0.1:{}.",
-                account.label, cfg.port
+                "The app account is {0}: sessions act as {0} (the desktop app's account); usage still rotates across the pool.",
+                account.label
             );
             println!(
-                "Sessions started from now on go through it; restart running ones to move them."
-            );
-        }
-        Command::Relay {
-            action: Some(RelayAction::Off),
-        } => {
-            ccr_core::relay::turn_off(store, paths)?;
-            println!(
-                "Relay mode is off. New sessions start without the relay; it serves the sessions started with it until it has had no request for an hour, then removes itself."
-            );
-            println!(
-                "Restart the sessions started while relay mode was on within the hour: once the relay has removed itself, they get connection errors."
+                "Sessions started from now on go through the local proxy on 127.0.0.1:{}; restart running ones to move them.",
+                cfg.port
             );
         }
         Command::Statusline { .. }
         | Command::Hook { .. }
         | Command::HerdrReport { .. }
-        | Command::Relay {
-            action: Some(RelayAction::Run),
-        }
+        | Command::Relay { .. }
         | Command::DesktopLaunch { .. }
         | Command::DesktopLinkTranscripts { .. }
         | Command::Desktop { .. }
@@ -941,9 +957,9 @@ impl ccr_relay::Lifecycle for RelayLifecycle {
     }
 
     fn retire(&self) -> Result<()> {
-        // `relay on` may have run since the last look.
+        // `app-account <account>` may have run since the last look.
         if self.home()?.is_some() {
-            bail!("relay mode is on again");
+            bail!("the app account is on again");
         }
         let service = ccr_core::relay_service::Service::real()?;
         let data_dir = std::env::var("CC_ROTATE_DATA_DIR").ok();
@@ -980,7 +996,7 @@ fn relay_home_label() -> Option<String> {
     Some(label.unwrap_or_else(|| format!("account {id}")))
 }
 
-/// What `cc-rotate-ctl relay` shows.
+/// What `cc-rotate-ctl app-account` shows.
 fn relay_view(store: &Store, paths: &Paths) -> Result<format::RelayView> {
     let home = match ccr_core::relay::home(store)? {
         Some(id) => Some(
@@ -1023,7 +1039,7 @@ fn relay_lock(data: &Paths, wait: bool) -> Result<Option<std::fs::File>> {
         Err(std::fs::TryLockError::WouldBlock) if wait => {
             ccr_relay::log_now(
                 &data.relay_log(),
-                "another relay runs; waiting for it to end",
+                "another local proxy runs; waiting for it to end",
             );
             file.lock()
                 .with_context(|| format!("locking {}", path.display()))?;
@@ -1385,5 +1401,71 @@ fn statusline_entry(profile: Option<PathBuf>, observe: bool, then: Option<String
     }
     for line in lines {
         let _ = writeln!(out, "{line}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    fn parse(args: &[&str]) -> Command {
+        let argv = std::iter::once("cc-rotate-ctl").chain(args.iter().copied());
+        Cli::try_parse_from(argv)
+            .unwrap_or_else(|e| panic!("{args:?}: {e}"))
+            .command
+    }
+
+    fn refused(args: &[&str]) -> bool {
+        Cli::try_parse_from(std::iter::once("cc-rotate-ctl").chain(args.iter().copied())).is_err()
+    }
+
+    #[test]
+    fn the_command_line_is_well_formed() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn app_account_and_the_hidden_relay_run_parse() {
+        assert!(matches!(
+            parse(&["app-account"]),
+            Command::AppAccount {
+                account: None,
+                no_service: false
+            }
+        ));
+        assert!(matches!(
+            parse(&["app-account", "work", "--no-service"]),
+            Command::AppAccount { account: Some(a), no_service: true } if a == "work"
+        ));
+        assert!(matches!(
+            parse(&["app-account", "off"]),
+            Command::AppAccount { account: Some(a), no_service: false } if a == "off"
+        ));
+        // The installed service runs exactly this.
+        assert!(matches!(
+            parse(&["relay", "run"]),
+            Command::Relay {
+                action: Some(RelayAction::Run)
+            }
+        ));
+        assert!(refused(&["app-account", "--no-service"]));
+        assert!(refused(&["relay", "on", "--home", "work"]));
+        assert!(refused(&["relay", "off"]));
+    }
+
+    #[test]
+    fn help_lists_app_account_and_not_relay() {
+        let help = Cli::command().render_help().to_string();
+        assert!(help.contains("app-account"), "{help}");
+        assert!(!help.to_lowercase().contains("relay"), "{help}");
+
+        let mut cli = Cli::command();
+        let app_account = cli.find_subcommand_mut("app-account").unwrap();
+        let help = app_account.render_long_help().to_string();
+        assert!(help.contains("off"), "{help}");
+        assert!(!help.to_lowercase().contains("relay"), "{help}");
+        assert!(!help.contains("--no-service"), "{help}");
+        assert!(!help.contains('\u{2014}'), "no em dashes: {help}");
     }
 }

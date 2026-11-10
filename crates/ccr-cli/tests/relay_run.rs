@@ -223,46 +223,58 @@ fn ctl(data: &Path, args: &[&str]) -> std::process::Output {
 }
 
 #[test]
-fn relay_shows_the_address_but_never_the_secret() {
+fn app_account_shows_the_address_but_never_the_secret() {
     let root = tempfile::tempdir().unwrap();
     let (data, cfg) = data_folder(root.path());
-    let out = ctl(&data, &["relay"]);
+    let out = ctl(&data, &["app-account"]);
     assert!(out.status.success(), "{out:?}");
     let text = String::from_utf8(out.stdout).unwrap();
-    assert!(text.contains("Relay mode: off"), "{text}");
+    assert!(text.contains("App account: off"), "{text}");
     assert!(
-        text.contains(&format!("Address: 127.0.0.1:{}", cfg.port)),
+        text.contains(&format!("Local proxy: 127.0.0.1:{}", cfg.port)),
         "{text}"
     );
     assert!(text.contains("Answering: no"), "{text}");
     assert!(text.contains("Service: "), "{text}");
     assert!(
-        text.contains("Sessions without the relay's address (last 10 minutes): 0"),
+        text.contains("Sessions not going through the local proxy (last 10 minutes): 0"),
         "{text}"
     );
     assert!(!text.contains(&cfg.secret), "{text}");
 }
 
-/// Sessions started while relay mode was on keep the relay's address, and get connection errors
-/// once the relay leaves, an hour after `relay off`.
+/// `relay` alone is no longer a command a user runs: it points at `app-account`.
 #[test]
-fn relay_off_says_to_restart_the_relays_sessions() {
+fn relay_alone_points_at_app_account() {
     let root = tempfile::tempdir().unwrap();
     let (data, _) = data_folder(root.path());
-    let out = ctl(&data, &["relay", "off"]);
+    let out = ctl(&data, &["relay"]);
+    assert!(!out.status.success(), "{out:?}");
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.contains("cc-rotate-ctl app-account"), "{err}");
+}
+
+/// Sessions started while the app account was on keep the local proxy's address, and get
+/// connection errors once it leaves, an hour after `app-account off`.
+#[test]
+fn app_account_off_says_to_restart_the_sessions_started_while_on() {
+    let root = tempfile::tempdir().unwrap();
+    let (data, _) = data_folder(root.path());
+    let out = ctl(&data, &["app-account", "off"]);
     assert!(out.status.success(), "{out:?}");
     let text = String::from_utf8(out.stdout).unwrap();
-    assert!(text.contains("Relay mode is off."), "{text}");
+    assert!(text.contains("The app account is off."), "{text}");
     assert!(
         text.contains(
-            "Restart the sessions started while relay mode was on within the hour: once the relay has removed itself, they get connection errors."
+            "Restart the sessions started while the app account was on within the hour: once the local proxy has removed itself, they get connection errors."
         ),
         "{text}"
     );
+    assert!(!text.contains('\u{2014}'), "no em dashes: {text}");
 }
 
 #[test]
-fn relay_on_refuses_an_account_that_cannot_be_home() {
+fn app_account_refuses_an_account_that_cannot_be_it() {
     let root = tempfile::tempdir().unwrap();
     let data = root.path().join("data");
     {
@@ -276,19 +288,19 @@ fn relay_on_refuses_an_account_that_cannot_be_home() {
             .unwrap();
     }
     for (home, why) in [("gone", "signed out"), ("nobody", "no account matches")] {
-        let out = ctl(&data, &["relay", "on", "--home", home, "--no-service"]);
+        let out = ctl(&data, &["app-account", home, "--no-service"]);
         assert!(!out.status.success());
         let err = String::from_utf8(out.stderr).unwrap();
         assert!(err.contains(why), "{err}");
     }
     assert!(!data.join("relay.json").exists());
 
-    let out = ctl(&data, &["relay", "off"]);
+    let out = ctl(&data, &["app-account", "off"]);
     assert!(out.status.success(), "{out:?}");
     assert!(
         String::from_utf8(out.stdout)
             .unwrap()
-            .contains("Relay mode is off")
+            .contains("The app account is off")
     );
 }
 
@@ -310,7 +322,7 @@ fn a_relay_the_service_started_waits_for_the_lock_and_then_serves() {
             .unwrap(),
     );
     let log = log_with(&data, "waiting", 1);
-    assert!(log.contains("another relay runs; waiting"), "{log}");
+    assert!(log.contains("another local proxy runs; waiting"), "{log}");
     std::thread::sleep(Duration::from_millis(500));
     assert!(relay.0.try_wait().unwrap().is_none(), "it exited");
     assert!(!ccr_core::relay::answers(cfg.port));

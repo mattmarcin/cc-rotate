@@ -215,7 +215,7 @@ pub fn finish_dead_swap(store: &Store, paths: &Paths, settler: Settler) -> Resul
                         Some(change.as_str()),
                         Some(json!({
                             "home": change.home(),
-                            "why": "finished a change of relay mode that was interrupted after writing the login",
+                            "why": "finished a change of the app account that was interrupted after writing the login",
                         })),
                     )?;
                 }
@@ -1162,7 +1162,7 @@ fn needs_renewal(expires_at: Option<i64>, now_ms: i64, margin_s: i64) -> bool {
 ///
 /// In relay mode (spec 6) a swap only changes which account is active: the profile keeps the
 /// home account's login, so it is not read, identified or written, and Claude Code's locks are
-/// not taken. A target whose stored access token is not valid for `relay_renew_margin_s` is
+/// not taken. A target whose stored access token is not valid for `app_account_renew_margin_s` is
 /// renewed first, within the checks' time budget, and passed over like a busy one when that
 /// leaves it no valid login.
 fn run_with(
@@ -1883,9 +1883,9 @@ pub fn move_profile_login(
         drop(refresh_lock);
         drop(account_lock);
         return Err(e.context(if restored {
-            "couldn't record the change of relay mode, so the previous login was put back"
+            "couldn't record the change of the app account, so the previous login was put back"
         } else {
-            "couldn't record the change of relay mode"
+            "couldn't record the change of the app account"
         }));
     }
     drop(storage_lock);

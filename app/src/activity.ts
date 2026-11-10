@@ -91,20 +91,21 @@ export function describe(e: EventRow, labelOf: (id: number | null) => string): {
     case "pool_exhausted":
       return { parts: ["No other account was ready to take over"], tone: "warn" };
     case "adopted_login":
-      // In relay mode a /login changes the home account, not the account in use.
+      // With the app account on (relay mode), a /login changes the app account, not the account in use.
       return e.detail?.home
-        ? { parts: ["Made ", to, " the home account after a /login in the profile"] }
+        ? { parts: ["Made ", to, " the app account after a /login in the profile"] }
         : { parts: ["Now using ", to, " after a /login in the profile"] };
+    // The app account's events keep their stored kinds (relay_mode, relay_resend, relay_error).
     case "relay_mode": {
       const home = e.detail?.home as number | null | undefined;
       return e.reason === "on"
-        ? { parts: ["Turned relay mode on, with ", nb(labelOf(home ?? null)), " as the home account"] }
-        : { parts: ["Turned relay mode off"] };
+        ? { parts: ["App account turned on (", nb(labelOf(home ?? null)), ")"] }
+        : { parts: ["App account turned off"] };
     }
     case "relay_resend":
-      return { parts: ["Sent a request again on ", to, " after ", from, " was at a usage limit"] };
+      return { parts: ["Resent on ", to, " after ", from, " was refused at a limit"] };
     case "relay_error":
-      return { parts: ["The relay couldn't reach Anthropic"], tone: "warn" };
+      return { parts: ["The local proxy couldn't reach Anthropic"], tone: "warn" };
     case "foreign_login":
       return { parts: ["The cc-rotate profile was signed in to an account that isn't in cc-rotate"], tone: "warn" };
     case "state":

@@ -662,7 +662,7 @@ fn job(
     // the profile under it, so a check that waited for the lock sees the account as home.
     let relay_home = relay::home(store)?;
     if relay_home == Some(account_id) {
-        return skipped("it's the profile's login (relay mode's home account)");
+        return skipped("it's the profile's login (the app account's)");
     }
     if let Recovery::Busy(why) = recover(store, paths, account_id)? {
         return attempted(store, &why);
@@ -2356,7 +2356,7 @@ mod tests {
         let CheckOutcome::Skipped { why } = out else {
             panic!("{out:?}")
         };
-        assert_eq!(why, "it's the profile's login (relay mode's home account)");
+        assert_eq!(why, "it's the profile's login (the app account's)");
     }
 
     /// `relay on` may make the account home while a renewal waits for its lock: the home check
@@ -2389,7 +2389,7 @@ mod tests {
         let CheckOutcome::Skipped { why } = out else {
             panic!("{out:?}")
         };
-        assert_eq!(why, "it's the profile's login (relay mode's home account)");
+        assert_eq!(why, "it's the profile's login (the app account's)");
     }
 
     #[test]

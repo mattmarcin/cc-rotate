@@ -118,7 +118,8 @@ pub fn launch_agent_plist(ctl: &Path, env: &[(&str, String)]) -> String {
 /// The systemd user unit: `cc-rotate-ctl relay run`, started at login and again whenever it
 /// ends, with `env` set.
 pub fn systemd_unit(ctl: &Path, env: &[(&str, String)]) -> String {
-    let mut out = String::from("[Unit]\nDescription=cc-rotate relay\n\n[Service]\n");
+    let mut out =
+        String::from("[Unit]\nDescription=cc-rotate local proxy (app account)\n\n[Service]\n");
     out.push_str(&format!(
         "ExecStart={} relay run\n",
         systemd_quote(&ctl.to_string_lossy(), true)
@@ -141,7 +142,7 @@ pub fn task_xml(ctl: &Path) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n\
          <Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n\
-         \x20 <RegistrationInfo>\n    <Description>cc-rotate relay</Description>\n  </RegistrationInfo>\n\
+         \x20 <RegistrationInfo>\n    <Description>cc-rotate local proxy (app account)</Description>\n  </RegistrationInfo>\n\
          \x20 <Triggers>\n    <LogonTrigger>\n      <Enabled>true</Enabled>\n    </LogonTrigger>\n  </Triggers>\n\
          \x20 <Principals>\n    <Principal id=\"Author\">\n      <LogonType>InteractiveToken</LogonType>\n      <RunLevel>LeastPrivilege</RunLevel>\n    </Principal>\n  </Principals>\n\
          \x20 <Settings>\n\
@@ -367,10 +368,13 @@ impl Service {
     pub fn describe(&self) -> String {
         match self.kind {
             Kind::LaunchAgent { .. } => {
-                format!("the relay's LaunchAgent, {}", self.file().display())
+                format!("the local proxy's LaunchAgent, {}", self.file().display())
             }
-            Kind::Systemd => format!("the relay's systemd user unit, {}", self.file().display()),
-            Kind::TaskScheduler => format!("the relay's scheduled task, {TASK_NAME}"),
+            Kind::Systemd => format!(
+                "the local proxy's systemd user unit, {}",
+                self.file().display()
+            ),
+            Kind::TaskScheduler => format!("the local proxy's scheduled task, {TASK_NAME}"),
         }
     }
 
@@ -518,7 +522,7 @@ impl Service {
 
     fn refuse_when_disabled(&self) -> Result<()> {
         if self.disabled {
-            bail!("{NO_SERVICE_ENV} is set, so the relay's service is left alone");
+            bail!("{NO_SERVICE_ENV} is set, so the local proxy's service is left alone");
         }
         Ok(())
     }

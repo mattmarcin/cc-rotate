@@ -93,7 +93,7 @@ impl StoreEvents {
         match relay::home(store) {
             Ok(home) => home.is_some(),
             Err(e) => {
-                self.log(&format!("reading relay mode failed: {e:#}"));
+                self.log(&format!("reading the app account failed: {e:#}"));
                 false
             }
         }
@@ -185,7 +185,7 @@ impl StoreEvents {
             let store = self.store();
             if !self.mode_on(&store) {
                 self.log(&format!(
-                    "account={account} refused {why}; relay mode is off, so no swap"
+                    "account={account} refused {why}; the app account is off, so no swap"
                 ));
                 return Swapped::No;
             }

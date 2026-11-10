@@ -4,6 +4,11 @@ Status: built, 2026-11-10; this text follows what was built.
 The end-to-end tests and the check in the app (section 16) are still to run.
 Builds on the main spec (`2026-10-24-cc-rotate.md`), whose section numbers are cited as "main 24.1" and so on.
 
+User-facing name: everything a user sees calls relay mode and its home account the **app account**, and the relay **the local proxy**.
+The commands are `cc-rotate-ctl app-account <account>` (on), `cc-rotate-ctl app-account off` (off; `off` always means off) and `cc-rotate-ctl app-account` (show); `doctor`'s line is "App account"; the setting is `app_account_renew_margin_s`.
+`cc-rotate-ctl relay run` stays, hidden, as the command the launchers and the service start.
+This spec keeps saying "relay mode", "home account" and "relay" for the design, as the code's names do.
+
 ## 1. Goal
 
 Artifacts published in any desktop Code session open in the Claude desktop app's artifact pane, whichever pool account was in use when they were published (main 24.5, F32).
@@ -39,9 +44,9 @@ What each one means here:
 
 ## 4. Turning it on and off, and what sessions get
 
-`cc-rotate-ctl relay` shows whether relay mode is on, the home account, the relay's address and whether it answers.
+`cc-rotate-ctl app-account` shows whether relay mode is on, the home account, the relay's address and whether it answers.
 
-`cc-rotate-ctl relay on --home <account>`:
+`cc-rotate-ctl app-account <account>`:
 
 1. Refuses unless the account is in the pool, signed in, and not held back by a check.
 2. Picks a free port on 127.0.0.1 between 49152 and 65535 and a random 256-bit secret, and writes them to `<data dir>/relay.json` (mode 0600; the data folder is 0700).
@@ -63,7 +68,7 @@ They do not add them to a desktop session the launcher keeps in the app's own pr
 Claude Code's own subprocesses (subagents, teammates, its background service, a `claude` the agent runs) inherit them.
 A `claude` started in the profile some other way (plain `claude` with `CLAUDE_CONFIG_DIR` set) bypasses the relay and runs on the home account directly.
 
-`cc-rotate-ctl relay off`:
+`cc-rotate-ctl app-account off`:
 
 1. Under the swap lock, when the active account is not the home account, writes the active account's login into the profile with the main spec's locks and steps (main 6, steps 4 to 6 and 8, the home account's login saved to its row first), so the main spec's invariant holds again (main 5.1).
    The transaction that commits it sets `relay_mode` to `off`; when the home account is active, that transaction is all there is.
@@ -75,7 +80,7 @@ A `claude` started in the profile some other way (plain `claude` with `CLAUDE_CO
 
 Sessions running when relay mode changes keep the environment they started with until they are restarted.
 Turning it on leaves earlier sessions on the profile's login, now the home account's, off the pool.
-The status line runs with its session's environment, so it sees whether the session has the relay's address; `relay` and `doctor` count the sessions without it among those whose status line reported in the last 10 minutes (desktop sessions run none, main F30, and start with it once relay mode is on).
+The status line runs with its session's environment, so it sees whether the session has the relay's address; `app-account` and `doctor` count the sessions without it among those whose status line reported in the last 10 minutes (desktop sessions run none, main F30, and start with it once relay mode is on).
 With relay mode off, the status line records a session whose `ANTHROPIC_BASE_URL` is a relay's address (`http://127.0.0.1:<port>/r/...`), and `doctor` warns while any reported in the last 10 minutes: it was started while relay mode was on and has to be restarted.
 
 ## 5. The relay
@@ -109,7 +114,7 @@ Many sessions and their subagents send at once, so requests are handled concurre
 Triggers, the pick, the cooldown and the checks before a swap are the main spec's (main 6, steps 1 to 3; main 7).
 Steps 4 to 8 become:
 
-4. Make sure the target's access token is valid for at least `relay_renew_margin_s` (section 9): if not, renew it with a check first, within the swap's 25 s budget for checks; a target that cannot be renewed is passed over like a busy one.
+4. Make sure the target's access token is valid for at least `app_account_renew_margin_s` (section 9): if not, renew it with a check first, within the swap's 25 s budget for checks; a target that cannot be renewed is passed over like a busy one.
 5. In one transaction, set the outgoing account to `parked` (`needs_login` for a dead-login swap, trigger 3, as in main 6 step 7) and the target to `active`, record the outgoing account as left at a limit for a `rate_limit` swap (section 8) as for a `stop_failure` one (main 7.2), and log the `swap` event as before.
 6. Release the swap lock.
 
@@ -157,8 +162,8 @@ Any other error, and any refusal once the response has started streaming, is pas
 Claude Code renews logins; cc-rotate never calls Anthropic's sign-in endpoints itself (main 2).
 
 - **The home account**: its login is the profile's, and the sessions' Claude Code renews it as today.
-  If it dies (main F8), every session fails, relay or not, so `login_warning_days` (main 21) matters for it most; `relay` and `doctor` name the home account in that warning.
-- **The active account, when it is not the home account**: no Claude Code holds its login, so the relay asks for a renewal `relay_renew_margin_s` before its access token expires.
+  If it dies (main F8), every session fails, relay or not, so `login_warning_days` (main 21) matters for it most; `app-account` and `doctor` name the home account in that warning.
+- **The active account, when it is not the home account**: no Claude Code holds its login, so the relay asks for a renewal `app_account_renew_margin_s` before its access token expires.
   A renewal is a usage check (main 20.1) that sets the copied login's `expiresAt` to 0 so Claude Code renews it at once (as for a held-back account, main 20.1 step 3), and stores the renewed login in the same transaction.
   The relay runs it in its own process, in the background (`usage_check::renew`), at most one at a time per account.
   A renewal that ordinary requests started is not started again within 60 s of the last one ending, so a renewal that fails fast does not run Claude Code on every request; one a 401 asks for (below) is not held back by that.
@@ -197,7 +202,7 @@ Every minute the relay checks whether its program file was replaced (an upgrade)
 If so, it keeps serving, and exits the moment no request is in flight, closing kept-alive connections gracefully, at most 660 s after it noticed; the service starts the new program.
 Claude Code retries a refused connection (up to 10 times with backoff), so the gap goes unnoticed.
 
-`relay off` (section 4) leaves the relay serving until it has had no request for an hour; it then deletes `relay.json`, removes its service (which stops it) and exits.
+`app-account off` (section 4) leaves the relay serving until it has had no request for an hour; it then deletes `relay.json`, removes its service (which stops it) and exits.
 `uninstall` stops the relay, removes its service and `relay.json`, and turns relay mode off first, as in section 4.
 
 ## 11. When the relay is down
@@ -207,7 +212,7 @@ Sessions fail visibly; they never fall back to another way of reaching Anthropic
 - A running session gets connection errors, which Claude Code retries and then reports ("Unable to connect to API").
   The service normally restarts the relay within seconds, inside those retries.
 - A new session gets the relay's address whether or not it answers; the launcher has started it (section 10).
-- `doctor` gains a "Relay" line: off (ok; warn while sessions started in relay mode still report with a relay's address, section 4); on and answering with this program's version (ok); on and answering with another version (warn); on and not answering, with the last line of its log (fail); the service missing (fail); the home account signed out or gone (fail: every session fails until it signs in again).
+- `doctor` gains an "App account" line: off (ok; warn while sessions started in relay mode still report with a relay's address, section 4); on and answering with this program's version (ok); on and answering with another version (warn); on and not answering, with the last line of its log (fail); the service missing (fail); the home account signed out or gone (fail: every session fails until it signs in again).
   It asks the relay its version with `GET /r/<secret>/__ccr/version`, which the relay answers itself, as plain text, asking Anthropic nothing and attaching no login; any other path, method or query under `__ccr` is forwarded like any request.
   It also warns when the profile's `env` sets `ANTHROPIC_BASE_URL`, `ANTHROPIC_UNIX_SOCKET`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` or `CLAUDE_CODE_OAUTH_TOKEN`, any of which would take a session off the relay or off the home account's login, and when sessions ran without the relay's address in the last 10 minutes (section 4).
 - `cc-rotate-ctl desktop` says whether relay mode is on and names the home account.
@@ -217,12 +222,13 @@ Sessions fail visibly; they never fall back to another way of reaching Anthropic
 | Key | Default |
 |---|---|
 | `relay_mode` | `off` |
-| `home_account` | none; set by `relay on` |
-| `relay_renew_margin_s` | 900 (60 to 3600) |
+| `home_account` | none; set by `app-account <account>` |
+| `app_account_renew_margin_s` | 900 (60 to 3600) |
 
 `<data dir>/relay.json` holds `{port, secret}`; `<data dir>/relay.lock` is held by the running relay.
 Samples the relay records have `profile = relay`.
 Events gain `relay_mode` (relay mode turned on, naming the home account, or off; with the accounts whose login the profile had and has), `relay_resend` (a request resent on another account, with both accounts) and `relay_error` (the relay could not reach Anthropic, at most one a minute).
+They keep these stored names; `events` and the app show them as the app account turned on or off, a request resent, and the local proxy not reaching Anthropic.
 Swaps gain the reasons `rate_limit` (a refusal at a limit, section 8) and `unauthorized` (a refused login that could not be renewed, section 9).
 
 ## 13. Security
@@ -252,7 +258,7 @@ All of these are made in the main spec.
 - Main 5.1, invariant: in relay mode the home account's newest login lives in the profile, and every other account's in the store.
 - Main 6: relay-mode swaps (section 6).
 - Main 8: the status line records no usage windows in relay mode, and evaluates only triggers 3 and 5 (section 7); its write-back (step 3) compares the profile's login with the home account's row, not the active one's, and stores renewals there.
-- Main 12: `doctor`'s Relay line (section 11).
+- Main 12: `doctor`'s App account line (section 11).
 - Main 13: the settings in section 12.
 - Main 20.1, step 2 and 20.4: which account a check skips, and no confirmation in relay mode (sections 7 and 9).
 - Main 21 and 24.3: the hook is a backstop, and the 31 s wake delay does not apply (section 8).
@@ -278,9 +284,9 @@ All of these are made in the main spec.
   - which login: home passes the session's own through, any other account its stored token;
   - usage from response headers, including an unknown window name and a missing reset;
   - the limit refusal (429 with `rejected`) against other 429s and errors, and the resend policy: never after the first byte, at most once per account, the last refusal returned when no swap happens;
-  - the renewal schedule from `expiresAt` and `relay_renew_margin_s`, the 60 s wait between renewals, the 401 path, and a renewal storing the renewed login;
+  - the renewal schedule from `expiresAt` and `app_account_renew_margin_s`, the 60 s wait between renewals, the 401 path, and a renewal storing the renewed login;
   - the launcher's environment plan with relay mode on and off, for both launchers, and for a resumed older desktop session;
-  - `relay on`/`off`: refusals, `relay.json`, and the profile's login written only when the active account is not the home account.
+  - `app-account <account>`/`app-account off`: refusals, `relay.json`, and the profile's login written only when the active account is not the home account.
 - Integration tests: the relay serves a local fake upstream (the upstream is a parameter of the relay's code, fixed to `https://api.anthropic.com` in the program; no flag, variable or setting changes it), with concurrent streamed responses, a session that disconnects mid-stream, a resend, and the refusal rules.
 - `tests/e2e/relay.py` runs Claude Code headless through the relay against the fake Messages API, with three accounts staged (main 21.4), built with a test-only feature that points the relay at the fake API:
   - a swap mid-session moves the next request to the target, with the profile's login unchanged;

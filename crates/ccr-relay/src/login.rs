@@ -18,7 +18,7 @@ use crate::{Choice, Logins, RelayEvents};
 /// by requests for this long; one asked for after a 401 always is.
 const RENEW_AGAIN_AFTER: Duration = Duration::from_secs(60);
 
-/// The largest `relay_renew_margin_s` the settings allow: a login that expires later than this
+/// The largest `app_account_renew_margin_s` the settings allow: a login that expires later than this
 /// is never due, and the settings are not read for it.
 const MAX_MARGIN_MS: i64 = 3_600_000;
 
@@ -58,7 +58,7 @@ impl Renewals for StoreRenewals {
 /// request of every session.
 /// The active account's access token is decrypted only when its stored login changes, held in
 /// memory, and zeroed when replaced or no longer needed.
-/// When it is due to expire within `relay_renew_margin_s`, a renewal starts in the background.
+/// When it is due to expire within `app_account_renew_margin_s`, a renewal starts in the background.
 pub struct StoreLogins {
     inner: Mutex<Inner>,
     renewals: Arc<dyn Renewals>,

@@ -154,7 +154,7 @@ fn blocked(plan: &Plan, force: bool) -> Option<String> {
     // is off. `--force` does not change that.
     if plan.relay_swap_pending {
         return Some(
-            "relay mode is on and a swap was interrupted and isn't settled yet, so relay mode can't be turned off first. cc-rotate settles it within a minute (or run cc-rotate-ctl status); then run cc-rotate-ctl uninstall again."
+            "the app account is on and a swap was interrupted and isn't settled yet, so the app account can't be turned off first. cc-rotate settles it within a minute (or run cc-rotate-ctl status); then run cc-rotate-ctl uninstall again."
                 .into(),
         );
     }
@@ -195,11 +195,11 @@ fn plan_lines(plan: &Plan) -> (Vec<String>, Vec<String>) {
     let mut remove = Vec::new();
     if let Some(home) = &plan.relay_home {
         remove.push(format!(
-            "Turn relay mode off, so the profile has the login of the account in use again (the home account is {home})"
+            "Turn the app account off, so the profile has the login of the account in use again (the app account is {home})"
         ));
     }
     if let Some(service) = &plan.relay_service {
-        remove.push(format!("Stop the relay and remove {service}"));
+        remove.push(format!("Stop the local proxy and remove {service}"));
     }
     if let Some(config) = &plan.relay_config {
         remove.push(format!("Delete {}", config.display()));
@@ -325,7 +325,7 @@ mod tests {
     fn uninstall_plan_lists_relay() {
         let plan = Plan {
             relay_home: Some("work".into()),
-            relay_service: Some("the relay's LaunchAgent, /a/cc-rotate.relay.plist".into()),
+            relay_service: Some("the local proxy's LaunchAgent, /a/cc-rotate.relay.plist".into()),
             relay_config: Some(PathBuf::from("/data/relay.json")),
             ..Default::default()
         };
@@ -333,8 +333,8 @@ mod tests {
         assert_eq!(
             remove[..4],
             [
-                "Turn relay mode off, so the profile has the login of the account in use again (the home account is work)",
-                "Stop the relay and remove the relay's LaunchAgent, /a/cc-rotate.relay.plist",
+                "Turn the app account off, so the profile has the login of the account in use again (the app account is work)",
+                "Stop the local proxy and remove the local proxy's LaunchAgent, /a/cc-rotate.relay.plist",
                 "Delete /data/relay.json",
                 "Quit the cc-rotate app, if it runs",
             ]
@@ -353,7 +353,7 @@ mod tests {
         for force in [false, true] {
             let why = blocked(&plan, force).expect("not blocked");
             assert!(why.contains("swap"), "{why}");
-            assert!(why.contains("relay mode"), "{why}");
+            assert!(why.contains("the app account"), "{why}");
         }
         assert_eq!(blocked(&Plan::default(), false), None);
     }

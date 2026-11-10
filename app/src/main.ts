@@ -326,7 +326,7 @@ function stateText(a: AccountView): string {
 function activeSince(): number | null {
   const id = state.snap?.active_id;
   if (id === null || id === undefined) return null;
-  // A /login in relay mode makes an account home, not the one in use.
+  // A /login with the app account on (relay mode) makes an account the app account, not the one in use.
   return state.events.find((e) => (e.kind === "swap" || (e.kind === "adopted_login" && !e.detail?.home)) && e.account_to === id)?.ts ?? null;
 }
 

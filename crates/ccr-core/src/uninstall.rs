@@ -890,8 +890,8 @@ pub fn run(system: &dyn System, plan: &Plan, this_exe: &Path) -> Outcome {
         let result = system.turn_relay_off(&plan.data, &plan.profile);
         let failed = result.is_err();
         step(
-            format!("Turned relay mode off (the home account was {home})"),
-            "Turning relay mode off".into(),
+            format!("Turned the app account off (it was {home})"),
+            "Turning the app account off".into(),
             result,
         );
         // The plan said the profile gets the login of the account in use again: not so.
@@ -900,14 +900,14 @@ pub fn run(system: &dyn System, plan: &Plan, this_exe: &Path) -> Outcome {
                 String::new(),
                 dir.display().to_string(),
                 Err(anyhow!(
-                    "it stays with the home account's login ({home}), not the login of the account in use"
+                    "it stays with the app account's login ({home}), not the login of the account in use"
                 )),
             );
         }
     }
     if let Some(service) = &plan.relay_service {
         step(
-            format!("Stopped the relay and removed {service}"),
+            format!("Stopped the local proxy and removed {service}"),
             format!("Removing {service}"),
             system.remove_relay_service(),
         );
@@ -1575,7 +1575,7 @@ mod tests {
         std::fs::create_dir_all(i.paths.logs_dir()).unwrap();
         std::fs::write(i.paths.relay_log(), "").unwrap();
         let fake = Fake {
-            relay_service: Some("the relay's LaunchAgent".into()),
+            relay_service: Some("the local proxy's LaunchAgent".into()),
             ..Default::default()
         };
         let store = Store::open_read_only(&i.paths.store_db()).unwrap();
@@ -1583,7 +1583,10 @@ mod tests {
         drop(store);
         assert_eq!(p.relay_home.as_deref(), Some("work"));
         assert!(!p.relay_swap_pending);
-        assert_eq!(p.relay_service.as_deref(), Some("the relay's LaunchAgent"));
+        assert_eq!(
+            p.relay_service.as_deref(),
+            Some("the local proxy's LaunchAgent")
+        );
         assert_eq!(p.relay_config, Some(i.paths.relay_config()));
         assert_eq!(p.data, i.paths.data_dir);
         let DataRemoval::Entries(_, entries) = &p.data_dir else {
@@ -1608,9 +1611,13 @@ mod tests {
                 "stop_app"
             ]
         );
-        assert!(out.done[0].contains("relay mode off"), "{:?}", out.done);
         assert!(
-            out.done[1].contains("the relay's LaunchAgent"),
+            out.done[0].contains("Turned the app account off"),
+            "{:?}",
+            out.done
+        );
+        assert!(
+            out.done[1].contains("the local proxy's LaunchAgent"),
             "{:?}",
             out.done
         );
@@ -1655,12 +1662,12 @@ mod tests {
         assert!(
             out.failed
                 .iter()
-                .any(|l| l.starts_with("Turning relay mode off")),
+                .any(|l| l.starts_with("Turning the app account off")),
             "{:?}",
             out.failed
         );
         let kept = format!(
-            "{}: it stays with the home account's login (work), not the login of the account in use",
+            "{}: it stays with the app account's login (work), not the login of the account in use",
             i.paths.profile_dir.display()
         );
         assert!(out.failed.iter().any(|l| l == &kept), "{:?}", out.failed);

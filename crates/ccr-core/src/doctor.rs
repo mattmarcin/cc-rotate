@@ -439,7 +439,7 @@ fn profile_login_check(store: &Store, paths: &Paths) -> Option<Check> {
             Status::Fail,
             if relay_mode {
                 format!(
-                    "The profile keeps the login of the home account {}, which has no saved login. Sign in to it again.",
+                    "The profile keeps the login of the app account {}, which has no saved login. Sign in to it again.",
                     account.label
                 )
             } else {
@@ -902,35 +902,40 @@ pub fn relay_check(
     version: impl Fn(u16) -> Option<String>,
 ) -> Check {
     use crate::relay::{self, RelayConfig};
-    let name = "Relay";
+    // Shown as "App account": relay mode's user-facing name.
+    let name = "App account";
     let home_id = match relay::home(store) {
         // Sessions started while relay mode was on still send their requests to the relay, which
         // leaves an hour after `relay off` (spec 4).
         Ok(None) => {
             return match relay::stale_count(store, time::now_ms()) {
-                Ok(0) | Err(_) => check(name, Status::Ok, "relay mode is off"),
+                Ok(0) | Err(_) => check(name, Status::Ok, "off"),
                 Ok(1) => check(
                     name,
                     Status::Warn,
-                    "relay mode is off, but 1 session still points at the relay; restart it",
+                    "off, but 1 session still goes through the local proxy; restart it",
                 ),
                 Ok(n) => check(
                     name,
                     Status::Warn,
-                    format!(
-                        "relay mode is off, but {n} sessions still point at the relay; restart them"
-                    ),
+                    format!("off, but {n} sessions still go through the local proxy; restart them"),
                 ),
             };
         }
         Ok(Some(id)) => id,
-        Err(e) => return check(name, Status::Fail, format!("can't read relay mode: {e:#}")),
+        Err(e) => {
+            return check(
+                name,
+                Status::Fail,
+                format!("can't read the app account: {e:#}"),
+            );
+        }
     };
     let home = store.account(home_id).ok().flatten();
     let label = home
         .as_ref()
         .map_or_else(|| format!("account {home_id}"), |a| a.label.clone());
-    // What `relay on --home` takes to put things right: the home account again, or another one
+    // What `app-account <account>` takes to put things right: the home account again, or another one
     // when it is gone.
     let again = home
         .as_ref()
@@ -941,16 +946,16 @@ pub fn relay_check(
 
     match &home {
         None => fails.push(format!(
-            "the home account ({label}) is no longer in cc-rotate, so it can't be signed in again: name another with `cc-rotate-ctl relay on --home <another account>`"
+            "the app account ({label}) is no longer in cc-rotate, so it can't be signed in again: name another with `cc-rotate-ctl app-account <another account>`"
         )),
         Some(a) if a.state == AccountState::NeedsLogin => fails.push(format!(
-            "the home account {label} is signed out: every session fails until it signs in again (`cc-rotate-ctl login --relogin {label}`)"
+            "the app account {label} is signed out: every session fails until it signs in again (`cc-rotate-ctl login --relogin {label}`)"
         )),
         Some(_) => {}
     }
     if service() == crate::relay_service::ServiceState::Missing {
         fails.push(format!(
-            "the relay's service is not installed, so nothing restarts the relay when it ends (`cc-rotate-ctl relay on --home {again}` installs it)"
+            "the local proxy's service is not installed, so nothing restarts the local proxy when it ends (`cc-rotate-ctl app-account {again}` installs it)"
         ));
     }
     let mut ok = None;
@@ -958,23 +963,23 @@ pub fn relay_check(
         Ok(Some(cfg)) => match version(cfg.port) {
             Some(v) if v == env!("CARGO_PKG_VERSION") => {
                 ok = Some(format!(
-                    "on, with {label} as the home account; the relay answers on 127.0.0.1:{} (version {v})",
+                    "{label}: sessions act as {label} (the desktop app's account); the local proxy answers on 127.0.0.1:{} (version {v})",
                     cfg.port
                 ));
             }
             Some(v) => warns.push(format!(
-                "the relay on 127.0.0.1:{} is version {v}, not this cc-rotate's {}: it changes over by itself within about 12 minutes (it looks for an upgrade every minute, then waits up to 11 minutes for the requests in flight)",
+                "the local proxy on 127.0.0.1:{} is version {v}, not this cc-rotate's {}: it changes over by itself within about 12 minutes (it looks for an upgrade every minute, then waits up to 11 minutes for the requests in flight)",
                 cfg.port,
                 env!("CARGO_PKG_VERSION")
             )),
             None => fails.push(format!(
-                "the relay doesn't answer on 127.0.0.1:{}, so sessions get connection errors; {}",
+                "the local proxy doesn't answer on 127.0.0.1:{}, so sessions get connection errors; {}",
                 cfg.port,
                 last_relay_log_line(paths)
             )),
         },
         Ok(None) => fails.push(format!(
-            "relay mode is on but {} is not there, so new sessions start without the relay (`cc-rotate-ctl relay on --home {again}` writes it)",
+            "the app account is on but {} is not there, so new sessions start without the local proxy (`cc-rotate-ctl app-account {again}` writes it)",
             paths.relay_config().display()
         )),
         Err(e) => fails.push(format!("{e:#}")),
@@ -996,14 +1001,14 @@ pub fn relay_check(
         .collect();
     if !set.is_empty() {
         warns.push(format!(
-            "the profile's settings.json sets {} in env, which takes sessions off the relay or off the home account's login",
+            "the profile's settings.json sets {} in env, which takes sessions off the local proxy or off the app account's login",
             set.join(" and ")
         ));
     }
     match relay::bypass_count(store, time::now_ms()) {
         Ok(0) | Err(_) => {}
         Ok(n) => warns.push(format!(
-            "{n} {} without the relay's address in the last 10 minutes: they run on the home account directly, off the pool, until restarted",
+            "{n} {} without the local proxy in the last 10 minutes: they run as {label} directly, off the pool, until restarted",
             if n == 1 { "session ran" } else { "sessions ran" }
         )),
     }
@@ -1293,9 +1298,9 @@ mod tests {
                 || panic!("relay mode is off: no service to ask about"),
                 |_| panic!("relay mode is off: nothing to ask"),
             );
-            assert_eq!(c.name, "Relay");
+            assert_eq!(c.name, "App account");
             assert_eq!(c.status, Status::Ok);
-            assert_eq!(c.detail, "relay mode is off");
+            assert_eq!(c.detail, "off");
         }
 
         #[test]
@@ -1314,7 +1319,7 @@ mod tests {
             assert_eq!(c.status, Status::Warn, "{}", c.detail);
             assert_eq!(
                 c.detail,
-                "relay mode is off, but 1 session still points at the relay; restart it"
+                "off, but 1 session still goes through the local proxy; restart it"
             );
             relay_mode::note_stale(&store, "s2", now).unwrap();
             let c = relay_check(
@@ -1326,7 +1331,7 @@ mod tests {
             assert_eq!(c.status, Status::Warn, "{}", c.detail);
             assert!(
                 c.detail
-                    .contains("2 sessions still point at the relay; restart them"),
+                    .contains("2 sessions still go through the local proxy; restart them"),
                 "{}",
                 c.detail
             );
@@ -1354,13 +1359,16 @@ mod tests {
             });
             assert_eq!(c.status, Status::Ok, "{}", c.detail);
             assert!(
-                c.detail
-                    .contains(&format!("with {HOME} as the home account")),
+                c.detail.contains(&format!(
+                    "sessions act as {HOME} (the desktop app's account)"
+                )),
                 "{}",
                 c.detail
             );
             assert!(c.detail.contains(&port.to_string()), "{}", c.detail);
             assert!(!c.detail.contains(&f.cfg.secret), "{}", c.detail);
+            assert_eq!(c.name, "App account");
+            assert!(!c.detail.to_lowercase().contains("relay"), "{}", c.detail);
         }
 
         #[test]
@@ -1414,7 +1422,7 @@ mod tests {
             assert_eq!(c.status, Status::Fail, "{}", c.detail);
             assert!(
                 c.detail.contains(
-                    "the home account Haven is signed out: every session fails until it signs in again (`cc-rotate-ctl login --relogin Haven`)"
+                    "the app account Haven is signed out: every session fails until it signs in again (`cc-rotate-ctl login --relogin Haven`)"
                 ),
                 "{}",
                 c.detail
@@ -1431,12 +1439,14 @@ mod tests {
             // Nothing suggests signing in to, or reinstalling for, an account that is gone.
             assert!(!c.detail.contains("--relogin"), "{}", c.detail);
             assert!(
-                !c.detail.contains(&format!("--home account {}", f.home)),
+                !c.detail
+                    .contains(&format!("app-account account {}", f.home)),
                 "{}",
                 c.detail
             );
             assert!(
-                c.detail.contains("relay on --home <another account>"),
+                c.detail
+                    .contains("cc-rotate-ctl app-account <another account>"),
                 "{}",
                 c.detail
             );
@@ -1486,7 +1496,7 @@ mod tests {
             .unwrap();
             let c = profile_login_check(&f.store, &f.paths).unwrap();
             assert_eq!(c.status, Status::Fail, "{}", c.detail);
-            assert!(c.detail.contains("home account Haven"), "{}", c.detail);
+            assert!(c.detail.contains("app account Haven"), "{}", c.detail);
             assert!(!c.detail.contains("in use"), "{}", c.detail);
         }
 
