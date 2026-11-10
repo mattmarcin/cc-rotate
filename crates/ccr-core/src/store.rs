@@ -917,6 +917,23 @@ impl Store {
         })
     }
 
+    /// One setting of the store at `path`, whatever its schema, without changing anything. For
+    /// the desktop launcher, which must find the profile even before an upgraded cc-rotate has
+    /// migrated the store (spec section 24.1).
+    pub fn read_setting_any_schema(path: &Path, key: &str) -> Result<Option<String>> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("opening store {} read-only", path.display()))?;
+        conn.busy_timeout(Duration::from_millis(5000))?;
+        Ok(conn
+            .query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| {
+                r.get(0)
+            })
+            .optional()?)
+    }
+
     /// A copy of the store at `source`, made at `copy` (a consistent snapshot read through a
     /// read-only connection), then opened and brought up to this build's schema, with the key
     /// next to `source`. For tools that read an installed cc-rotate's store whatever its schema,
@@ -3064,6 +3081,39 @@ mod tests {
             .note_session_cost("s1", "pid:7", 3.75, Some(930_000), a, 3_000)
             .unwrap();
         assert!((added - 0.25).abs() < 1e-9, "{added}");
+    }
+
+    /// The desktop launcher reads where the profile is from a store of any schema: after an
+    /// upgrade, nothing may have migrated it yet (spec section 24.1).
+    #[test]
+    fn a_setting_is_read_from_a_store_of_another_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        let store = Store::open(&path).unwrap();
+        store
+            .set_setting("profile_dir", Some("/somewhere/profile"))
+            .unwrap();
+        drop(store);
+        for version in [SCHEMA_VERSION - 1, SCHEMA_VERSION + 1] {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            drop(conn);
+            assert_eq!(
+                Store::read_setting_any_schema(&path, "profile_dir")
+                    .unwrap()
+                    .as_deref(),
+                Some("/somewhere/profile")
+            );
+            assert_eq!(
+                Store::read_setting_any_schema(&path, "claude_path").unwrap(),
+                None
+            );
+        }
+        let conn = Connection::open(&path).unwrap();
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION + 1, "never migrated");
     }
 
     #[test]

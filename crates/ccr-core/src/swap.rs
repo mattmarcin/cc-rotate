@@ -580,6 +580,18 @@ pub const META_LEFT_AT_STOP_PREFIX: &str = "left_at_stop:";
 pub const LEFT_AT_STOP_HOLD_MS: i64 = 5 * 3600 * 1000;
 /// When the active account became active: a swap, or a login adopted from the profile.
 pub const META_ACTIVE_SINCE: &str = "active_since";
+
+/// When the last swap's write of the login returned (after its lock waits, which `active_since`
+/// precedes). The desktop wake waits for Claude Code's Keychain cache from here (spec 24.3).
+pub const META_LOGIN_WRITTEN_AT: &str = "login_written_at";
+
+/// `META_LOGIN_WRITTEN_AT`, or `active_since` for a swap made before it was recorded.
+pub fn login_written_at(store: &Store) -> Result<i64> {
+    Ok(store
+        .meta_i64(META_LOGIN_WRITTEN_AT)?
+        .unwrap_or(0)
+        .max(active_since(store)?))
+}
 /// The model id the rotation profile's sessions last reported in their status line. The models
 /// in use (`models_in_use`) fall back to it.
 pub const META_PROFILE_MODEL: &str = "profile_model_seen";
@@ -1373,6 +1385,8 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
         }
         return Err(e);
     }
+    // When the new login is in place: Claude Code may have read the old one until now.
+    let written_at = time::now_ms();
     let marker = creds.change_marker().ok().flatten();
 
     // Taken for its expiring budget: it stays ahead after its 5-hour limit this week.
@@ -1397,6 +1411,7 @@ pub fn run(store: &Store, paths: &Paths, req: &SwapRequest) -> Result<SwapOutcom
         s.set_meta(META_LAST_SWAP_AT, now)?;
         s.set_meta(META_PROFILE_FOREIGN, "0")?;
         s.set_meta(META_ACTIVE_SINCE, now)?;
+        s.set_meta(META_LOGIN_WRITTEN_AT, written_at)?;
         let mut resets: Vec<i64> = match previous_swap {
             Some(last) if now - last <= STALE_SAMPLE_GUARD_MS => left_resets(s)?,
             _ => Vec::new(),

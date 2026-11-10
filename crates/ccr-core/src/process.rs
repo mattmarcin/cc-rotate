@@ -338,11 +338,21 @@ impl Tree {
         let child = cmd.spawn()?;
         #[cfg(windows)]
         {
-            let job = job_for(&child);
+            let job = job_for(&child, false);
             Ok(Tree { child, job })
         }
         #[cfg(unix)]
         Ok(Tree { child })
+    }
+
+    /// Windows: start `cmd` in a job that ends it, and it alone, when the job closes. The
+    /// processes it starts leave the job (silent breakaway), as they outlive a launcher that
+    /// `exec`s on Unix. For the desktop launcher (spec section 24.4).
+    #[cfg(windows)]
+    pub fn spawn_child_only(cmd: &mut Command) -> std::io::Result<Tree> {
+        let child = cmd.spawn()?;
+        let job = job_for(&child, true);
+        Ok(Tree { child, job })
     }
 
     pub fn id(&self) -> u32 {
@@ -396,13 +406,13 @@ impl Drop for Tree {
 /// A job that kills its processes when closed, with the child in it. `None` when that is not
 /// possible; the child is then only killed directly.
 #[cfg(windows)]
-fn job_for(child: &Child) -> Option<windows_sys::Win32::Foundation::HANDLE> {
+fn job_for(child: &Child, child_only: bool) -> Option<windows_sys::Win32::Foundation::HANDLE> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-        SetInformationJobObject,
+        JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, SetInformationJobObject,
     };
     // SAFETY: the job is created, configured and closed on failure here; the process handle
     // belongs to `child`, which outlives this call.
@@ -412,7 +422,12 @@ fn job_for(child: &Child) -> Option<windows_sys::Win32::Foundation::HANDLE> {
             return None;
         }
         let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            | if child_only {
+                JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK
+            } else {
+                0
+            };
         let configured = SetInformationJobObject(
             job,
             JobObjectExtendedLimitInformation,

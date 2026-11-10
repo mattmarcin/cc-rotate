@@ -349,6 +349,7 @@ When its input or output isn't a terminal, it prints the status once and exits.
 | `cc-rotate-ctl warm-up <label>` | Start an account's 5-hour window now with one short Haiku request, then read its usage. |
 | `cc-rotate-ctl events` | Recent swaps, logins and problems. |
 | `cc-rotate-ctl doctor` | Check the profile, the store and Claude Code. |
+| `cc-rotate-ctl desktop` | Show whether the Claude desktop app's Code sessions run on the pool, and print the commands that turn that on or off (see **Desktop app sessions**). |
 | `cc-rotate-ctl backup <file>` | Print a daily backup of the profile's login file, decrypted. It contains tokens, so keep the output private. |
 | `cc-rotate-ctl config [key] [value]` | Show or change settings. `--unset` restores a default. |
 | `cc-rotate-ctl setup` | Create the cc-rotate profile. `--from <dir>` picks the template, `--force` rebuilds it. `--remove-alias` removes the `cc-rotate` PowerShell function older versions added; with an existing profile, that is all it does. `--keep-existing` keeps an existing profile instead of failing, only updating cc-rotate's hooks in it. |
@@ -445,9 +446,33 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.herdr-server.plist
 
 To undo it: `launchctl bootout gui/$(id -u)/local.herdr-server`, then delete the file.
 
+## Desktop app sessions
+
+The Claude desktop app's Code tab normally passes its own login to Claude Code, so its sessions use the account the app is signed in to and don't rotate.
+On macOS and Windows you can have the app start them through cc-rotate instead, and they then run on the pool like `cc-rotate` sessions: the preview, file and terminal panes work as before.
+This uses Claude Code's corporate launcher, which only an administrator can turn on, so it is off until you set it up.
+
+1. Run `cc-rotate-ctl desktop`. It shows what is set now and prints the commands to run, in Terminal on macOS or in PowerShell run as administrator on Windows.
+   - On macOS, the app's policy comes as a configuration profile: open it, then install **cc-rotate: desktop sessions on the pool** in System Settings > General > Device Management.
+   - A `sudo` (macOS) or administrator (Windows) command writes Claude Code's managed settings, naming `cc-rotate-ctl` as the launcher.
+2. Quit and reopen the Claude app. New Code sessions run on the pool.
+   A session started before stays in its old profile and runs on the login Claude Code has stored there (from `claude /login` in a terminal), which may be another account than the app's, or none: then it says it is not logged in. Start a new session to run on the pool.
+3. `cc-rotate-ctl doctor` shows the result on its **Desktop app** line.
+
+To turn it off, run the commands `cc-rotate-ctl desktop` prints then, and quit and reopen the app.
+`cc-rotate-ctl uninstall` refuses while the app still starts sessions through `cc-rotate-ctl`, since the app could then start none.
+
+What to know:
+
+- **Artifacts.** An artifact belongs to the account that published it, and the app's artifact pane opens it with the app's own sign-in, so one published while another account was in use shows "This artifact has been deleted or is no longer available" there. Your claude.ai connectors in a session also follow the account in use.
+- **Swaps happen at a limit.** Desktop sessions don't run a status line, so cc-rotate gets no usage readings from them: a desktop session swaps when it stops at a limit, and is woken on the next account. Sessions in a terminal still swap before a limit.
+- **Windows** works the same way by design, but has not been tried in the Windows app yet.
+- **WSL sessions** the app runs inside WSL don't go through a launcher, so they stay on the app's account.
+- **Organization-managed computers.** When device management sets the app's policies or Claude Code's managed settings, `cc-rotate-ctl desktop` prints nothing that would replace them and says what to ask your administrator for.
+
 ## What it does not cover
 
-- **The Claude desktop app.** Its Code tab passes its own login to Claude Code directly, so swapping the profile's login cannot reach it.
+- **The Claude desktop app, unless you set it up.** Its Code tab passes its own login to Claude Code, so swapping the profile's login cannot reach its sessions until they start through cc-rotate (see **Desktop app sessions**).
 - **Claude Code's Windows Credential Manager storage.** Claude Code can be switched to keep its login in the Windows Credential Manager; swaps would then stop reaching running sessions. `cc-rotate-ctl doctor` fails loudly if that is on.
 - **Cloud sessions.** Cloud agents (`isolation: "remote"`), `/ultrareview`, routines and Claude Code on the web run on Anthropic's servers under the account that started them, and use that account's limits.
   A swap cannot move them to another account.

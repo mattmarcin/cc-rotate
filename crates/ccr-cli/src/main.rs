@@ -1,3 +1,4 @@
+mod desktop_launch;
 mod format;
 mod herdr;
 mod interrupts;
@@ -215,6 +216,13 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Show whether the Claude desktop app's Code sessions run on the pool, and the commands that
+    /// turn that on or off (macOS and Windows; they need an administrator).
+    Desktop {
+        /// Print the macOS configuration profile that turns on the app's launcher policy.
+        #[arg(long)]
+        mobileconfig: bool,
+    },
     /// Check cc-rotate's data, the profile and Claude Code.
     Doctor {
         #[arg(long)]
@@ -249,6 +257,14 @@ enum Command {
     /// cc-rotate writing it (started in the background by the status line).
     #[command(hide = true)]
     SettleLogin,
+    /// The launcher the Claude desktop app runs for each Code session, named in Claude Code's
+    /// managed settings (`processWrapper`): it puts desktop sessions on the cc-rotate profile.
+    #[command(hide = true)]
+    DesktopLaunch {
+        /// Claude Code and its arguments, after `--`.
+        #[arg(last = true, required = true, value_parser = clap::value_parser!(std::ffi::OsString))]
+        command: Vec<std::ffi::OsString>,
+    },
     /// Tell herdr how to resume a session (started in the background by `hook session-start`).
     #[command(hide = true)]
     HerdrReport {
@@ -270,6 +286,8 @@ enum HookCommand {
     StopFailure,
     /// Report `cc-rotate --resume <id>` to herdr when the session runs in a herdr pane.
     SessionStart,
+    /// A turn ended normally: a session stopped at a usage limit is working again.
+    Stop,
 }
 
 fn main() -> ExitCode {
@@ -291,6 +309,20 @@ fn run(cli: Cli) -> Result<ExitCode> {
             yes,
             force,
         } => uninstall::run(cli.profile, dry_run, yes, force),
+        // Reads system settings only.
+        Command::Desktop { mobileconfig: true } => {
+            print!("{}", ccr_core::desktop::mobileconfig());
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Desktop {
+            mobileconfig: false,
+        } => {
+            let setup = ccr_core::desktop::read_setup();
+            print!("{}", format::desktop(&setup, &dunce_exe()?));
+            Ok(ExitCode::SUCCESS)
+        }
+        // Starts Claude Code for the desktop app: nothing here may write to the store.
+        Command::DesktopLaunch { command } => Ok(desktop_launch::run(cli.profile, command)),
         Command::Statusline { observe, then } => {
             statusline_entry(cli.profile, observe, then);
             Ok(ExitCode::SUCCESS)
@@ -305,6 +337,15 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 ExitCode::SUCCESS
             }
         }),
+        Command::Hook {
+            hook: HookCommand::Stop,
+        } => {
+            // Never fails the session: errors only go to the log.
+            if let Err(e) = stop_hook(cli.profile, &read_stdin()) {
+                process::log_error("hook stop", &e);
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Hook {
             hook: HookCommand::SessionStart,
         } => {
@@ -641,6 +682,8 @@ fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> 
         Command::Statusline { .. }
         | Command::Hook { .. }
         | Command::HerdrReport { .. }
+        | Command::DesktopLaunch { .. }
+        | Command::Desktop { .. }
         | Command::Uninstall { .. } => {
             unreachable!()
         }
@@ -875,6 +918,22 @@ fn login_cmd(
             ""
         },
     );
+    Ok(())
+}
+
+/// `hook stop` (spec section 24.3). Runs after every turn of every session in the profile, so it
+/// does nothing beyond reading the store unless the session has an open stop.
+fn stop_hook(profile: Option<PathBuf>, input: &str) -> Result<()> {
+    let payload: serde_json::Value = serde_json::from_str(input).unwrap_or_default();
+    let Some(session) = payload
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty() && s.len() <= 128)
+    else {
+        return Ok(());
+    };
+    let (store, _) = ccr_core::open(profile)?;
+    ccr_core::waiting::note_turn_ended(&store, session, time::now_ms())?;
     Ok(())
 }
 
