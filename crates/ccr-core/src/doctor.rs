@@ -890,6 +890,7 @@ const RELAY_ENV_OVERRIDES: &[&str] = &[
 
 /// Relay mode (relay spec, section 11): off, or on with the relay answering with this program's
 /// version, or what is wrong with it.
+/// Off, it warns while sessions started in relay mode still report with the relay's address.
 ///
 /// `service` says whether the relay's service is installed (`relay_service::status`), and
 /// `version` asks whatever answers on a port for its version (`relay::running_version`), `None`
@@ -903,7 +904,25 @@ pub fn relay_check(
     use crate::relay::{self, RelayConfig};
     let name = "Relay";
     let home_id = match relay::home(store) {
-        Ok(None) => return check(name, Status::Ok, "relay mode is off"),
+        // Sessions started while relay mode was on still send their requests to the relay, which
+        // leaves an hour after `relay off` (spec 4).
+        Ok(None) => {
+            return match relay::stale_count(store, time::now_ms()) {
+                Ok(0) | Err(_) => check(name, Status::Ok, "relay mode is off"),
+                Ok(1) => check(
+                    name,
+                    Status::Warn,
+                    "relay mode is off, but 1 session still points at the relay; restart it",
+                ),
+                Ok(n) => check(
+                    name,
+                    Status::Warn,
+                    format!(
+                        "relay mode is off, but {n} sessions still point at the relay; restart them"
+                    ),
+                ),
+            };
+        }
         Ok(Some(id)) => id,
         Err(e) => return check(name, Status::Fail, format!("can't read relay mode: {e:#}")),
     };
@@ -1280,6 +1299,52 @@ mod tests {
         }
 
         #[test]
+        fn relay_off_warns_while_sessions_point_at_the_relay() {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = Paths::new(dir.path().join("data"), dir.path().join("profile"));
+            let store = Store::open_in_memory().unwrap();
+            let now = time::now_ms();
+            relay_mode::note_stale(&store, "s1", now - 60_000).unwrap();
+            let c = relay_check(
+                &store,
+                &paths,
+                || panic!("no service"),
+                |_| panic!("no ask"),
+            );
+            assert_eq!(c.status, Status::Warn, "{}", c.detail);
+            assert_eq!(
+                c.detail,
+                "relay mode is off, but 1 session still points at the relay; restart it"
+            );
+            relay_mode::note_stale(&store, "s2", now).unwrap();
+            let c = relay_check(
+                &store,
+                &paths,
+                || panic!("no service"),
+                |_| panic!("no ask"),
+            );
+            assert_eq!(c.status, Status::Warn, "{}", c.detail);
+            assert!(
+                c.detail
+                    .contains("2 sessions still point at the relay; restart them"),
+                "{}",
+                c.detail
+            );
+            // Reported more than 10 minutes ago: no longer counted.
+            let old = tempfile::tempdir().unwrap();
+            let store = Store::open_in_memory().unwrap();
+            relay_mode::note_stale(&store, "s1", now - 11 * 60_000).unwrap();
+            let paths = Paths::new(old.path().join("data"), old.path().join("profile"));
+            let c = relay_check(
+                &store,
+                &paths,
+                || panic!("no service"),
+                |_| panic!("no ask"),
+            );
+            assert_eq!(c.status, Status::Ok, "{}", c.detail);
+        }
+
+        #[test]
         fn relay_ok() {
             let f = on();
             let port = f.cfg.port;
@@ -1306,22 +1371,25 @@ mod tests {
             assert!(c.detail.contains("0.0.1-old"), "{}", c.detail);
         }
 
+        /// The line `relay run` writes when another program has the port (spec 13).
         #[test]
         fn relay_not_answering_fails() {
             let f = on();
             std::fs::create_dir_all(f.paths.logs_dir()).unwrap();
+            let taken = format!(
+                "cannot start: 127.0.0.1:{} is taken by another program",
+                f.cfg.port
+            );
             std::fs::write(
                 f.paths.relay_log(),
-                "1800000000000 GET /v1/models 200 req_1 account=-\n1800000000001 cannot start: the port is taken\n",
+                format!(
+                    "1800000000000 GET /v1/models 200 req_1 account=-\n1800000000001 {taken}\n"
+                ),
             )
             .unwrap();
             let c = run(&f, ServiceState::Installed, |_| None);
             assert_eq!(c.status, Status::Fail, "{}", c.detail);
-            assert!(
-                c.detail.contains("cannot start: the port is taken"),
-                "{}",
-                c.detail
-            );
+            assert!(c.detail.contains(&taken), "{}", c.detail);
             assert!(!c.detail.contains("/v1/models"), "{}", c.detail);
 
             // No log at all: still a failure, said plainly.

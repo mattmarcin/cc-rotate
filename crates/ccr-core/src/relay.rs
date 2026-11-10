@@ -210,7 +210,12 @@ fn log_mode(s: &Store, account: i64, change: RelayChange) -> Result<()> {
 /// Meta key prefix of a session whose status line runs without the relay's address.
 pub const META_BYPASS_PREFIX: &str = "relay_bypass:";
 
-/// How long a session's report without the relay's address counts (spec 4).
+/// Meta key prefix of a session whose status line runs with a relay's address while relay mode is
+/// off: it was started while relay mode was on.
+pub const META_STALE_PREFIX: &str = "relay_stale:";
+
+/// How long a session's report without the relay's address, or with it while relay mode is off,
+/// counts (spec 4).
 pub const BYPASS_WINDOW_MS: i64 = 10 * 60_000;
 
 /// Record that `session_id`'s status line ran at `now_ms` without the relay's address: the session
@@ -221,12 +226,30 @@ pub fn note_bypass(store: &Store, session_id: &str, now_ms: i64) -> Result<()> {
 
 /// How many sessions reported without the relay's address in the 10 minutes before `now_ms`.
 pub fn bypass_count(store: &Store, now_ms: i64) -> Result<usize> {
+    count_marks(store, META_BYPASS_PREFIX, now_ms)
+}
+
+/// Record that `session_id`'s status line ran at `now_ms` with a relay's address while relay mode
+/// is off: the session still sends its requests to a relay, which leaves for good an hour after
+/// `relay off`, so it has to be restarted.
+pub fn note_stale(store: &Store, session_id: &str, now_ms: i64) -> Result<()> {
+    store.set_meta(&format!("{META_STALE_PREFIX}{session_id}"), now_ms)
+}
+
+/// How many sessions reported with a relay's address while relay mode was off, in the 10 minutes
+/// before `now_ms`.
+pub fn stale_count(store: &Store, now_ms: i64) -> Result<usize> {
+    count_marks(store, META_STALE_PREFIX, now_ms)
+}
+
+/// How many sessions under `prefix` reported in the 10 minutes before `now_ms`.
+fn count_marks(store: &Store, prefix: &str, now_ms: i64) -> Result<usize> {
     let count: i64 = store.conn().query_row(
         "SELECT COUNT(*) FROM meta WHERE substr(key, 1, ?1) = ?2
              AND CAST(value AS INTEGER) > ?3 AND CAST(value AS INTEGER) <= ?4",
         params![
-            META_BYPASS_PREFIX.len() as i64,
-            META_BYPASS_PREFIX,
+            prefix.len() as i64,
+            prefix,
             now_ms - BYPASS_WINDOW_MS,
             now_ms
         ],
@@ -235,18 +258,28 @@ pub fn bypass_count(store: &Store, now_ms: i64) -> Result<usize> {
     Ok(count as usize)
 }
 
-/// Forget the sessions that last reported without the relay's address 10 minutes or more before
-/// `now_ms` (`Store::prune`).
+/// Forget the sessions that last reported without the relay's address, or with it while relay
+/// mode was off, 10 minutes or more before `now_ms` (`Store::prune`).
 pub(crate) fn prune_bypass(store: &Store, now_ms: i64) -> Result<()> {
-    store.conn().execute(
-        "DELETE FROM meta WHERE substr(key, 1, ?1) = ?2 AND CAST(value AS INTEGER) <= ?3",
-        params![
-            META_BYPASS_PREFIX.len() as i64,
-            META_BYPASS_PREFIX,
-            now_ms - BYPASS_WINDOW_MS
-        ],
-    )?;
+    for prefix in [META_BYPASS_PREFIX, META_STALE_PREFIX] {
+        store.conn().execute(
+            "DELETE FROM meta WHERE substr(key, 1, ?1) = ?2 AND CAST(value AS INTEGER) <= ?3",
+            params![prefix.len() as i64, prefix, now_ms - BYPASS_WINDOW_MS],
+        )?;
+    }
     Ok(())
+}
+
+/// Whether `base_url` looks like a relay's address, `http://127.0.0.1:<port>/r/...`, whichever
+/// relay: after `relay off` the relay's `relay.json` goes when it leaves.
+pub fn points_at_relay(base_url: Option<&str>) -> bool {
+    let Some(rest) = base_url.and_then(|u| u.strip_prefix("http://127.0.0.1:")) else {
+        return false;
+    };
+    let Some((port, _)) = rest.split_once("/r/") else {
+        return false;
+    };
+    !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Whether a session with this environment bypasses the relay: its `ANTHROPIC_BASE_URL` is not
@@ -506,6 +539,51 @@ mod tests {
                 .is_some()
         );
         assert_eq!(bypass_count(&store, now + BYPASS_WINDOW_MS).unwrap(), 0);
+    }
+
+    #[test]
+    fn stale_counted_and_pruned() {
+        let store = Store::open_in_memory().unwrap();
+        let now = 1_800_000_000_000;
+        note_stale(&store, "s1", now - BYPASS_WINDOW_MS).unwrap();
+        note_stale(&store, "s2", now - 60_000).unwrap();
+        note_stale(&store, "s3", now).unwrap();
+        note_stale(&store, "s3", now).unwrap();
+        // Separate from the sessions that bypass the relay.
+        note_bypass(&store, "s4", now).unwrap();
+        assert_eq!(stale_count(&store, now).unwrap(), 2);
+        assert_eq!(bypass_count(&store, now).unwrap(), 1);
+        store.prune(now).unwrap();
+        assert_eq!(store.meta(&format!("{META_STALE_PREFIX}s1")).unwrap(), None);
+        assert!(
+            store
+                .meta(&format!("{META_STALE_PREFIX}s2"))
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(stale_count(&store, now + BYPASS_WINDOW_MS).unwrap(), 0);
+    }
+
+    #[test]
+    fn relay_address_rule() {
+        let cfg = RelayConfig {
+            port: 50_123,
+            secret: "ab".repeat(32),
+        };
+        assert!(points_at_relay(Some(&cfg.base_url())));
+        assert!(points_at_relay(Some("http://127.0.0.1:1/r/x")));
+        for other in [
+            None,
+            Some(""),
+            Some("https://api.anthropic.com"),
+            Some("http://127.0.0.1:50123/v1"),
+            Some("http://127.0.0.1:/r/x"),
+            Some("http://127.0.0.1:5x/r/x"),
+            Some("http://localhost:50123/r/x"),
+            Some("https://127.0.0.1:50123/r/x"),
+        ] {
+            assert!(!points_at_relay(other), "{other:?}");
+        }
     }
 
     #[test]

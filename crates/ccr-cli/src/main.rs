@@ -774,6 +774,9 @@ fn dispatch(
             println!(
                 "Relay mode is off. New sessions start without the relay; it serves the sessions started with it until it has had no request for an hour, then removes itself."
             );
+            println!(
+                "Restart the sessions started while relay mode was on within the hour: once the relay has removed itself, they get connection errors."
+            );
         }
         Command::Statusline { .. }
         | Command::Hook { .. }
@@ -798,8 +801,10 @@ const RELAY_START_FAILED_WAIT: Duration = Duration::from_secs(10);
 /// `cc-rotate-ctl relay run` (spec sections 5 and 10): hold `relay.lock`, resolve the store and
 /// profile, bind 127.0.0.1 on the port in `relay.json`, and serve until the relay leaves (an
 /// upgrade, or an hour without requests once relay mode is off).
-/// Another relay holding the lock, or already listening on the port, means there is nothing to
-/// do. A relay that cannot start says why in `relay.log` and exits with an error after a wait.
+/// Another relay holding the lock, or another program listening on the port, means there is
+/// nothing to do: it exits at once and quietly, the taken port noted in `relay.log`.
+/// A relay that cannot start otherwise says why in `relay.log` and exits with an error after a
+/// wait.
 fn relay_run() -> ExitCode {
     // The program as it is now, before any wait: an upgrade while this relay waits for the lock
     // is still one, and it leaves at its first check.
@@ -838,7 +843,8 @@ fn relay_run() -> ExitCode {
 }
 
 /// Everything the relay needs, resolved before it takes the port, and then the port: what
-/// serves until the relay leaves. `None` when something else listens on the port.
+/// serves until the relay leaves. `None` when something else listens on the port, which is
+/// written to `relay.log`.
 fn relay_ready(
     data: &Paths,
     program: Option<PathBuf>,
@@ -856,7 +862,17 @@ fn relay_ready(
     let events_store = Store::open(&paths.store_db())?;
     let listener = match std::net::TcpListener::bind(("127.0.0.1", cfg.port)) {
         Ok(listener) => listener,
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => return Ok(None),
+        // Exits quietly (a relay of another data folder may serve it), but says so for `doctor`.
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            ccr_relay::log_now(
+                &data.relay_log(),
+                &format!(
+                    "cannot start: 127.0.0.1:{} is taken by another program",
+                    cfg.port
+                ),
+            );
+            return Ok(None);
+        }
         Err(e) => {
             return Err(e).with_context(|| format!("listening on 127.0.0.1:{}", cfg.port));
         }

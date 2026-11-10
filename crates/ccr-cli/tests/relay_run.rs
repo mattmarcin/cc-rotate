@@ -88,15 +88,41 @@ fn relay_run_exits_at_once_while_another_process_holds_the_lock() {
     assert!(!data.join("logs/cc-rotate.log").exists());
 }
 
+/// Another program on the relay's port: the relay exits at once and without a word on the
+/// terminal, whether a launcher or its service started it, and says why in `relay.log` for
+/// `doctor`.
 #[test]
 fn relay_run_exits_quietly_when_its_port_is_taken() {
-    let root = tempfile::tempdir().unwrap();
-    let (data, cfg) = data_folder(root.path());
-    let _taken = std::net::TcpListener::bind(("127.0.0.1", cfg.port)).unwrap();
-    let mut child = Running(relay_run(&data));
-    let status = exits_within(&mut child.0, Duration::from_secs(10)).expect("still running");
-    assert!(status.success());
-    assert!(!data.join("logs/cc-rotate.log").exists());
+    for from_service in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let (data, cfg) = data_folder(root.path());
+        let _taken = std::net::TcpListener::bind(("127.0.0.1", cfg.port)).unwrap();
+        let mut cmd = common::program(env!("CARGO_BIN_EXE_cc-rotate-ctl"));
+        cmd.args(["relay", "run"])
+            .env("CC_ROTATE_DATA_DIR", &data)
+            .env("CC_ROTATE_PROFILE", data.join("no profile"))
+            .env_remove("CC_ROTATE_RELAY_TEST_UPSTREAM")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if from_service {
+            cmd.env("CC_ROTATE_RELAY_SERVICE", "1");
+        } else {
+            cmd.env_remove("CC_ROTATE_RELAY_SERVICE");
+        }
+        let started = Instant::now();
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "service {from_service}");
+        assert!(started.elapsed() < Duration::from_secs(9), "it waited");
+        assert!(out.stdout.is_empty() && out.stderr.is_empty(), "{out:?}");
+        assert!(!data.join("logs/cc-rotate.log").exists());
+        let log = std::fs::read_to_string(data.join("logs/relay.log")).unwrap_or_default();
+        let line = format!(
+            "cannot start: 127.0.0.1:{} is taken by another program",
+            cfg.port
+        );
+        assert!(log.contains(&line), "service {from_service}: {log:?}");
+        assert_eq!(log.lines().count(), 1, "{log}");
+    }
 }
 
 #[cfg(unix)]
@@ -215,6 +241,24 @@ fn relay_shows_the_address_but_never_the_secret() {
         "{text}"
     );
     assert!(!text.contains(&cfg.secret), "{text}");
+}
+
+/// Sessions started while relay mode was on keep the relay's address, and get connection errors
+/// once the relay leaves, an hour after `relay off`.
+#[test]
+fn relay_off_says_to_restart_the_relays_sessions() {
+    let root = tempfile::tempdir().unwrap();
+    let (data, _) = data_folder(root.path());
+    let out = ctl(&data, &["relay", "off"]);
+    assert!(out.status.success(), "{out:?}");
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("Relay mode is off."), "{text}");
+    assert!(
+        text.contains(
+            "Restart the sessions started while relay mode was on within the hour: once the relay has removed itself, they get connection errors."
+        ),
+        "{text}"
+    );
 }
 
 #[test]

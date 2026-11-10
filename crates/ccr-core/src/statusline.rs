@@ -226,6 +226,9 @@ pub fn tick(
     // account's.
     let relay_mode = relay::home(store)?.is_some();
     let bypasses = relay_mode && note_relay_bypass(store, paths, input, &env, now_ms)?;
+    if !relay_mode {
+        note_stale_relay_session(store, input, &env, now_ms)?;
+    }
     let cost_for = |active_id: i64| -> Result<i64> {
         Ok(match bypasses {
             true => relay::home(store)?.unwrap_or(active_id),
@@ -370,6 +373,24 @@ fn note_relay_bypass(
         relay::note_bypass(store, session, now_ms)?;
     }
     Ok(true)
+}
+
+/// With relay mode off, record a session whose `ANTHROPIC_BASE_URL` is a relay's address: it was
+/// started while relay mode was on, and gets connection errors once the relay leaves, an hour
+/// after `relay off` (spec 4). `doctor` warns while any reported in the last 10 minutes.
+fn note_stale_relay_session(
+    store: &Store,
+    input: &StatusInput,
+    env: &impl Fn(&str) -> Option<String>,
+    now_ms: i64,
+) -> Result<()> {
+    if !relay::points_at_relay(env(relay::ENV_BASE_URL).as_deref()) {
+        return Ok(());
+    }
+    if let Some(session) = input.session_id.as_deref().filter(|s| !s.is_empty()) {
+        relay::note_stale(store, session, now_ms)?;
+    }
+    Ok(())
 }
 
 /// A fresh reading of the account in use from a session stopped at a usage limit, with room,
@@ -1374,6 +1395,52 @@ mod tests {
             let now = crate::time::now_ms();
             tick(&env.store, &env.paths, &input("s1", 10.0, 1.0), now, no_env).unwrap();
             assert_eq!(relay::bypass_count(&env.store, now).unwrap(), 0);
+        }
+
+        /// With relay mode off, a session started while it was on still sends its requests to
+        /// the relay, which leaves an hour after `relay off` (spec 4).
+        #[test]
+        fn stale_relay_session_counted_outside_relay_mode() {
+            let env = Env::new();
+            let now = crate::time::now_ms();
+            tick(
+                &env.store,
+                &env.paths,
+                &input("plain", 10.0, 1.0),
+                now,
+                no_env,
+            )
+            .unwrap();
+            assert_eq!(relay::stale_count(&env.store, now).unwrap(), 0);
+            tick(
+                &env.store,
+                &env.paths,
+                &input("stale", 10.0, 1.0),
+                now,
+                through_relay,
+            )
+            .unwrap();
+            assert_eq!(relay::stale_count(&env.store, now).unwrap(), 1);
+            assert_eq!(relay::bypass_count(&env.store, now).unwrap(), 0);
+            assert_eq!(
+                relay::stale_count(&env.store, now + 10 * 60_000).unwrap(),
+                0
+            );
+        }
+
+        #[test]
+        fn no_stale_session_counted_in_relay_mode() {
+            let env = relay_env();
+            let now = crate::time::now_ms();
+            tick(
+                &env.store,
+                &env.paths,
+                &input("through", 10.0, 1.0),
+                now,
+                through_relay,
+            )
+            .unwrap();
+            assert_eq!(relay::stale_count(&env.store, now).unwrap(), 0);
         }
     }
 }
