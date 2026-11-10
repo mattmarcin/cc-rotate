@@ -312,9 +312,8 @@ def served_on(name, lines, label):
     wrong = [(f, e.get("who"), e.get("status")) for f, e in lines if e.get("who") != label or e.get("status") != 200]
     if wrong:
         fail(f"{name}: every model request should be served on {label}, the fake API saw {wrong}")
-    via = {e.get("prefix") for _, e in lines}
-    if via != {""}:
-        fail(f"{name}: requests should arrive through the relay with its prefix taken off, prefixes {via}")
+    # `lines` are requests whose path is exactly `/v1/messages`, so each arrived with the relay's
+    # prefix taken off; there is nothing more to check about the prefix here.
 
 
 def prepare():
@@ -463,7 +462,10 @@ def version_check():
     succeeded("claude with the relay's variables", result, stdout, stderr)
     # The profile has a's login; c on the fake API means the relay put the active account's on.
     served_on("claude with the relay's variables", messages_since(m), "c")
-    lines = [l for l in tail(debug, 10**8).splitlines() if "custom_base_url" in l]
+    text = tail(debug, 10**8)
+    if not text.strip():
+        fail(f"Claude Code wrote no debug file at {debug}, so custom_base_url can't be checked")
+    lines = [l for l in text.splitlines() if "custom_base_url" in l]
     if lines:
         fail(f"Claude Code's debug file mentions custom_base_url: {lines[:3]}")
 

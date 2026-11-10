@@ -69,10 +69,14 @@ A `claude` started in the profile some other way (plain `claude` with `CLAUDE_CO
    The transaction that commits it sets `relay_mode` to `off`; when the home account is active, that transaction is all there is.
    New sessions then start without the variables.
 2. Leaves the relay running for sessions started with it; after an hour without requests it deletes `relay.json`, removes its service and exits (section 10).
+   Meanwhile the relay only forwards: it records no reading, asks for no swap, holds no account back and starts no renewal, and a refusal goes back to the session as it is.
+   The status line records readings and asks for swaps again, and a swap writes the profile's login, which a session started with the relay does not send.
+3. Says that the sessions started while relay mode was on must be restarted within the hour: once the relay has left, they get connection errors.
 
 Sessions running when relay mode changes keep the environment they started with until they are restarted.
 Turning it on leaves earlier sessions on the profile's login, now the home account's, off the pool.
 The status line runs with its session's environment, so it sees whether the session has the relay's address; `relay` and `doctor` count the sessions without it among those whose status line reported in the last 10 minutes (desktop sessions run none, main F30, and start with it once relay mode is on).
+With relay mode off, the status line records a session whose `ANTHROPIC_BASE_URL` is a relay's address (`http://127.0.0.1:<port>/r/...`), and `doctor` warns while any reported in the last 10 minutes: it was started while relay mode was on and has to be restarted.
 
 ## 5. The relay
 
@@ -159,7 +163,7 @@ Claude Code renews logins; cc-rotate never calls Anthropic's sign-in endpoints i
   The relay runs it in its own process, in the background (`usage_check::renew`), at most one at a time per account.
   A renewal that ordinary requests started is not started again within 60 s of the last one ending, so a renewal that fails fast does not run Claude Code on every request; one a 401 asks for (below) is not held back by that.
   The old access token keeps working until it expires, so requests are not held.
-- **A 401 on a model request**: the relay reads the stored login again and resends once if it changed; otherwise it asks for a renewal and holds that account's requests for up to 30 s.
+- **A 401 on a model request**: the relay reads the stored login again and resends once if it changed; otherwise it asks for a renewal and holds the refused request for up to 30 s; other requests, of that account or another, go on meanwhile.
   If no valid login comes, the account is held back (main 20.3) until a check settles whether its login works, and the relay swaps away from it as in section 8, with reason `unauthorized`; it is not marked `needs_login`.
   A login Anthropic rejects outright is marked `needs_login` by the check, as today.
 - **Parked accounts** are renewed only when they become active (section 6, step 4), as today.
@@ -185,7 +189,7 @@ The relay runs as a per-user service that restarts it when it ends:
 
 Only one relay runs: it holds an OS file lock on `<data dir>/relay.lock`, which the system releases when the process ends however it ends, and binds the fixed port.
 A relay a launcher started exits quietly when another relay holds the lock; one the service started (its definition sets `CC_ROTATE_RELAY_SERVICE=1`) waits for the lock instead, so the service does not restart it over and over.
-A relay that finds the port taken (`AddrInUse`) exits quietly too.
+A relay that finds the port taken (`AddrInUse`) exits quietly too, whichever started it, after writing one line to `relay.log`: `cannot start: 127.0.0.1:<port> is taken by another program`.
 A relay that cannot start (the store, the profile or the port cannot be opened) writes one line to `relay.log`, waits 10 s and exits with an error, so the service restarts it at that pace.
 A launcher that finds nothing answering on the port starts `cc-rotate-ctl relay run` detached and starts Claude Code without waiting, keeping its time budget (main 24.1); the session's first request a moment later finds it running.
 
@@ -203,7 +207,7 @@ Sessions fail visibly; they never fall back to another way of reaching Anthropic
 - A running session gets connection errors, which Claude Code retries and then reports ("Unable to connect to API").
   The service normally restarts the relay within seconds, inside those retries.
 - A new session gets the relay's address whether or not it answers; the launcher has started it (section 10).
-- `doctor` gains a "Relay" line: off (ok); on and answering with this program's version (ok); on and answering with another version (warn); on and not answering, with the last line of its log (fail); the service missing (fail); the home account signed out or gone (fail: every session fails until it signs in again).
+- `doctor` gains a "Relay" line: off (ok; warn while sessions started in relay mode still report with a relay's address, section 4); on and answering with this program's version (ok); on and answering with another version (warn); on and not answering, with the last line of its log (fail); the service missing (fail); the home account signed out or gone (fail: every session fails until it signs in again).
   It asks the relay its version with `GET /r/<secret>/__ccr/version`, which the relay answers itself, as plain text, asking Anthropic nothing and attaching no login; any other path, method or query under `__ccr` is forwarded like any request.
   It also warns when the profile's `env` sets `ANTHROPIC_BASE_URL`, `ANTHROPIC_UNIX_SOCKET`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` or `CLAUDE_CODE_OAUTH_TOKEN`, any of which would take a session off the relay or off the home account's login, and when sessions ran without the relay's address in the last 10 minutes (section 4).
 - `cc-rotate-ctl desktop` says whether relay mode is on and names the home account.
@@ -234,6 +238,10 @@ The relay can attach any pool login to a request, so it accepts requests only fr
 
 The threat model is the main spec's (main 5.1): other users on the machine and web pages are kept out; code running as the same user can read `master.key` and the profile's login anyway, so the relay gives it nothing new.
 The secret also appears in the sessions' environment, which the user's own processes can read (`ps -E` on macOS shows it to the same user only).
+
+One risk remains: the port is fixed, and while no relay listens on it (between an exit and the restart, or after the relay has left while sessions still point at it), another local user can bind it.
+That program then receives the sessions' requests, including the path's secret and the home account's access token, which every session sends in its `Authorization` header.
+cc-rotate cannot prevent this on a shared machine; a relay that finds its port taken writes so to `relay.log`, and `doctor` shows that line while the relay does not answer.
 
 ## 14. Changes to the main spec
 
@@ -274,7 +282,7 @@ All of these are made in the main spec.
   - the launcher's environment plan with relay mode on and off, for both launchers, and for a resumed older desktop session;
   - `relay on`/`off`: refusals, `relay.json`, and the profile's login written only when the active account is not the home account.
 - Integration tests: the relay serves a local fake upstream (the upstream is a parameter of the relay's code, fixed to `https://api.anthropic.com` in the program; no flag, variable or setting changes it), with concurrent streamed responses, a session that disconnects mid-stream, a resend, and the refusal rules.
-- `tests/e2e/relay-*.py` run Claude Code headless through the relay against the fake Messages API, with three accounts staged (main 21.4), built with a test-only feature that points the relay at the fake API:
+- `tests/e2e/relay.py` runs Claude Code headless through the relay against the fake Messages API, with three accounts staged (main 21.4), built with a test-only feature that points the relay at the fake API:
   - a swap mid-session moves the next request to the target, with the profile's login unchanged;
   - a refusal at a limit is resent on the next account, and the turn finishes without `StopFailure`;
   - the relay killed mid-session is restarted by the launcher's fallback, and the session's next turn works;

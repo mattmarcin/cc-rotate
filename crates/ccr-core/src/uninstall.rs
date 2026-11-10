@@ -12,7 +12,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Map, Value};
 
 use crate::credstore::Credentials;
@@ -887,11 +887,23 @@ pub fn run(system: &dyn System, plan: &Plan, this_exe: &Path) -> Outcome {
     // Relay mode off first, as `relay off` does, so a profile that stays has the login of the
     // account in use (relay spec 10).
     if let Some(home) = &plan.relay_home {
+        let result = system.turn_relay_off(&plan.data, &plan.profile);
+        let failed = result.is_err();
         step(
             format!("Turned relay mode off (the home account was {home})"),
             "Turning relay mode off".into(),
-            system.turn_relay_off(&plan.data, &plan.profile),
+            result,
         );
+        // The plan said the profile gets the login of the account in use again: not so.
+        if failed && let Removal::Keep(dir, _) = &plan.profile_dir {
+            step(
+                String::new(),
+                dir.display().to_string(),
+                Err(anyhow!(
+                    "it stays with the home account's login ({home}), not the login of the account in use"
+                )),
+            );
+        }
     }
     if let Some(service) = &plan.relay_service {
         step(
@@ -1346,6 +1358,7 @@ mod tests {
         /// Keychain items of other profiles (scratch ones) that are there.
         items: Vec<PathBuf>,
         fail_alias: bool,
+        fail_relay_off: bool,
         /// The relay's service, when it is installed.
         relay_service: Option<String>,
         calls: std::cell::RefCell<Vec<String>>,
@@ -1400,6 +1413,9 @@ mod tests {
             Ok(())
         }
         fn turn_relay_off(&self, data_dir: &Path, profile: &Path) -> Result<()> {
+            if self.fail_relay_off {
+                bail!("a swap is pending");
+            }
             let store = Store::open(&data_dir.join("store.db"))?;
             crate::relay::set_mode(&store, None)?;
             let name = profile.file_name().unwrap_or_default().to_string_lossy();
@@ -1609,6 +1625,73 @@ mod tests {
         assert_eq!(again.relay_config, None);
         run(&quiet, &again, &i.ctl);
         assert!(!quiet.calls.borrow().iter().any(|c| c.contains("relay")));
+    }
+
+    /// Relay mode that could not be turned off leaves the home account's login in a profile that
+    /// stays: the outcome says so, rather than the plan's "the login of the account in use".
+    #[test]
+    fn a_kept_profile_after_a_failed_relay_off_is_named() {
+        let i = install();
+        {
+            let store = Store::open(&i.paths.store_db()).unwrap();
+            let home = store
+                .insert_account(
+                    "work",
+                    &crate::store::AccountIdentity::default(),
+                    crate::store::AccountState::Active,
+                )
+                .unwrap();
+            crate::relay::set_mode(&store, Some(home)).unwrap();
+        }
+        let fake = Fake {
+            fail_relay_off: true,
+            ..Default::default()
+        };
+        let store = Store::open_read_only(&i.paths.store_db()).unwrap();
+        let mut p = plan(&fake, &i.paths, Some(&store), &i.ctl, time::now_ms()).unwrap();
+        drop(store);
+        p.profile_dir = Removal::Keep(i.paths.profile_dir.clone(), "a test".into());
+        let out = run(&fake, &p, &i.ctl);
+        assert!(
+            out.failed
+                .iter()
+                .any(|l| l.starts_with("Turning relay mode off")),
+            "{:?}",
+            out.failed
+        );
+        let kept = format!(
+            "{}: it stays with the home account's login (work), not the login of the account in use",
+            i.paths.profile_dir.display()
+        );
+        assert!(out.failed.iter().any(|l| l == &kept), "{:?}", out.failed);
+
+        // A profile that goes needs no such line.
+        let i = install();
+        {
+            let store = Store::open(&i.paths.store_db()).unwrap();
+            let home = store
+                .insert_account(
+                    "work",
+                    &crate::store::AccountIdentity::default(),
+                    crate::store::AccountState::Active,
+                )
+                .unwrap();
+            crate::relay::set_mode(&store, Some(home)).unwrap();
+        }
+        let store = Store::open_read_only(&i.paths.store_db()).unwrap();
+        let p = plan(&fake, &i.paths, Some(&store), &i.ctl, time::now_ms()).unwrap();
+        drop(store);
+        assert!(
+            matches!(p.profile_dir, Removal::Delete(..)),
+            "{:?}",
+            p.profile_dir
+        );
+        let out = run(&fake, &p, &i.ctl);
+        assert!(
+            !out.failed.iter().any(|l| l.contains("stays with")),
+            "{:?}",
+            out.failed
+        );
     }
 
     #[test]

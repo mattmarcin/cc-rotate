@@ -840,7 +840,8 @@ pub struct Settings {
     /// When every account is at a limit and the one in use has extra usage on, move to one
     /// without, so sessions wait for a reset instead of paying (`extra_usage`).
     pub avoid_extra_usage: bool,
-    /// Relay mode renews the home account's access token when it ends within this many seconds.
+    /// Relay mode renews the access token of the account in use, when it is not the home account,
+    /// when it ends within this many seconds.
     pub relay_renew_margin_s: i64,
 }
 

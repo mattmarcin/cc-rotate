@@ -497,6 +497,8 @@ It is off until you turn it on, and covers every session in the cc-rotate profil
 
 `cc-rotate-ctl relay off` turns it off: the login of the account in use goes back into the profile, and new sessions start without the relay.
 The relay keeps serving the sessions started with it until it has had no request for an hour, then removes its service and itself.
+Restart the sessions started while relay mode was on within that hour: once the relay is gone they get connection errors.
+`cc-rotate-ctl doctor` warns while any of them still runs.
 `cc-rotate-ctl uninstall` turns relay mode off and removes the relay.
 
 What to know:
@@ -507,6 +509,7 @@ What to know:
 - **The relay has to run.** When it is down, sessions report connection errors ("Unable to connect to API") instead of falling back to another account. Its service restarts it within seconds, and the launchers start it when nothing answers.
 - **Logins of accounts not in use.** No session holds them, so the relay has Claude Code renew the login of the account in use before it expires, as a usage check does.
 - **Security.** The relay listens on 127.0.0.1 only, and every request has to carry a random secret in its address, which is in `relay.json` in the data folder (readable only by you) and in your sessions' environment. It never logs a login, a request or a response body. Its log is `logs/relay.log` in the data folder.
+  One risk remains on a computer shared with other people: while no relay listens on its port (for a moment while it restarts, or after it has removed itself while sessions still point at it), another user of the computer can take the port and would receive your sessions' requests, including the secret and the home account's access token. A relay that finds its port taken says so in its log, and `doctor` shows that line.
 
 Relay mode does not cover:
 
