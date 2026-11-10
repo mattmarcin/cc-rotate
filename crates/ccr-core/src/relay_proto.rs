@@ -31,7 +31,8 @@ pub fn route(
     has_origin: bool,
     cfg: &RelayConfig,
 ) -> Route {
-    if has_origin || !matches!(method, "GET" | "HEAD" | "POST") {
+    // A short or empty secret would let any local process in, whatever relay.json held.
+    if cfg.secret.len() < 32 || has_origin || !matches!(method, "GET" | "HEAD" | "POST") {
         return Route::Refuse;
     }
     if host != Some(format!("127.0.0.1:{}", cfg.port).as_str()) {
@@ -151,7 +152,7 @@ pub fn renew_due(expires_at_ms: i64, now_ms: i64, margin_s: i64) -> bool {
 mod tests {
     use super::*;
 
-    const S: &str = "sekret123";
+    const S: &str = "0123456789abcdef0123456789abcdef";
 
     fn cfg() -> RelayConfig {
         RelayConfig {
@@ -227,6 +228,57 @@ mod tests {
         assert_eq!(route("POST", &ok, None, false, &c), Route::Refuse);
         assert_eq!(route("POST", &ok, host(), true, &c), Route::Refuse);
         assert_eq!(route("PUT", &ok, host(), false, &c), Route::Refuse);
+    }
+
+    #[test]
+    fn route_refuse_empty_secret() {
+        for secret in ["", "short"] {
+            let c = RelayConfig {
+                port: 4455,
+                secret: secret.into(),
+            };
+            assert_eq!(
+                route(
+                    "POST",
+                    &format!("/r/{secret}/v1/messages"),
+                    host(),
+                    false,
+                    &c
+                ),
+                Route::Refuse
+            );
+        }
+    }
+
+    #[test]
+    fn route_edge_cases() {
+        let c = cfg();
+        assert_eq!(
+            route("POST", &format!("/r/{S}/../v1/messages"), host(), false, &c),
+            Route::Pass {
+                path: "/../v1/messages".into()
+            }
+        );
+        assert_eq!(
+            route("GET", &format!("/r/{S}?q=1"), host(), false, &c),
+            Route::Pass {
+                path: "/?q=1".into()
+            }
+        );
+        assert_eq!(
+            route("GET", &format!("/r/{S}"), host(), false, &c),
+            Route::Pass { path: "/".into() }
+        );
+        assert_eq!(
+            route("post", &format!("/r/{S}/v1/messages"), host(), false, &c),
+            Route::Refuse
+        );
+        assert_eq!(
+            route("HEAD", &format!("/r/{S}/v1/messages"), host(), false, &c),
+            Route::Pass {
+                path: "/v1/messages".into()
+            }
+        );
     }
 
     #[test]
