@@ -279,6 +279,12 @@ enum Command {
         #[arg(long, value_name = "PID")]
         watch_pid: Option<u32>,
     },
+    /// Relay mode's loopback relay.
+    #[command(hide = true)]
+    Relay {
+        #[command(subcommand)]
+        action: RelayAction,
+    },
     /// Tell herdr how to resume a session (started in the background by `hook session-start`).
     #[command(hide = true)]
     HerdrReport {
@@ -291,6 +297,14 @@ enum Command {
         pane: String,
         session: String,
     },
+}
+
+#[derive(Subcommand)]
+enum RelayAction {
+    /// Serve the relay on the port in `relay.json` (started by the launchers and the relay's
+    /// service); exits at once when another relay runs.
+    #[command(hide = true)]
+    Run,
 }
 
 #[derive(Subcommand)]
@@ -376,6 +390,17 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        // Uses the data folder only, never the profile.
+        Command::Relay {
+            action: RelayAction::Run,
+        } => Ok(match relay_run() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                // Started detached: nobody reads its output.
+                process::log_error("relay run", &e);
+                ExitCode::FAILURE
+            }
+        }),
         Command::HerdrReport {
             seq,
             timeout_ms,
@@ -707,6 +732,7 @@ fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> 
         Command::Statusline { .. }
         | Command::Hook { .. }
         | Command::HerdrReport { .. }
+        | Command::Relay { .. }
         | Command::DesktopLaunch { .. }
         | Command::DesktopLinkTranscripts { .. }
         | Command::Desktop { .. }
@@ -715,6 +741,57 @@ fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> 
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `cc-rotate-ctl relay run` (spec sections 5 and 10): hold `relay.lock`, bind 127.0.0.1 on the
+/// port in `relay.json`, and serve until the process ends. Another relay holding the lock means
+/// there is nothing to do.
+fn relay_run() -> Result<()> {
+    use ccr_core::lock::{DirLock, LockError, LockOptions};
+    use ccr_relay::RelayEvents;
+    use std::sync::Arc;
+
+    // The relay reads only the data folder, so it needs no profile.
+    let paths = Paths::new(Paths::default_data_dir()?, PathBuf::new());
+    let _lock = match DirLock::acquire(&paths.relay_lock(), LockOptions::claude(Duration::ZERO)) {
+        Ok(lock) => lock,
+        Err(LockError::Busy(_)) => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    let cfg = ccr_core::relay::RelayConfig::read(&paths.relay_config())?
+        .with_context(|| format!("{} does not exist", paths.relay_config().display()))?;
+    let listener = std::net::TcpListener::bind(("127.0.0.1", cfg.port))
+        .with_context(|| format!("listening on 127.0.0.1:{}", cfg.port))?;
+    let store = Store::open(&paths.store_db())?;
+    let upstream = relay_upstream()?;
+    let events = Arc::new(ccr_relay::FileLog::new(paths.relay_log()));
+    events.log(&format!(
+        "started, version {}, port {}",
+        env!("CARGO_PKG_VERSION"),
+        cfg.port
+    ));
+    ccr_relay::run_blocking(
+        listener,
+        cfg,
+        upstream,
+        Arc::new(ccr_relay::StoreLogins::new(store)),
+        events,
+    )
+}
+
+/// Anthropic's API; a test build can name a local server in `CC_ROTATE_RELAY_TEST_UPSTREAM`.
+fn relay_upstream() -> Result<ccr_relay::Upstream> {
+    #[cfg(feature = "relay-test-upstream")]
+    if let Some(base) = std::env::var_os("CC_ROTATE_RELAY_TEST_UPSTREAM").filter(|v| !v.is_empty())
+    {
+        let base = base
+            .to_str()
+            .context("CC_ROTATE_RELAY_TEST_UPSTREAM is not valid UTF-8")?
+            .parse()
+            .context("CC_ROTATE_RELAY_TEST_UPSTREAM is not a URL")?;
+        return ccr_relay::Upstream::for_test(base);
+    }
+    ccr_relay::Upstream::anthropic()
 }
 
 fn dunce_exe() -> Result<PathBuf> {

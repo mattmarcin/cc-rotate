@@ -344,19 +344,28 @@ fn a_resumed_desktop_session_only_in_the_app_profile_runs_on_the_pool() {
 }
 
 /// A data folder whose store has relay mode on (home account 1), with `relay.json` when `config`.
-fn relay_data(root: &Path, config: bool) {
+///
+/// `relay.json` names the port of the listener returned, which the test keeps open: the launcher
+/// then finds something answering and starts no relay of its own.
+fn relay_data(root: &Path, config: bool) -> Option<std::net::TcpListener> {
     let data = root.join("data");
     let store = ccr_core::Store::open(&data.join("store.db")).unwrap();
     ccr_core::relay::set_mode(&store, Some(1)).unwrap();
-    if config {
-        ccr_core::relay::RelayConfig::create(&data.join("relay.json")).unwrap();
+    if !config {
+        return None;
     }
+    let path = data.join("relay.json");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut cfg = ccr_core::relay::RelayConfig::create(&path).unwrap();
+    cfg.port = listener.local_addr().unwrap().port();
+    std::fs::write(&path, serde_json::to_vec(&cfg).unwrap()).unwrap();
+    Some(listener)
 }
 
 #[test]
 fn relay_mode_gives_a_desktop_session_the_relay_variables() {
     let root = tempfile::tempdir().unwrap();
-    relay_data(root.path(), true);
+    let _relay = relay_data(root.path(), true);
     let profile = root.path().join("rotate profile");
     let out = launch(root.path(), profile.to_str().unwrap(), true, &print_env());
     assert!(out.status.success(), "{out:?}");
@@ -375,12 +384,15 @@ fn relay_mode_gives_a_desktop_session_the_relay_variables() {
         Some("1")
     );
     assert!(out.stderr.is_empty());
+    // The port answered, so no relay was started (one would take `relay.lock`).
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(!root.path().join("data").join("relay.lock").exists());
 }
 
 #[test]
 fn relay_mode_leaves_other_sessions_alone() {
     let root = tempfile::tempdir().unwrap();
-    relay_data(root.path(), true);
+    let _relay = relay_data(root.path(), true);
     let profile = root.path().join("rotate profile");
     let out = launch(root.path(), profile.to_str().unwrap(), false, &print_env());
     assert!(!parse(&out).contains_key("ANTHROPIC_BASE_URL"));

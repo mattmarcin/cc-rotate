@@ -1,0 +1,33 @@
+[package]
+name = "ccr-relay"
+description = "The loopback relay that runs cc-rotate's relay mode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+# Lets tests point the relay at a local server. Release builds never enable it.
+test-upstream = []
+
+[dependencies]
+anyhow = "1.0.104"
+bytes = "1"
+ccr-core = { version = "0.1.0", path = "../ccr-core" }
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "rustls-platform-verifier", "ring", "tls12"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "server-auto", "tokio", "http1", "http2"] }
+# Named directly to pick ring as the TLS crypto, whatever else in a build enables.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "time"] }
+zeroize = "1"
+
+[dev-dependencies]
+# Turns on `Upstream::for_test` for this crate's own tests.
+ccr-relay = { path = ".", features = ["test-upstream"] }
+tempfile = "3.27.0"
