@@ -1,9 +1,11 @@
-// Fake Messages API for tests/e2e/wait-at-limit.py and idle-across-swap.py. The account whose
+// Fake Messages API for tests/e2e/wait-at-limit.py, idle-across-swap.py and relay.py. The account whose
 // access token hashes to the entry labelled <limited> in <map file> (or every account, for `*`;
 // none, for `-`) reaches its 5-hour limit with the session's first turn:
 // Claude Code's own checks before it pass (at 50%), and from that turn on it gets the usage-limit
 // 429 Anthropic answers at a limit. Any other account gets a one-word answer. Model requests never reach Anthropic, so the test uses
 // no quota. Prints its port, then one JSON line per request (never a token).
+// Each line's `prefix` is the part of the path before `/v1/` (null when there is none): empty when
+// the request came through cc-rotate's relay, which takes its `/r/<secret>` off.
 //
 // With `-`, each account has its own 5-hour numbers, in the order of the labels sorted: the first
 // 40% resetting at <reset>, the next 5% resetting half an hour later, and so on.
@@ -62,19 +64,21 @@ const server = http.createServer((req, res) => {
     const token = String(req.headers.authorization ?? "").replace(/^Bearer /, "");
     const who = tokenMap[createHash("sha256").update(token).digest("hex")] ?? "?";
     const path = req.url.split("?")[0];
+    const v1 = path.indexOf("/v1/");
+    const prefix = v1 < 0 ? null : path.slice(0, v1);
     let parsed = {};
     try {
       parsed = JSON.parse(body);
     } catch {}
     if (path !== "/v1/messages") {
-      emit({ path, who, status: 404 });
+      emit({ path, prefix, who, status: 404 });
       res.writeHead(404, { "content-type": "application/json" });
       res.end(JSON.stringify({ type: "error", error: { type: "not_found_error", message: "not here" } }));
       return;
     }
     const last = parsed.messages?.at(-1);
     const lastText = typeof last?.content === "string" ? last.content : (last?.content ?? []).map((b) => b.text ?? "").join(" ");
-    const info = { path, who, stream: !!parsed.stream, max_tokens: parsed.max_tokens, last: lastText.slice(0, 200) };
+    const info = { path, prefix, who, stream: !!parsed.stream, max_tokens: parsed.max_tokens, last: lastText.slice(0, 200) };
     const isLimited = limited === "*" || who === limited;
     if (isLimited && parsed.stream) limitReached = true;
     if (isLimited && limitReached) {
