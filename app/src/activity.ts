@@ -15,6 +15,7 @@ export const REASONS: Record<string, string> = {
   stop_failure: "after Claude Code hit a limit",
   avoid_extra_usage: "so sessions wait instead of paying for extra usage",
   dead_login: "because the login stopped working",
+  unauthorized: "because its login was refused and couldn't be renewed",
   manual: "by hand",
   login: "after its first sign-in",
   completed: "after an interrupted swap",

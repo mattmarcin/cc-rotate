@@ -230,7 +230,7 @@ impl RelayEvents for StoreEvents {
         if let Err(e) = usage_check::hold_back(&self.store(), account) {
             self.log(&format!("holding back account {account} failed: {e:#}"));
         }
-        self.swap_away(account, Reason::DeadLogin, "at a refused login")
+        self.swap_away(account, Reason::Unauthorized, "at a refused login")
     }
 
     fn resent(&self, from: i64, to: i64) {
@@ -522,7 +522,7 @@ mod tests {
         let req = env.next_swap().unwrap();
         assert_eq!(req.from, Some(env.b));
         assert_eq!(req.to, None);
-        assert_eq!(req.reason, Reason::DeadLogin);
+        assert_eq!(req.reason, Reason::Unauthorized);
         assert!(req.wait);
         let st = ccr_core::usage_check::state(&env.open(), env.b).unwrap();
         assert!(st.held_back);

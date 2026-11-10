@@ -2456,6 +2456,47 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn relay_swap_at_a_refused_login_parks_the_account() {
+        let env = Env::new();
+        env.relay_on_b_active();
+        let req = SwapRequest {
+            from: Some(env.b),
+            to: Some(env.c),
+            reason: Reason::Unauthorized,
+            wait: true,
+        };
+        run_with(&env.store, &env.paths, &req, &no_renewal).unwrap();
+        // A check settles the login; only one that sees it rejected marks it `needs_login`.
+        assert_eq!(env.state(env.b), AccountState::Parked);
+        assert_eq!(env.state(env.c), AccountState::Active);
+        assert!(
+            env.store
+                .meta_i64(&left_at_stop_key(env.b))
+                .unwrap()
+                .is_none()
+        );
+        let ev = env.store.last_event_of(kind::SWAP).unwrap().unwrap();
+        assert_eq!(ev.reason.as_deref(), Some("unauthorized"));
+    }
+
+    #[test]
+    fn relay_refused_login_with_nowhere_to_go_stays_active() {
+        let env = Env::new();
+        env.relay_on_b_active();
+        for id in [env.a, env.c] {
+            env.store.set_state(id, AccountState::Paused).unwrap();
+        }
+        let req = SwapRequest {
+            from: Some(env.b),
+            to: None,
+            reason: Reason::Unauthorized,
+            wait: true,
+        };
+        run_with(&env.store, &env.paths, &req, &no_renewal).unwrap();
+        assert_eq!(env.state(env.b), AccountState::Active);
+    }
+
+    #[test]
     fn relay_changed_login_compares_with_home() {
         let env = Env::new();
         env.relay_on_b_active();

@@ -133,7 +133,7 @@ pub trait RelayEvents: Send + Sync {
     /// Anthropic refused a model request sent with `account`'s stored login as not signed in, and
     /// no renewed login came within the hold (spec 9).
     /// Holds the account back until a check settles its login, then swaps away from it as
-    /// `refused_at_limit` does, and says which account is active now.
+    /// `refused_at_limit` does (reason `unauthorized`), and says which account is active now.
     /// Called on a thread that may block.
     fn dead_login(&self, _account: i64) -> Swapped {
         Swapped::No

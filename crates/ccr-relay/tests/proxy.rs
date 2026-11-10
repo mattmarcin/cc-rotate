@@ -1628,9 +1628,17 @@ async fn unauthorized_holds_back_and_swaps_in_the_store() {
     let calls = swaps.calls.lock().unwrap().clone();
     assert_eq!(calls.len(), 1, "{calls:?}");
     assert_eq!(calls[0].from, Some(pool.b));
-    assert_eq!(calls[0].reason, ccr_core::scheduler::Reason::DeadLogin);
+    assert_eq!(calls[0].reason, ccr_core::scheduler::Reason::Unauthorized);
     assert!(calls[0].wait);
     assert_eq!(store.active_account().unwrap().unwrap().id, pool.c);
+    // Held back for a check to settle, not marked as needing a new sign-in.
+    assert_eq!(
+        store.account(pool.b).unwrap().unwrap().state,
+        AccountState::Parked
+    );
+    let swapped = store.events_of_kind_since(kind::SWAP, 0).unwrap();
+    assert_eq!(swapped.len(), 1);
+    assert_eq!(swapped[0].reason.as_deref(), Some("unauthorized"));
     let resends = store.events_of_kind_since(kind::RELAY_RESEND, 0).unwrap();
     assert_eq!(resends.len(), 1);
     assert_eq!(

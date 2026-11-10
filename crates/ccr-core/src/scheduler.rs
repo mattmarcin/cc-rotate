@@ -343,6 +343,10 @@ pub enum Reason {
     /// The relay saw Anthropic refuse a request because the login is at a limit.
     LimitRefused,
     DeadLogin,
+    /// The relay saw Anthropic keep refusing the active account's stored login as not signed in,
+    /// and no renewed login came (relay spec 9). The account is held back for a check to settle;
+    /// unlike `DeadLogin`, the swap does not mark it as needing a new sign-in.
+    Unauthorized,
     Manual,
     Login,
     /// Every account is at a limit and the one in use runs on paid extra usage: move to one
@@ -361,6 +365,7 @@ impl Reason {
             Self::StopFailure => "stop_failure",
             Self::LimitRefused => "rate_limit",
             Self::DeadLogin => "dead_login",
+            Self::Unauthorized => "unauthorized",
             Self::Manual => "manual",
             Self::Login => "login",
             Self::AvoidExtraUsage => "avoid_extra_usage",
@@ -377,6 +382,7 @@ impl Reason {
             "stop_failure" => Self::StopFailure,
             "rate_limit" => Self::LimitRefused,
             "dead_login" => Self::DeadLogin,
+            "unauthorized" => Self::Unauthorized,
             "manual" => Self::Manual,
             "login" => Self::Login,
             "avoid_extra_usage" => Self::AvoidExtraUsage,
@@ -1322,6 +1328,30 @@ mod tests {
             threshold_trigger(&pool[0]).map(|(r, _)| r),
             Some(Reason::FiveHour)
         );
+    }
+
+    #[test]
+    fn reason_strings_round_trip() {
+        for r in [
+            Reason::FiveHour,
+            Reason::Weekly,
+            Reason::OtherLimit,
+            Reason::PreferredAvailable,
+            Reason::WeeklyExpiring,
+            Reason::StopFailure,
+            Reason::LimitRefused,
+            Reason::DeadLogin,
+            Reason::Unauthorized,
+            Reason::Manual,
+            Reason::Login,
+            Reason::AvoidExtraUsage,
+        ] {
+            assert_eq!(Reason::parse(r.as_str()), Some(r), "{r:?}");
+        }
+        assert_eq!(Reason::Unauthorized.as_str(), "unauthorized");
+        // Urgent, like a dead login: no cooldown.
+        assert!(!Reason::Unauthorized.respects_cooldown());
+        assert!(!Reason::Unauthorized.is_threshold());
     }
 
     #[test]
