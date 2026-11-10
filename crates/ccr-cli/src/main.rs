@@ -77,6 +77,9 @@ enum Command {
         accounts: Vec<String>,
         #[arg(long)]
         json: bool,
+        /// Renew the one account's login with Claude Code in a scratch profile (used by relay mode).
+        #[arg(long, hide = true)]
+        renew: bool,
     },
     /// Start an account's 5-hour window now: Claude Code sends one short prompt to the smallest
     /// model with its login, then reads its usage.
@@ -505,7 +508,11 @@ fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> 
                 }
             }
         }
-        Command::Check { accounts, json } => check_cmd(store, paths, &accounts, json)?,
+        Command::Check {
+            accounts,
+            json,
+            renew,
+        } => check_cmd(store, paths, &accounts, json, renew)?,
         Command::SettleLogin => {
             let timeout = Duration::from_millis(store.settings()?.lock_timeout_ms);
             let _lock = ccr_core::lock::DirLock::acquire(
@@ -722,7 +729,16 @@ fn strip_verbatim(p: &std::path::Path) -> PathBuf {
     PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s))
 }
 
-fn check_cmd(store: &Store, paths: &Paths, references: &[String], json: bool) -> Result<()> {
+fn check_cmd(
+    store: &Store,
+    paths: &Paths,
+    references: &[String],
+    json: bool,
+    renew: bool,
+) -> Result<()> {
+    if renew && references.len() != 1 {
+        bail!("--renew takes exactly one account");
+    }
     // Settle anything an earlier check left behind first.
     usage_check::sweep(store, paths)?;
     let accounts = if references.is_empty() {
@@ -748,7 +764,11 @@ fn check_cmd(store: &Store, paths: &Paths, references: &[String], json: bool) ->
             print!("{:<width$}  ", a.label);
             let _ = std::io::stdout().flush();
         }
-        let outcome = usage_check::check(store, paths, a.id, usage_check::Trigger::Manual)?;
+        let outcome = if renew {
+            usage_check::renew(store, paths, a.id)?
+        } else {
+            usage_check::check(store, paths, a.id, usage_check::Trigger::Manual)?
+        };
         if json {
             results.push(serde_json::json!({ "label": a.label, "result": outcome }));
         } else {

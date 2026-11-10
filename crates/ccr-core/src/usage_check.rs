@@ -47,7 +47,9 @@ use crate::lock::{DirLock, LockError, LockOptions};
 use crate::paths::Paths;
 use crate::process::{self, Tree};
 use crate::store::{Account, AccountState, Sample, SampleWindow, Store, kind};
-use crate::{credfile, credstore, login, profile_usage, scheduler, swap, time, usage_report};
+use crate::{
+    credfile, credstore, login, profile_usage, relay, scheduler, swap, time, usage_report,
+};
 
 /// How long Claude Code may take: it starts up, fetches its settings, then the usage.
 pub const RUN_TIMEOUT: Duration = Duration::from_secs(60);
@@ -145,6 +147,9 @@ pub enum Trigger {
     Background,
     /// The app keeps an account's 5-hour window running (`warm_up`).
     WarmUp,
+    /// The login needs renewing now (relay mode): Claude Code renews it in a scratch profile.
+    /// Runs whatever the settings and back-offs say, and waits for the account's lock.
+    Renew,
 }
 
 /// What cc-rotate remembers about an account's checks.
@@ -554,6 +559,12 @@ fn warm_up_with(
     })
 }
 
+/// Renew an account's login on demand: a check whose copy of the login is already expired, so
+/// Claude Code renews it in the scratch profile (cc-rotate never calls a sign-in endpoint).
+pub fn renew(store: &Store, paths: &Paths, account_id: i64) -> Result<CheckOutcome> {
+    check(store, paths, account_id, Trigger::Renew)
+}
+
 /// Check one account's usage with Claude Code's `/usage`.
 pub fn check(
     store: &Store,
@@ -598,7 +609,7 @@ fn job(
         })
     };
     let settings = store.settings()?;
-    if !settings.usage_checks && trigger != Trigger::Manual {
+    if !settings.usage_checks && !matches!(trigger, Trigger::Manual | Trigger::Renew) {
         return skipped("usage checks are off");
     }
     if let Some(why) = checks_possible(store, paths)? {
@@ -611,6 +622,11 @@ fn job(
     {
         return skipped("Anthropic asked to wait before the next check");
     }
+    // In relay mode the profile holds the home account's login, which a check must not touch.
+    let relay_home = relay::home(store)?;
+    if relay_home == Some(account_id) {
+        return skipped("it's the profile's login (relay mode's home account)");
+    }
     // A skip below is about this account: count it as an attempt, so the background moves on
     // to the next account instead of picking this one every minute.
     let attempted = |store: &Store, why: &str| -> Result<CheckOutcome> {
@@ -621,7 +637,7 @@ fn job(
     };
 
     let wait = match trigger {
-        Trigger::Manual => Duration::from_millis(settings.lock_timeout_ms),
+        Trigger::Manual | Trigger::Renew => Duration::from_millis(settings.lock_timeout_ms),
         _ => Duration::ZERO,
     };
     let _lock = match DirLock::acquire(&paths.account_lock(account_id), LockOptions::claude(wait)) {
@@ -643,11 +659,15 @@ fn job(
         return skipped("the account no longer exists");
     };
     match account.state {
-        AccountState::Active => {
+        // In relay mode the profile belongs to the home account, so an active account that is
+        // not the home account is checked like a parked one.
+        AccountState::Active if relay_home.is_none() => {
             return skipped("it's in use, so its usage comes from the status line");
         }
         AccountState::NeedsLogin => return skipped("it's signed out"),
-        AccountState::Paused if trigger != Trigger::Manual => return skipped("it's paused"),
+        AccountState::Paused if !matches!(trigger, Trigger::Manual | Trigger::Renew) => {
+            return skipped("it's paused");
+        }
         _ => {}
     }
     if trigger == Trigger::WarmUp && !account.keep_running {
@@ -700,8 +720,8 @@ fn job(
 
     let mut scratch = Scratch::create(paths, SCRATCH_PREFIX, Some((account_id, started)))?;
     let mut oauth = stored.oauth.clone();
-    if st.held_back {
-        // Settle whether the stored login still works: make Claude Code renew it.
+    if st.held_back || trigger == Trigger::Renew {
+        // Settle whether the stored login still works, or renew it: make Claude Code renew it.
         oauth["expiresAt"] = json!(0);
     }
     // First, so a scratch profile without it is known never to have held the login (20.3).
@@ -2254,6 +2274,82 @@ mod tests {
             check_with(&e.store, &e.paths, parked, Trigger::BeforeSwap, &never).unwrap(),
             CheckOutcome::Skipped { .. }
         ));
+    }
+
+    #[test]
+    fn renew_forces_expiry_zero() {
+        let e = env();
+        let a = account(&e, "a", "ua", AccountState::Parked);
+        let seen = std::cell::Cell::new(None);
+        let inner = fake(Fake {
+            stamp: Some("ua".into()),
+            renew: Some(Some(oauth("a-renewed"))),
+            ..Default::default()
+        });
+        let run = |dir: &Path| {
+            seen.set(
+                Credentials::for_profile(dir)
+                    .read_oauth()
+                    .unwrap()
+                    .map(|o| o["expiresAt"].clone()),
+            );
+            inner(dir)
+        };
+        check_with(&e.store, &e.paths, a, Trigger::Renew, &run).unwrap();
+        assert_eq!(seen.take(), Some(json!(0)));
+        let stored = e.store.credential(a).unwrap().unwrap();
+        assert_eq!(stored.oauth["refreshToken"], "refresh-a-renewed");
+        assert_eq!(stored.source, SOURCE);
+    }
+
+    #[test]
+    fn renew_ignores_not_before_and_the_off_switch() {
+        let e = env();
+        let a = account(&e, "a", "ua", AccountState::Parked);
+        let mut st = state(&e.store, a).unwrap();
+        st.not_before = Some(time::now_ms() + 3_600_000);
+        save_state(&e.store, a, &st).unwrap();
+        e.store.set_setting("usage_checks", Some("false")).unwrap();
+        let ran = std::cell::Cell::new(false);
+        let run = |_: &Path| -> Result<Run> {
+            ran.set(true);
+            Ok(Run::default())
+        };
+        check_with(&e.store, &e.paths, a, Trigger::Renew, &run).unwrap();
+        assert!(ran.get(), "the renewal ran");
+    }
+
+    #[test]
+    fn relay_checks_active_non_home() {
+        let e = env();
+        let home = account(&e, "a", "ua", AccountState::Parked);
+        let active = account(&e, "b", "ub", AccountState::Active);
+        relay::set_mode(&e.store, Some(home)).unwrap();
+        let ran = std::cell::Cell::new(false);
+        let run = |_: &Path| -> Result<Run> {
+            ran.set(true);
+            Ok(Run::default())
+        };
+        check_with(&e.store, &e.paths, active, Trigger::Background, &run).unwrap();
+        assert!(ran.get(), "the active account that is not home is checked");
+        let never = |_: &Path| -> Result<Run> { panic!("Claude Code must not run") };
+        let out = check_with(&e.store, &e.paths, home, Trigger::Manual, &never).unwrap();
+        let CheckOutcome::Skipped { why } = out else {
+            panic!("{out:?}")
+        };
+        assert_eq!(why, "it's the profile's login (relay mode's home account)");
+    }
+
+    #[test]
+    fn off_mode_unchanged() {
+        let e = env();
+        let active = account(&e, "b", "ub", AccountState::Active);
+        let never = |_: &Path| -> Result<Run> { panic!("Claude Code must not run") };
+        let out = check_with(&e.store, &e.paths, active, Trigger::Background, &never).unwrap();
+        let CheckOutcome::Skipped { why } = out else {
+            panic!("{out:?}")
+        };
+        assert_eq!(why, "it's in use, so its usage comes from the status line");
     }
 
     /// A check's leftover: its start fingerprint, then (optionally) the login it left.
