@@ -153,3 +153,95 @@ fn relay_run_serves_on_its_port_and_refuses_strangers() {
         assert_eq!(mode & 0o777, 0o600);
     }
 }
+
+#[test]
+fn relay_run_that_cannot_start_says_why_and_waits_before_exiting() {
+    let root = tempfile::tempdir().unwrap();
+    let (data, cfg) = data_folder(root.path());
+    // A store that cannot be opened: the relay cannot resolve the store or the profile.
+    std::fs::write(data.join("store.db"), "not a database").unwrap();
+    let started = Instant::now();
+    let mut child = Running(
+        Command::new(env!("CARGO_BIN_EXE_cc-rotate-ctl"))
+            .args(["relay", "run"])
+            .env("CC_ROTATE_DATA_DIR", &data)
+            .env_remove("CC_ROTATE_PROFILE")
+            .spawn()
+            .unwrap(),
+    );
+    let log = log_with(&data, "cannot start", 1);
+    assert!(log.contains("cannot start"), "{log}");
+    assert_eq!(log.lines().count(), 1, "{log}");
+    assert!(
+        !ccr_core::relay::answers(cfg.port),
+        "it never took the port"
+    );
+    let status = exits_within(&mut child.0, Duration::from_secs(30)).expect("still running");
+    assert!(!status.success());
+    assert!(
+        started.elapsed() >= Duration::from_secs(9),
+        "exited after {:?}: its service would restart it at once",
+        started.elapsed()
+    );
+}
+
+fn ctl(data: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_cc-rotate-ctl"))
+        .args(args)
+        .env("CC_ROTATE_DATA_DIR", data)
+        .env("CC_ROTATE_PROFILE", data.join("profile"))
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn relay_shows_the_address_but_never_the_secret() {
+    let root = tempfile::tempdir().unwrap();
+    let (data, cfg) = data_folder(root.path());
+    let out = ctl(&data, &["relay"]);
+    assert!(out.status.success(), "{out:?}");
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("Relay mode: off"), "{text}");
+    assert!(
+        text.contains(&format!("Address: 127.0.0.1:{}", cfg.port)),
+        "{text}"
+    );
+    assert!(text.contains("Answering: no"), "{text}");
+    assert!(text.contains("Service: "), "{text}");
+    assert!(
+        text.contains("Sessions without the relay's address (last 10 minutes): 0"),
+        "{text}"
+    );
+    assert!(!text.contains(&cfg.secret), "{text}");
+}
+
+#[test]
+fn relay_on_refuses_an_account_that_cannot_be_home() {
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join("data");
+    {
+        let store = ccr_core::Store::open(&data.join("store.db")).unwrap();
+        store
+            .insert_account(
+                "gone",
+                &ccr_core::store::AccountIdentity::default(),
+                ccr_core::store::AccountState::NeedsLogin,
+            )
+            .unwrap();
+    }
+    for (home, why) in [("gone", "signed out"), ("nobody", "no account matches")] {
+        let out = ctl(&data, &["relay", "on", "--home", home, "--no-service"]);
+        assert!(!out.status.success());
+        let err = String::from_utf8(out.stderr).unwrap();
+        assert!(err.contains(why), "{err}");
+    }
+    assert!(!data.join("relay.json").exists());
+
+    let out = ctl(&data, &["relay", "off"]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .contains("Relay mode is off")
+    );
+}

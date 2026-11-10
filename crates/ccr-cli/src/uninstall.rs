@@ -169,7 +169,34 @@ fn blocked(plan: &Plan, force: bool) -> Option<String> {
 }
 
 fn print_plan(plan: &Plan) {
-    let mut remove = vec!["Quit the cc-rotate app, if it runs".to_string()];
+    let (remove, keep) = plan_lines(plan);
+    println!("This removes cc-rotate:");
+    for line in &remove {
+        println!("  - {line}");
+    }
+    if !keep.is_empty() {
+        println!("It leaves alone:");
+        for line in &keep {
+            println!("  - {line}");
+        }
+    }
+}
+
+/// What the plan removes and what it leaves alone, a line each, in the order `run` goes.
+fn plan_lines(plan: &Plan) -> (Vec<String>, Vec<String>) {
+    let mut remove = Vec::new();
+    if let Some(home) = &plan.relay_home {
+        remove.push(format!(
+            "Turn relay mode off, so the profile has the login of the account in use again (the home account is {home})"
+        ));
+    }
+    if let Some(service) = &plan.relay_service {
+        remove.push(format!("Stop the relay and remove {service}"));
+    }
+    if let Some(config) = &plan.relay_config {
+        remove.push(format!("Delete {}", config.display()));
+    }
+    remove.push("Quit the cc-rotate app, if it runs".to_string());
     let mut keep = Vec::new();
     if let Some(entry) = &plan.autostart {
         remove.push(format!("Stop it starting at login: {entry}"));
@@ -279,15 +306,32 @@ fn print_plan(plan: &Plan) {
     if let Some(why) = &plan.programs_kept {
         keep.push(format!("The programs: {why}"));
     }
+    (remove, keep)
+}
 
-    println!("This removes cc-rotate:");
-    for line in &remove {
-        println!("  - {line}");
-    }
-    if !keep.is_empty() {
-        println!("It leaves alone:");
-        for line in &keep {
-            println!("  - {line}");
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uninstall_plan_lists_relay() {
+        let plan = Plan {
+            relay_home: Some("work".into()),
+            relay_service: Some("the relay's LaunchAgent, /a/cc-rotate.relay.plist".into()),
+            relay_config: Some(PathBuf::from("/data/relay.json")),
+            ..Default::default()
+        };
+        let (remove, _) = plan_lines(&plan);
+        assert_eq!(
+            remove[..4],
+            [
+                "Turn relay mode off, so the profile has the login of the account in use again (the home account is work)",
+                "Stop the relay and remove the relay's LaunchAgent, /a/cc-rotate.relay.plist",
+                "Delete /data/relay.json",
+                "Quit the cc-rotate app, if it runs",
+            ]
+        );
+        let (remove, _) = plan_lines(&Plan::default());
+        assert_eq!(remove, ["Quit the cc-rotate app, if it runs"]);
     }
 }

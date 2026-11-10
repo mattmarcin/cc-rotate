@@ -404,6 +404,8 @@ struct Relay<E = Recorder> {
     cfg: RelayConfig,
     events: Arc<E>,
     client: Client<HttpConnector, Full<Bytes>>,
+    /// `serve`, which resolves when the relay leaves.
+    task: tokio::task::JoinHandle<anyhow::Result<()>>,
 }
 
 impl<E> Relay<E> {
@@ -446,7 +448,7 @@ async fn relay_holding<E: RelayEvents + 'static>(
         secret: S.into(),
     };
     let upstream = Upstream::for_test(format!("http://{addr}").parse().unwrap()).unwrap();
-    tokio::spawn(ccr_relay::serve(
+    let task = tokio::spawn(ccr_relay::serve(
         listener,
         cfg.clone(),
         options,
@@ -459,6 +461,7 @@ async fn relay_holding<E: RelayEvents + 'static>(
         cfg,
         events,
         client,
+        task,
     }
 }
 
@@ -1346,6 +1349,7 @@ async fn wait_for(cond: impl Fn() -> bool) {
 fn holding(ms: u64) -> Options {
     Options {
         login_hold: Duration::from_millis(ms),
+        ..Options::default()
     }
 }
 
@@ -1645,4 +1649,127 @@ async fn unauthorized_holds_back_and_swaps_in_the_store() {
         (resends[0].account_from, resends[0].account_to),
         (Some(pool.b), Some(pool.c))
     );
+}
+
+/// Whether something accepts a connection on `port`, asked off the runtime's threads.
+async fn answers(port: u16) -> bool {
+    tokio::task::spawn_blocking(move || ccr_core::relay::answers(port))
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn exits_after_upgrade_when_idle() {
+    let fake = fake_upstream().await;
+    let dir = tempfile::tempdir().unwrap();
+    // Stands in for the relay's own program file.
+    let program = dir.path().join("cc-rotate-ctl");
+    std::fs::write(&program, "version 1").unwrap();
+    let options = Options {
+        check_every: Duration::from_millis(30),
+        program: Some(program.clone()),
+        ..Options::default()
+    };
+    let relay = relay_holding(
+        fake.addr,
+        Switch::new(token(2, "tok-b")),
+        Arc::new(Recorder::default()),
+        options,
+    )
+    .await;
+    let port = relay.cfg.port;
+    let resp = relay
+        .send(model_request(&relay, "?sse=gated", Some("Bearer home")))
+        .await;
+    assert_eq!(resp.status(), 200);
+    let mut body = resp.into_body();
+    let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
+    assert_eq!(&first[..], b"event: a\n\n");
+
+    // An upgrade replaces the program while the stream is open.
+    std::fs::write(&program, "version 2, longer").unwrap();
+    let until = Instant::now() + Duration::from_secs(5);
+    while answers(port).await {
+        assert!(Instant::now() < until, "still accepting after the upgrade");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !relay.task.is_finished(),
+        "left while a request was in flight"
+    );
+
+    fake.state.release.notify_one();
+    let mut rest = Vec::new();
+    while let Some(frame) = body.frame().await {
+        if let Ok(data) = frame.unwrap().into_data() {
+            rest.extend_from_slice(&data);
+        }
+    }
+    assert_eq!(&rest[..], b"event: z\n\n", "the open stream finished");
+    let ended = tokio::time::timeout(Duration::from_secs(5), relay.task)
+        .await
+        .expect("the relay did not leave once the stream ended");
+    ended.unwrap().unwrap();
+}
+
+/// Relay mode as a test sets it, and how often the relay left for good.
+#[derive(Default)]
+struct Mode {
+    off: std::sync::atomic::AtomicBool,
+    retired: std::sync::atomic::AtomicUsize,
+}
+
+impl ccr_relay::Lifecycle for Mode {
+    fn mode_on(&self) -> bool {
+        !self.off.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn retire(&self) -> anyhow::Result<()> {
+        self.retired
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn idle_exit_when_off() {
+    use std::sync::atomic::Ordering;
+    let fake = fake_upstream().await;
+    let mode = Arc::new(Mode::default());
+    let options = Options {
+        check_every: Duration::from_millis(20),
+        idle_exit: Duration::from_millis(400),
+        lifecycle: mode.clone(),
+        ..Options::default()
+    };
+    let relay = relay_holding(
+        fake.addr,
+        Switch::new(token(2, "tok-b")),
+        Arc::new(Recorder::default()),
+        options,
+    )
+    .await;
+    let port = relay.cfg.port;
+
+    // On: idle as long as it likes.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(!relay.task.is_finished());
+
+    // A request starts the idle time again, so turning it off now leaves only after that.
+    let resp = relay
+        .send(model_request(&relay, "", Some("Bearer home")))
+        .await;
+    assert_eq!(resp.status(), 200);
+    body_of(resp).await;
+    mode.off.store(true, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(!relay.task.is_finished(), "left before the idle time");
+    assert_eq!(mode.retired.load(Ordering::SeqCst), 0);
+
+    let ended = tokio::time::timeout(Duration::from_secs(5), relay.task)
+        .await
+        .expect("the relay did not leave when idle");
+    ended.unwrap().unwrap();
+    assert_eq!(mode.retired.load(Ordering::SeqCst), 1);
+    assert!(!answers(port).await);
 }

@@ -279,11 +279,11 @@ enum Command {
         #[arg(long, value_name = "PID")]
         watch_pid: Option<u32>,
     },
-    /// Relay mode's loopback relay.
-    #[command(hide = true)]
+    /// Relay mode: send every session's requests through a local relay that puts the pool's
+    /// account on them. Without an action, shows whether it is on.
     Relay {
         #[command(subcommand)]
-        action: RelayAction,
+        action: Option<RelayAction>,
     },
     /// Tell herdr how to resume a session (started in the background by `hook session-start`).
     #[command(hide = true)]
@@ -301,6 +301,19 @@ enum Command {
 
 #[derive(Subcommand)]
 enum RelayAction {
+    /// Turn relay mode on, with the account whose login the profile keeps.
+    On {
+        /// The home account (label, email or id): signed in, and not held back by a check.
+        #[arg(long, value_name = "ACCOUNT")]
+        home: String,
+        /// Everything but installing the relay's service (for tests, which run the relay
+        /// themselves).
+        #[arg(long, hide = true)]
+        no_service: bool,
+    },
+    /// Turn relay mode off; the relay serves sessions started with it until an hour without
+    /// requests.
+    Off,
     /// Serve the relay on the port in `relay.json` (started by the launchers and the relay's
     /// service); exits at once when another relay runs.
     #[command(hide = true)]
@@ -390,17 +403,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        // Uses the data folder only, never the profile.
+        // Opens the store and resolves the profile itself, after taking the relay's lock.
         Command::Relay {
-            action: RelayAction::Run,
-        } => Ok(match relay_run() {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                // Started detached: nobody reads its output.
-                process::log_error("relay run", &e);
-                ExitCode::FAILURE
-            }
-        }),
+            action: Some(RelayAction::Run),
+        } => Ok(relay_run()),
         Command::HerdrReport {
             seq,
             timeout_ms,
@@ -414,13 +420,19 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
         },
         command => {
-            let (store, paths) = ccr_core::open(cli.profile)?;
-            dispatch(command, &store, &paths)
+            let (store, paths) = ccr_core::open(cli.profile.clone())?;
+            dispatch(command, &store, &paths, cli.profile)
         }
     }
 }
 
-fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> {
+/// `profile_flag` is `--profile`, which `open` already used for `paths`.
+fn dispatch(
+    command: Command,
+    store: &Store,
+    paths: &Paths,
+    profile_flag: Option<PathBuf>,
+) -> Result<ExitCode> {
     match command {
         Command::Status { json } => {
             let _ = ccr_core::budget::refresh_rates(store, time::now_ms());
@@ -729,10 +741,41 @@ fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> 
             println!();
         }
         Command::Dashboard => process::launch_app()?,
+        Command::Relay { action: None } => print!("{}", format::relay(&relay_view(store, paths)?)),
+        Command::Relay {
+            action: Some(RelayAction::On { home, no_service }),
+        } => {
+            let ctl = dunce_exe()?;
+            let profile_flag = profile_flag.as_deref();
+            let (account, cfg) = ccr_core::relay::on(store, paths, &home, || {
+                if no_service {
+                    return Ok(());
+                }
+                let env = ccr_core::relay_service::service_env(profile_flag);
+                ccr_core::relay_service::Service::real()?.install(&ctl, &env)
+            })?;
+            println!(
+                "Relay mode is on, with {} as the home account. The relay listens on 127.0.0.1:{}.",
+                account.label, cfg.port
+            );
+            println!(
+                "Sessions started from now on go through it; restart running ones to move them."
+            );
+        }
+        Command::Relay {
+            action: Some(RelayAction::Off),
+        } => {
+            ccr_core::relay::turn_off(store, paths)?;
+            println!(
+                "Relay mode is off. New sessions start without the relay; it serves the sessions started with it until it has had no request for an hour, then removes itself."
+            );
+        }
         Command::Statusline { .. }
         | Command::Hook { .. }
         | Command::HerdrReport { .. }
-        | Command::Relay { .. }
+        | Command::Relay {
+            action: Some(RelayAction::Run),
+        }
         | Command::DesktopLaunch { .. }
         | Command::DesktopLinkTranscripts { .. }
         | Command::Desktop { .. }
@@ -743,57 +786,165 @@ fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> 
     Ok(ExitCode::SUCCESS)
 }
 
-/// `cc-rotate-ctl relay run` (spec sections 5 and 10): hold `relay.lock`, bind 127.0.0.1 on the
-/// port in `relay.json`, and serve until the process ends. Another relay holding the lock, or
-/// already listening on the port, means there is nothing to do.
-fn relay_run() -> Result<()> {
+/// How long a relay that cannot start waits before it exits, so its service (which restarts it
+/// whenever it ends) restarts it at that pace rather than in a tight loop.
+const RELAY_START_FAILED_WAIT: Duration = Duration::from_secs(10);
+
+/// `cc-rotate-ctl relay run` (spec sections 5 and 10): hold `relay.lock`, resolve the store and
+/// profile, bind 127.0.0.1 on the port in `relay.json`, and serve until the relay leaves (an
+/// upgrade, or an hour without requests once relay mode is off).
+/// Another relay holding the lock, or already listening on the port, means there is nothing to
+/// do. A relay that cannot start says why in `relay.log` and exits with an error after a wait.
+fn relay_run() -> ExitCode {
+    // The lock and `relay.json` are in the data folder; the profile is resolved below.
+    let data = match Paths::default_data_dir() {
+        Ok(dir) => Paths::new(dir, PathBuf::new()),
+        Err(e) => return relay_start_failed(None, &e),
+    };
+    // An OS file lock, held for the life of the process: however the process ends (a crash,
+    // SIGKILL, SIGTERM from its service), the system releases it and the next relay can start.
+    let _lock = match relay_lock(&data.relay_lock()) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => return ExitCode::SUCCESS,
+        Err(e) => return relay_start_failed(Some(&data), &e),
+    };
+    let ready = match relay_ready(&data) {
+        Ok(Some(ready)) => ready,
+        // Another relay (one from another data folder, say) already serves this port.
+        Ok(None) => return ExitCode::SUCCESS,
+        Err(e) => return relay_start_failed(Some(&data), &e),
+    };
+    match ready() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            // Started detached: nobody reads its output.
+            process::log_error("relay run", &e);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Everything the relay needs, resolved before it takes the port, and then the port: what
+/// serves until the relay leaves. `None` when something else listens on the port.
+fn relay_ready(data: &Paths) -> Result<Option<impl FnOnce() -> Result<()> + use<>>> {
     use ccr_relay::RelayEvents;
     use std::sync::Arc;
 
-    // The lock and `relay.json` are in the data folder; the profile is resolved below.
-    let paths = Paths::new(Paths::default_data_dir()?, PathBuf::new());
-    // An OS file lock, held for the life of the process: however the process ends (a crash,
-    // SIGKILL, SIGTERM from its service), the system releases it and the next relay can start.
-    let Some(_lock) = relay_lock(&paths.relay_lock())? else {
-        return Ok(());
-    };
-    let cfg = ccr_core::relay::RelayConfig::read(&paths.relay_config())?
-        .with_context(|| format!("{} does not exist", paths.relay_config().display()))?;
+    // The relay runs swaps, which need the profile as any swap does: the one every other command
+    // resolves (`CC_ROTATE_PROFILE`, the `profile_dir` setting, `~/.claude-rotate`).
+    let (store, paths) = ccr_core::open(None).context("opening the store and the profile")?;
+    let cfg = ccr_core::relay::RelayConfig::read(&data.relay_config())?
+        .with_context(|| format!("{} does not exist", data.relay_config().display()))?;
+    let upstream = relay_upstream()?;
+    let events_store = Store::open(&paths.store_db())?;
     let listener = match std::net::TcpListener::bind(("127.0.0.1", cfg.port)) {
         Ok(listener) => listener,
-        // Another relay (one from another data folder, say) already serves this port.
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => return Ok(None),
         Err(e) => {
             return Err(e).with_context(|| format!("listening on 127.0.0.1:{}", cfg.port));
         }
     };
-    // The relay runs swaps, which need the profile as any swap does: the one every other command
-    // resolves (`CC_ROTATE_PROFILE`, the `profile_dir` setting, `~/.claude-rotate`).
-    let (store, paths) = ccr_core::open(None)?;
-    let upstream = relay_upstream()?;
-    let log = Arc::new(ccr_relay::FileLog::new(paths.relay_log()));
-    log.log(&format!(
-        "started, version {}, port {}",
-        env!("CARGO_PKG_VERSION"),
-        cfg.port
-    ));
-    // Readings, threshold swaps and swaps at a refused limit (spec 7 and 8). Each part has a
-    // store connection of its own, and every swap opens another.
-    let events = Arc::new(ccr_relay::StoreEvents::new(
-        Store::open(&paths.store_db())?,
-        Arc::new(ccr_relay::StoreSwaps::new(paths.clone())),
-        log.clone(),
-    ));
-    // Renewals run a check on a store of their own (spec 9).
-    let renewals = Arc::new(ccr_relay::StoreRenewals::new(paths.clone(), log));
-    ccr_relay::run_blocking(
-        listener,
-        cfg,
-        ccr_relay::Options::default(),
-        upstream,
-        Arc::new(ccr_relay::StoreLogins::new(store, renewals)),
-        events,
-    )
+    Ok(Some(move || {
+        let log = Arc::new(ccr_relay::FileLog::new(paths.relay_log()));
+        log.log(&format!(
+            "started, version {}, port {}",
+            env!("CARGO_PKG_VERSION"),
+            cfg.port
+        ));
+        // Readings, threshold swaps and swaps at a refused limit (spec 7 and 8). Each part has a
+        // store connection of its own, and every swap opens another.
+        let events = Arc::new(ccr_relay::StoreEvents::new(
+            events_store,
+            Arc::new(ccr_relay::StoreSwaps::new(paths.clone())),
+            log.clone(),
+        ));
+        // Renewals run a check on a store of their own (spec 9).
+        let renewals = Arc::new(ccr_relay::StoreRenewals::new(paths.clone(), log));
+        let options = ccr_relay::Options {
+            lifecycle: Arc::new(RelayLifecycle {
+                paths: paths.clone(),
+            }),
+            ..ccr_relay::Options::default()
+        };
+        ccr_relay::run_blocking(
+            listener,
+            cfg,
+            options,
+            upstream,
+            Arc::new(ccr_relay::StoreLogins::new(store, renewals)),
+            events,
+        )
+    }))
+}
+
+/// One line in `relay.log` (or cc-rotate's log, without a data folder), then the wait, then an
+/// error exit.
+fn relay_start_failed(data: Option<&Paths>, e: &anyhow::Error) -> ExitCode {
+    match data {
+        Some(data) => ccr_relay::log_now(&data.relay_log(), &format!("cannot start: {e:#}")),
+        None => process::log_error("relay run", e),
+    }
+    std::thread::sleep(RELAY_START_FAILED_WAIT);
+    ExitCode::FAILURE
+}
+
+/// Whether relay mode is on, and what the relay removes when it leaves for good (spec 10).
+struct RelayLifecycle {
+    paths: Paths,
+}
+
+impl RelayLifecycle {
+    fn home(&self) -> Result<Option<i64>> {
+        ccr_core::relay::home(&Store::open(&self.paths.store_db())?)
+    }
+}
+
+impl ccr_relay::Lifecycle for RelayLifecycle {
+    fn mode_on(&self) -> bool {
+        // Unsure counts as on: the relay stays.
+        !matches!(self.home(), Ok(None))
+    }
+
+    fn retire(&self) -> Result<()> {
+        // `relay on` may have run since the last look.
+        if self.home()?.is_some() {
+            bail!("relay mode is on again");
+        }
+        // Only the service that runs a relay of this data folder: a relay a test started in a
+        // folder of its own leaves the user's alone.
+        let service = ccr_core::relay_service::Service::real()?;
+        let data_dir = std::env::var("CC_ROTATE_DATA_DIR").ok();
+        if service.serves(data_dir.as_deref()) {
+            service.remove()?;
+        }
+        match std::fs::remove_file(self.paths.relay_config()) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => {
+                Err(e).with_context(|| format!("deleting {}", self.paths.relay_config().display()))
+            }
+        }
+    }
+}
+
+/// What `cc-rotate-ctl relay` shows.
+fn relay_view(store: &Store, paths: &Paths) -> Result<format::RelayView> {
+    let home = match ccr_core::relay::home(store)? {
+        Some(id) => Some(
+            store
+                .account(id)?
+                .map_or_else(|| format!("account {id}"), |a| a.label),
+        ),
+        None => None,
+    };
+    let port = ccr_core::relay::RelayConfig::read(&paths.relay_config())?.map(|cfg| cfg.port);
+    Ok(format::RelayView {
+        home,
+        port,
+        answers: port.is_some_and(ccr_core::relay::answers),
+        service: ccr_core::relay_service::status(),
+        bypassing: ccr_core::relay::bypass_count(store, time::now_ms())?,
+    })
 }
 
 /// The relay's lock file, locked: `None` when another process holds it.

@@ -594,6 +594,57 @@ pub fn doctor(checks: &[Check]) -> String {
     out
 }
 
+/// What `cc-rotate-ctl relay` shows (relay spec 4).
+#[derive(Debug, Clone)]
+pub struct RelayView {
+    /// The home account's label while relay mode is on.
+    pub home: Option<String>,
+    /// The relay's port, from `relay.json`, when it is there.
+    pub port: Option<u16>,
+    pub answers: bool,
+    pub service: ccr_core::relay_service::ServiceState,
+    /// Sessions whose status line ran without the relay's address in the last 10 minutes.
+    pub bypassing: usize,
+}
+
+/// `cc-rotate-ctl relay`: the relay's address, never its secret.
+pub fn relay(v: &RelayView) -> String {
+    use ccr_core::relay_service::ServiceState;
+    let mut out = String::new();
+    let mode = if v.home.is_some() { "on" } else { "off" };
+    let _ = writeln!(out, "Relay mode: {mode}");
+    if let Some(home) = &v.home {
+        let _ = writeln!(out, "Home account: {home}");
+    }
+    match v.port {
+        Some(port) => {
+            let _ = writeln!(out, "Address: 127.0.0.1:{port}");
+            let answers = if v.answers { "yes" } else { "no" };
+            let _ = writeln!(out, "Answering: {answers}");
+        }
+        None => {
+            let _ = writeln!(out, "Address: none (relay.json is not there)");
+        }
+    }
+    let service = match v.service {
+        ServiceState::Installed => "installed",
+        ServiceState::Missing => "not installed",
+    };
+    let _ = writeln!(out, "Service: {service}");
+    let _ = writeln!(
+        out,
+        "Sessions without the relay's address (last 10 minutes): {}",
+        v.bypassing
+    );
+    if v.home.is_some() && v.bypassing > 0 {
+        let _ = writeln!(
+            out,
+            "Those run on the home account directly, off the pool: restart them to move them onto the relay."
+        );
+    }
+    out
+}
+
 /// `cc-rotate-ctl desktop` (spec section 24.2).
 pub fn desktop(setup: &ccr_core::desktop::Setup, ctl: &std::path::Path) -> String {
     use ccr_core::desktop::{self, Launcher, Platform, Policy};
@@ -894,6 +945,23 @@ mod tests {
         assert_eq!(
             report(&[], 4),
             "No accounts yet. Add one with `cc-rotate-ctl login`.\n"
+        );
+    }
+
+    #[test]
+    fn relay_on_names_home_and_sessions_off_the_relay() {
+        let text = relay(&RelayView {
+            home: Some("work".into()),
+            port: Some(50123),
+            answers: true,
+            service: ccr_core::relay_service::ServiceState::Installed,
+            bypassing: 2,
+        });
+        assert_eq!(
+            text,
+            "Relay mode: on\nHome account: work\nAddress: 127.0.0.1:50123\nAnswering: yes\n\
+             Service: installed\nSessions without the relay's address (last 10 minutes): 2\n\
+             Those run on the home account directly, off the pool: restart them to move them onto the relay.\n"
         );
     }
 }

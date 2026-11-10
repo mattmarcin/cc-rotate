@@ -12,6 +12,7 @@ use std::convert::Infallible;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
@@ -43,20 +44,64 @@ const SESSION_HEADER: &str = "x-claude-code-session-id";
 const REFRESH_EVERY: Duration = Duration::from_millis(500);
 
 /// How the relay behaves, apart from where it listens.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Options {
     /// How long a model request refused as not signed in waits for a renewed login before the
     /// relay swaps away from its account (spec 9).
     pub login_hold: Duration,
+    /// How often the relay checks whether its program file was replaced and whether it has been
+    /// idle long enough to leave (spec 10).
+    pub check_every: Duration,
+    /// How long without a request before the relay leaves for good once relay mode is off.
+    pub idle_exit: Duration,
+    /// The program file whose replacement is an upgrade: the running executable when `None`.
+    pub program: Option<PathBuf>,
+    /// Says whether relay mode is on, and removes the relay's service when it leaves for good.
+    pub lifecycle: Arc<dyn Lifecycle>,
 }
 
 impl Default for Options {
     fn default() -> Options {
         Options {
             login_hold: Duration::from_secs(30),
+            check_every: Duration::from_secs(60),
+            idle_exit: Duration::from_secs(3600),
+            program: None,
+            lifecycle: Arc::new(Stays),
         }
     }
 }
+
+impl std::fmt::Debug for Options {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Options")
+            .field("login_hold", &self.login_hold)
+            .field("check_every", &self.check_every)
+            .field("idle_exit", &self.idle_exit)
+            .field("program", &self.program)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What decides whether the relay may leave for good (spec 10).
+/// Every method is called on a thread that may block.
+pub trait Lifecycle: Send + Sync {
+    /// Whether relay mode is on. An error reading it counts as on: the relay stays.
+    fn mode_on(&self) -> bool {
+        true
+    }
+
+    /// Relay mode is off and no request came for `Options::idle_exit`: remove the relay's
+    /// service and `relay.json`, so nothing starts the relay again.
+    fn retire(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// A relay that never leaves for being idle.
+pub struct Stays;
+
+impl Lifecycle for Stays {}
 
 /// Which login a model request goes out with.
 #[derive(Clone)]
@@ -187,6 +232,12 @@ impl RelayEvents for FileLog {
     }
 }
 
+/// Write one line to the relay's log at `path` now, as `FileLog` does, for when no `FileLog` runs
+/// yet (the relay could not start).
+pub fn log_now(path: &Path, line: &str) {
+    write_line(path, &format!("{} {line}", ccr_core::time::now_ms()));
+}
+
 fn write_line(path: &Path, line: &str) {
     if let Some(dir) = path.parent() {
         let _ = ccr_core::secret::create_private_dir(dir);
@@ -280,11 +331,127 @@ struct State {
     upstream: Upstream,
     logins: Arc<dyn Logins>,
     events: Arc<dyn RelayEvents>,
+    in_flight: Arc<InFlight>,
+    /// When the last request with the relay's secret arrived, or the relay started.
+    last_request: std::sync::Mutex<tokio::time::Instant>,
+}
+
+/// How many requests are in flight: from their arrival until their response's body has gone
+/// back to the session, or the session went away.
+#[derive(Default)]
+struct InFlight {
+    count: AtomicUsize,
+    zero: tokio::sync::Notify,
+}
+
+impl InFlight {
+    fn enter(self: &Arc<Self>) -> Entered {
+        self.count.fetch_add(1, Ordering::SeqCst);
+        Entered(self.clone())
+    }
+
+    fn now(&self) -> usize {
+        self.count.load(Ordering::SeqCst)
+    }
+
+    /// Wait until no request is in flight.
+    async fn idle(&self) {
+        loop {
+            let notified = self.zero.notified();
+            let mut notified = std::pin::pin!(notified);
+            notified.as_mut().enable();
+            if self.now() == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// One request in flight, until dropped.
+struct Entered(Arc<InFlight>);
+
+impl Drop for Entered {
+    fn drop(&mut self) {
+        if self.0.count.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.0.zero.notify_waiters();
+        }
+    }
+}
+
+/// A response body that counts its request in flight until it is done or dropped.
+struct Tracked {
+    inner: RelayBody,
+    _entered: Entered,
+}
+
+impl hyper::body::Body for Tracked {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, hyper::Error>>> {
+        std::pin::Pin::new(&mut self.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// Why the relay leaves (spec 10).
+enum Leave {
+    /// Its program file was replaced: the service starts the new one.
+    Upgrade,
+    /// Relay mode is off and no request came for a while.
+    Idle,
+}
+
+/// What tells a replaced program file from the one the relay started from.
+fn fingerprint(path: &Path) -> Option<(std::time::SystemTime, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
+/// Whether the relay should leave now.
+async fn check(
+    st: &Arc<State>,
+    program: Option<&Path>,
+    started: Option<(std::time::SystemTime, u64)>,
+) -> Option<Leave> {
+    if let (Some(program), Some(started)) = (program, started)
+        && fingerprint(program) != Some(started)
+    {
+        return Some(Leave::Upgrade);
+    }
+    let quiet = st
+        .last_request
+        .lock()
+        .map(|t| t.elapsed())
+        .unwrap_or_default();
+    if quiet < st.options.idle_exit || st.in_flight.now() > 0 {
+        return None;
+    }
+    let lifecycle = st.options.lifecycle.clone();
+    let on = tokio::task::spawn_blocking(move || lifecycle.mode_on())
+        .await
+        .unwrap_or(true);
+    (!on).then_some(Leave::Idle)
 }
 
 type RelayBody = BoxBody<Bytes, hyper::Error>;
 
-/// Serve requests from `listener`, which must be bound to 127.0.0.1, until the process ends.
+/// Serve requests from `listener`, which must be bound to 127.0.0.1, until the relay leaves
+/// (spec 10): its program file was replaced, or relay mode is off and no request came for
+/// `Options::idle_exit`.
+/// Either way it stops accepting connections, waits for the requests in flight to finish, and
+/// returns; when idle, it first removes its service (`Lifecycle::retire`).
 pub async fn serve(
     listener: std::net::TcpListener,
     cfg: RelayConfig,
@@ -299,21 +466,40 @@ pub async fn serve(
     }
     listener.set_nonblocking(true)?;
     let listener = tokio::net::TcpListener::from_std(listener)?;
+    let program = options
+        .program
+        .clone()
+        .or_else(|| std::env::current_exe().ok());
+    let started = program.as_deref().and_then(fingerprint);
+    let mut ticks = tokio::time::interval(options.check_every);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The first tick is at once.
+    ticks.tick().await;
     let state = Arc::new(State {
         cfg,
         options,
         upstream,
         logins,
         events,
+        in_flight: Arc::new(InFlight::default()),
+        last_request: std::sync::Mutex::new(tokio::time::Instant::now()),
     });
-    loop {
-        let stream = match listener.accept().await {
-            Ok((stream, _)) => stream,
-            Err(e) => {
-                // Out of file descriptors, for one: wait for some to close.
-                state.events.log(&format!("accept failed: {e}"));
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
+    let leave = loop {
+        let stream = tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => stream,
+                Err(e) => {
+                    // Out of file descriptors, for one: wait for some to close.
+                    state.events.log(&format!("accept failed: {e}"));
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            },
+            _ = ticks.tick() => {
+                match check(&state, program.as_deref(), started).await {
+                    Some(leave) => break leave,
+                    None => continue,
+                }
             }
         };
         let _ = stream.set_nodelay(true);
@@ -321,7 +507,17 @@ pub async fn serve(
         tokio::spawn(async move {
             let service = service_fn(move |req| {
                 let state = state.clone();
-                async move { Ok::<_, Infallible>(handle(req, &state).await) }
+                async move {
+                    let entered = state.in_flight.enter();
+                    let resp = handle(req, &state).await;
+                    Ok::<_, Infallible>(resp.map(|inner| {
+                        Tracked {
+                            inner,
+                            _entered: entered,
+                        }
+                        .boxed()
+                    }))
+                }
             });
             let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
             // The timer lets hyper drop a connection whose request headers never finish.
@@ -330,10 +526,38 @@ pub async fn serve(
                 .serve_connection(TokioIo::new(stream), service)
                 .await;
         });
+    };
+    // No new connections from here on: a session's next one finds the next relay.
+    drop(listener);
+    match leave {
+        Leave::Upgrade => {
+            state.events.log(&format!(
+                "program replaced; leaving once {} requests in flight finish",
+                state.in_flight.now()
+            ));
+            state.in_flight.idle().await;
+            state.events.log("left for the new program");
+        }
+        Leave::Idle => {
+            state.events.log(&format!(
+                "relay mode is off and no request came for {} s; leaving",
+                state.options.idle_exit.as_secs()
+            ));
+            state.in_flight.idle().await;
+            let lifecycle = state.options.lifecycle.clone();
+            match tokio::task::spawn_blocking(move || lifecycle.retire()).await {
+                Ok(Ok(())) => state.events.log("removed the relay's service"),
+                Ok(Err(e)) => state
+                    .events
+                    .log(&format!("removing the relay's service failed: {e:#}")),
+                Err(_) => state.events.log("removing the relay's service failed"),
+            }
+        }
     }
+    Ok(())
 }
 
-/// `serve` on a runtime of its own, for `cc-rotate-ctl relay run`.
+/// `serve` on a runtime of its own, for `cc-rotate-ctl relay run`: returns when the relay leaves.
 pub fn run_blocking(
     listener: std::net::TcpListener,
     cfg: RelayConfig,
@@ -532,6 +756,10 @@ async fn handle(req: Request<Incoming>, st: &State) -> Response<RelayBody> {
         Route::Model { path } => (true, path),
         Route::Pass { path } => (false, path),
     };
+    // Only a request with the relay's secret keeps an idle relay from leaving.
+    if let Ok(mut last) = st.last_request.lock() {
+        *last = tokio::time::Instant::now();
+    }
     let (parts, body) = req.into_parts();
     let method = parts.method.clone();
     let bare_path = path.split('?').next().unwrap_or("").to_string();

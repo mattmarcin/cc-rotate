@@ -91,18 +91,7 @@ pub fn turn_on(store: &Store, paths: &Paths, home_id: i64) -> Result<()> {
     let account = store
         .account(home_id)?
         .ok_or_else(|| anyhow!("account {home_id} does not exist"))?;
-    if account.state == AccountState::NeedsLogin || store.credential_meta(home_id)?.is_none() {
-        return Err(anyhow!(
-            "{} is signed out. Sign in to it again first.",
-            account.label
-        ));
-    }
-    if crate::usage_check::state(store, home_id)?.held_back {
-        return Err(anyhow!(
-            "{} is on hold until a usage check confirms its login. Check its usage first.",
-            account.label
-        ));
-    }
+    eligible_home(store, &account)?;
     settled(store, paths)?;
     let profile = profile_account(store)?.ok_or_else(|| {
         anyhow!("no account is in use, so cc-rotate can't tell whose login the profile has")
@@ -115,6 +104,46 @@ pub fn turn_on(store: &Store, paths: &Paths, home_id: i64) -> Result<()> {
         set_mode(s, Some(home_id))?;
         log_mode(s, home_id, change)
     })
+}
+
+/// `cc-rotate-ctl relay on --home <reference>` (spec 4): refuse unless the account can be home,
+/// write `relay.json` when it is not there, `install` the relay's service, then `turn_on`.
+///
+/// Nothing changes when the account is refused. The port and secret of a `relay.json` already
+/// there stay, so sessions started earlier keep reaching the relay.
+pub fn on(
+    store: &Store,
+    paths: &Paths,
+    reference: &str,
+    install: impl FnOnce() -> Result<()>,
+) -> Result<(Account, RelayConfig)> {
+    let account = store.find_account(reference)?;
+    eligible_home(store, &account)?;
+    let path = paths.relay_config();
+    let cfg = match RelayConfig::read(&path)? {
+        Some(cfg) => cfg,
+        None => RelayConfig::create(&path)?,
+    };
+    install().context("installing the relay's service")?;
+    turn_on(store, paths, account.id)?;
+    Ok((account, cfg))
+}
+
+/// Refuse a home account that is signed out or held back by a check (spec 4, step 1).
+fn eligible_home(store: &Store, account: &Account) -> Result<()> {
+    if account.state == AccountState::NeedsLogin || store.credential_meta(account.id)?.is_none() {
+        return Err(anyhow!(
+            "{} is signed out. Sign in to it again first.",
+            account.label
+        ));
+    }
+    if crate::usage_check::state(store, account.id)?.held_back {
+        return Err(anyhow!(
+            "{} is on hold until a usage check confirms its login. Check its usage first.",
+            account.label
+        ));
+    }
+    Ok(())
 }
 
 /// Turn relay mode off (spec 4, `relay off` step 1): under the swap lock, make the active
@@ -642,6 +671,77 @@ mod tests {
             assert_eq!(home(&env.store).unwrap(), None);
             assert!(swap::pending_swap(&env.store).unwrap().is_none());
             assert!(!env.paths.refresh_lock().exists());
+        }
+
+        #[test]
+        fn on_refuses_signed_out() {
+            // Refused before anything changes: no relay.json, no service, no mode.
+            let env = Env::new();
+            env.activate(env.b);
+            let label = |id| env.store.account(id).unwrap().unwrap().label;
+            env.store
+                .set_state(env.a, AccountState::NeedsLogin)
+                .unwrap();
+            env.store.set_state(env.c, AccountState::Parked).unwrap();
+            crate::usage_check::hold_back(&env.store, env.c).unwrap();
+            let before = env.profile_bytes();
+            let installs = std::cell::Cell::new(0);
+            for (reference, why) in [
+                (label(env.a), "signed out"),
+                (label(env.c), "on hold"),
+                ("nobody".to_string(), "no account matches"),
+            ] {
+                let err = on(&env.store, &env.paths, &reference, || {
+                    installs.set(installs.get() + 1);
+                    Ok(())
+                })
+                .unwrap_err();
+                assert!(format!("{err:#}").contains(why), "{err:#}");
+            }
+            assert_eq!(installs.get(), 0);
+            assert!(!env.paths.relay_config().exists());
+            assert_eq!(home(&env.store).unwrap(), None);
+            assert_eq!(env.profile_bytes(), before);
+        }
+
+        #[test]
+        fn on_writes_config_installs_and_turns_on() {
+            let env = Env::new();
+            env.activate(env.b);
+            let label = env.store.account(env.a).unwrap().unwrap().label;
+            let installs = std::cell::Cell::new(0);
+            let (account, cfg) = on(&env.store, &env.paths, &label, || {
+                installs.set(installs.get() + 1);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(account.id, env.a);
+            assert_eq!(installs.get(), 1);
+            assert_eq!(
+                RelayConfig::read(&env.paths.relay_config()).unwrap(),
+                Some(cfg.clone())
+            );
+            assert_eq!(home(&env.store).unwrap(), Some(env.a));
+            assert_eq!(env.profile_refresh(), "refresh-a1");
+
+            // Again, with another home: the same port and secret, so earlier sessions still
+            // reach the relay.
+            let other = env.store.account(env.b).unwrap().unwrap().label;
+            let (_, again) = on(&env.store, &env.paths, &other, || Ok(())).unwrap();
+            assert_eq!(again, cfg);
+            assert_eq!(home(&env.store).unwrap(), Some(env.b));
+        }
+
+        #[test]
+        fn on_stops_when_the_service_does_not_install() {
+            let env = Env::new();
+            let label = env.store.account(env.a).unwrap().unwrap().label;
+            let err = on(&env.store, &env.paths, &label, || {
+                Err(anyhow!("launchd said no"))
+            })
+            .unwrap_err();
+            assert!(format!("{err:#}").contains("launchd said no"), "{err:#}");
+            assert_eq!(home(&env.store).unwrap(), None);
         }
 
         #[test]
