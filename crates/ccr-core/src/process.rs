@@ -1,7 +1,141 @@
 //! Child processes that must not outlive their purpose: whether a process is alive, and a
 //! process tree that can be killed as a whole.
 
-use std::process::{Child, Command};
+use std::io::Write;
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
+
+use anyhow::{Context, Result};
+
+#[cfg(windows)]
+mod spawn_flags {
+    pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    pub const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    pub const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+}
+
+/// Start `exe` in the background with the arguments `args` adds.
+/// It must outlive the statusline or hook process that starts it, so it leaves Claude Code's job
+/// object if allowed (Windows) or its process group (Unix), and a signal sent to that process's
+/// group when Claude Code times it out does not reach it. It must not hold Claude Code's pipes
+/// either: Claude Code sees the end of a statusline's or hook's output only once every copy of
+/// the pipe is closed.
+pub fn spawn_detached(exe: &Path, args: impl Fn(&mut Command), what: &str) -> Result<()> {
+    // Not the session's project folder, whose files have no business in a background job.
+    // The data folder, or before it exists (nothing stored yet) the system's temp folder.
+    // Absolute, so a relative CC_ROTATE_DATA_DIR still names the same folder from there.
+    let dir = crate::Paths::default_data_dir()
+        .ok()
+        .and_then(|d| dunce::canonicalize(d).ok())
+        .unwrap_or_else(std::env::temp_dir);
+    let build = || {
+        let mut cmd = Command::new(exe);
+        args(&mut cmd);
+        cmd.current_dir(&dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        cmd
+    };
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let _private = StdHandlesNotInherited::new();
+        let base = spawn_flags::CREATE_NO_WINDOW | spawn_flags::CREATE_NEW_PROCESS_GROUP;
+        if build()
+            .creation_flags(base | spawn_flags::CREATE_BREAKAWAY_FROM_JOB)
+            .spawn()
+            .is_ok()
+        {
+            return Ok(());
+        }
+        build()
+            .creation_flags(base)
+            .spawn()
+            .context(what.to_string())?;
+    }
+    #[cfg(unix)]
+    {
+        // The child's stdio is /dev/null and every other descriptor Rust opens is close-on-exec,
+        // so nothing of the caller's pipes reaches it.
+        use std::os::unix::process::CommandExt;
+        build().process_group(0).spawn().context(what.to_string())?;
+    }
+    Ok(())
+}
+
+/// Windows starts children with every inheritable handle of the parent, whatever their stdio is
+/// set to, and the standard handles this process got from Claude Code are inheritable. While one
+/// of these exists, this process's standard handles are kept out of the children it starts.
+#[cfg(windows)]
+struct StdHandlesNotInherited {
+    saved: Vec<(windows_sys::Win32::Foundation::HANDLE, u32)>,
+}
+
+#[cfg(windows)]
+impl StdHandlesNotInherited {
+    fn new() -> Self {
+        use windows_sys::Win32::Foundation::{
+            GetHandleInformation, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+        };
+        use windows_sys::Win32::System::Console::{
+            GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+        };
+        let mut saved = Vec::new();
+        for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            // SAFETY: plain Win32 calls on this process's own standard handles, which stay open.
+            unsafe {
+                let handle = GetStdHandle(id);
+                if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+                    continue;
+                }
+                let mut flags = 0u32;
+                if GetHandleInformation(handle, &mut flags) == 0 || flags & HANDLE_FLAG_INHERIT == 0
+                {
+                    continue;
+                }
+                if SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) != 0 {
+                    saved.push((handle, flags & HANDLE_FLAG_INHERIT));
+                }
+            }
+        }
+        Self { saved }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for StdHandlesNotInherited {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+        for &(handle, flags) in &self.saved {
+            // SAFETY: restores the flag cleared in `new` on the same, still open handle.
+            unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, flags) };
+        }
+    }
+}
+
+/// Append an error to `<data dir>/logs/cc-rotate.log`, keeping the file under 1 MB.
+pub fn log_error(context: &str, error: &anyhow::Error) {
+    let Ok(data) = crate::Paths::default_data_dir() else {
+        return;
+    };
+    let dir = data.join("logs");
+    let _ = crate::secret::create_private_dir(&dir);
+    let path = dir.join("cc-rotate.log");
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 1_000_000) {
+        let _ = std::fs::rename(&path, dir.join("cc-rotate.log.1"));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    if let Ok(mut file) = options.open(&path) {
+        let _ = writeln!(file, "{} {context}: {error:#}", crate::time::now_ms());
+    }
+}
 
 /// Whether the process `pid` is running.
 #[cfg(windows)]

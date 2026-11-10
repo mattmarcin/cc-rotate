@@ -10,7 +10,7 @@ use std::process::{Command, ExitCode};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use ccr_core::login;
+use ccr_core::{login, relay};
 
 fn main() -> ExitCode {
     match run() {
@@ -51,6 +51,10 @@ fn run() -> Result<ExitCode> {
     let mut cmd = ccr_core::paths::program_command(&claude);
     cmd.args(std::env::args_os().skip(1))
         .env("CLAUDE_CONFIG_DIR", &paths.profile_dir);
+    if let Some(cfg) = relay::launch_config_logged("cc-rotate") {
+        cmd.envs(relay::session_env(&cfg));
+        relay::ensure_running("cc-rotate", &cfg);
+    }
     run_claude(cmd, &claude)
 }
 

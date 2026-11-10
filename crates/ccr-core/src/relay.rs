@@ -141,6 +141,87 @@ pub fn session_env(cfg: &RelayConfig) -> [(&'static str, String); 2] {
     ]
 }
 
+/// The relay's config when relay mode is on: `Ok(None)` when it is off, an error when it is on
+/// but `relay.json` is missing or unreadable.
+///
+/// Read-only and whatever the store's schema, for the launchers, which must start quickly and
+/// before an upgraded cc-rotate has migrated the store.
+pub fn launch_config(data_dir: &Path) -> Result<Option<RelayConfig>> {
+    let store = data_dir.join("store.db");
+    if !store.exists() {
+        return Ok(None);
+    }
+    if Store::read_setting_any_schema(&store, SETTING_MODE)?.as_deref() != Some("on") {
+        return Ok(None);
+    }
+    let path = data_dir.join("relay.json");
+    let cfg = RelayConfig::read(&path)?
+        .with_context(|| format!("relay mode is on but {} does not exist", path.display()))?;
+    Ok(Some(cfg))
+}
+
+/// The variables a new session gets: `Ok(None)` when relay mode is off, an error when it is on
+/// but `relay.json` is missing or unreadable.
+pub fn launch_env(data_dir: &Path) -> Result<Option<[(&'static str, String); 2]>> {
+    Ok(launch_config(data_dir)?.map(|cfg| session_env(&cfg)))
+}
+
+/// What a launcher does first: the relay's config when relay mode is on.
+/// A failure is written to cc-rotate's log and the session starts without the relay (spec
+/// section 10); nothing is printed.
+pub fn launch_config_logged(context: &str) -> Option<RelayConfig> {
+    let result = crate::Paths::default_data_dir().and_then(|dir| launch_config(&dir));
+    match result {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            crate::process::log_error(context, &e);
+            None
+        }
+    }
+}
+
+/// Start the relay in the background unless it answers, without waiting for it; a failure is only
+/// logged.
+pub fn ensure_running(context: &str, cfg: &RelayConfig) {
+    if !answers(cfg.port)
+        && let Err(e) = spawn_relay()
+    {
+        crate::process::log_error(context, &e);
+    }
+}
+
+/// Start `cc-rotate-ctl relay run` in the background, without waiting for it.
+///
+/// Used by both launchers, so it finds `cc-rotate-ctl` next to the running executable: that is
+/// the executable itself in `cc-rotate-ctl`, and its sibling in `cc-rotate`.
+pub fn spawn_relay() -> Result<()> {
+    let exe = std::env::current_exe().context("finding the running executable")?;
+    let name = format!("cc-rotate-ctl{}", std::env::consts::EXE_SUFFIX);
+    let ctl = if exe.file_name().is_some_and(|n| *n == *name) {
+        exe
+    } else {
+        exe.with_file_name(name)
+    };
+    crate::process::spawn_detached(
+        &ctl,
+        |cmd| {
+            cmd.args(["relay", "run"]);
+        },
+        "starting the relay",
+    )
+}
+
+/// Whether something accepts a connection on `port` of 127.0.0.1 within 50 ms.
+pub fn answers(port: u16) -> bool {
+    use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+    use std::time::Duration;
+    TcpStream::connect_timeout(
+        &SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+        Duration::from_millis(50),
+    )
+    .is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,5 +293,45 @@ mod tests {
                 ("_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL", "1".to_string()),
             ]
         );
+    }
+
+    fn data_dir_with_store(mode_on: bool) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("store.db")).unwrap();
+        if mode_on {
+            let (a, _) = two_accounts(&store);
+            set_mode(&store, Some(a)).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn launch_env_off() {
+        let none = tempfile::tempdir().unwrap();
+        assert_eq!(launch_env(none.path()).unwrap(), None);
+        let dir = data_dir_with_store(false);
+        assert_eq!(launch_env(dir.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn launch_env_on() {
+        let dir = data_dir_with_store(true);
+        let cfg = RelayConfig::create(&dir.path().join("relay.json")).unwrap();
+        assert_eq!(launch_env(dir.path()).unwrap(), Some(session_env(&cfg)));
+    }
+
+    #[test]
+    fn launch_env_missing_config() {
+        let dir = data_dir_with_store(true);
+        assert!(launch_env(dir.path()).is_err());
+    }
+
+    #[test]
+    fn answers_when_something_listens() {
+        let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = l.local_addr().unwrap().port();
+        assert!(answers(port));
+        drop(l);
+        assert!(!answers(port));
     }
 }

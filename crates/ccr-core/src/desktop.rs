@@ -34,20 +34,25 @@ pub struct LaunchPlan {
     /// `~/.claude` set by hand is another login than `~/.claude` by default.
     pub config_dir: Option<PathBuf>,
     pub remove: Vec<&'static str>,
+    /// Variables to set; the relay's two when relay mode is on and the session runs on the pool.
+    pub set: Vec<(&'static str, String)>,
 }
 
 /// The launch of `args` (Claude Code's arguments, without its path) in the environment `var`
-/// reads, with the cc-rotate profile at `rotate_profile`.
+/// reads, with the cc-rotate profile at `rotate_profile`. `relay_env` is what relay mode gives a
+/// session (spec section 4); it goes only to a session that runs on the pool.
 pub fn plan_launch(
     args: &[OsString],
     var: impl Fn(&str) -> Option<OsString>,
     rotate_profile: &Path,
     home: &Path,
+    relay_env: Option<[(&'static str, String); 2]>,
 ) -> LaunchPlan {
     if !is_desktop_session(&var) {
         return LaunchPlan {
             config_dir: None,
             remove: Vec::new(),
+            set: Vec::new(),
         };
     }
     // A session only the app's profile holds runs there, so the app can still resume it: one
@@ -61,9 +66,14 @@ pub fn plan_launch(
         }
         _ => Some(rotate_profile.to_path_buf()),
     };
+    let set = match (&config_dir, relay_env) {
+        (Some(dir), Some(env)) if dir == rotate_profile => env.into(),
+        _ => Vec::new(),
+    };
     LaunchPlan {
         config_dir,
         remove: REMOVED.to_vec(),
+        set,
     }
 }
 
@@ -853,12 +863,13 @@ mod tests {
             env(&[("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST", "1")]),
         ] {
             assert!(!is_desktop_session(&vars));
-            let plan = plan_launch(&args(&["-p"]), &vars, &rotate, root.path());
+            let plan = plan_launch(&args(&["-p"]), &vars, &rotate, root.path(), None);
             assert_eq!(
                 plan,
                 LaunchPlan {
                     config_dir: None,
-                    remove: vec![]
+                    remove: vec![],
+                    set: vec![]
                 }
             );
         }
@@ -875,6 +886,7 @@ mod tests {
             &vars,
             &rotate,
             root.path(),
+            None,
         );
         assert_eq!(plan.config_dir, Some(rotate));
         assert_eq!(plan.remove, REMOVED.to_vec());
@@ -894,7 +906,7 @@ mod tests {
             args(&["-p", "--resume", "abc-123"]),
             args(&["--resume=abc-123", "-p"]),
         ] {
-            let plan = plan_launch(&a, &vars, &rotate, root.path());
+            let plan = plan_launch(&a, &vars, &rotate, root.path(), None);
             // The app's CLAUDE_CONFIG_DIR is left as it is.
             assert_eq!(plan.config_dir, None, "{a:?}");
             assert_eq!(plan.remove, REMOVED.to_vec());
@@ -911,6 +923,7 @@ mod tests {
             env(&DESKTOP),
             &rotate,
             &home,
+            None,
         );
         assert_eq!(plan.config_dir, None);
         assert_eq!(plan.remove, REMOVED.to_vec());
@@ -928,11 +941,18 @@ mod tests {
             env(&DESKTOP),
             &rotate,
             &home,
+            None,
         );
         assert_eq!(plan.config_dir, Some(rotate.clone()));
 
         // A session in neither profile (a new one the app resumes by id) runs on the pool.
-        let plan = plan_launch(&args(&["--resume", "zzz"]), env(&DESKTOP), &rotate, &home);
+        let plan = plan_launch(
+            &args(&["--resume", "zzz"]),
+            env(&DESKTOP),
+            &rotate,
+            &home,
+            None,
+        );
         assert_eq!(plan.config_dir, Some(rotate));
     }
 
@@ -949,7 +969,13 @@ mod tests {
 
         let root = tempfile::tempdir().unwrap();
         let rotate = root.path().join("rotate");
-        let plan = plan_launch(&args(&["--resume"]), env(&DESKTOP), &rotate, root.path());
+        let plan = plan_launch(
+            &args(&["--resume"]),
+            env(&DESKTOP),
+            &rotate,
+            root.path(),
+            None,
+        );
         assert_eq!(plan.config_dir, Some(rotate));
     }
 
@@ -962,9 +988,71 @@ mod tests {
         transcript(&home.join(".claude"), "x");
         std::fs::write(home.join(".claude").join("projects").join("y.jsonl"), "").unwrap();
         for id in ["../y", "a/b", "a\\b", ".."] {
-            let plan = plan_launch(&args(&["--resume", id]), env(&DESKTOP), &rotate, &home);
+            let plan = plan_launch(
+                &args(&["--resume", id]),
+                env(&DESKTOP),
+                &rotate,
+                &home,
+                None,
+            );
             assert_eq!(plan.config_dir, Some(rotate.clone()), "{id}");
         }
+    }
+
+    const RELAY: [(&str, &str); 2] = [("ANTHROPIC_BASE_URL", "http://x"), ("FIRST", "1")];
+
+    fn relay_env() -> Option<[(&'static str, String); 2]> {
+        Some([
+            ("ANTHROPIC_BASE_URL", "http://x".to_string()),
+            ("FIRST", "1".to_string()),
+        ])
+    }
+
+    #[test]
+    fn relay_env_set_for_pool_session() {
+        let root = tempfile::tempdir().unwrap();
+        let rotate = root.path().join("rotate");
+        let plan = plan_launch(
+            &args(&["-p"]),
+            env(&DESKTOP),
+            &rotate,
+            root.path(),
+            relay_env(),
+        );
+        assert_eq!(plan.config_dir, Some(rotate));
+        let want: Vec<(&str, String)> = RELAY.iter().map(|(k, v)| (*k, v.to_string())).collect();
+        assert_eq!(plan.set, want);
+    }
+
+    #[test]
+    fn relay_env_not_for_resumed_old_session() {
+        let root = tempfile::tempdir().unwrap();
+        let rotate = root.path().join("rotate");
+        let home = root.path().join("home");
+        transcript(&home.join(".claude"), "def-456");
+        let plan = plan_launch(
+            &args(&["--resume", "def-456"]),
+            env(&DESKTOP),
+            &rotate,
+            &home,
+            relay_env(),
+        );
+        assert_eq!(plan.config_dir, None);
+        assert!(plan.set.is_empty());
+    }
+
+    #[test]
+    fn relay_env_not_for_non_desktop() {
+        let root = tempfile::tempdir().unwrap();
+        let rotate = root.path().join("rotate");
+        let plan = plan_launch(
+            &args(&["-p"]),
+            env(&[("CLAUDE_CODE_ENTRYPOINT", "cli")]),
+            &rotate,
+            root.path(),
+            relay_env(),
+        );
+        assert!(plan.set.is_empty());
     }
 }
 

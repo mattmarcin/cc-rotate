@@ -41,6 +41,8 @@ fn launch(root: &Path, profile: &str, desktop: bool, program: &[String]) -> Outp
         .env("CC_ROTATE_DATA_DIR", root.join("data"))
         .env("CC_ROTATE_PROFILE", profile)
         .env("KEEP_ME", "kept as it was")
+        .env_remove("ANTHROPIC_BASE_URL")
+        .env_remove("_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL")
         .env("CLAUDE_CONFIG_DIR", root.join("app profile"));
     for name in REMOVED {
         cmd.env(name, "1");
@@ -339,6 +341,62 @@ fn a_resumed_desktop_session_only_in_the_app_profile_runs_on_the_pool() {
             .unwrap()
             .ino()
     );
+}
+
+/// A data folder whose store has relay mode on (home account 1), with `relay.json` when `config`.
+fn relay_data(root: &Path, config: bool) {
+    let data = root.join("data");
+    let store = ccr_core::Store::open(&data.join("store.db")).unwrap();
+    ccr_core::relay::set_mode(&store, Some(1)).unwrap();
+    if config {
+        ccr_core::relay::RelayConfig::create(&data.join("relay.json")).unwrap();
+    }
+}
+
+#[test]
+fn relay_mode_gives_a_desktop_session_the_relay_variables() {
+    let root = tempfile::tempdir().unwrap();
+    relay_data(root.path(), true);
+    let profile = root.path().join("rotate profile");
+    let out = launch(root.path(), profile.to_str().unwrap(), true, &print_env());
+    assert!(out.status.success(), "{out:?}");
+    let cfg = ccr_core::relay::RelayConfig::read(&root.path().join("data").join("relay.json"))
+        .unwrap()
+        .unwrap();
+    let vars = parse(&out);
+    assert_eq!(
+        vars.get("ANTHROPIC_BASE_URL"),
+        Some(&cfg.base_url()),
+        "{vars:?}"
+    );
+    assert_eq!(
+        vars.get("_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL")
+            .map(String::as_str),
+        Some("1")
+    );
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn relay_mode_leaves_other_sessions_alone() {
+    let root = tempfile::tempdir().unwrap();
+    relay_data(root.path(), true);
+    let profile = root.path().join("rotate profile");
+    let out = launch(root.path(), profile.to_str().unwrap(), false, &print_env());
+    assert!(!parse(&out).contains_key("ANTHROPIC_BASE_URL"));
+}
+
+#[test]
+fn relay_mode_without_its_config_starts_without_the_relay_and_says_nothing() {
+    let root = tempfile::tempdir().unwrap();
+    relay_data(root.path(), false);
+    let profile = root.path().join("rotate profile");
+    let out = launch(root.path(), profile.to_str().unwrap(), true, &print_env());
+    assert!(out.status.success(), "{out:?}");
+    assert!(!parse(&out).contains_key("ANTHROPIC_BASE_URL"));
+    assert!(out.stderr.is_empty());
+    let log = std::fs::read_to_string(root.path().join("data/logs/cc-rotate.log")).unwrap();
+    assert!(log.contains("relay"), "{log}");
 }
 
 /// A new desktop session's transcript, written once Claude Code has started, is linked into the
