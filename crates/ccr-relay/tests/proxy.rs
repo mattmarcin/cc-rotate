@@ -644,3 +644,68 @@ async fn concurrent_requests() {
             .all(|s| s.headers["authorization"] == "Bearer tok-b")
     );
 }
+
+/// Sends one HTTP/2 request (prior knowledge, no `Host` header) to the relay over a new connection.
+async fn h2_request(port: u16, uri: &str) -> StatusCode {
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let (mut send, conn) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tcp))
+            .await
+            .unwrap();
+    tokio::spawn(conn);
+    let req = Request::get(uri)
+        .version(http::Version::HTTP_2)
+        .header("authorization", "Bearer home")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    assert!(req.headers().get("host").is_none());
+    let resp = send.send_request(req).await.unwrap();
+    let status = resp.status();
+    body_of(resp).await;
+    status
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn http2_authority_is_the_host() {
+    let fake = fake_upstream().await;
+    let relay = relay_to(fake.addr, Switch::new(token(2, "tok-b"))).await;
+    let port = relay.cfg.port;
+
+    let status = h2_request(port, &relay.url("/api/hello?x=1")).await;
+    assert_eq!(status, StatusCode::OK);
+    let seen = fake.seen();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].path, "/api/hello?x=1");
+    assert_eq!(seen[0].headers["authorization"], "Bearer home");
+
+    for uri in [
+        format!("http://evil.example/r/{S}/api/hello"),
+        format!("http://localhost:{port}/r/{S}/api/hello"),
+        format!("http://127.0.0.1:{port}/r/{}/api/hello", "f".repeat(64)),
+    ] {
+        assert_eq!(h2_request(port, &uri).await, StatusCode::NOT_FOUND, "{uri}");
+    }
+    assert_eq!(fake.seen().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_authorization_headers_get_no_pool_token() {
+    let fake = fake_upstream().await;
+    let relay = relay_to(fake.addr, Switch::new(token(2, "tok-b"))).await;
+    let mut req = model_request(&relay, "", Some("Bearer home"));
+    req.headers_mut()
+        .append("authorization", "Bearer other".parse().unwrap());
+    let sent_headers = req.headers().clone();
+    assert_eq!(relay.send(req).await.status(), 200);
+
+    let seen = fake.seen();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(
+        values(&seen[0].headers, "authorization"),
+        vec![&b"Bearer home"[..], &b"Bearer other"[..]]
+    );
+    assert_same_headers_except(&sent_headers, &seen[0].headers, &["host"]);
+    assert!(relay.events.responses.lock().unwrap().is_empty());
+}

@@ -744,24 +744,29 @@ fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> 
 }
 
 /// `cc-rotate-ctl relay run` (spec sections 5 and 10): hold `relay.lock`, bind 127.0.0.1 on the
-/// port in `relay.json`, and serve until the process ends. Another relay holding the lock means
-/// there is nothing to do.
+/// port in `relay.json`, and serve until the process ends. Another relay holding the lock, or
+/// already listening on the port, means there is nothing to do.
 fn relay_run() -> Result<()> {
-    use ccr_core::lock::{DirLock, LockError, LockOptions};
     use ccr_relay::RelayEvents;
     use std::sync::Arc;
 
     // The relay reads only the data folder, so it needs no profile.
     let paths = Paths::new(Paths::default_data_dir()?, PathBuf::new());
-    let _lock = match DirLock::acquire(&paths.relay_lock(), LockOptions::claude(Duration::ZERO)) {
-        Ok(lock) => lock,
-        Err(LockError::Busy(_)) => return Ok(()),
-        Err(e) => return Err(e.into()),
+    // An OS file lock, held for the life of the process: however the process ends (a crash,
+    // SIGKILL, SIGTERM from its service), the system releases it and the next relay can start.
+    let Some(_lock) = relay_lock(&paths.relay_lock())? else {
+        return Ok(());
     };
     let cfg = ccr_core::relay::RelayConfig::read(&paths.relay_config())?
         .with_context(|| format!("{} does not exist", paths.relay_config().display()))?;
-    let listener = std::net::TcpListener::bind(("127.0.0.1", cfg.port))
-        .with_context(|| format!("listening on 127.0.0.1:{}", cfg.port))?;
+    let listener = match std::net::TcpListener::bind(("127.0.0.1", cfg.port)) {
+        Ok(listener) => listener,
+        // Another relay (one from another data folder, say) already serves this port.
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => return Ok(()),
+        Err(e) => {
+            return Err(e).with_context(|| format!("listening on 127.0.0.1:{}", cfg.port));
+        }
+    };
     let store = Store::open(&paths.store_db())?;
     let upstream = relay_upstream()?;
     let events = Arc::new(ccr_relay::FileLog::new(paths.relay_log()));
@@ -777,6 +782,30 @@ fn relay_run() -> Result<()> {
         Arc::new(ccr_relay::StoreLogins::new(store)),
         events,
     )
+}
+
+/// The relay's lock file, locked: `None` when another process holds it.
+fn relay_lock(path: &std::path::Path) -> Result<Option<std::fs::File>> {
+    if let Some(dir) = path.parent() {
+        ccr_core::secret::create_private_dir(dir)?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => {
+            Err(e).with_context(|| format!("locking {}", path.display()))
+        }
+    }
 }
 
 /// Anthropic's API; a test build can name a local server in `CC_ROTATE_RELAY_TEST_UPSTREAM`.

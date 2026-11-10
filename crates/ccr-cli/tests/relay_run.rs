@@ -47,14 +47,71 @@ fn data_folder(root: &Path) -> (std::path::PathBuf, RelayConfig) {
     (data, cfg)
 }
 
+/// Waits until the relay answers on `port`, failing if it exits or takes longer than `limit`.
+fn wait_serving(relay: &mut Running, data: &Path, port: u16, limit: Duration) {
+    let deadline = Instant::now() + limit;
+    while !ccr_core::relay::answers(port) {
+        assert!(
+            relay.0.try_wait().unwrap().is_none(),
+            "the relay exited: {:?}",
+            std::fs::read_to_string(data.join("logs/cc-rotate.log"))
+        );
+        assert!(Instant::now() < deadline, "the relay never answered");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The relay's log once it has `count` lines containing `needle`: the log is written by a
+/// thread of its own, a moment after the event.
+fn log_with(data: &Path, needle: &str, count: usize) -> String {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let log = std::fs::read_to_string(data.join("logs/relay.log")).unwrap_or_default();
+        if log.matches(needle).count() >= count || Instant::now() > deadline {
+            return log;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[test]
-fn relay_run_exits_at_once_while_another_relay_holds_the_lock() {
+fn relay_run_exits_at_once_while_another_process_holds_the_lock() {
     let root = tempfile::tempdir().unwrap();
     let (data, _) = data_folder(root.path());
-    std::fs::create_dir(data.join("relay.lock")).unwrap();
+    let held = std::fs::File::create(data.join("relay.lock")).unwrap();
+    held.try_lock().unwrap();
     let mut child = Running(relay_run(&data));
     let status = exits_within(&mut child.0, Duration::from_secs(10)).expect("still running");
     assert!(status.success());
+    assert!(!data.join("logs/cc-rotate.log").exists());
+}
+
+#[test]
+fn relay_run_exits_quietly_when_its_port_is_taken() {
+    let root = tempfile::tempdir().unwrap();
+    let (data, cfg) = data_folder(root.path());
+    let _taken = std::net::TcpListener::bind(("127.0.0.1", cfg.port)).unwrap();
+    let mut child = Running(relay_run(&data));
+    let status = exits_within(&mut child.0, Duration::from_secs(10)).expect("still running");
+    assert!(status.success());
+    assert!(!data.join("logs/cc-rotate.log").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_killed_relay_leaves_no_lock_behind() {
+    let root = tempfile::tempdir().unwrap();
+    let (data, cfg) = data_folder(root.path());
+    let mut first = Running(relay_run(&data));
+    wait_serving(&mut first, &data, cfg.port, Duration::from_secs(20));
+    // SIGKILL: nothing in the relay runs on the way out.
+    first.0.kill().unwrap();
+    first.0.wait().unwrap();
+    assert!(data.join("relay.lock").exists());
+
+    let mut second = Running(relay_run(&data));
+    wait_serving(&mut second, &data, cfg.port, Duration::from_secs(2));
+    assert_eq!(log_with(&data, "started", 2).matches("started").count(), 2);
 }
 
 #[test]
@@ -62,17 +119,7 @@ fn relay_run_serves_on_its_port_and_refuses_strangers() {
     let root = tempfile::tempdir().unwrap();
     let (data, cfg) = data_folder(root.path());
     let mut relay = Running(relay_run(&data));
-
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !ccr_core::relay::answers(cfg.port) {
-        assert!(
-            relay.0.try_wait().unwrap().is_none(),
-            "the relay exited: {:?}",
-            std::fs::read_to_string(data.join("logs/cc-rotate.log"))
-        );
-        assert!(Instant::now() < deadline, "the relay never answered");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    wait_serving(&mut relay, &data, cfg.port, Duration::from_secs(20));
 
     let mut tcp = TcpStream::connect(("127.0.0.1", cfg.port)).unwrap();
     write!(
@@ -92,7 +139,7 @@ fn relay_run_serves_on_its_port_and_refuses_strangers() {
     assert!(relay.0.try_wait().unwrap().is_none());
 
     let log_path = data.join("logs/relay.log");
-    let log = std::fs::read_to_string(&log_path).unwrap();
+    let log = log_with(&data, "refused 404", 1);
     assert!(log.contains("started"), "{log}");
     assert!(log.contains("refused 404"), "{log}");
     assert!(

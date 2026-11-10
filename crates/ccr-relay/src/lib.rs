@@ -10,8 +10,8 @@ use std::borrow::Cow;
 use std::convert::Infallible;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr};
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -85,41 +85,52 @@ pub trait RelayEvents: Send + Sync {
 
 /// Events that only write the log lines to a file: `relay.log`, rotated at 1 MB like cc-rotate's
 /// own log, readable by the owner alone.
+///
+/// A thread of its own does the writing, so logging never blocks the threads serving requests.
 pub struct FileLog {
-    path: PathBuf,
-    lock: Mutex<()>,
+    tx: mpsc::Sender<String>,
 }
 
 impl FileLog {
     pub fn new(path: impl Into<PathBuf>) -> FileLog {
-        FileLog {
-            path: path.into(),
-            lock: Mutex::new(()),
-        }
+        let path = path.into();
+        let (tx, rx) = mpsc::channel::<String>();
+        // Without the thread, lines are dropped: the relay keeps serving.
+        let _ = std::thread::Builder::new()
+            .name("relay-log".into())
+            .spawn(move || {
+                for line in rx {
+                    write_line(&path, &line);
+                }
+            });
+        FileLog { tx }
     }
 }
 
 impl RelayEvents for FileLog {
     fn log(&self, line: &str) {
-        let _held = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(dir) = self.path.parent() {
-            let _ = ccr_core::secret::create_private_dir(dir);
-        }
-        if std::fs::metadata(&self.path).is_ok_and(|m| m.len() > 1_000_000) {
-            let mut old = self.path.clone().into_os_string();
-            old.push(".1");
-            let _ = std::fs::rename(&self.path, old);
-        }
-        let mut options = std::fs::OpenOptions::new();
-        options.create(true).append(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        if let Ok(mut file) = options.open(&self.path) {
-            let _ = writeln!(file, "{} {line}", ccr_core::time::now_ms());
-        }
+        let _ = self.tx.send(format!("{} {line}", ccr_core::time::now_ms()));
+    }
+}
+
+fn write_line(path: &Path, line: &str) {
+    if let Some(dir) = path.parent() {
+        let _ = ccr_core::secret::create_private_dir(dir);
+    }
+    if std::fs::metadata(path).is_ok_and(|m| m.len() > 1_000_000) {
+        let mut old = path.as_os_str().to_owned();
+        old.push(".1");
+        let _ = std::fs::rename(path, old);
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    if let Ok(mut file) = options.open(path) {
+        let _ = writeln!(file, "{line}");
     }
 }
 
@@ -430,7 +441,6 @@ async fn handle(req: Request<Incoming>, st: &State) -> Response<RelayBody> {
             .get(SESSION_HEADER)
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
-        let model_name = model_of(&body);
         let status = rparts.status.as_u16();
         let headers: Vec<(String, String)> = rparts
             .headers
@@ -443,6 +453,7 @@ async fn handle(req: Request<Incoming>, st: &State) -> Response<RelayBody> {
             })
             .collect();
         let _ = tokio::task::spawn_blocking(move || {
+            let model_name = model_of(&body);
             events.response(
                 account,
                 session.as_deref(),
