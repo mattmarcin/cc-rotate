@@ -634,11 +634,6 @@ fn job(
     {
         return skipped("Anthropic asked to wait before the next check");
     }
-    // In relay mode the profile holds the home account's login, which a check must not touch.
-    let relay_home = relay::home(store)?;
-    if relay_home == Some(account_id) {
-        return skipped("it's the profile's login (relay mode's home account)");
-    }
     // A skip below is about this account: count it as an attempt, so the background moves on
     // to the next account instead of picking this one every minute.
     let attempted = |store: &Store, why: &str| -> Result<CheckOutcome> {
@@ -662,6 +657,13 @@ fn job(
         }
         Err(e) => return Err(e.into()),
     };
+    // In relay mode the profile holds the home account's login, which a check must not touch.
+    // Read under the lock, as the account below: `relay on` moves the home account's login into
+    // the profile under it, so a check that waited for the lock sees the account as home.
+    let relay_home = relay::home(store)?;
+    if relay_home == Some(account_id) {
+        return skipped("it's the profile's login (relay mode's home account)");
+    }
     if let Recovery::Busy(why) = recover(store, paths, account_id)? {
         return attempted(store, &why);
     }
@@ -2351,6 +2353,39 @@ mod tests {
         assert!(ran.get(), "the active account that is not home is checked");
         let never = |_: &Path| -> Result<Run> { panic!("Claude Code must not run") };
         let out = check_with(&e.store, &e.paths, home, Trigger::Manual, &never).unwrap();
+        let CheckOutcome::Skipped { why } = out else {
+            panic!("{out:?}")
+        };
+        assert_eq!(why, "it's the profile's login (relay mode's home account)");
+    }
+
+    /// `relay on` may make the account home while a renewal waits for its lock: the home check
+    /// is made under the lock, so the login just moved into the profile is never renewed.
+    #[test]
+    fn relay_home_read_under_the_account_lock() {
+        let e = env();
+        let other = account(&e, "a", "ua", AccountState::Parked);
+        let target = account(&e, "b", "ub", AccountState::Parked);
+        relay::set_mode(&e.store, Some(other)).unwrap();
+        let held = DirLock::acquire(
+            &e.paths.account_lock(target),
+            LockOptions::claude(Duration::ZERO),
+        )
+        .unwrap();
+        let db = e.paths.store_db();
+        let turn_on = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            relay::set_mode(&Store::open(&db).unwrap(), Some(target)).unwrap();
+            drop(held);
+        });
+        let ran = std::cell::Cell::new(false);
+        let run = |_: &Path| -> Result<Run> {
+            ran.set(true);
+            Ok(Run::default())
+        };
+        let out = check_with(&e.store, &e.paths, target, Trigger::Renew, &run).unwrap();
+        turn_on.join().unwrap();
+        assert!(!ran.get(), "the home account's login was renewed");
         let CheckOutcome::Skipped { why } = out else {
             panic!("{out:?}")
         };
