@@ -8,8 +8,9 @@
 //! once. Errors go to cc-rotate's log only.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+use std::time::{Duration, Instant};
 
 use ccr_core::desktop;
 
@@ -36,11 +37,45 @@ pub fn run(profile: Option<PathBuf>, command: Vec<OsString>) -> ExitCode {
                 if let Some(dir) = &plan.config_dir {
                     cmd.env("CLAUDE_CONFIG_DIR", dir);
                 }
+                if cfg!(unix) && plan.config_dir.as_deref() == Some(rotate.as_path()) {
+                    // A new session has no transcript yet: it appears with the first message,
+                    // so the helper waits for it while this process (Claude Code, once
+                    // exec'd) runs.
+                    let watch = desktop::resumed_id(args).is_none().then(std::process::id);
+                    let app = desktop::app_profile(var, &home);
+                    if let Err(e) = process::spawn_link_transcripts(&rotate, &app, watch) {
+                        process::log_error("desktop-launch", &e);
+                    }
+                }
             }
             Err(e) => process::log_error("desktop-launch", &e),
         }
     }
     start(cmd)
+}
+
+/// How often, and for how long at most, `link_transcripts` looks for a new session's transcript.
+const LINK_POLL: Duration = Duration::from_secs(2);
+const LINK_WATCH_MAX: Duration = Duration::from_secs(60 * 60);
+
+/// `cc-rotate-ctl desktop-link-transcripts`: link the pool's desktop transcripts into the app's
+/// profile (`ccr_core::desktop::link_app_transcripts`); with `watch_pid`, keep looking while
+/// that process runs, until something new is linked or an hour has passed.
+pub fn link_transcripts(profile: Option<PathBuf>, app_profile: &Path, watch_pid: Option<u32>) {
+    let rotate = match ccr_core::resolve_profile_read_only(profile) {
+        Ok(rotate) => rotate,
+        Err(e) => return process::log_error("desktop-link-transcripts", &e),
+    };
+    // What this first sweep links is older sessions'; a new session's comes later.
+    desktop::link_app_transcripts(&rotate, app_profile);
+    let Some(pid) = watch_pid else { return };
+    let start = Instant::now();
+    while start.elapsed() < LINK_WATCH_MAX && ccr_core::process::alive(pid) {
+        std::thread::sleep(LINK_POLL);
+        if !desktop::link_app_transcripts(&rotate, app_profile).is_empty() {
+            return;
+        }
+    }
 }
 
 /// Replace this process with Claude Code, so signals and the exit code are its own.

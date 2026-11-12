@@ -53,10 +53,7 @@ pub fn plan_launch(
     // A session started before desktop sessions moved to the pool stays in its profile, so the
     // app can still resume it. CLAUDE_CONFIG_DIR is then left exactly as the app set it (or
     // unset), so Claude Code finds that profile's login in the same Keychain item as before.
-    let app_profile = var("CLAUDE_CONFIG_DIR")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".claude"));
+    let app_profile = app_profile(&var, home);
     let config_dir = match resumed_id(args) {
         Some(id) if !has_transcript(rotate_profile, &id) && has_transcript(&app_profile, &id) => {
             None
@@ -97,6 +94,99 @@ pub fn resumed_id(args: &[OsString]) -> Option<String> {
         }
     }
     None
+}
+
+/// The profile the app started a session in: `CLAUDE_CONFIG_DIR` as the app set it, or
+/// `~/.claude`.
+pub fn app_profile(var: impl Fn(&str) -> Option<OsString>, home: &Path) -> PathBuf {
+    var("CLAUDE_CONFIG_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".claude"))
+}
+
+/// How much of a transcript is read to find where its session was started.
+const ENTRYPOINT_HEAD: u64 = 64 * 1024;
+
+/// Link, into the app's profile, the transcripts of desktop sessions that ran on the pool, and
+/// return the links made.
+///
+/// The app looks for a session's transcript only in its own profile
+/// (`projects/<folder>/<id>.jsonl`). A session that runs on the pool writes it in the pool
+/// profile, so once the app restarts (after an update, say) it finds nothing there and shows
+/// the session as "not found on disk". A link at the same place, to the pool's file, lets it
+/// read the history while the session keeps running on the pool: `plan_launch` resumes a
+/// session on the pool whenever the pool holds its transcript. The session's folder of
+/// subagent transcripts and tool results (`<id>/`) is linked with it.
+///
+/// Only transcripts whose session the app started (`"entrypoint":"claude-desktop"`) are linked,
+/// and nothing already at a link's place is touched. Errors leave a transcript for the next
+/// sweep.
+pub fn link_app_transcripts(rotate_profile: &Path, app_profile: &Path) -> Vec<PathBuf> {
+    let mut linked = Vec::new();
+    #[cfg(unix)]
+    {
+        let same = match (
+            dunce::canonicalize(rotate_profile),
+            dunce::canonicalize(app_profile),
+        ) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => rotate_profile == app_profile,
+        };
+        if same {
+            return linked;
+        }
+        let Ok(folders) = std::fs::read_dir(rotate_profile.join("projects")) else {
+            return linked;
+        };
+        for folder in folders.flatten() {
+            let Ok(files) = std::fs::read_dir(folder.path()) else {
+                continue;
+            };
+            let app_folder = app_profile.join("projects").join(folder.file_name());
+            for file in files.flatten() {
+                let path = file.path();
+                let is_transcript = path.extension().is_some_and(|e| e == "jsonl")
+                    && file.file_type().is_ok_and(|t| t.is_file());
+                if !is_transcript {
+                    continue;
+                }
+                let link = app_folder.join(file.file_name());
+                if std::fs::symlink_metadata(&link).is_ok() || !started_by_the_app(&path) {
+                    continue;
+                }
+                if std::fs::create_dir_all(&app_folder).is_err()
+                    || std::os::unix::fs::symlink(&path, &link).is_err()
+                {
+                    continue;
+                }
+                let dir = path.with_extension("");
+                let dir_link = link.with_extension("");
+                if dir.is_dir() && std::fs::symlink_metadata(&dir_link).is_err() {
+                    let _ = std::os::unix::fs::symlink(&dir, &dir_link);
+                }
+                linked.push(link);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (rotate_profile, app_profile, ENTRYPOINT_HEAD);
+    linked
+}
+
+/// Whether the session of the transcript at `path` was started by the desktop app.
+#[cfg(unix)]
+fn started_by_the_app(path: &Path) -> bool {
+    use std::io::Read;
+    let mut head = Vec::new();
+    let read =
+        std::fs::File::open(path).and_then(|f| f.take(ENTRYPOINT_HEAD).read_to_end(&mut head));
+    if read.is_err() {
+        return false;
+    }
+    let head = String::from_utf8_lossy(&head);
+    head.find("\"entrypoint\":\"")
+        .is_some_and(|at| head[at..].starts_with("\"entrypoint\":\"claude-desktop\""))
 }
 
 // ---- Turning it on and off (spec section 24.2) ------------------------------------------------
@@ -1116,5 +1206,102 @@ mod setup_tests {
         let s = setup(Platform::Unsupported, Policy::Off, Launcher::None);
         assert!(on_commands(&s, Path::new("/x")).is_empty());
         assert!(off_commands(&s).is_empty());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod link_tests {
+    use super::*;
+
+    const FOLDER: &str = "-Users-me-project";
+
+    fn pool_transcript(rotate: &Path, id: &str, first_line: &str) -> PathBuf {
+        let dir = rotate.join("projects").join(FOLDER);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(format!("{id}.jsonl"));
+        std::fs::write(&file, format!("{first_line}\n")).unwrap();
+        file
+    }
+
+    const DESKTOP_LINE: &str =
+        r#"{"type":"user","entrypoint":"claude-desktop","sessionId":"x","message":{}}"#;
+
+    #[test]
+    fn a_desktop_transcript_on_the_pool_is_linked_into_the_app_profile() {
+        let root = tempfile::tempdir().unwrap();
+        let (rotate, app) = (root.path().join("rotate"), root.path().join("app"));
+        let file = pool_transcript(&rotate, "abc", DESKTOP_LINE);
+        // Its subagents' transcripts and tool results.
+        std::fs::create_dir_all(file.with_extension("").join("subagents")).unwrap();
+
+        let linked = link_app_transcripts(&rotate, &app);
+
+        let link = app.join("projects").join(FOLDER).join("abc.jsonl");
+        assert_eq!(linked, vec![link.clone()]);
+        assert_eq!(std::fs::read_link(&link).unwrap(), file);
+        assert_eq!(
+            std::fs::read_link(app.join("projects").join(FOLDER).join("abc")).unwrap(),
+            file.with_extension("")
+        );
+        // What the session writes later shows through the link.
+        std::fs::write(&file, "more\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "more\n");
+
+        // Done once: a second sweep links nothing.
+        assert!(link_app_transcripts(&rotate, &app).is_empty());
+    }
+
+    #[test]
+    fn only_desktop_sessions_are_linked() {
+        let root = tempfile::tempdir().unwrap();
+        let (rotate, app) = (root.path().join("rotate"), root.path().join("app"));
+        pool_transcript(&rotate, "cli", r#"{"type":"user","entrypoint":"cli"}"#);
+        // Nothing yet tells where it was started: looked at again on the next sweep.
+        pool_transcript(&rotate, "fresh", r#"{"type":"queue-operation"}"#);
+
+        assert!(link_app_transcripts(&rotate, &app).is_empty());
+        assert!(!app.join("projects").join(FOLDER).exists());
+    }
+
+    #[test]
+    fn a_transcript_already_in_the_app_profile_is_left_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let (rotate, app) = (root.path().join("rotate"), root.path().join("app"));
+        pool_transcript(&rotate, "abc", DESKTOP_LINE);
+        let own = app.join("projects").join(FOLDER).join("abc.jsonl");
+        std::fs::create_dir_all(own.parent().unwrap()).unwrap();
+        std::fs::write(&own, "the app's own copy\n").unwrap();
+
+        assert!(link_app_transcripts(&rotate, &app).is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&own).unwrap(),
+            "the app's own copy\n"
+        );
+        assert!(!std::fs::symlink_metadata(&own).unwrap().is_symlink());
+    }
+
+    #[test]
+    fn nothing_is_linked_when_the_app_uses_the_pool_profile() {
+        let root = tempfile::tempdir().unwrap();
+        let rotate = root.path().join("rotate");
+        pool_transcript(&rotate, "abc", DESKTOP_LINE);
+        assert!(link_app_transcripts(&rotate, &rotate).is_empty());
+        assert!(
+            link_app_transcripts(&root.path().join("none"), &root.path().join("app")).is_empty()
+        );
+    }
+
+    #[test]
+    fn the_app_profile_is_its_config_dir_or_dot_claude() {
+        let home = Path::new("/home/me");
+        assert_eq!(app_profile(|_| None, home), home.join(".claude"));
+        assert_eq!(
+            app_profile(|_| Some(OsString::new()), home),
+            home.join(".claude")
+        );
+        assert_eq!(
+            app_profile(|_| Some(OsString::from("/elsewhere")), home),
+            PathBuf::from("/elsewhere")
+        );
     }
 }

@@ -265,6 +265,17 @@ enum Command {
         #[arg(last = true, required = true, value_parser = clap::value_parser!(std::ffi::OsString))]
         command: Vec<std::ffi::OsString>,
     },
+    /// Link the transcripts of desktop sessions on the pool into the app's profile, so the app
+    /// finds them after it restarts (started in the background by `desktop-launch`). With
+    /// `--watch-pid`, keep looking while that Claude Code runs, until its new transcript is
+    /// linked.
+    #[command(hide = true)]
+    DesktopLinkTranscripts {
+        #[arg(long, value_name = "DIR")]
+        app_profile: PathBuf,
+        #[arg(long, value_name = "PID")]
+        watch_pid: Option<u32>,
+    },
     /// Tell herdr how to resume a session (started in the background by `hook session-start`).
     #[command(hide = true)]
     HerdrReport {
@@ -323,6 +334,13 @@ fn run(cli: Cli) -> Result<ExitCode> {
         }
         // Starts Claude Code for the desktop app: nothing here may write to the store.
         Command::DesktopLaunch { command } => Ok(desktop_launch::run(cli.profile, command)),
+        Command::DesktopLinkTranscripts {
+            app_profile,
+            watch_pid,
+        } => {
+            desktop_launch::link_transcripts(cli.profile, &app_profile, watch_pid);
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Statusline { observe, then } => {
             statusline_entry(cli.profile, observe, then);
             Ok(ExitCode::SUCCESS)
@@ -683,6 +701,7 @@ fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> 
         | Command::Hook { .. }
         | Command::HerdrReport { .. }
         | Command::DesktopLaunch { .. }
+        | Command::DesktopLinkTranscripts { .. }
         | Command::Desktop { .. }
         | Command::Uninstall { .. } => {
             unreachable!()

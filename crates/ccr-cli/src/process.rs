@@ -81,6 +81,28 @@ pub fn spawn_herdr_report(pane_id: &str, session_id: &str, seq: u64) -> Result<(
     )
 }
 
+/// Start `cc-rotate-ctl desktop-link-transcripts` in the background for a desktop session on
+/// the pool, so the launcher starts Claude Code at once.
+pub fn spawn_link_transcripts(
+    rotate: &std::path::Path,
+    app_profile: &std::path::Path,
+    watch_pid: Option<u32>,
+) -> Result<()> {
+    spawn_ctl(
+        |cmd| {
+            cmd.arg("--profile")
+                .arg(rotate)
+                .arg("desktop-link-transcripts")
+                .arg("--app-profile")
+                .arg(app_profile);
+            if let Some(pid) = watch_pid {
+                cmd.args(["--watch-pid", &pid.to_string()]);
+            }
+        },
+        "starting the background transcript links",
+    )
+}
+
 /// Start this executable in the background with the arguments `args` adds.
 /// It must outlive the statusline or hook process that starts it, so it leaves Claude Code's job
 /// object if allowed (Windows) or its process group (Unix), and a signal sent to that process's
