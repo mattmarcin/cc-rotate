@@ -41,6 +41,19 @@ pub fn profile_account(store: &Store) -> Result<Option<Account>> {
     }
 }
 
+/// Refuse to remove the home account while relay mode is on: the profile keeps its login, and
+/// removing the account would delete the saved copy and leave the mode naming an account that
+/// no longer exists. Every path that removes an account goes through this.
+pub fn refuse_removal(store: &Store, account: &Account) -> Result<()> {
+    if home(store)? == Some(account.id) {
+        anyhow::bail!(
+            "{} is the app account. Make another account the app account (cc-rotate-ctl app-account <account>) or turn it off (cc-rotate-ctl app-account off) first.",
+            account.label
+        );
+    }
+    Ok(())
+}
+
 /// Turn relay mode on with `home` as the home account, or off with `None`.
 ///
 /// Both settings are written in one transaction, straight to the table: neither is a setting

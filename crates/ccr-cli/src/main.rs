@@ -597,6 +597,8 @@ fn dispatch(
             if a.state == AccountState::Active {
                 bail!("{} is in use. Swap to another account first.", a.label);
             }
+            // Before asking for --yes: there is nothing to confirm.
+            ccr_core::relay::refuse_removal(store, &a)?;
             if !yes {
                 bail!(
                     "This removes {} and its saved login. Run again with --yes to confirm.",

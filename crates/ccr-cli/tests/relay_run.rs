@@ -304,6 +304,63 @@ fn app_account_refuses_an_account_that_cannot_be_it() {
     );
 }
 
+/// Removing the app account would delete the login the profile keeps: `remove` refuses it,
+/// before asking for `--yes`, and allows it once another account is the app account or it is off.
+#[test]
+fn remove_refuses_the_app_account() {
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join("data");
+    let (a, c) = {
+        let store = ccr_core::Store::open(&data.join("store.db")).unwrap();
+        let add = |label: &str, state| {
+            store
+                .insert_account(label, &ccr_core::store::AccountIdentity::default(), state)
+                .unwrap()
+        };
+        let a = add("a", ccr_core::store::AccountState::Parked);
+        add("b", ccr_core::store::AccountState::Active);
+        let c = add("c", ccr_core::store::AccountState::Parked);
+        ccr_core::relay::set_mode(&store, Some(a)).unwrap();
+        (a, c)
+    };
+    let refusal = "a is the app account. Make another account the app account (cc-rotate-ctl app-account <account>) or turn it off (cc-rotate-ctl app-account off) first.";
+    for args in [&["remove", "a"][..], &["remove", "a", "--yes"][..]] {
+        let out = ctl(&data, args);
+        assert!(!out.status.success(), "{args:?}: {out:?}");
+        let err = String::from_utf8(out.stderr).unwrap();
+        assert!(err.contains(refusal), "{args:?}: {err}");
+        assert!(!err.contains('\u{2014}'), "no em dashes: {err}");
+    }
+    let exists = |id| {
+        ccr_core::Store::open(&data.join("store.db"))
+            .unwrap()
+            .account(id)
+            .unwrap()
+            .is_some()
+    };
+    assert!(exists(a));
+
+    // Another account is the app account.
+    ccr_core::relay::set_mode(
+        &ccr_core::Store::open(&data.join("store.db")).unwrap(),
+        Some(c),
+    )
+    .unwrap();
+    let out = ctl(&data, &["remove", "a", "--yes"]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(!exists(a));
+
+    // The app account is off.
+    ccr_core::relay::set_mode(
+        &ccr_core::Store::open(&data.join("store.db")).unwrap(),
+        None,
+    )
+    .unwrap();
+    let out = ctl(&data, &["remove", "c", "--yes"]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(!exists(c));
+}
+
 #[test]
 fn a_relay_the_service_started_waits_for_the_lock_and_then_serves() {
     let root = tempfile::tempdir().unwrap();

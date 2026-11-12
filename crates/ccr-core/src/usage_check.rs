@@ -1282,6 +1282,10 @@ pub fn remove_account(store: &Store, paths: &Paths, account_id: i64) -> Result<(
     let wait = Duration::from_millis(store.settings()?.lock_timeout_ms) + JOB_TIMEOUT;
     let _lock = DirLock::acquire(&paths.account_lock(account_id), LockOptions::claude(wait))
         .context("waiting for a usage check of the account to finish")?;
+    // Under the lock, so a mode change that made it the app account meanwhile is seen.
+    if let Some(account) = store.account(account_id)? {
+        crate::relay::refuse_removal(store, &account)?;
+    }
     let dirs = scratch_dirs(paths, &format!("{SCRATCH_PREFIX}{account_id}-"));
     if dirs.iter().any(|d| running(d)) {
         bail!("A usage check of this account is running. Try again in a minute.");
@@ -2629,6 +2633,37 @@ mod tests {
         assert!(e.store.account(a).unwrap().is_none());
         assert!(!dir.exists());
         assert_eq!(state(&e.store, a).unwrap(), CheckState::default());
+    }
+
+    #[test]
+    fn removing_the_app_account_is_refused() {
+        let e = env();
+        let a = account(&e, "a", "ua", AccountState::Parked);
+        account(&e, "b", "ub", AccountState::Active);
+        crate::relay::set_mode(&e.store, Some(a)).unwrap();
+        let err = remove_account(&e.store, &e.paths, a).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "a is the app account. Make another account the app account (cc-rotate-ctl app-account <account>) or turn it off (cc-rotate-ctl app-account off) first."
+        );
+        assert!(e.store.account(a).unwrap().is_some());
+        assert!(e.store.credential(a).unwrap().is_some());
+    }
+
+    #[test]
+    fn removing_a_former_app_account_works() {
+        let e = env();
+        let a = account(&e, "a", "ua", AccountState::Parked);
+        let c = account(&e, "c", "uc", AccountState::Parked);
+        account(&e, "b", "ub", AccountState::Active);
+        // Another account became the app account.
+        crate::relay::set_mode(&e.store, Some(c)).unwrap();
+        remove_account(&e.store, &e.paths, a).unwrap();
+        assert!(e.store.account(a).unwrap().is_none());
+        // The app account is off.
+        crate::relay::set_mode(&e.store, None).unwrap();
+        remove_account(&e.store, &e.paths, c).unwrap();
+        assert!(e.store.account(c).unwrap().is_none());
     }
 
     #[test]
