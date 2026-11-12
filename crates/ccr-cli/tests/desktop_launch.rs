@@ -306,9 +306,13 @@ fn a_new_sessions_transcript_is_linked_into_the_app_profile() {
 
     let folder = root.path().join("app profile/projects/-Users-me-project");
     let pool = profile.join("projects/-Users-me-project");
+    // A hard link: the app refuses a transcript that is a symlink.
+    use std::os::unix::fs::MetadataExt;
+    let link = std::fs::symlink_metadata(folder.join("new-id.jsonl")).unwrap();
+    assert!(link.file_type().is_file());
     assert_eq!(
-        std::fs::read_link(folder.join("new-id.jsonl")).unwrap(),
-        pool.join("new-id.jsonl")
+        link.ino(),
+        std::fs::metadata(pool.join("new-id.jsonl")).unwrap().ino()
     );
     assert_eq!(
         std::fs::read_link(folder.join("new-id")).unwrap(),

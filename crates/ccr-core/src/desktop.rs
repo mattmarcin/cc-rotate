@@ -114,10 +114,11 @@ const ENTRYPOINT_HEAD: u64 = 64 * 1024;
 /// The app looks for a session's transcript only in its own profile
 /// (`projects/<folder>/<id>.jsonl`). A session that runs on the pool writes it in the pool
 /// profile, so once the app restarts (after an update, say) it finds nothing there and shows
-/// the session as "not found on disk". A link at the same place, to the pool's file, lets it
-/// read the history while the session keeps running on the pool: `plan_launch` resumes a
-/// session on the pool whenever the pool holds its transcript. The session's folder of
-/// subagent transcripts and tool results (`<id>/`) is linked with it.
+/// the session as "not found on disk". A hard link at the same place, to the pool's file, lets
+/// it read the history while the session keeps running on the pool: `plan_launch` resumes a
+/// session on the pool whenever the pool holds its transcript. (The app refuses a transcript
+/// that is a symlink; both profiles live under the home folder, so one volume.) The session's
+/// folder of subagent transcripts and tool results (`<id>/`) is symlinked with it.
 ///
 /// Only transcripts whose session the app started (`"entrypoint":"claude-desktop"`) are linked,
 /// and nothing already at a link's place is touched. Errors leave a transcript for the next
@@ -152,11 +153,17 @@ pub fn link_app_transcripts(rotate_profile: &Path, app_profile: &Path) -> Vec<Pa
                     continue;
                 }
                 let link = app_folder.join(file.file_name());
-                if std::fs::symlink_metadata(&link).is_ok() || !started_by_the_app(&path) {
+                // Earlier builds made a symlink, which the app now refuses to read: such a
+                // link to this transcript is replaced.
+                let ours = std::fs::read_link(&link).is_ok_and(|to| to == path);
+                if (!ours && std::fs::symlink_metadata(&link).is_ok())
+                    || !started_by_the_app(&path)
+                {
                     continue;
                 }
                 if std::fs::create_dir_all(&app_folder).is_err()
-                    || std::os::unix::fs::symlink(&path, &link).is_err()
+                    || (ours && std::fs::remove_file(&link).is_err())
+                    || std::fs::hard_link(&path, &link).is_err()
                 {
                     continue;
                 }
@@ -1238,7 +1245,8 @@ mod link_tests {
 
         let link = app.join("projects").join(FOLDER).join("abc.jsonl");
         assert_eq!(linked, vec![link.clone()]);
-        assert_eq!(std::fs::read_link(&link).unwrap(), file);
+        // A hard link: the app refuses a transcript that is a symlink.
+        assert_same_file(&link, &file);
         assert_eq!(
             std::fs::read_link(app.join("projects").join(FOLDER).join("abc")).unwrap(),
             file.with_extension("")
@@ -1249,6 +1257,41 @@ mod link_tests {
 
         // Done once: a second sweep links nothing.
         assert!(link_app_transcripts(&rotate, &app).is_empty());
+    }
+
+    fn assert_same_file(link: &Path, file: &Path) {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::symlink_metadata(link).unwrap();
+        assert!(meta.file_type().is_file(), "{link:?} is not a regular file");
+        assert_eq!(meta.ino(), std::fs::metadata(file).unwrap().ino());
+    }
+
+    #[test]
+    fn a_symlink_left_by_an_earlier_build_becomes_a_hard_link() {
+        let root = tempfile::tempdir().unwrap();
+        let (rotate, app) = (root.path().join("rotate"), root.path().join("app"));
+        let file = pool_transcript(&rotate, "abc", DESKTOP_LINE);
+        let link = app.join("projects").join(FOLDER).join("abc.jsonl");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+
+        assert_eq!(link_app_transcripts(&rotate, &app), vec![link.clone()]);
+        assert_same_file(&link, &file);
+    }
+
+    #[test]
+    fn a_symlink_to_something_else_is_left_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let (rotate, app) = (root.path().join("rotate"), root.path().join("app"));
+        pool_transcript(&rotate, "abc", DESKTOP_LINE);
+        let elsewhere = root.path().join("elsewhere.jsonl");
+        std::fs::write(&elsewhere, "x\n").unwrap();
+        let link = app.join("projects").join(FOLDER).join("abc.jsonl");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+
+        assert!(link_app_transcripts(&rotate, &app).is_empty());
+        assert_eq!(std::fs::read_link(&link).unwrap(), elsewhere);
     }
 
     #[test]
