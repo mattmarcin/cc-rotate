@@ -134,16 +134,18 @@ pub fn systemd_unit(ctl: &Path, env: &[(&str, String)]) -> String {
     out
 }
 
-/// The Task Scheduler task: `cc-rotate-ctl relay run` at the user's logon, restarted every
+/// The Task Scheduler task: `cc-rotate-ctl relay run` at `user`'s logon, restarted every
 /// minute after it fails.
+/// The logon trigger names `user` (`DOMAIN\name`): one without a user fires at any user's logon,
+/// and only an administrator may create that.
 /// A task cannot set environment variables, so on Windows the relay finds the store and profile
 /// as other commands do.
-pub fn task_xml(ctl: &Path) -> String {
+pub fn task_xml(ctl: &Path, user: &str) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n\
          <Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n\
          \x20 <RegistrationInfo>\n    <Description>cc-rotate local proxy (app account)</Description>\n  </RegistrationInfo>\n\
-         \x20 <Triggers>\n    <LogonTrigger>\n      <Enabled>true</Enabled>\n    </LogonTrigger>\n  </Triggers>\n\
+         \x20 <Triggers>\n    <LogonTrigger>\n      <Enabled>true</Enabled>\n      <UserId>{}</UserId>\n    </LogonTrigger>\n  </Triggers>\n\
          \x20 <Principals>\n    <Principal id=\"Author\">\n      <LogonType>InteractiveToken</LogonType>\n      <RunLevel>LeastPrivilege</RunLevel>\n    </Principal>\n  </Principals>\n\
          \x20 <Settings>\n\
          \x20   <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n\
@@ -154,7 +156,27 @@ pub fn task_xml(ctl: &Path) -> String {
          \x20 </Settings>\n\
          \x20 <Actions Context=\"Author\">\n    <Exec>\n      <Command>{}</Command>\n      <Arguments>relay run</Arguments>\n    </Exec>\n  </Actions>\n\
          </Task>\n",
+        xml_escape(user),
         xml_escape(&ctl.to_string_lossy())
+    )
+}
+
+/// The user running this, as Task Scheduler names them: `DOMAIN\name`, or `name` alone where
+/// Windows sets no domain. Tests, which run the Task Scheduler code on every platform, get a
+/// fixed one.
+fn windows_user() -> Result<String> {
+    if cfg!(test) {
+        return Ok(r"PC\tester".to_string());
+    }
+    let name = std::env::var("USERNAME")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .context("USERNAME is not set, so the local proxy's task cannot name its user")?;
+    Ok(
+        match std::env::var("USERDOMAIN").ok().filter(|v| !v.is_empty()) {
+            Some(domain) => format!("{domain}\\{name}"),
+            None => name,
+        },
     )
 }
 
@@ -427,7 +449,7 @@ impl Service {
                 let file = self.file();
                 // Task Scheduler reads its definitions as UTF-16.
                 let mut bytes = vec![0xFF, 0xFE];
-                for unit in task_xml(ctl).encode_utf16() {
+                for unit in task_xml(ctl, &windows_user()?).encode_utf16() {
                     bytes.extend_from_slice(&unit.to_le_bytes());
                 }
                 self.write(&file, &bytes)?;
@@ -769,8 +791,14 @@ mod tests {
     #[test]
     fn task_text() {
         let ctl = Path::new(r"C:\Users\me\bin\cc-rotate-ctl.exe");
-        let xml = task_xml(ctl);
-        assert!(xml.contains("<LogonTrigger>"), "{xml}");
+        let xml = task_xml(ctl, r"PC\me & you");
+        // A logon trigger without a user needs an administrator to create it.
+        assert!(
+            xml.contains(
+                "<LogonTrigger>\n      <Enabled>true</Enabled>\n      <UserId>PC\\me &amp; you</UserId>\n    </LogonTrigger>"
+            ),
+            "{xml}"
+        );
         assert!(
             xml.contains("<RestartOnFailure>\n      <Interval>PT1M</Interval>"),
             "{xml}"
