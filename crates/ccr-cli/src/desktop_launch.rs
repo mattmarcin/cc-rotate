@@ -30,6 +30,12 @@ pub fn run(profile: Option<PathBuf>, command: Vec<OsString>) -> ExitCode {
             .and_then(|rotate| Ok((rotate, ccr_core::paths::home_dir()?)));
         match resolved {
             Ok((rotate, home)) => {
+                let app = desktop::app_profile(var, &home);
+                // A session only the app's profile holds (one it forked, say) would run on that
+                // profile's own login, out of the rotation's reach.
+                if let Some(id) = desktop::resumed_id(args) {
+                    desktop::adopt_app_transcript(&id, &rotate, &app);
+                }
                 let plan = desktop::plan_launch(args, var, &rotate, &home);
                 for name in &plan.remove {
                     cmd.env_remove(name);
@@ -40,9 +46,9 @@ pub fn run(profile: Option<PathBuf>, command: Vec<OsString>) -> ExitCode {
                 if cfg!(unix) && plan.config_dir.as_deref() == Some(rotate.as_path()) {
                     // A new session has no transcript yet: it appears with the first message,
                     // so the helper waits for it while this process (Claude Code, once
-                    // exec'd) runs.
-                    let watch = desktop::resumed_id(args).is_none().then(std::process::id);
-                    let app = desktop::app_profile(var, &home);
+                    // exec'd) runs. A resumed one may get a new id, and with it a new
+                    // transcript, the same way.
+                    let watch = Some(std::process::id());
                     if let Err(e) = process::spawn_link_transcripts(&rotate, &app, watch) {
                         process::log_error("desktop-launch", &e);
                     }

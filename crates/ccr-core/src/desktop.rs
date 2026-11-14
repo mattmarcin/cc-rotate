@@ -50,9 +50,10 @@ pub fn plan_launch(
             remove: Vec::new(),
         };
     }
-    // A session started before desktop sessions moved to the pool stays in its profile, so the
-    // app can still resume it. CLAUDE_CONFIG_DIR is then left exactly as the app set it (or
-    // unset), so Claude Code finds that profile's login in the same Keychain item as before.
+    // A session only the app's profile holds runs there, so the app can still resume it: one
+    // `adopt_app_transcript` could not bring onto the pool (it was not started by the app, or
+    // the link failed). CLAUDE_CONFIG_DIR is then left exactly as the app set it (or unset), so
+    // Claude Code finds that profile's login in the same Keychain item as before.
     let app_profile = app_profile(&var, home);
     let config_dir = match resumed_id(args) {
         Some(id) if !has_transcript(rotate_profile, &id) && has_transcript(&app_profile, &id) => {
@@ -69,15 +70,76 @@ pub fn plan_launch(
 /// Whether `profile` holds the transcript of session `id` (`projects/<folder>/<id>.jsonl`).
 /// An id that could name another path is never looked up.
 fn has_transcript(profile: &Path, id: &str) -> bool {
+    find_transcript(profile, id).is_some()
+}
+
+/// Where `profile` holds the transcript of session `id`, if it does.
+fn find_transcript(profile: &Path, id: &str) -> Option<PathBuf> {
     if id.is_empty() || id.contains(['/', '\\']) || id.contains("..") {
-        return false;
+        return None;
     }
     let file = format!("{id}.jsonl");
     std::fs::read_dir(profile.join("projects"))
         .into_iter()
         .flatten()
         .flatten()
-        .any(|folder| folder.path().join(&file).is_file())
+        .map(|folder| folder.path().join(&file))
+        .find(|path| path.is_file())
+}
+
+/// Bring a desktop session that only the app's profile holds onto the pool, and return the
+/// pool's new transcript.
+///
+/// The app writes some sessions' transcripts into its own profile even after desktop sessions
+/// moved to the pool: a session forked from another one, or started before the move. Resumed
+/// there, such a session would run on that profile's own login, where no swap reaches it, and
+/// stop at that account's limit. A hard link at the same place in the pool (the
+/// `link_app_transcripts` link the other way round) makes `plan_launch` resume it on the pool,
+/// while the app keeps reading the same file. Its folder (`<id>/`) is symlinked with it.
+///
+/// Only a session the app started (`"entrypoint":"claude-desktop"`) is brought over, and
+/// nothing already in the pool is touched. `None` when there is nothing to do or the link
+/// failed: the session then stays in the app's profile.
+pub fn adopt_app_transcript(
+    id: &str,
+    rotate_profile: &Path,
+    app_profile: &Path,
+) -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        if same_profile(rotate_profile, app_profile) || has_transcript(rotate_profile, id) {
+            return None;
+        }
+        let file = find_transcript(app_profile, id)?;
+        if !started_by_the_app(&file) {
+            return None;
+        }
+        let folder = rotate_profile
+            .join("projects")
+            .join(file.parent()?.file_name()?);
+        let link = folder.join(file.file_name()?);
+        std::fs::create_dir_all(&folder).ok()?;
+        std::fs::hard_link(&file, &link).ok()?;
+        let dir = file.with_extension("");
+        let dir_link = link.with_extension("");
+        if dir.is_dir() && std::fs::symlink_metadata(&dir_link).is_err() {
+            let _ = std::os::unix::fs::symlink(&dir, &dir_link);
+        }
+        Some(link)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (id, rotate_profile, app_profile);
+        None
+    }
+}
+
+/// Whether the two profiles are one folder.
+fn same_profile(a: &Path, b: &Path) -> bool {
+    match (dunce::canonicalize(a), dunce::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
 }
 
 /// The session id that `--resume <id>` or `--resume=<id>` names, if any.
@@ -127,14 +189,7 @@ pub fn link_app_transcripts(rotate_profile: &Path, app_profile: &Path) -> Vec<Pa
     let mut linked = Vec::new();
     #[cfg(unix)]
     {
-        let same = match (
-            dunce::canonicalize(rotate_profile),
-            dunce::canonicalize(app_profile),
-        ) {
-            (Ok(a), Ok(b)) => a == b,
-            _ => rotate_profile == app_profile,
-        };
-        if same {
+        if same_profile(rotate_profile, app_profile) {
             return linked;
         }
         let Ok(folders) = std::fs::read_dir(rotate_profile.join("projects")) else {
@@ -156,8 +211,7 @@ pub fn link_app_transcripts(rotate_profile: &Path, app_profile: &Path) -> Vec<Pa
                 // Earlier builds made a symlink, which the app now refuses to read: such a
                 // link to this transcript is replaced.
                 let ours = std::fs::read_link(&link).is_ok_and(|to| to == path);
-                if (!ours && std::fs::symlink_metadata(&link).is_ok())
-                    || !started_by_the_app(&path)
+                if (!ours && std::fs::symlink_metadata(&link).is_ok()) || !started_by_the_app(&path)
                 {
                     continue;
                 }
@@ -1332,6 +1386,52 @@ mod link_tests {
         assert!(
             link_app_transcripts(&root.path().join("none"), &root.path().join("app")).is_empty()
         );
+    }
+
+    fn app_transcript(app: &Path, id: &str, first_line: &str) -> PathBuf {
+        pool_transcript(app, id, first_line)
+    }
+
+    #[test]
+    fn a_desktop_session_only_in_the_app_profile_is_brought_onto_the_pool() {
+        let root = tempfile::tempdir().unwrap();
+        let (rotate, app) = (root.path().join("rotate"), root.path().join("app"));
+        // A session the app forked writes its transcript only in its own profile.
+        let file = app_transcript(&app, "fork", DESKTOP_LINE);
+        std::fs::create_dir_all(file.with_extension("").join("subagents")).unwrap();
+
+        let adopted = adopt_app_transcript("fork", &rotate, &app);
+
+        let pool = rotate.join("projects").join(FOLDER).join("fork.jsonl");
+        assert_eq!(adopted, Some(pool.clone()));
+        // One file in both profiles: what the session writes on the pool shows in the app.
+        assert_same_file(&pool, &file);
+        assert_eq!(
+            std::fs::read_link(pool.with_extension("")).unwrap(),
+            file.with_extension("")
+        );
+        // The launch then resumes it on the pool.
+        assert!(has_transcript(&rotate, "fork"));
+        // Done once.
+        assert_eq!(adopt_app_transcript("fork", &rotate, &app), None);
+        // And the sweep back into the app's profile leaves the app's file alone.
+        assert!(link_app_transcripts(&rotate, &app).is_empty());
+        assert_same_file(&file, &pool);
+    }
+
+    #[test]
+    fn only_desktop_sessions_are_brought_onto_the_pool() {
+        let root = tempfile::tempdir().unwrap();
+        let (rotate, app) = (root.path().join("rotate"), root.path().join("app"));
+        app_transcript(&app, "cli", r#"{"type":"user","entrypoint":"cli"}"#);
+        app_transcript(&app, "unknown", "{}");
+        for id in ["cli", "unknown", "missing", "../x", ""] {
+            assert_eq!(adopt_app_transcript(id, &rotate, &app), None, "{id}");
+        }
+        assert!(!rotate.join("projects").exists());
+        // Nothing is adopted when the app already uses the pool profile.
+        app_transcript(&rotate, "own", DESKTOP_LINE);
+        assert_eq!(adopt_app_transcript("own", &rotate, &rotate), None);
     }
 
     #[test]

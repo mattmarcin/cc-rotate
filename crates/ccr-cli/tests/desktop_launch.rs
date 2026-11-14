@@ -285,6 +285,62 @@ fn a_resumed_older_session_keeps_the_apps_config_dir_unset() {
     }
 }
 
+/// Resuming a desktop session whose transcript only the app's profile holds (a forked session,
+/// say) brings it onto the pool: otherwise it runs on that profile's own login, which no swap
+/// reaches, and stops at that account's limit.
+#[cfg(unix)]
+#[test]
+fn a_resumed_desktop_session_only_in_the_app_profile_runs_on_the_pool() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let folder = home
+        .join(".claude")
+        .join("projects")
+        .join("-Users-me-project");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(
+        folder.join("fork-1.jsonl"),
+        "{\"type\":\"user\",\"entrypoint\":\"claude-desktop\"}\n",
+    )
+    .unwrap();
+    let profile = root.path().join("rotate profile");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_cc-rotate-ctl"));
+    cmd.args([
+        "desktop-launch",
+        "--",
+        "/bin/sh",
+        "-c",
+        "/usr/bin/env",
+        "sh",
+    ])
+    .args(["--resume", "fork-1"])
+    .current_dir(root.path())
+    .env("HOME", &home)
+    .env("CC_ROTATE_DATA_DIR", root.path().join("data"))
+    .env("CC_ROTATE_PROFILE", &profile)
+    .env_remove("CLAUDE_CONFIG_DIR")
+    .env("CLAUDE_CODE_ENTRYPOINT", "claude-desktop");
+    for name in REMOVED {
+        cmd.env(name, "1");
+    }
+    let out = cmd.output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let vars = parse(&out);
+    assert_eq!(
+        vars.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+        Some(profile.to_str().unwrap())
+    );
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(
+        std::fs::metadata(profile.join("projects/-Users-me-project/fork-1.jsonl"))
+            .unwrap()
+            .ino(),
+        std::fs::metadata(folder.join("fork-1.jsonl"))
+            .unwrap()
+            .ino()
+    );
+}
+
 /// A new desktop session's transcript, written once Claude Code has started, is linked into the
 /// app's profile, so the app still finds it after it restarts.
 #[cfg(unix)]
