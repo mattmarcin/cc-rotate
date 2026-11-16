@@ -99,6 +99,15 @@ let colorOf = (_id: number) => "";
 const fiveOf = (a: AccountView) => a.windows.find((w) => w.kind === "session" && w.model === null);
 const weekOf = (a: AccountView) => a.windows.find((w) => w.kind === "weekly" && w.model === null);
 /** Windows limited to one model, or of a kind cc-rotate does not know. */
+/**
+ * The weekly window on Fable. Until each account's next Fable request, the proxy's last Fable
+ * reading may still carry its old name (`7d_oi`, which only ever came back on Fable requests).
+ */
+const fableOf = (a: AccountView) =>
+  a.windows.find((w) => w.kind === "weekly" && w.model === "fable") ?? a.windows.find((w) => w.name === "seven_day_overage_included");
+/** "Fable weekly limit: 38% used, resets Thu 9:00 AM", for a tooltip. */
+const fableTitle = (w: WindowUsage) =>
+  `Fable weekly limit: ${pct(w.pct)} used${w.resets_at && w.resets_at * 1000 > Date.now() ? `, resets ${clock(w.resets_at * 1000)}` : ""}`;
 const otherWindows = (a: AccountView) => a.windows.filter((w) => w.model !== null || w.kind === "other");
 /** No weekly limit: the 5-hour window is what runs out. */
 const noWeekly = (a: AccountView) => a.weekly.effective === "none";
@@ -539,6 +548,7 @@ function renderNav() {
             const five = fiveOf(a);
             const left = a.state === "needs_login" ? 0 : five ? Math.max(0, 100 - five.pct) : 100;
             const st = sideState(a);
+            const fable = fableOf(a);
             return h(
               "li",
               { class: "side-acct", "data-id": a.id },
@@ -549,7 +559,7 @@ function renderNav() {
                   class: "side-link",
                   "data-focus": `acct-${a.id}`,
                   "aria-current": isAccount(a.id) ? "page" : null,
-                  title: a.email ?? a.label,
+                  title: [a.email ?? a.label, fable && fableTitle(fable)].filter(Boolean).join("\n"),
                   onclick: () => go({ page: "account", id: a.id }),
                 },
                 h("span", { class: "swatch", style: { background: colorOf(a.id) } }),
@@ -736,6 +746,7 @@ function planSection(snap: Snapshot): Child {
             ? h("button", { class: "row-action quiet", "data-focus": `row-${a.id}`, onclick: () => useNow(a), title: `Swap to ${a.label} now` }, "Use now")
             : null;
     const st = stateLine(a, next === a.id);
+    const fable = fableOf(a);
     return h(
       "li",
       { class: `plan-row${a.id === snap.active_id ? " is-active" : ""}`, "data-id": a.id, style: { "--c": colorOf(a.id) } },
@@ -746,7 +757,10 @@ function planSection(snap: Snapshot): Child {
         h(
           "button",
           { class: "plan-who", "data-focus": `plan-${a.id}`, title: a.reason ? `${a.rank ? `${ordinal(a.rank)} pick: ` : ""}${a.reason}` : null, onclick: () => go({ page: "account", id: a.id }) },
-          h("span", { class: "plan-name" }, h("span", { class: "swatch" }), a.label, a.plan && h("span", { class: "plan-tag" }, a.plan)),
+          h("span", { class: "plan-name" }, h("span", { class: "swatch" }), h("span", { class: "plan-label" }, a.label),
+            a.plan && h("span", { class: "plan-tag" }, a.plan),
+            fable && h("span", { class: `plan-fable${fable.pct >= fable.threshold ? " over" : ""}`, title: fableTitle(fable) }, `Fable ${pct(fable.pct)}`),
+          ),
           h("span", { class: `plan-state ${a.state === "needs_login" ? "danger" : ""}`.trim() }, st),
         ),
         action,

@@ -778,10 +778,40 @@ button {
   background: var(--c);
 }
 
+/* A full name line drops the plan, then shortens the name (`fitLabels`). */
+.plan-label {
+  flex: none;
+}
+
+.plan-name.tight .plan-label {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .plan-tag {
+  flex: none;
   font-size: 11.5px;
   font-weight: 500;
   color: var(--muted);
+}
+
+/* The account's Fable weekly usage, beside its plan. */
+.plan-fable {
+  flex: none;
+  padding: 0 5px;
+  border-radius: 4px;
+  background: var(--tank);
+  font-size: 11px;
+  font-weight: 560;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.plan-fable.over {
+  background: var(--amber-soft);
+  color: var(--amber);
 }
 
 .plan-state {

@@ -5,6 +5,7 @@
 //! The design is in `docs/specs/2026-11-10-relay-mode.md`, sections 5, 7 and 8.
 
 use crate::relay::RelayConfig;
+use crate::scheduler;
 use crate::store::SampleWindow;
 
 /// What the relay does with one request.
@@ -97,23 +98,35 @@ pub fn forward_response_header(name: &str) -> bool {
     !hop_or_length(&name.to_ascii_lowercase())
 }
 
-/// Claude Code's name for a window, from the name used in the rate-limit headers.
-pub fn window_name(header_window: &str) -> String {
+/// Claude Code's name for a window, from the name used in the rate-limit headers of a response
+/// to a request for `model`.
+///
+/// `7d_oi` is the weekly limit of the requested model's family: it comes back on every Fable
+/// request and on no other, at the percent and reset `/usage` shows as Fable's weekly limit.
+/// So it is named the way `/usage` names that limit (`seven_day_fable`), and counts only for
+/// that family. For a model cc-rotate does not know, it keeps the name it had.
+pub fn window_name(header_window: &str, model: Option<&str>) -> String {
     match header_window {
-        "5h" => "five_hour",
-        "7d" => "seven_day",
-        "7d_oi" => "seven_day_overage_included",
-        "overage" => "overage",
-        other => other,
+        "5h" => "five_hour".into(),
+        "7d" => "seven_day".into(),
+        "7d_oi" => match model.and_then(scheduler::model_family) {
+            Some(family) => format!("seven_day_{family}"),
+            None => "seven_day_overage_included".into(),
+        },
+        "overage" => "overage".into(),
+        other => other.into(),
     }
-    .to_string()
 }
 
 const UNIFIED: &str = "anthropic-ratelimit-unified-";
 
-/// The usage windows in a response's headers, in the order their utilization headers appear.
-/// A window needs a utilization that parses as a finite number; `pct` is that value times 100.
-pub fn readings<'a>(headers: impl IntoIterator<Item = (&'a str, &'a str)>) -> Vec<SampleWindow> {
+/// The usage windows in a response's headers, in the order their utilization headers appear,
+/// for a request for `model` (`window_name`). A window needs a utilization that parses as a
+/// finite number; `pct` is that value times 100.
+pub fn readings<'a>(
+    headers: impl IntoIterator<Item = (&'a str, &'a str)>,
+    model: Option<&str>,
+) -> Vec<SampleWindow> {
     let all: Vec<(String, &str)> = headers
         .into_iter()
         .map(|(k, v)| (k.to_ascii_lowercase(), v.trim()))
@@ -129,7 +142,7 @@ pub fn readings<'a>(headers: impl IntoIterator<Item = (&'a str, &'a str)>) -> Ve
         let Some(util) = value.parse::<f64>().ok().filter(|u| u.is_finite()) else {
             continue;
         };
-        let name = window_name(w);
+        let name = window_name(w, model);
         if out.iter().any(|x| x.name == name) {
             continue;
         }
@@ -340,11 +353,23 @@ mod tests {
 
     #[test]
     fn window_names() {
-        assert_eq!(window_name("5h"), "five_hour");
-        assert_eq!(window_name("7d"), "seven_day");
-        assert_eq!(window_name("7d_oi"), "seven_day_overage_included");
-        assert_eq!(window_name("overage"), "overage");
-        assert_eq!(window_name("7d_fable"), "7d_fable");
+        assert_eq!(window_name("5h", None), "five_hour");
+        assert_eq!(window_name("7d", None), "seven_day");
+        assert_eq!(window_name("7d_oi", None), "seven_day_overage_included");
+        assert_eq!(
+            window_name("7d_oi", Some("claude-fable-5-2")),
+            "seven_day_fable"
+        );
+        assert_eq!(
+            window_name("7d_oi", Some("claude-opus-5-5")),
+            "seven_day_opus"
+        );
+        assert_eq!(
+            window_name("7d_oi", Some("gpt-x")),
+            "seven_day_overage_included"
+        );
+        assert_eq!(window_name("overage", None), "overage");
+        assert_eq!(window_name("7d_fable", None), "7d_fable");
     }
 
     #[test]
@@ -356,7 +381,7 @@ mod tests {
             ("anthropic-ratelimit-unified-7d-reset", "1794499200"),
             ("content-type", "application/json"),
         ];
-        let w = readings(h);
+        let w = readings(h, None);
         assert_eq!(
             w,
             vec![
@@ -372,11 +397,14 @@ mod tests {
                 },
             ]
         );
-        let w = readings([
-            ("anthropic-ratelimit-unified-7d_fable-utilization", "0.5"),
-            ("anthropic-ratelimit-unified-5h-utilization", "abc"),
-            ("anthropic-ratelimit-unified-7d-utilization", "NaN"),
-        ]);
+        let w = readings(
+            [
+                ("anthropic-ratelimit-unified-7d_fable-utilization", "0.5"),
+                ("anthropic-ratelimit-unified-5h-utilization", "abc"),
+                ("anthropic-ratelimit-unified-7d-utilization", "NaN"),
+            ],
+            None,
+        );
         assert_eq!(
             w,
             vec![SampleWindow {
@@ -385,6 +413,21 @@ mod tests {
                 resets_at: None
             }]
         );
+    }
+
+    #[test]
+    fn fable_weekly_from_a_fable_request() {
+        let h = [
+            ("anthropic-ratelimit-unified-7d-utilization", "0.44"),
+            ("anthropic-ratelimit-unified-7d_oi-utilization", "0.8"),
+            ("anthropic-ratelimit-unified-7d_oi-reset", "1794891600"),
+        ];
+        let w = readings(h, Some("claude-fable-5-2"));
+        assert_eq!(w[1].name, "seven_day_fable");
+        assert_eq!(w[1].pct, 80.0);
+        assert_eq!(w[1].resets_at, Some(1794891600));
+        let spec = scheduler::classify(&w[1].name);
+        assert_eq!(spec.model.as_deref(), Some("fable"));
     }
 
     #[test]

@@ -109,7 +109,8 @@ impl StoreEvents {
         status: u16,
         headers: &[(String, String)],
     ) -> Result<Option<SwapRequest>> {
-        let windows = relay_proto::readings(headers.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        let windows =
+            relay_proto::readings(headers.iter().map(|(k, v)| (k.as_str(), v.as_str())), model);
         if windows.is_empty() {
             return Ok(None);
         }

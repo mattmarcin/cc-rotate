@@ -193,6 +193,15 @@ export function fitLabels(root: HTMLElement) {
       if (seg.scrollWidth <= seg.clientWidth) break;
     }
   }
+  // A full name line drops the plan first, then shortens the name; the Fable usage stays.
+  for (const line of root.querySelectorAll<HTMLElement>(".plan-name")) {
+    const tag = line.querySelector<HTMLElement>(".plan-tag");
+    line.classList.remove("tight");
+    if (tag) tag.hidden = false;
+    if (line.scrollWidth <= line.clientWidth) continue;
+    if (tag) tag.hidden = true;
+    if (line.scrollWidth > line.clientWidth) line.classList.add("tight");
+  }
 }
 
 /** The stretches with no account left and the hour lines behind every lane, and the line for now over them. */
