@@ -2,7 +2,7 @@
 
 Run one Claude Code profile on a pool of your own Claude accounts.
 When the account in use gets close to one of its usage limits, cc-rotate swaps the profile to another account in place.
-Running sessions keep going on their next request, with no restart and no proxy.
+Running sessions keep going on their next request, with no restart and, unless you turn on the app account, no proxy.
 
 Because every session lives in one profile, sessions can see and message each other, and their history lives in one place.
 
@@ -33,9 +33,11 @@ Because every session lives in one profile, sessions can see and message each ot
   A swap also checks the account it is about to use first when its usage data is more than 15 minutes old.
 - For accounts you choose, cc-rotate can also keep a 5-hour window running: as soon as one ends while the account isn't in use, Claude Code sends one short Haiku request with its login (see **Keeping 5-hour windows running**).
 - The Claude desktop app's Code sessions can run on the pool too, once an administrator has the app start them through cc-rotate (see **Desktop app sessions**).
+- Optionally, the **app account** keeps every session signed in to one account, the one the desktop app uses, so artifacts and connectors stay with it, while a local proxy sends model requests on the pool account in use (see **App account**).
 
 cc-rotate never sends a request to Anthropic itself.
 All traffic is the unmodified Claude Code talking to Anthropic: your sessions, the sign-ins, the usage checks and, if you turn it on, the short requests that keep 5-hour windows running.
+The one exception is the app account, which is off unless you turn it on: its local proxy forwards your sessions' model requests to Anthropic with the login of the pool account in use, and changes nothing else in them.
 
 The design, with the Claude Code behavior it relies on, is in [docs/specs/2026-10-24-cc-rotate.md](docs/specs/2026-10-24-cc-rotate.md).
 
@@ -46,6 +48,7 @@ The design, with the Claude Code behavior it relies on, is in [docs/specs/2026-1
 | Rotation | Supported, verified with real accounts | Supported, verified with real accounts (in WSL); Claude Code keeps its login in the same file as on Windows | Supported, verified with real accounts, with the login in the Keychain and in the file |
 | Desktop app | Supported | Builds; needs a desktop with a system tray | Builds; runs as a plain executable, not an app bundle |
 | Claude desktop app sessions | Supported, tried in the Claude app | Not covered | Supported, verified with real accounts in the Claude app |
+| App account | Supported, tried in the Claude app | Builds; not tried yet | Supported, verified with real accounts |
 | Data folder | `%LOCALAPPDATA%\cc-rotate` | `~/.local/share/cc-rotate` | `~/Library/Application Support/cc-rotate` |
 
 `~` is your home folder (`%USERPROFILE%` on Windows).

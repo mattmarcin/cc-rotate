@@ -39,7 +39,10 @@ There are no versioned releases yet, so only the latest `main` is supported.
   One left behind when cc-rotate was quit, crashed or interrupted with Ctrl+C is deleted the next time a sign-in starts or the app starts, with its Keychain item on macOS.
 - While a usage check or warm-up runs, the account it uses has its login in plain text in a scratch folder under `staging`, the way Claude Code needs it; it is deleted when the check ends, and one interrupted by a crash is settled and deleted later.
 - On Linux and macOS, the data folder and the rotation profile are made readable only by you (mode 700) each time cc-rotate opens them, the store, logs and settings it writes only by you (600), even when an older version or `CC_ROTATE_DATA_DIR` made them with wider permissions.
-- cc-rotate makes no network requests of its own, and the desktop app opens no network port.
+- cc-rotate makes no network requests of its own, and the desktop app opens no network port, except for the app account, which is off unless you turn it on.
+- With the app account on, its local proxy listens on 127.0.0.1 only, and refuses every request that does not carry the random 256-bit secret in its address, that names a `Host` other than its own address, or that has an `Origin` header, as a web page's requests do. The secret is in `relay.json` in the data folder (readable only by you on Linux and macOS) and in your sessions' environment.
+  The proxy replaces only the login on model requests, with the stored login of the pool account in use, sends them to `api.anthropic.com` only, and never logs a login, a request or a response body.
+  While nothing listens on its port (for a moment while it restarts, or after it removed itself while sessions still point at it), another user of the same computer could take the port and receive your sessions' requests, including the secret and the app account's access token. A proxy that finds its port taken logs it, and `cc-rotate-ctl doctor` shows that line.
 - The desktop app's window can change only the settings shown in it: the ones that name a program to run or where the login is written (`claude_path`, `statusline_downstream`, `profile_dir`) are set with `cc-rotate-ctl config` alone, and the window can reopen only the sign-in page Claude Code announced, not any address.
 - `claude` is found in the `claude_path` setting, which must be a full path, or in the absolute folders on `PATH`: a relative `PATH` entry such as `.` is skipped, so a project folder can't put its own `claude` in reach of a login.
   When `PATH` has none, cc-rotate looks where installers put it (`~/.local/bin`, Homebrew's folders on macOS and Linux, npm's on Windows).
@@ -58,6 +61,7 @@ In scope:
 - Tokens written to disk unencrypted anywhere other than the rotation profile's `.credentials.json`, or written to logs, events or error messages.
 - A swap or login that leaves a token readable by another user, or that leaks a token through a process argument, environment variable or temporary file.
 - Ways for another local program or a web page to drive the desktop app or the CLI into revealing, replacing or exporting a login.
+- Ways to get the app account's local proxy to forward a request without its secret, to send a login anywhere but `api.anthropic.com`, or to log a login or a request body.
 - Staging folders or backups that are not cleaned up or not encrypted as described above.
 - Supply-chain issues in this repository, such as the install script, the build, or the CI workflow.
 
