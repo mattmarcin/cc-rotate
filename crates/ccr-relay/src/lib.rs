@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
+use ccr_core::api_cost::{self, UsageTap};
 use ccr_core::relay::RelayConfig;
 use ccr_core::relay_proto::{self, Route};
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Uri, Version, header};
@@ -205,6 +206,12 @@ pub trait RelayEvents: Send + Sync {
     /// Anthropic could not be reached; `kind` names what failed, never a value.
     /// Called on a thread that may block.
     fn unreachable(&self, _kind: &str) {}
+
+    /// A model response served with `account`'s login, to a session whose status line does not
+    /// count its cost (`relay_proto::status_line_counts_cost`), would have cost `usd` at API
+    /// prices (`ccr_core::api_cost`). Called once its body has gone back to the session, or was
+    /// cut off, on a thread that may block.
+    fn cost(&self, _account: i64, _session: Option<&str>, _usd: f64) {}
 }
 
 /// What became of a swap away from an account refused at a limit.
@@ -661,6 +668,97 @@ fn has_bearer(headers: &HeaderMap) -> bool {
 }
 
 /// The `model` a request body names, without reading the rest of it into memory twice.
+/// A model response's body on its way back to the session, read as it passes
+/// (`api_cost::UsageTap`): once it ends, or is cut off, what it cost at API prices goes to
+/// `RelayEvents::cost`.
+struct Metered {
+    inner: RelayBody,
+    tap: Option<UsageTap>,
+    events: Arc<dyn RelayEvents>,
+    account: i64,
+    session: Option<String>,
+    /// The model the request asked for, for a response that names none.
+    model: Option<String>,
+}
+
+impl Metered {
+    fn new(
+        inner: RelayBody,
+        events: Arc<dyn RelayEvents>,
+        account: i64,
+        session: Option<String>,
+        model: Option<String>,
+    ) -> Metered {
+        Metered {
+            inner,
+            tap: Some(UsageTap::new()),
+            events,
+            account,
+            session,
+            model,
+        }
+    }
+
+    /// Price what the body reported and hand it on, once.
+    fn report(&mut self) {
+        let Some(tap) = self.tap.take() else { return };
+        let Some((model, usage)) = tap.finish() else {
+            return;
+        };
+        let model = model.or_else(|| self.model.take());
+        let usd = api_cost::cost_usd(model.as_deref(), &usage);
+        if !usd.is_finite() || usd <= 0.0 {
+            return;
+        }
+        let events = self.events.clone();
+        let (account, session) = (self.account, self.session.take());
+        let record = move || events.cost(account, session.as_deref(), usd);
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                rt.spawn_blocking(record);
+            }
+            Err(_) => record(),
+        }
+    }
+}
+
+impl hyper::body::Body for Metered {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, hyper::Error>>> {
+        use std::task::Poll;
+        let polled = std::pin::Pin::new(&mut self.inner).poll_frame(cx);
+        match &polled {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let (Some(data), Some(tap)) = (frame.data_ref(), self.tap.as_mut()) {
+                    tap.feed(data);
+                }
+            }
+            Poll::Ready(None) => self.report(),
+            Poll::Ready(Some(Err(_))) | Poll::Pending => {}
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl Drop for Metered {
+    fn drop(&mut self) {
+        self.report();
+    }
+}
+
 fn model_of(body: &[u8]) -> Option<String> {
     #[derive(serde::Deserialize)]
     struct ModelOnly<'a> {
@@ -774,7 +872,15 @@ async fn renewed_login(st: &State, account: i64, old: &str) -> Option<Choice> {
 /// The response for the session: the upstream's status, headers but the hop-by-hop ones, and
 /// its body as it arrives.
 fn respond(rparts: http::response::Parts, rbody: Incoming, head: bool) -> Response<RelayBody> {
-    let mut back = Response::new(rbody.boxed());
+    respond_with(rparts, rbody.boxed(), head)
+}
+
+fn respond_with(
+    rparts: http::response::Parts,
+    rbody: RelayBody,
+    head: bool,
+) -> Response<RelayBody> {
+    let mut back = Response::new(rbody);
     *back.status_mut() = rparts.status;
     let headers = back.headers_mut();
     for (name, value) in &rparts.headers {
@@ -857,6 +963,17 @@ async fn handle(req: Request<Incoming>, st: &State) -> Response<RelayBody> {
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
     let head = parts.method == Method::HEAD;
+    let own_cost = relay_proto::status_line_counts_cost(
+        parts
+            .headers
+            .get(header::USER_AGENT)
+            .and_then(|v| v.to_str().ok()),
+    );
+    let request_model = if model { model_of(&body) } else { None };
+    // A response the session's status line will not count is priced here as it streams back
+    // (spec 12), so it is asked for uncompressed: Anthropic compresses a body whenever the
+    // client accepts it, and Claude Code always does.
+    let metered = model && bare_path == "/v1/messages" && !own_cost;
 
     // Each pool account is tried at most once (spec 8), and a refused login is renewed at most
     // once per account (spec 9).
@@ -875,9 +992,18 @@ async fn handle(req: Request<Incoming>, st: &State) -> Response<RelayBody> {
         *out.uri_mut() = uri.clone();
         let headers = out.headers_mut();
         for (name, value) in &parts.headers {
+            if metered && name == header::ACCEPT_ENCODING {
+                continue;
+            }
             if relay_proto::forward_request_header(name.as_str(), token.is_some()) {
                 headers.append(name.clone(), value.clone());
             }
+        }
+        if metered {
+            headers.insert(
+                header::ACCEPT_ENCODING,
+                HeaderValue::from_static("identity"),
+            );
         }
         if let Some(token) = &token {
             let bearer = Zeroizing::new(format!("Bearer {}", token.as_str()));
@@ -946,6 +1072,21 @@ async fn handle(req: Request<Incoming>, st: &State) -> Response<RelayBody> {
             .take()
             .filter(|_| status == 401 && !renewed.contains(&account));
         if !at_limit && old.is_none() {
+            // A body that came back compressed after all is not read.
+            let plain = rparts
+                .headers
+                .get(header::CONTENT_ENCODING)
+                .is_none_or(|v| v.as_bytes().eq_ignore_ascii_case(b"identity"));
+            if metered && status == 200 && plain {
+                let metered = Metered::new(
+                    rbody.boxed(),
+                    st.events.clone(),
+                    account,
+                    session.clone(),
+                    request_model.clone(),
+                );
+                return respond_with(rparts, metered.boxed(), head);
+            }
             return respond(rparts, rbody, head);
         }
         if let Some(old) = old {

@@ -904,11 +904,14 @@ fn relay_ready(
         ));
         // Readings, threshold swaps and swaps at a refused limit (spec 7 and 8). Each part has a
         // store connection of its own, and every swap opens another.
-        let events = Arc::new(ccr_relay::StoreEvents::new(
-            events_store,
-            Arc::new(ccr_relay::StoreSwaps::new(paths.clone())),
-            log.clone(),
-        ));
+        let events = Arc::new(
+            ccr_relay::StoreEvents::new(
+                events_store,
+                Arc::new(ccr_relay::StoreSwaps::new(paths.clone())),
+                log.clone(),
+            )
+            .with_profile(&paths.profile_dir),
+        );
         // Renewals run a check on a store of their own (spec 9).
         let renewals = Arc::new(ccr_relay::StoreRenewals::new(paths.clone(), log));
         let options = ccr_relay::Options {

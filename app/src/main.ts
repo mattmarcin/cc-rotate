@@ -1115,7 +1115,7 @@ function loadCostTable() {
               ),
               h("tfoot", null, h("tr", null, h("td", null, "Total"), spans.map(([, since]) => h("td", { class: "num" }, usd(rows.reduce((s, a) => s + sum(a.id, since), 0)))))),
             ),
-        h("p", { class: "muted cost-note" }, "Counted from the status line of sessions in the cc-rotate profile and other profiles cc-rotate tracks. An hour that started before a span counts in full."),
+        h("p", { class: "muted cost-note" }, "Counted from the status line of terminal sessions in the cc-rotate profile and other profiles cc-rotate tracks, and by the app account's proxy for desktop app sessions. An hour that started before a span counts in full."),
       );
     })
     .catch((e) => read === costReads && replace(costTable, h("h2", null, "By account"), h("p", { class: "muted" }, `Couldn't read API cost: ${e}`)));
@@ -1166,7 +1166,7 @@ function renderProjectTable() {
     projectTable,
     h("h2", null, "By folder"),
     noneYet
-      ? h("p", { class: "muted" }, "No project usage yet. cc-rotate starts counting a folder when a session's status line runs after this update. Earlier use stays on API cost, by account.")
+      ? h("p", { class: "muted" }, "No project usage yet. cc-rotate starts counting a folder when a session's status line runs, or when the app account's proxy serves a desktop app session. Earlier use stays on API cost, by account.")
       : rows.length === 0
         ? h("p", { class: "muted" }, "No project usage in this span.")
         : h(

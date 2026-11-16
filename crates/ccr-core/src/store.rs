@@ -2397,6 +2397,34 @@ impl Store {
         })
     }
 
+    /// What one model response would have cost at API prices, priced by the relay for a session
+    /// whose status line does not count it (`relay_proto::status_line_counts_cost`): it counts
+    /// whole for `account_id`, in the hour of `now_ms`, and, with the session and the folder it
+    /// was launched in, for that folder too.
+    pub fn note_response_cost(
+        &self,
+        session_id: Option<&str>,
+        project: Option<&str>,
+        usd: f64,
+        account_id: i64,
+        now_ms: i64,
+    ) -> Result<()> {
+        if !usd.is_finite() || usd <= 0.0 {
+            return Ok(());
+        }
+        self.immediate(|s| {
+            s.conn.execute(
+                "INSERT INTO account_costs (account_id, hour, usd) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (account_id, hour) DO UPDATE SET usd = usd + excluded.usd",
+                params![account_id, now_ms.div_euclid(3_600_000), usd],
+            )?;
+            if let (Some(session), Some(path)) = (session_id.filter(|s| !s.is_empty()), project) {
+                write_project(&s.conn, session, path, account_id, usd, now_ms)?;
+            }
+            Ok(())
+        })
+    }
+
     /// What each launch folder's use would have cost at API prices, hour by hour, from the hour
     /// holding `since_ms` on: by path, then hour, then account. Hours with nothing counted are
     /// left out.
@@ -3944,6 +3972,48 @@ mod tests {
         assert_eq!(s.find_account("u1@example.com").unwrap().id, a);
         assert_eq!(s.find_account(&a.to_string()).unwrap().id, a);
         assert!(s.find_account("missing").is_err());
+    }
+
+    #[test]
+    fn response_costs_add_up_per_account_hour_and_folder() {
+        let s = Store::open_in_memory().unwrap();
+        let a = s
+            .insert_account("a", &ident("u1"), AccountState::Active)
+            .unwrap();
+        let hour = 3_600_000;
+        let h0 = 490_000 * hour;
+        s.note_response_cost(Some("s1"), Some("/work/app"), 0.25, a, h0 + 1)
+            .unwrap();
+        s.note_response_cost(Some("s1"), Some("/work/app/"), 0.5, a, h0 + 2)
+            .unwrap();
+        // No folder: the account's hour only. Nothing, or nonsense, counts nothing.
+        s.note_response_cost(Some("s2"), None, 1.0, a, h0 + 3)
+            .unwrap();
+        s.note_response_cost(None, Some("/work/other"), 2.0, a, h0 + 4)
+            .unwrap();
+        s.note_response_cost(Some("s3"), Some("/work/zero"), 0.0, a, h0 + 5)
+            .unwrap();
+        s.note_response_cost(Some("s3"), Some("/work/nan"), f64::NAN, a, h0 + 5)
+            .unwrap();
+        assert_eq!(
+            s.hourly_costs_since(h0).unwrap(),
+            vec![HourlyCost {
+                account_id: a,
+                ts: h0,
+                usd: 3.75
+            }]
+        );
+        let spend = s.project_spend_since(h0).unwrap();
+        assert_eq!(spend.len(), 1);
+        assert_eq!(spend[0].path, "/work/app");
+        assert!((spend[0].usd - 0.75).abs() < 1e-9);
+        let touched: Vec<_> = s
+            .project_touches_since(h0)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.path)
+            .collect();
+        assert_eq!(touched, vec!["/work/app"]);
     }
 
     #[test]

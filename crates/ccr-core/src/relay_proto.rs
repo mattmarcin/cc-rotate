@@ -98,6 +98,23 @@ pub fn forward_response_header(name: &str) -> bool {
     !hop_or_length(&name.to_ascii_lowercase())
 }
 
+/// Whether the session that sent a request with this `User-Agent` has a status line that counts
+/// its cost at API prices (`statusline::note_cost`), so the relay must not count it again.
+///
+/// Claude Code names where it runs in its `User-Agent`: `claude-cli/<version> (external,
+/// <entrypoint>, ...)`. Only an interactive terminal session (`cli`) runs a status line; a
+/// session of the Claude desktop app (`claude-desktop`), `claude -p` (`sdk-cli`) and SDK clients
+/// do not, and neither does a client that is not Claude Code.
+pub fn status_line_counts_cost(user_agent: Option<&str>) -> bool {
+    let Some(rest) = user_agent.and_then(|ua| ua.trim().strip_prefix("claude-cli/")) else {
+        return false;
+    };
+    let Some(inside) = rest.split_once('(').and_then(|(_, r)| r.split_once(')')) else {
+        return false;
+    };
+    inside.0.split(',').nth(1).map(str::trim) == Some("cli")
+}
+
 /// Claude Code's name for a window, from the name used in the rate-limit headers of a response
 /// to a request for `model`.
 ///
@@ -443,5 +460,21 @@ mod tests {
         let now = 1_000_000;
         assert!(!renew_due(now + 901_000, now, 900));
         assert!(renew_due(now + 900_000, now, 900));
+    }
+
+    #[test]
+    fn only_an_interactive_session_counts_its_own_cost() {
+        let counts = |ua| status_line_counts_cost(Some(ua));
+        assert!(counts("claude-cli/2.1.322 (external, cli)"));
+        assert!(counts("claude-cli/2.1.322 (external, cli, workload/cron)"));
+        assert!(!counts("claude-cli/2.1.325 (external, claude-desktop)"));
+        assert!(!counts("claude-cli/2.1.325 (external, sdk-cli)"));
+        assert!(!counts(
+            "claude-cli/2.1.325 (external, sdk-ts, agent-sdk/0.3.1)"
+        ));
+        assert!(!counts("claude-cli/2.1.325 (external, cli-like)"));
+        assert!(!counts("curl/8.7.1"));
+        assert!(!counts("claude-cli/2.1.325"));
+        assert!(!status_line_counts_cost(None));
     }
 }

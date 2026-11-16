@@ -71,6 +71,24 @@ const LIMIT_BODY: &str =
 const UNAUTHORIZED_BODY: &str =
     r#"{"type":"error","error":{"type":"authentication_error","message":"invalid token"}}"#;
 
+/// A model response stream that reports its usage: Fable 5.2, 1,000 tokens in, 2,000 read from
+/// the cache, 500 written to it for an hour, 300 out.
+const USAGE_STREAM: &str = concat!(
+    "event: message_start\n",
+    r#"data: {"type":"message_start","message":{"id":"msg_1","model":"claude-fable-5-2","usage":{"input_tokens":1000,"cache_creation_input_tokens":500,"cache_read_input_tokens":2000,"output_tokens":1,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":500}}}}"#,
+    "\n\nevent: content_block_delta\n",
+    r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#,
+    "\n\nevent: message_delta\n",
+    r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":300}}"#,
+    "\n\nevent: message_stop\n",
+    r#"data: {"type":"message_stop"}"#,
+    "\n\n",
+);
+
+/// What `USAGE_STREAM` costs at Fable 5.2's prices ($8 in, $40 out, $0.20 read, $16 an hour's
+/// write, per million tokens).
+const USAGE_STREAM_USD: f64 = (1000.0 * 8.0 + 300.0 * 40.0 + 2000.0 * 0.2 + 500.0 * 16.0) / 1e6;
+
 struct Fake {
     addr: SocketAddr,
     state: Arc<FakeState>,
@@ -193,6 +211,28 @@ async fn fake_handle(
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        });
+        return Ok(sse(chunk_stream(rx)));
+    }
+    if path.contains("sse=compressed") {
+        // Claimed compressed: the relay must not read it as text.
+        return Ok(Response::builder()
+            .status(200)
+            .header("content-type", "text/event-stream")
+            .header("content-encoding", "br")
+            .body(BodyExt::boxed(Full::new(Bytes::from(USAGE_STREAM))))
+            .unwrap());
+    }
+    if path.contains("sse=usage") {
+        let (tx, rx) = mpsc::channel(8);
+        tokio::spawn(async move {
+            // Split mid-line, as the network may.
+            let (a, b) = USAGE_STREAM.split_at(USAGE_STREAM.len() / 3);
+            let (b, c) = b.split_at(b.len() / 2);
+            for part in [a, b, c] {
+                let _ = tx.send(Bytes::from(part)).await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
         });
         return Ok(sse(chunk_stream(rx)));
@@ -330,6 +370,7 @@ struct Recorder {
     dead_logins: Mutex<Vec<i64>>,
     resent: Mutex<Vec<(i64, i64)>>,
     unreachable: Mutex<Vec<String>>,
+    costs: Mutex<Vec<(i64, Option<String>, f64)>>,
 }
 
 impl Recorder {
@@ -397,6 +438,12 @@ impl RelayEvents for Recorder {
     }
     fn unreachable(&self, kind: &str) {
         self.unreachable.lock().unwrap().push(kind.to_string());
+    }
+    fn cost(&self, account: i64, session: Option<&str>, usd: f64) {
+        self.costs
+            .lock()
+            .unwrap()
+            .push((account, session.map(str::to_string), usd));
     }
 }
 
@@ -1996,4 +2043,96 @@ async fn relay_off_401_of_a_pool_login_renews_and_holds_nothing() {
     assert!(store.account_samples_since(pool.c, 0).unwrap().is_empty());
     assert_eq!(store.active_account().unwrap().unwrap().id, pool.b);
     assert_eq!(pool.profile_login(), profile);
+}
+
+/// The costs the relay reported, once `want` of them came (or two seconds passed).
+async fn costs_after(relay: &Relay, want: usize) -> Vec<(i64, Option<String>, f64)> {
+    for _ in 0..100 {
+        let costs = relay.events.costs.lock().unwrap().clone();
+        if costs.len() >= want {
+            return costs;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    relay.events.costs.lock().unwrap().clone()
+}
+
+fn with_agent(mut req: Request<Full<Bytes>>, agent: &str) -> Request<Full<Bytes>> {
+    req.headers_mut()
+        .insert("user-agent", agent.parse().unwrap());
+    req
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn desktop_session_response_is_priced_as_it_streams_back() {
+    let fake = fake_upstream().await;
+    let relay = relay_to(fake.addr, Switch::new(token(2, "tok-b"))).await;
+    let mut req = with_agent(
+        model_request(&relay, "?sse=usage", Some("Bearer home")),
+        "claude-cli/2.1.325 (external, claude-desktop)",
+    );
+    req.headers_mut().insert(
+        "accept-encoding",
+        "gzip, deflate, br, zstd".parse().unwrap(),
+    );
+    let resp = relay.send(req).await;
+    assert_eq!(resp.status(), 200);
+    // Asked for uncompressed, so it can be read.
+    assert_eq!(
+        values(&fake.seen()[0].headers, "accept-encoding"),
+        vec![&b"identity"[..]]
+    );
+    // The session gets the stream unchanged.
+    assert_eq!(&body_of(resp).await[..], USAGE_STREAM.as_bytes());
+    let costs = costs_after(&relay, 1).await;
+    assert_eq!(costs.len(), 1, "{costs:?}");
+    let (account, session, usd) = &costs[0];
+    assert_eq!(*account, 2);
+    assert_eq!(session.as_deref(), Some("sess-1"));
+    assert!((usd - USAGE_STREAM_USD).abs() < 1e-9, "{usd}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn terminal_session_response_is_left_to_its_status_line() {
+    let fake = fake_upstream().await;
+    let relay = relay_to(fake.addr, Switch::new(token(2, "tok-b"))).await;
+    let mut req = with_agent(
+        model_request(&relay, "?sse=usage", Some("Bearer home")),
+        "claude-cli/2.1.325 (external, cli)",
+    );
+    req.headers_mut()
+        .insert("accept-encoding", "gzip, br".parse().unwrap());
+    let resp = relay.send(req).await;
+    assert_eq!(&body_of(resp).await[..], USAGE_STREAM.as_bytes());
+    // Left as the session asked.
+    assert_eq!(
+        values(&fake.seen()[0].headers, "accept-encoding"),
+        vec![&b"gzip, br"[..]]
+    );
+    // A response without usage reports nothing either.
+    let plain = with_agent(
+        model_request(&relay, "", Some("Bearer home")),
+        "claude-cli/2.1.325 (external, sdk-cli)",
+    );
+    assert_eq!(
+        &body_of(relay.send(plain).await).await[..],
+        b"{\"ok\":true}"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(relay.events.costs.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn compressed_response_is_not_read() {
+    let fake = fake_upstream().await;
+    let relay = relay_to(fake.addr, Switch::new(token(2, "tok-b"))).await;
+    let req = with_agent(
+        model_request(&relay, "?sse=compressed", Some("Bearer home")),
+        "claude-cli/2.1.325 (external, claude-desktop)",
+    );
+    let resp = relay.send(req).await;
+    assert_eq!(resp.headers()["content-encoding"], "br");
+    assert_eq!(&body_of(resp).await[..], USAGE_STREAM.as_bytes());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(relay.events.costs.lock().unwrap().is_empty());
 }

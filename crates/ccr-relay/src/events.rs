@@ -1,6 +1,9 @@
 //! What the relay records in the store (spec 7, 8, 9 and 12): usage readings, threshold swaps,
 //! swaps at a refused limit or login, resends and errors.
 
+use std::collections::HashMap;
+use std::io::BufRead;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::Result;
@@ -60,6 +63,11 @@ pub struct StoreEvents {
     refusals: Mutex<()>,
     /// When the last `relay_error` event was recorded, in epoch ms.
     last_error_ms: Mutex<i64>,
+    /// The profile whose sessions the relay serves: their transcripts say which folder each was
+    /// launched in, for the cost by project (`with_profile`).
+    profile: Option<PathBuf>,
+    /// Launch folders found so far, by session.
+    folders: Mutex<HashMap<String, String>>,
 }
 
 impl StoreEvents {
@@ -70,7 +78,32 @@ impl StoreEvents {
             log,
             refusals: Mutex::new(()),
             last_error_ms: Mutex::new(0),
+            profile: None,
+            folders: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Look up the folder each session was launched in from its transcript in `profile`, so
+    /// the costs the relay counts are filed under it.
+    pub fn with_profile(mut self, profile: impl Into<PathBuf>) -> StoreEvents {
+        self.profile = Some(profile.into());
+        self
+    }
+
+    /// The folder `session` was launched in: the `cwd` its transcript starts with. `None` until
+    /// the transcript names one, or without a profile.
+    fn launch_folder(&self, session: &str) -> Option<String> {
+        let known = self.folders.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(folder) = known.get(session) {
+            return Some(folder.clone());
+        }
+        drop(known);
+        let folder = transcript_cwd(self.profile.as_deref()?, session)?;
+        self.folders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(session.to_string(), folder.clone());
+        Some(folder)
     }
 
     fn store(&self) -> MutexGuard<'_, Store> {
@@ -284,6 +317,23 @@ impl RelayEvents for StoreEvents {
         }
     }
 
+    fn cost(&self, account: i64, session: Option<&str>, usd: f64) {
+        let session = session.filter(|s| !s.is_empty());
+        let project = session.and_then(|s| self.launch_folder(s));
+        let store = self.store();
+        // With relay mode off the status line counts what it can, as it does readings.
+        if !self.mode_on(&store) {
+            return;
+        }
+        if let Err(e) =
+            store.note_response_cost(session, project.as_deref(), usd, account, time::now_ms())
+        {
+            self.log(&format!(
+                "recording what a response of account {account} cost failed: {e:#}"
+            ));
+        }
+    }
+
     fn unreachable(&self, failure: &str) {
         let now = time::now_ms();
         {
@@ -303,6 +353,35 @@ impl RelayEvents for StoreEvents {
             self.log(&format!("recording an error failed: {e:#}"));
         }
     }
+}
+
+/// The first `cwd` in `session`'s transcript under `profile` (`projects/<folder>/<id>.jsonl`),
+/// read from its first lines only. A session id that is not a plain name finds nothing.
+fn transcript_cwd(profile: &Path, session: &str) -> Option<String> {
+    if session.is_empty()
+        || !session
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return None;
+    }
+    let file = format!("{session}.jsonl");
+    let path = std::fs::read_dir(profile.join("projects"))
+        .ok()?
+        .flatten()
+        .map(|folder| folder.path().join(&file))
+        .find(|p| p.is_file())?;
+    let reader = std::io::BufReader::new(std::fs::File::open(path).ok()?);
+    #[derive(serde::Deserialize)]
+    struct Line {
+        cwd: Option<String>,
+    }
+    reader
+        .lines()
+        .take(50)
+        .map_while(Result::ok)
+        .filter_map(|line| serde_json::from_str::<Line>(&line).ok()?.cwd)
+        .find(|cwd| !cwd.trim().is_empty())
 }
 
 #[cfg(test)]
@@ -431,6 +510,56 @@ mod tests {
             let got = self.swaps.recv_timeout(Duration::from_millis(300));
             assert!(got.is_err(), "unexpected swap {got:?}");
         }
+    }
+
+    #[test]
+    fn cost_counts_for_the_account_and_the_folder_the_transcript_names() {
+        let Env {
+            _root: root,
+            db,
+            b,
+            c,
+            events,
+            ..
+        } = env(exhausted());
+        let profile = root.path().join("profile");
+        let folder = profile.join("projects").join("-work-app");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(
+            folder.join("sess-1.jsonl"),
+            "{\"type\":\"queue-operation\"}\n{\"type\":\"user\",\"cwd\":\"/work/app\",\"sessionId\":\"sess-1\"}\n",
+        )
+        .unwrap();
+        let events = events.with_profile(&profile);
+        events.cost(c, Some("sess-1"), 0.5);
+        events.cost(c, Some("sess-1"), 0.25);
+        // No transcript, or no session: the account only.
+        events.cost(b, Some("sess-2"), 1.0);
+        events.cost(b, None, 2.0);
+        // A session id that is not a plain name is not looked up.
+        events.cost(b, Some("../sess-1"), 4.0);
+        let store = Store::open(&db).unwrap();
+        let total = |id| store.account_cost_between(id, 0, i64::MAX / 1000).unwrap();
+        assert_eq!(total(c), Some(0.75));
+        assert_eq!(total(b), Some(7.0));
+        let spend = store.project_spend_since(0).unwrap();
+        assert_eq!(spend.len(), 1, "{spend:?}");
+        assert_eq!(spend[0].path, "/work/app");
+        assert_eq!(spend[0].account_id, c);
+        assert!((spend[0].usd - 0.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cost_with_relay_mode_off_counts_nothing() {
+        let env = env(exhausted());
+        ccr_core::relay::set_mode(&env.open(), None).unwrap();
+        env.events.cost(env.c, Some("sess-1"), 0.5);
+        assert_eq!(
+            env.open()
+                .account_cost_between(env.c, 0, i64::MAX / 1000)
+                .unwrap(),
+            None
+        );
     }
 
     #[test]
