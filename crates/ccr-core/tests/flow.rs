@@ -2047,9 +2047,9 @@ fn a_weekly_budget_that_would_reset_unused_moves_its_account_ahead() {
     assert!((marked - week_reset).abs() <= 5, "{marked} vs {week_reset}");
 }
 
-/// Every model the sessions' status lines reported in the last hour decides which model-scoped
-/// limits count, not only the one reported last: while one terminal session uses Fable and
-/// another Opus, an account at its Fable limit is not picked.
+/// The models sessions sent requests for decide which model-scoped limits count, not only the
+/// model the status line saw last: desktop sessions run no status line, so while one uses Fable
+/// through the proxy, an account at its Fable limit is not picked.
 #[test]
 fn an_account_at_its_fable_limit_is_skipped_while_a_session_uses_fable() {
     let env = Env::new();
@@ -2077,30 +2077,31 @@ fn an_account_at_its_fable_limit_is_skipped_while_a_session_uses_fable() {
         "on Opus alone, b's Fable limit does not count"
     );
 
-    // Another terminal session's status line reports Fable.
-    let reported = |pct, ts, model: &str| Sample {
+    // A desktop session sends a Fable request through the proxy.
+    let relayed = |pct, ts, model: &str| Sample {
         ts,
-        session_id: Some("terminal-2".into()),
+        profile: "relay".into(),
+        session_id: Some("desktop-1".into()),
         model: Some(model.into()),
         ..sample(a, pct, 40.0)
     };
     let now = time::now_ms();
     store
-        .record_sample(&reported(12.0, now, "claude-fable-5-2"))
+        .record_sample(&relayed(12.0, now, "claude-fable-5-2"))
         .unwrap();
     assert_eq!(
         swap::next_target(&store, Some(a)).unwrap().unwrap().id,
         c,
         "b is at its Fable limit"
     );
-    // A minute later it reports Opus: Fable is still in use.
+    // Its next request goes out on Opus a minute later: Fable is still in use.
     store
-        .record_sample(&reported(13.0, now + 60_000, "claude-opus-5-5"))
+        .record_sample(&relayed(13.0, now + 60_000, "claude-opus-5-5"))
         .unwrap();
     assert_eq!(swap::next_target(&store, Some(a)).unwrap().unwrap().id, c);
-    // No session reported Fable in the hour before the latest reading: b is back.
+    // Nothing sent Fable in the hour before the latest request: b is back.
     store
-        .record_sample(&reported(14.0, now + 3_600_000 + 1, "claude-opus-5-5"))
+        .record_sample(&relayed(14.0, now + 3_600_000 + 1, "claude-opus-5-5"))
         .unwrap();
     assert_eq!(swap::next_target(&store, Some(a)).unwrap().unwrap().id, b);
 }

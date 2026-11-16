@@ -688,10 +688,11 @@ pub const MODELS_IN_USE_MS: i64 = 3_600_000;
 
 /// The models sessions are using, which decide whether a window scoped to one model family
 /// applies (`scheduler::WindowSpec::applies_to_any`): every model a reading came back for
-/// within `MODELS_IN_USE_MS` of the latest one. Each status line run records its session's
-/// model, so every model that sessions running side by side use counts, not only the last one
-/// reported. Measured from the latest reading rather than now, so a pause does not forget them.
-/// Before any reading names a model, the one the status line saw last.
+/// within `MODELS_IN_USE_MS` of the latest one. The proxy records the model of each request it
+/// relays and the status line its session's, so desktop sessions, which run no status line,
+/// count too, and so does each model one session mixes (a Fable main loop with Haiku helpers).
+/// Measured from the latest reading rather than now, so a pause does not forget them. Before
+/// any reading names a model, the one the status line saw last.
 pub fn models_in_use(store: &Store) -> Result<Vec<String>> {
     let models = store.recent_models(MODELS_IN_USE_MS)?;
     if !models.is_empty() {
