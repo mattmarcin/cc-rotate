@@ -467,7 +467,7 @@ What to know:
 - **Artifacts.** An artifact belongs to the account that published it, and the app's artifact pane opens it with the app's own sign-in, so one published while another account was in use shows "This artifact has been deleted or is no longer available" there. Your claude.ai connectors in a session also follow the account in use.
 - **Swaps happen at a limit.** Desktop sessions don't run a status line, so cc-rotate gets no usage readings from them: a desktop session swaps when it stops at a limit, and is woken on the next account. Sessions in a terminal still swap before a limit.
 - **History after the app restarts.** The app looks for a session's history only in its own profile, so cc-rotate links each desktop session's transcript there, and the app still shows the session after it restarts (after an update, say). This is macOS only for now: on Windows the app may not find the history of a session that ran on the pool once it restarts.
-- **Windows** works the same way by design, but has not been tried in the Windows app yet.
+- **Windows** works the same way, and was tried in the Windows app: sessions run on the pool, follow swaps, and are woken on the next account at a limit.
 - **WSL sessions** the app runs inside WSL don't go through a launcher, so they stay on the app's account.
 - **Organization-managed computers.** When device management sets the app's policies or Claude Code's managed settings, `cc-rotate-ctl desktop` prints nothing that would replace them and says what to ask your administrator for.
 
