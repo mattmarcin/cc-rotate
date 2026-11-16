@@ -32,6 +32,7 @@ Because every session lives in one profile, sessions can see and message each ot
 - Accounts that are not in use get a usage check from time to time: cc-rotate runs Claude Code's own `/usage` with that account's login in a scratch folder, which shows how much of each limit is used without sending a prompt or using any of the account's limits.
   A swap also checks the account it is about to use first when its usage data is more than 15 minutes old.
 - For accounts you choose, cc-rotate can also keep a 5-hour window running: as soon as one ends while the account isn't in use, Claude Code sends one short Haiku request with its login (see **Keeping 5-hour windows running**).
+- The Claude desktop app's Code sessions can run on the pool too, once an administrator has the app start them through cc-rotate (see **Desktop app sessions**).
 
 cc-rotate never sends a request to Anthropic itself.
 All traffic is the unmodified Claude Code talking to Anthropic: your sessions, the sign-ins, the usage checks and, if you turn it on, the short requests that keep 5-hour windows running.
@@ -44,6 +45,7 @@ The design, with the Claude Code behavior it relies on, is in [docs/specs/2026-1
 |---|---|---|---|
 | Rotation | Supported, verified with real accounts | Supported, verified with real accounts (in WSL); Claude Code keeps its login in the same file as on Windows | Supported, verified with real accounts, with the login in the Keychain and in the file |
 | Desktop app | Supported | Builds; needs a desktop with a system tray | Builds; runs as a plain executable, not an app bundle |
+| Claude desktop app sessions | Supported, tried in the Claude app | Not covered | Supported, verified with real accounts in the Claude app |
 | Data folder | `%LOCALAPPDATA%\cc-rotate` | `~/.local/share/cc-rotate` | `~/Library/Application Support/cc-rotate` |
 
 `~` is your home folder (`%USERPROFILE%` on Windows).
