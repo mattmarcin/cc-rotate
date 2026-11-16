@@ -106,8 +106,20 @@ const weekOf = (a: AccountView) => a.windows.find((w) => w.kind === "weekly" && 
 const fableOf = (a: AccountView) =>
   a.windows.find((w) => w.kind === "weekly" && w.model === "fable") ?? a.windows.find((w) => w.name === "seven_day_overage_included");
 /** "Fable weekly limit: 38% used, resets Thu 9:00 AM", for a tooltip. */
-const fableTitle = (w: WindowUsage) =>
-  `Fable weekly limit: ${pct(w.pct)} used${w.resets_at && w.resets_at * 1000 > Date.now() ? `, resets ${clock(w.resets_at * 1000)}` : ""}`;
+const limitTitle = (name: string, w: WindowUsage) =>
+  `${name}: ${pct(w.pct)} used${w.resets_at && w.resets_at * 1000 > Date.now() ? `, resets ${clock(w.resets_at * 1000)}` : ""}`;
+const fableTitle = (w: WindowUsage) => limitTitle("Fable weekly limit", w);
+/** The 5-hour, weekly and Fable limits, one line each, for an account's tooltip. */
+function limitsTitle(a: AccountView): string[] {
+  const five = fiveOf(a);
+  const week = weekOf(a);
+  const fable = fableOf(a);
+  return [
+    five ? limitTitle("5-hour limit", five) : "5-hour limit: not read yet",
+    week ? limitTitle("Weekly limit", week) : noWeekly(a) ? "No weekly limit" : "Weekly limit: not read yet",
+    fable ? fableTitle(fable) : "Fable weekly limit: not read yet",
+  ];
+}
 const otherWindows = (a: AccountView) => a.windows.filter((w) => w.model !== null || w.kind === "other");
 /** No weekly limit: the 5-hour window is what runs out. */
 const noWeekly = (a: AccountView) => a.weekly.effective === "none";
@@ -548,7 +560,6 @@ function renderNav() {
             const five = fiveOf(a);
             const left = a.state === "needs_login" ? 0 : five ? Math.max(0, 100 - five.pct) : 100;
             const st = sideState(a);
-            const fable = fableOf(a);
             return h(
               "li",
               { class: "side-acct", "data-id": a.id },
@@ -559,7 +570,7 @@ function renderNav() {
                   class: "side-link",
                   "data-focus": `acct-${a.id}`,
                   "aria-current": isAccount(a.id) ? "page" : null,
-                  title: [a.email ?? a.label, fable && fableTitle(fable)].filter(Boolean).join("\n"),
+                  title: [a.email ?? a.label, ...limitsTitle(a)].join("\n"),
                   onclick: () => go({ page: "account", id: a.id }),
                 },
                 h("span", { class: "swatch", style: { background: colorOf(a.id) } }),
