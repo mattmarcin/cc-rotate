@@ -456,7 +456,7 @@ This uses Claude Code's corporate launcher, which only an administrator can turn
    - On macOS, the app's policy comes as a configuration profile: open it, then install **cc-rotate: desktop sessions on the pool** in System Settings > General > Device Management.
    - A `sudo` (macOS) or administrator (Windows) command writes Claude Code's managed settings, naming `cc-rotate-ctl` as the launcher.
 2. Quit and reopen the Claude app. New Code sessions run on the pool.
-   A session started before stays in its old profile and runs on the login Claude Code has stored there (from `claude /login` in a terminal), which may be another account than the app's, or none: then it says it is not logged in. Start a new session to run on the pool.
+   A session started before, or one the app forks from another, moves to the pool when you continue it. On Windows it stays in its old profile instead and runs on the login Claude Code has stored there (from `claude /login` in a terminal), which may be another account than the app's, or none: then it says it is not logged in. Start a new session to run on the pool.
 3. `cc-rotate-ctl doctor` shows the result on its **Desktop app** line.
 
 To turn it off, run the commands `cc-rotate-ctl desktop` prints then, and quit and reopen the app.
@@ -466,6 +466,7 @@ What to know:
 
 - **Artifacts.** An artifact belongs to the account that published it, and the app's artifact pane opens it with the app's own sign-in, so one published while another account was in use shows "This artifact has been deleted or is no longer available" there. Your claude.ai connectors in a session also follow the account in use.
 - **Swaps happen at a limit.** Desktop sessions don't run a status line, so cc-rotate gets no usage readings from them: a desktop session swaps when it stops at a limit, and is woken on the next account. Sessions in a terminal still swap before a limit.
+- **History after the app restarts.** The app looks for a session's history only in its own profile, so cc-rotate links each desktop session's transcript there, and the app still shows the session after it restarts (after an update, say). This is macOS only for now: on Windows the app may not find the history of a session that ran on the pool once it restarts.
 - **Windows** works the same way by design, but has not been tried in the Windows app yet.
 - **WSL sessions** the app runs inside WSL don't go through a launcher, so they stay on the app's account.
 - **Organization-managed computers.** When device management sets the app's policies or Claude Code's managed settings, `cc-rotate-ctl desktop` prints nothing that would replace them and says what to ask your administrator for.
