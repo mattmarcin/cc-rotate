@@ -518,7 +518,6 @@ The app account does not cover:
 - A network that needs an HTTP proxy or its own certificate authority to reach Anthropic: the local proxy connects directly.
 - Models or features the app account's plan offers but the plan of the account in use doesn't: Claude Code offers what the app account has, and such a request fails with Anthropic's error.
 - Artifacts published before the app account was on: they stay with the account that published them.
-- Windows: not tried yet.
 - Future Claude Code versions: the local proxy relies on an internal Claude Code setting to be treated as Anthropic's own address. If a version stops honoring it, sessions keep working but offer fewer models; `doctor` warns when your Claude Code version has not been tested.
 
 ## What it does not cover

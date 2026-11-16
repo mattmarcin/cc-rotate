@@ -1,7 +1,7 @@
 # cc-rotate relay mode: every session on the app's account, model requests on the pool
 
 Status: built, 2026-11-10; this text follows what was built.
-The end-to-end tests and the check in the app (section 16) are still to run.
+The end-to-end tests ran on macOS during development; the check in the app (section 16) was done by hand in the Windows app.
 Builds on the main spec (`2026-10-24-cc-rotate.md`), whose section numbers are cited as "main 24.1" and so on.
 
 User-facing name: everything a user sees calls relay mode and its home account the **app account**, and the relay **the local proxy**.
@@ -190,7 +190,7 @@ The relay runs as a per-user service that restarts it when it ends:
 
 - macOS: a LaunchAgent, `~/Library/LaunchAgents/cc-rotate.relay.plist`, with `RunAtLoad` and `KeepAlive`.
 - Linux: a systemd user unit, `cc-rotate-relay.service`, with `Restart=always`.
-- Windows: a Task Scheduler task at logon that restarts on failure (not run yet, like the rest of Windows desktop support, main 24.4).
+- Windows: a Task Scheduler task at logon that restarts on failure (tried by hand: a standard user can create it, and it starts the relay).
 
 Only one relay runs: it holds an OS file lock on `<data dir>/relay.lock`, which the system releases when the process ends however it ends, and binds the fixed port.
 A relay a launcher started exits quietly when another relay holds the lock; one the service started (its definition sets `CC_ROTATE_RELAY_SERVICE=1`) waits for the lock instead, so the service does not restart it over and over.
@@ -273,7 +273,6 @@ All of these are made in the main spec.
 - A machine that needs an HTTP proxy or its own certificate authority to reach Anthropic: the relay connects directly with the system's roots.
 - Models or features the home account offers but the active account's plan does not: Claude Code decides what to offer by the home account, so such a request fails on the active account with Anthropic's error.
 - Artifacts published before relay mode was on stay with the account that published them.
-- Windows, until the tests in section 16 pass there (main 24.4).
 - `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL` is internal to Claude Code (F35). If a version stops honoring it, sessions on the relay lose first-party behaviour (fewer models offered, no experimental betas) but keep working; the version check in section 16 catches it, and `doctor` warns on an untested version as before.
 
 ## 16. Testing
@@ -296,7 +295,7 @@ All of these are made in the main spec.
 
   Renewal is covered by the unit tests only: the fake API cannot renew a login.
 - A version check, run like the other end-to-end tests on each new Claude Code: with the relay's two variables, Claude Code logs in with the stored login, sends model requests to the base URL, and treats it as first-party (it offers the same models as without the relay).
-- In the app on macOS, with relay mode on and the home account the app's: a new Code session runs, a swap to another account moves its next turn there (the relay's log), an artifact published while that account is active opens in the artifact pane, and a session at a limit continues on the next account without stopping. Then on Windows.
+- In the app on macOS, with relay mode on and the home account the app's: a new Code session runs, a swap to another account moves its next turn there (the relay's log), an artifact published while that account is active opens in the artifact pane, and a session at a limit continues on the next account without stopping. Done by hand in the Windows app: turned on as a standard user, the task starts the relay, sessions keep working across swaps, and an artifact published while another pool account is active opens in the artifact pane.
 
 ## 17. Decisions
 
