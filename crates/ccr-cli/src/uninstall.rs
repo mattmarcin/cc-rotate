@@ -59,7 +59,11 @@ pub fn run(profile: Option<PathBuf>, dry_run: bool, yes: bool, force: bool) -> R
     drop(store);
 
     print_plan(&plan);
-    let blocked = blocked(&plan, force);
+    let blocked = blocked(&plan, force).or_else(|| {
+        (!force)
+            .then(|| ccr_core::desktop::uninstall_refusal(&ccr_core::desktop::read_setup()))
+            .flatten()
+    });
     if dry_run {
         if let Some(why) = blocked {
             println!();
@@ -146,6 +150,14 @@ pub fn run(profile: Option<PathBuf>, dry_run: bool, yes: bool, force: bool) -> R
 
 /// Why the plan cannot be carried out now, if it cannot.
 fn blocked(plan: &Plan, force: bool) -> Option<String> {
+    // Turning relay mode off is refused while a swap is pending; the store must not go before it
+    // is off. `--force` does not change that.
+    if plan.relay_swap_pending {
+        return Some(
+            "the app account is on and a swap was interrupted and isn't settled yet, so the app account can't be turned off first. cc-rotate settles it within a minute (or run cc-rotate-ctl status); then run cc-rotate-ctl uninstall again."
+                .into(),
+        );
+    }
     if let KeychainItem::Unreachable(service) = &plan.keychain {
         return Some(format!(
             "this session can't use the macOS Keychain, which holds the cc-rotate profile's login (\"{service}\"). Run cc-rotate-ctl uninstall in Terminal on the Mac itself, not over SSH."
@@ -165,7 +177,34 @@ fn blocked(plan: &Plan, force: bool) -> Option<String> {
 }
 
 fn print_plan(plan: &Plan) {
-    let mut remove = vec!["Quit the cc-rotate app, if it runs".to_string()];
+    let (remove, keep) = plan_lines(plan);
+    println!("This removes cc-rotate:");
+    for line in &remove {
+        println!("  - {line}");
+    }
+    if !keep.is_empty() {
+        println!("It leaves alone:");
+        for line in &keep {
+            println!("  - {line}");
+        }
+    }
+}
+
+/// What the plan removes and what it leaves alone, a line each, in the order `run` goes.
+fn plan_lines(plan: &Plan) -> (Vec<String>, Vec<String>) {
+    let mut remove = Vec::new();
+    if let Some(home) = &plan.relay_home {
+        remove.push(format!(
+            "Turn the app account off, so the profile has the login of the account in use again (the app account is {home})"
+        ));
+    }
+    if let Some(service) = &plan.relay_service {
+        remove.push(format!("Stop the local proxy and remove {service}"));
+    }
+    if let Some(config) = &plan.relay_config {
+        remove.push(format!("Delete {}", config.display()));
+    }
+    remove.push("Quit the cc-rotate app, if it runs".to_string());
     let mut keep = Vec::new();
     if let Some(entry) = &plan.autostart {
         remove.push(format!("Stop it starting at login: {entry}"));
@@ -275,15 +314,47 @@ fn print_plan(plan: &Plan) {
     if let Some(why) = &plan.programs_kept {
         keep.push(format!("The programs: {why}"));
     }
+    (remove, keep)
+}
 
-    println!("This removes cc-rotate:");
-    for line in &remove {
-        println!("  - {line}");
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uninstall_plan_lists_relay() {
+        let plan = Plan {
+            relay_home: Some("work".into()),
+            relay_service: Some("the local proxy's LaunchAgent, /a/cc-rotate.relay.plist".into()),
+            relay_config: Some(PathBuf::from("/data/relay.json")),
+            ..Default::default()
+        };
+        let (remove, _) = plan_lines(&plan);
+        assert_eq!(
+            remove[..4],
+            [
+                "Turn the app account off, so the profile has the login of the account in use again (the app account is work)",
+                "Stop the local proxy and remove the local proxy's LaunchAgent, /a/cc-rotate.relay.plist",
+                "Delete /data/relay.json",
+                "Quit the cc-rotate app, if it runs",
+            ]
+        );
+        let (remove, _) = plan_lines(&Plan::default());
+        assert_eq!(remove, ["Quit the cc-rotate app, if it runs"]);
     }
-    if !keep.is_empty() {
-        println!("It leaves alone:");
-        for line in &keep {
-            println!("  - {line}");
+
+    #[test]
+    fn a_pending_swap_in_relay_mode_blocks_uninstall_even_forced() {
+        let plan = Plan {
+            relay_home: Some("work".into()),
+            relay_swap_pending: true,
+            ..Default::default()
+        };
+        for force in [false, true] {
+            let why = blocked(&plan, force).expect("not blocked");
+            assert!(why.contains("swap"), "{why}");
+            assert!(why.contains("the app account"), "{why}");
         }
+        assert_eq!(blocked(&Plan::default(), false), None);
     }
 }

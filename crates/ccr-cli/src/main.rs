@@ -1,3 +1,4 @@
+mod desktop_launch;
 mod format;
 mod herdr;
 mod interrupts;
@@ -76,6 +77,10 @@ enum Command {
         accounts: Vec<String>,
         #[arg(long)]
         json: bool,
+        /// Renew the one account's login with Claude Code in a scratch profile (used by the local
+        /// proxy while the app account is on).
+        #[arg(long, hide = true)]
+        renew: bool,
     },
     /// Start an account's 5-hour window now: Claude Code sends one short prompt to the smallest
     /// model with its login, then reads its usage.
@@ -215,6 +220,13 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Show whether the Claude desktop app's Code sessions run on the pool, and the commands that
+    /// turn that on or off (macOS and Windows; they need an administrator).
+    Desktop {
+        /// Print the macOS configuration profile that turns on the app's launcher policy.
+        #[arg(long)]
+        mobileconfig: bool,
+    },
     /// Check cc-rotate's data, the profile and Claude Code.
     Doctor {
         #[arg(long)]
@@ -249,6 +261,49 @@ enum Command {
     /// cc-rotate writing it (started in the background by the status line).
     #[command(hide = true)]
     SettleLogin,
+    /// The launcher the Claude desktop app runs for each Code session, named in Claude Code's
+    /// managed settings (`processWrapper`): it puts desktop sessions on the cc-rotate profile.
+    #[command(hide = true)]
+    DesktopLaunch {
+        /// Claude Code and its arguments, after `--`.
+        #[arg(last = true, required = true, value_parser = clap::value_parser!(std::ffi::OsString))]
+        command: Vec<std::ffi::OsString>,
+    },
+    /// Link the transcripts of desktop sessions on the pool into the app's profile, so the app
+    /// finds them after it restarts (started in the background by `desktop-launch`). With
+    /// `--watch-pid`, keep looking while that Claude Code runs, until its new transcript is
+    /// linked.
+    #[command(hide = true)]
+    DesktopLinkTranscripts {
+        #[arg(long, value_name = "DIR")]
+        app_profile: PathBuf,
+        #[arg(long, value_name = "PID")]
+        watch_pid: Option<u32>,
+    },
+    /// Show the app account, or set it: sessions act as the account the Claude desktop app is
+    /// signed in to (so artifacts open in the app's artifact pane), while usage still rotates
+    /// across the pool through a local proxy.
+    ///
+    /// `cc-rotate-ctl app-account <account>` turns it on, `cc-rotate-ctl app-account off` turns
+    /// it off, and `cc-rotate-ctl app-account` shows it.
+    AppAccount {
+        /// The account the desktop app is signed in to (label, email or id), or `off` to turn the
+        /// app account off. `off` always means off: name an account labelled "off" by its email
+        /// or id.
+        #[arg(value_name = "ACCOUNT")]
+        account: Option<String>,
+        /// Everything but installing the local proxy's service (for tests, which run the local
+        /// proxy themselves).
+        #[arg(long, hide = true, requires = "account")]
+        no_service: bool,
+    },
+    /// The local proxy behind the app account (`relay run`, started by the launchers and its
+    /// service).
+    #[command(hide = true)]
+    Relay {
+        #[command(subcommand)]
+        action: Option<RelayAction>,
+    },
     /// Tell herdr how to resume a session (started in the background by `hook session-start`).
     #[command(hide = true)]
     HerdrReport {
@@ -264,12 +319,22 @@ enum Command {
 }
 
 #[derive(Subcommand)]
+enum RelayAction {
+    /// Serve the relay on the port in `relay.json` (started by the launchers and the relay's
+    /// service); exits at once when another relay runs.
+    #[command(hide = true)]
+    Run,
+}
+
+#[derive(Subcommand)]
 enum HookCommand {
     /// A turn stopped at a usage limit: swap, then wake the session once the profile holds an
     /// account with room.
     StopFailure,
     /// Report `cc-rotate --resume <id>` to herdr when the session runs in a herdr pane.
     SessionStart,
+    /// A turn ended normally: a session stopped at a usage limit is working again.
+    Stop,
 }
 
 fn main() -> ExitCode {
@@ -291,6 +356,32 @@ fn run(cli: Cli) -> Result<ExitCode> {
             yes,
             force,
         } => uninstall::run(cli.profile, dry_run, yes, force),
+        // Reads system settings only.
+        Command::Desktop { mobileconfig: true } => {
+            print!("{}", ccr_core::desktop::mobileconfig());
+            Ok(ExitCode::SUCCESS)
+        }
+        // Reads system settings, and the store only for the app account.
+        Command::Desktop {
+            mobileconfig: false,
+        } => {
+            let setup = ccr_core::desktop::read_setup();
+            let home = relay_home_label();
+            print!(
+                "{}",
+                format::desktop(&setup, &dunce_exe()?, home.as_deref())
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        // Starts Claude Code for the desktop app: nothing here may write to the store.
+        Command::DesktopLaunch { command } => Ok(desktop_launch::run(cli.profile, command)),
+        Command::DesktopLinkTranscripts {
+            app_profile,
+            watch_pid,
+        } => {
+            desktop_launch::link_transcripts(cli.profile, &app_profile, watch_pid);
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Statusline { observe, then } => {
             statusline_entry(cli.profile, observe, then);
             Ok(ExitCode::SUCCESS)
@@ -306,6 +397,15 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
         }),
         Command::Hook {
+            hook: HookCommand::Stop,
+        } => {
+            // Never fails the session: errors only go to the log.
+            if let Err(e) = stop_hook(cli.profile, &read_stdin()) {
+                process::log_error("hook stop", &e);
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Hook {
             hook: HookCommand::SessionStart,
         } => {
             // Never fails Claude Code's startup: errors only go to the log.
@@ -313,6 +413,17 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 process::log_error("hook session-start", &e);
             }
             Ok(ExitCode::SUCCESS)
+        }
+        // Opens the store and resolves the profile itself, after taking the relay's lock.
+        Command::Relay {
+            action: Some(RelayAction::Run),
+        } => Ok(relay_run()),
+        // `relay` alone is no longer a user command: point at its replacement.
+        Command::Relay { action: None } => {
+            eprintln!(
+                "error: the app account is shown and set with `cc-rotate-ctl app-account` (see `cc-rotate-ctl app-account --help`)."
+            );
+            Ok(ExitCode::from(2))
         }
         Command::HerdrReport {
             seq,
@@ -327,13 +438,19 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
         },
         command => {
-            let (store, paths) = ccr_core::open(cli.profile)?;
-            dispatch(command, &store, &paths)
+            let (store, paths) = ccr_core::open(cli.profile.clone())?;
+            dispatch(command, &store, &paths, cli.profile)
         }
     }
 }
 
-fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> {
+/// `profile_flag` is `--profile`, which `open` already used for `paths`.
+fn dispatch(
+    command: Command,
+    store: &Store,
+    paths: &Paths,
+    profile_flag: Option<PathBuf>,
+) -> Result<ExitCode> {
     match command {
         Command::Status { json } => {
             let _ = ccr_core::budget::refresh_rates(store, time::now_ms());
@@ -446,7 +563,11 @@ fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> 
                 }
             }
         }
-        Command::Check { accounts, json } => check_cmd(store, paths, &accounts, json)?,
+        Command::Check {
+            accounts,
+            json,
+            renew,
+        } => check_cmd(store, paths, &accounts, json, renew)?,
         Command::SettleLogin => {
             let timeout = Duration::from_millis(store.settings()?.lock_timeout_ms);
             let _lock = ccr_core::lock::DirLock::acquire(
@@ -476,6 +597,8 @@ fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> 
             if a.state == AccountState::Active {
                 bail!("{} is in use. Swap to another account first.", a.label);
             }
+            // Before asking for --yes: there is nothing to confirm.
+            ccr_core::relay::refuse_removal(store, &a)?;
             if !yes {
                 bail!(
                     "This removes {} and its saved login. Run again with --yes to confirm.",
@@ -638,14 +761,315 @@ fn dispatch(command: Command, store: &Store, paths: &Paths) -> Result<ExitCode> 
             println!();
         }
         Command::Dashboard => process::launch_app()?,
+        Command::AppAccount { account: None, .. } => {
+            print!("{}", format::relay(&relay_view(store, paths)?))
+        }
+        // `off` is a keyword: it always means off, whatever an account is called.
+        Command::AppAccount {
+            account: Some(off), ..
+        } if off == "off" => {
+            ccr_core::relay::turn_off(store, paths)?;
+            println!(
+                "The app account is off. New sessions start without the local proxy; it serves the sessions started while the app account was on until it has had no request for an hour, then removes itself."
+            );
+            println!(
+                "Restart the sessions started while the app account was on within the hour: once the local proxy has removed itself, they get connection errors."
+            );
+        }
+        Command::AppAccount {
+            account: Some(home),
+            no_service,
+        } => {
+            let ctl = dunce_exe()?;
+            let profile_flag = profile_flag.as_deref();
+            let (account, cfg) = ccr_core::relay::on(store, paths, &home, || {
+                if no_service {
+                    return Ok(());
+                }
+                let env = ccr_core::relay_service::service_env(profile_flag);
+                ccr_core::relay_service::Service::real()?.install(&ctl, &env)
+            })?;
+            println!(
+                "The app account is {0}: sessions act as {0} (the desktop app's account); usage still rotates across the pool.",
+                account.label
+            );
+            println!(
+                "Sessions started from now on go through the local proxy on 127.0.0.1:{}; restart running ones to move them.",
+                cfg.port
+            );
+        }
         Command::Statusline { .. }
         | Command::Hook { .. }
         | Command::HerdrReport { .. }
+        | Command::Relay { .. }
+        | Command::DesktopLaunch { .. }
+        | Command::DesktopLinkTranscripts { .. }
+        | Command::Desktop { .. }
         | Command::Uninstall { .. } => {
             unreachable!()
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// How long a relay that cannot start waits before it exits, so its service (which restarts it
+/// whenever it ends) restarts it at that pace rather than in a tight loop.
+const RELAY_START_FAILED_WAIT: Duration = Duration::from_secs(10);
+
+/// `cc-rotate-ctl relay run` (spec sections 5 and 10): hold `relay.lock`, resolve the store and
+/// profile, bind 127.0.0.1 on the port in `relay.json`, and serve until the relay leaves (an
+/// upgrade, or an hour without requests once relay mode is off).
+/// Another relay holding the lock, or another program listening on the port, means there is
+/// nothing to do: it exits at once and quietly, the taken port noted in `relay.log`.
+/// A relay that cannot start otherwise says why in `relay.log` and exits with an error after a
+/// wait.
+fn relay_run() -> ExitCode {
+    // The program as it is now, before any wait: an upgrade while this relay waits for the lock
+    // is still one, and it leaves at its first check.
+    let program = std::env::current_exe().ok();
+    let program_at_start = program.as_deref().and_then(ccr_relay::fingerprint);
+    // Read once, and not passed on to what the relay starts (Claude Code for renewals).
+    let from_service =
+        std::env::var_os(ccr_core::relay_service::SERVICE_MARK_ENV).is_some_and(|v| !v.is_empty());
+    // SAFETY: no other thread runs yet, so none reads the environment meanwhile.
+    unsafe { std::env::remove_var(ccr_core::relay_service::SERVICE_MARK_ENV) };
+    // The lock and `relay.json` are in the data folder; the profile is resolved below.
+    let data = match Paths::default_data_dir() {
+        Ok(dir) => Paths::new(dir, PathBuf::new()),
+        Err(e) => return relay_start_failed(None, &e),
+    };
+    // An OS file lock, held for the life of the process: however the process ends (a crash,
+    // SIGKILL, SIGTERM from its service), the system releases it and the next relay can start.
+    // One the service started waits for it, and takes over when the relay a launcher started
+    // ends: exiting would only have the service start it again and again.
+    let _lock = match relay_lock(&data, from_service) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => return ExitCode::SUCCESS,
+        Err(e) => return relay_start_failed(Some(&data), &e),
+    };
+    let ready = match relay_ready(&data, program, program_at_start) {
+        Ok(Some(ready)) => ready,
+        // Another relay (one from another data folder, say) already serves this port.
+        Ok(None) => return ExitCode::SUCCESS,
+        Err(e) => return relay_start_failed(Some(&data), &e),
+    };
+    match ready() {
+        Ok(()) => ExitCode::SUCCESS,
+        // The runtime would not start, or the relay refused its address: before it served.
+        Err(e) => relay_start_failed(Some(&data), &e),
+    }
+}
+
+/// Everything the relay needs, resolved before it takes the port, and then the port: what
+/// serves until the relay leaves. `None` when something else listens on the port, which is
+/// written to `relay.log`.
+fn relay_ready(
+    data: &Paths,
+    program: Option<PathBuf>,
+    program_at_start: Option<ccr_relay::Fingerprint>,
+) -> Result<Option<impl FnOnce() -> Result<()> + use<>>> {
+    use ccr_relay::RelayEvents;
+    use std::sync::Arc;
+
+    // The relay runs swaps, which need the profile as any swap does: the one every other command
+    // resolves (`CC_ROTATE_PROFILE`, the `profile_dir` setting, `~/.claude-rotate`).
+    let (store, paths) = ccr_core::open(None).context("opening the store and the profile")?;
+    let cfg = ccr_core::relay::RelayConfig::read(&data.relay_config())?
+        .with_context(|| format!("{} does not exist", data.relay_config().display()))?;
+    let upstream = relay_upstream()?;
+    let events_store = Store::open(&paths.store_db())?;
+    let listener = match std::net::TcpListener::bind(("127.0.0.1", cfg.port)) {
+        Ok(listener) => listener,
+        // Exits quietly (a relay of another data folder may serve it), but says so for `doctor`.
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            ccr_relay::log_now(
+                &data.relay_log(),
+                &format!(
+                    "cannot start: 127.0.0.1:{} is taken by another program",
+                    cfg.port
+                ),
+            );
+            return Ok(None);
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!("listening on 127.0.0.1:{}", cfg.port));
+        }
+    };
+    Ok(Some(move || {
+        let log = Arc::new(ccr_relay::FileLog::new(paths.relay_log()));
+        log.log(&format!(
+            "started, version {}, port {}",
+            env!("CARGO_PKG_VERSION"),
+            cfg.port
+        ));
+        // Readings, threshold swaps and swaps at a refused limit (spec 7 and 8). Each part has a
+        // store connection of its own, and every swap opens another.
+        let events = Arc::new(
+            ccr_relay::StoreEvents::new(
+                events_store,
+                Arc::new(ccr_relay::StoreSwaps::new(paths.clone())),
+                log.clone(),
+            )
+            .with_profile(&paths.profile_dir),
+        );
+        // Renewals run a check on a store of their own (spec 9).
+        let renewals = Arc::new(ccr_relay::StoreRenewals::new(paths.clone(), log));
+        let options = ccr_relay::Options {
+            program,
+            program_at_start,
+            lifecycle: Arc::new(RelayLifecycle {
+                paths: paths.clone(),
+            }),
+            ..ccr_relay::Options::default()
+        };
+        ccr_relay::run_blocking(
+            listener,
+            cfg,
+            options,
+            upstream,
+            Arc::new(ccr_relay::StoreLogins::new(store, renewals)),
+            events,
+        )
+    }))
+}
+
+/// One line in `relay.log` (or cc-rotate's log, without a data folder), then the wait, then an
+/// error exit.
+fn relay_start_failed(data: Option<&Paths>, e: &anyhow::Error) -> ExitCode {
+    match data {
+        Some(data) => ccr_relay::log_now(&data.relay_log(), &format!("cannot start: {e:#}")),
+        None => process::log_error("relay run", e),
+    }
+    std::thread::sleep(RELAY_START_FAILED_WAIT);
+    ExitCode::FAILURE
+}
+
+/// Whether relay mode is on, and what the relay removes when it leaves for good (spec 10).
+struct RelayLifecycle {
+    paths: Paths,
+}
+
+impl RelayLifecycle {
+    fn home(&self) -> Result<Option<i64>> {
+        ccr_core::relay::home(&Store::open(&self.paths.store_db())?)
+    }
+}
+
+impl ccr_relay::Lifecycle for RelayLifecycle {
+    fn mode_on(&self) -> bool {
+        // Unsure counts as on: the relay stays.
+        !matches!(self.home(), Ok(None))
+    }
+
+    fn retire(&self) -> Result<()> {
+        // `app-account <account>` may have run since the last look.
+        if self.home()?.is_some() {
+            bail!("the app account is on again");
+        }
+        let service = ccr_core::relay_service::Service::real()?;
+        let data_dir = std::env::var("CC_ROTATE_DATA_DIR").ok();
+        ccr_core::relay_service::retire(&service, &self.paths.relay_config(), data_dir.as_deref())
+    }
+}
+
+/// The home account's label while relay mode is on, for `desktop`, which otherwise reads system
+/// settings only: `None` when relay mode is off, or the store isn't there or can't be read.
+/// Read-only: `desktop` never writes to, or migrates, the store.
+fn relay_home_label() -> Option<String> {
+    use ccr_core::relay::{SETTING_HOME, SETTING_MODE};
+    let path = Paths::default_data_dir().ok()?.join("store.db");
+    if !path.exists() {
+        return None;
+    }
+    if Store::read_setting_any_schema(&path, SETTING_MODE)
+        .ok()??
+        .as_str()
+        != "on"
+    {
+        return None;
+    }
+    let id: i64 = Store::read_setting_any_schema(&path, SETTING_HOME)
+        .ok()??
+        .trim()
+        .parse()
+        .ok()?;
+    // The label needs this build's schema; without it, the id still says which account.
+    let label = Store::open_read_only(&path)
+        .ok()
+        .and_then(|store| store.account(id).ok().flatten())
+        .map(|a| a.label);
+    Some(label.unwrap_or_else(|| format!("account {id}")))
+}
+
+/// What `cc-rotate-ctl app-account` shows.
+fn relay_view(store: &Store, paths: &Paths) -> Result<format::RelayView> {
+    let home = match ccr_core::relay::home(store)? {
+        Some(id) => Some(
+            store
+                .account(id)?
+                .map_or_else(|| format!("account {id}"), |a| a.label),
+        ),
+        None => None,
+    };
+    let port = ccr_core::relay::RelayConfig::read(&paths.relay_config())?.map(|cfg| cfg.port);
+    Ok(format::RelayView {
+        home,
+        port,
+        answers: port.is_some_and(ccr_core::relay::answers),
+        service: ccr_core::relay_service::status(),
+        bypassing: ccr_core::relay::bypass_count(store, time::now_ms())?,
+    })
+}
+
+/// The relay's lock file, locked: `None` when another process holds it.
+/// With `wait`, waits for the process that holds it to let go instead.
+fn relay_lock(data: &Paths, wait: bool) -> Result<Option<std::fs::File>> {
+    let path = data.relay_lock();
+    let path = path.as_path();
+    if let Some(dir) = path.parent() {
+        ccr_core::secret::create_private_dir(dir)?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) if wait => {
+            ccr_relay::log_now(
+                &data.relay_log(),
+                "another local proxy runs; waiting for it to end",
+            );
+            file.lock()
+                .with_context(|| format!("locking {}", path.display()))?;
+            Ok(Some(file))
+        }
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => {
+            Err(e).with_context(|| format!("locking {}", path.display()))
+        }
+    }
+}
+
+/// Anthropic's API; a test build can name a local server in `CC_ROTATE_RELAY_TEST_UPSTREAM`.
+fn relay_upstream() -> Result<ccr_relay::Upstream> {
+    #[cfg(feature = "relay-test-upstream")]
+    if let Some(base) = std::env::var_os("CC_ROTATE_RELAY_TEST_UPSTREAM").filter(|v| !v.is_empty())
+    {
+        let base = base
+            .to_str()
+            .context("CC_ROTATE_RELAY_TEST_UPSTREAM is not valid UTF-8")?
+            .parse()
+            .context("CC_ROTATE_RELAY_TEST_UPSTREAM is not a URL")?;
+        return ccr_relay::Upstream::for_test(base);
+    }
+    ccr_relay::Upstream::anthropic()
 }
 
 fn dunce_exe() -> Result<PathBuf> {
@@ -660,7 +1084,16 @@ fn strip_verbatim(p: &std::path::Path) -> PathBuf {
     PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s))
 }
 
-fn check_cmd(store: &Store, paths: &Paths, references: &[String], json: bool) -> Result<()> {
+fn check_cmd(
+    store: &Store,
+    paths: &Paths,
+    references: &[String],
+    json: bool,
+    renew: bool,
+) -> Result<()> {
+    if renew && references.len() != 1 {
+        bail!("--renew takes exactly one account");
+    }
     // Settle anything an earlier check left behind first.
     usage_check::sweep(store, paths)?;
     let accounts = if references.is_empty() {
@@ -686,7 +1119,11 @@ fn check_cmd(store: &Store, paths: &Paths, references: &[String], json: bool) ->
             print!("{:<width$}  ", a.label);
             let _ = std::io::stdout().flush();
         }
-        let outcome = usage_check::check(store, paths, a.id, usage_check::Trigger::Manual)?;
+        let outcome = if renew {
+            usage_check::renew(store, paths, a.id)?
+        } else {
+            usage_check::check(store, paths, a.id, usage_check::Trigger::Manual)?
+        };
         if json {
             results.push(serde_json::json!({ "label": a.label, "result": outcome }));
         } else {
@@ -878,6 +1315,22 @@ fn login_cmd(
     Ok(())
 }
 
+/// `hook stop` (spec section 24.3). Runs after every turn of every session in the profile, so it
+/// does nothing beyond reading the store unless the session has an open stop.
+fn stop_hook(profile: Option<PathBuf>, input: &str) -> Result<()> {
+    let payload: serde_json::Value = serde_json::from_str(input).unwrap_or_default();
+    let Some(session) = payload
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty() && s.len() <= 128)
+    else {
+        return Ok(());
+    };
+    let (store, _) = ccr_core::open(profile)?;
+    ccr_core::waiting::note_turn_ended(&store, session, time::now_ms())?;
+    Ok(())
+}
+
 fn read_stdin() -> String {
     let mut text = String::new();
     if !std::io::stdin().is_terminal() {
@@ -905,7 +1358,9 @@ fn statusline_entry(profile: Option<PathBuf>, observe: bool, then: Option<String
             statusline::observe(&store, &dir, &paths.home, &input, time::now_ms())?;
             return Ok(None);
         }
-        let result = statusline::tick(&store, &paths, &input, time::now_ms())?;
+        let result = statusline::tick(&store, &paths, &input, time::now_ms(), |name| {
+            std::env::var(name).ok()
+        })?;
         if let Some(req) = &result.swap {
             process::spawn_swap(req, profile.as_deref())?;
         } else if result.settle_login {
@@ -951,5 +1406,71 @@ fn statusline_entry(profile: Option<PathBuf>, observe: bool, then: Option<String
     }
     for line in lines {
         let _ = writeln!(out, "{line}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    fn parse(args: &[&str]) -> Command {
+        let argv = std::iter::once("cc-rotate-ctl").chain(args.iter().copied());
+        Cli::try_parse_from(argv)
+            .unwrap_or_else(|e| panic!("{args:?}: {e}"))
+            .command
+    }
+
+    fn refused(args: &[&str]) -> bool {
+        Cli::try_parse_from(std::iter::once("cc-rotate-ctl").chain(args.iter().copied())).is_err()
+    }
+
+    #[test]
+    fn the_command_line_is_well_formed() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn app_account_and_the_hidden_relay_run_parse() {
+        assert!(matches!(
+            parse(&["app-account"]),
+            Command::AppAccount {
+                account: None,
+                no_service: false
+            }
+        ));
+        assert!(matches!(
+            parse(&["app-account", "work", "--no-service"]),
+            Command::AppAccount { account: Some(a), no_service: true } if a == "work"
+        ));
+        assert!(matches!(
+            parse(&["app-account", "off"]),
+            Command::AppAccount { account: Some(a), no_service: false } if a == "off"
+        ));
+        // The installed service runs exactly this.
+        assert!(matches!(
+            parse(&["relay", "run"]),
+            Command::Relay {
+                action: Some(RelayAction::Run)
+            }
+        ));
+        assert!(refused(&["app-account", "--no-service"]));
+        assert!(refused(&["relay", "on", "--home", "work"]));
+        assert!(refused(&["relay", "off"]));
+    }
+
+    #[test]
+    fn help_lists_app_account_and_not_relay() {
+        let help = Cli::command().render_help().to_string();
+        assert!(help.contains("app-account"), "{help}");
+        assert!(!help.to_lowercase().contains("relay"), "{help}");
+
+        let mut cli = Cli::command();
+        let app_account = cli.find_subcommand_mut("app-account").unwrap();
+        let help = app_account.render_long_help().to_string();
+        assert!(help.contains("off"), "{help}");
+        assert!(!help.to_lowercase().contains("relay"), "{help}");
+        assert!(!help.contains("--no-service"), "{help}");
+        assert!(!help.contains('\u{2014}'), "no em dashes: {help}");
     }
 }

@@ -254,7 +254,8 @@ fn scheduler_follows_the_order_and_skips_exhausted() {
         }
     );
 
-    store.record_sample(&sample(a, 10.0, 98.5)).unwrap();
+    // a is at its weekly limit (weekly limits swap at 100%), so every account is used up.
+    store.record_sample(&sample(a, 10.0, 100.0)).unwrap();
     let before = env.file_doc();
     assert_eq!(
         swap::run(&store, &env.paths, &manual(None)).unwrap(),
@@ -435,7 +436,7 @@ fn tick_records_usage_and_requests_swap_at_threshold() {
             time::now_s() + 86_400
         ))
     };
-    let r = statusline::tick(&store, &env.paths, &input(50.0), time::now_ms()).unwrap();
+    let r = statusline::tick(&store, &env.paths, &input(50.0), time::now_ms(), |_| None).unwrap();
     assert!(r.swap.is_none());
     assert_eq!(
         store
@@ -448,11 +449,11 @@ fn tick_records_usage_and_requests_swap_at_threshold() {
         50.0
     );
 
-    let r = statusline::tick(&store, &env.paths, &input(98.0), time::now_ms()).unwrap();
+    let r = statusline::tick(&store, &env.paths, &input(98.0), time::now_ms(), |_| None).unwrap();
     let req = r.swap.expect("swap requested at 98%");
     assert_eq!((req.from, req.reason), (Some(a), Reason::FiveHour));
 
-    let r = statusline::tick(&store, &env.paths, &input(99.0), time::now_ms()).unwrap();
+    let r = statusline::tick(&store, &env.paths, &input(99.0), time::now_ms(), |_| None).unwrap();
     assert!(
         r.swap.is_none(),
         "requests are throttled while one is pending"
@@ -463,10 +464,24 @@ fn tick_records_usage_and_requests_swap_at_threshold() {
 fn tick_writes_back_refreshed_login() {
     let env = Env::new();
     let (store, a, _, _) = pool(&env);
-    statusline::tick(&store, &env.paths, &StatusInput::default(), time::now_ms()).unwrap();
+    statusline::tick(
+        &store,
+        &env.paths,
+        &StatusInput::default(),
+        time::now_ms(),
+        |_| None,
+    )
+    .unwrap();
     std::thread::sleep(Duration::from_millis(20));
     credfile::write_oauth(&env.cred_file(), &oauth("a9")).unwrap();
-    statusline::tick(&store, &env.paths, &StatusInput::default(), time::now_ms()).unwrap();
+    statusline::tick(
+        &store,
+        &env.paths,
+        &StatusInput::default(),
+        time::now_ms(),
+        |_| None,
+    )
+    .unwrap();
     assert_eq!(
         store.credential(a).unwrap().unwrap().oauth["refreshToken"],
         "refresh-a9"
@@ -485,7 +500,14 @@ fn tick_writes_back_refreshed_login() {
 fn dead_login_triggers_swap_and_marks_needs_login() {
     let env = Env::new();
     let (store, a, _, _) = pool(&env);
-    statusline::tick(&store, &env.paths, &StatusInput::default(), time::now_ms()).unwrap();
+    statusline::tick(
+        &store,
+        &env.paths,
+        &StatusInput::default(),
+        time::now_ms(),
+        |_| None,
+    )
+    .unwrap();
     std::thread::sleep(Duration::from_millis(20));
     credfile::write_oauth(
         &env.cred_file(),
@@ -493,7 +515,14 @@ fn dead_login_triggers_swap_and_marks_needs_login() {
     )
     .unwrap();
 
-    let r = statusline::tick(&store, &env.paths, &StatusInput::default(), time::now_ms()).unwrap();
+    let r = statusline::tick(
+        &store,
+        &env.paths,
+        &StatusInput::default(),
+        time::now_ms(),
+        |_| None,
+    )
+    .unwrap();
     let req = r.swap.expect("dead login requests a swap");
     assert_eq!(req.reason, Reason::DeadLogin);
     swap::run(&store, &env.paths, &req).unwrap();
@@ -527,6 +556,7 @@ fn readings_of_the_old_account_after_a_swap_are_ignored() {
         &env.paths,
         &StatusInput::parse(&stale),
         time::now_ms(),
+        |_| None,
     )
     .unwrap();
     assert!(
@@ -692,7 +722,14 @@ fn manual_login_inside_profile_is_adopted() {
         json!({"oauthAccount": {"accountUuid": "ua"}}).to_string(),
     )
     .unwrap();
-    statusline::tick(&store, &env.paths, &StatusInput::default(), time::now_ms()).unwrap();
+    statusline::tick(
+        &store,
+        &env.paths,
+        &StatusInput::default(),
+        time::now_ms(),
+        |_| None,
+    )
+    .unwrap();
 
     // The user ran /login as account b inside the rotation profile.
     std::thread::sleep(Duration::from_millis(20));
@@ -702,7 +739,14 @@ fn manual_login_inside_profile_is_adopted() {
         json!({"oauthAccount": {"accountUuid": "ub"}}).to_string(),
     )
     .unwrap();
-    statusline::tick(&store, &env.paths, &StatusInput::default(), time::now_ms()).unwrap();
+    statusline::tick(
+        &store,
+        &env.paths,
+        &StatusInput::default(),
+        time::now_ms(),
+        |_| None,
+    )
+    .unwrap();
 
     assert_eq!(store.active_account().unwrap().unwrap().id, b);
     assert_eq!(
@@ -753,7 +797,14 @@ fn tick_switches_back_to_a_preferred_account() {
         now_s + 86_400 * 3
     );
     let tick = |at_ms: i64| {
-        statusline::tick(&store, &env.paths, &StatusInput::parse(&input), at_ms).unwrap()
+        statusline::tick(
+            &store,
+            &env.paths,
+            &StatusInput::parse(&input),
+            at_ms,
+            |_| None,
+        )
+        .unwrap()
     };
 
     let r = tick(time::now_ms());
@@ -805,6 +856,7 @@ fn tick_switches_back_to_a_preferred_account() {
         &env.paths,
         &StatusInput::default(),
         time::now_ms() + 3_600_000,
+        |_| None,
     )
     .unwrap();
     assert!(r.swap.is_none());
@@ -830,14 +882,28 @@ fn a_session_idle_since_a_swap_is_not_taken_for_the_account_in_use() {
         now_s + 86_400 * 3
     );
     let before = time::now_ms() - 60_000;
-    statusline::tick(&store, &env.paths, &input("idle", &a_numbers), before).unwrap();
+    statusline::tick(
+        &store,
+        &env.paths,
+        &input("idle", &a_numbers),
+        before,
+        |_| None,
+    )
+    .unwrap();
     assert_eq!(store.last_sample(a).unwrap().unwrap().windows[0].pct, 40.0);
 
     swap::run(&store, &env.paths, &manual(Some(b))).unwrap();
     // Well past the 120 s right after a swap, when the old account's reset times are dropped
     // anyway.
     let later = time::now_ms() + 10 * 60_000;
-    statusline::tick(&store, &env.paths, &input("idle", &a_numbers), later).unwrap();
+    statusline::tick(
+        &store,
+        &env.paths,
+        &input("idle", &a_numbers),
+        later,
+        |_| None,
+    )
+    .unwrap();
     assert!(
         store.last_sample(b).unwrap().is_none(),
         "the idle session still shows a"
@@ -852,6 +918,7 @@ fn a_session_idle_since_a_swap_is_not_taken_for_the_account_in_use() {
         &env.paths,
         &input("idle", &weekly_only),
         later + 1000,
+        |_| None,
     )
     .unwrap();
     assert!(store.last_sample(b).unwrap().is_none());
@@ -862,7 +929,14 @@ fn a_session_idle_since_a_swap_is_not_taken_for_the_account_in_use() {
         now_s + 4 * 3600,
         now_s + 86_400 * 5
     );
-    statusline::tick(&store, &env.paths, &input("idle", &b_numbers), later + 2000).unwrap();
+    statusline::tick(
+        &store,
+        &env.paths,
+        &input("idle", &b_numbers),
+        later + 2000,
+        |_| None,
+    )
+    .unwrap();
     let last = store.last_sample(b).unwrap().expect("b's own reading");
     assert_eq!(last.windows[0].pct, 3.0);
     assert_eq!(store.last_sample(a).unwrap().unwrap().windows[0].pct, 40.0);
@@ -987,6 +1061,7 @@ fn an_account_found_used_up_after_a_swap_is_left_at_once() {
         &env.paths,
         &five_hour_input(100.0, time::now_s() + 7200),
         now,
+        |_| None,
     )
     .unwrap();
     let req = tick
@@ -1011,6 +1086,7 @@ fn an_account_found_used_up_after_a_swap_is_left_at_once() {
         &env.paths,
         &five_hour_input(40.0, resets),
         now + 1000,
+        |_| None,
     )
     .unwrap();
     let tick = statusline::tick(
@@ -1018,6 +1094,7 @@ fn an_account_found_used_up_after_a_swap_is_left_at_once() {
         &env.paths,
         &five_hour_input(99.0, resets),
         now + 40_000,
+        |_| None,
     )
     .unwrap();
     assert!(tick.swap.is_none(), "within the cooldown");
@@ -1100,6 +1177,7 @@ fn an_idle_session_does_not_push_the_rotation_through_the_pool() {
         &env.paths,
         &five_hour_input(100.0, time::now_s() + 7200),
         now,
+        |_| None,
     )
     .unwrap()
     .swap
@@ -1118,6 +1196,7 @@ fn an_idle_session_does_not_push_the_rotation_through_the_pool() {
         &env.paths,
         &five_hour_input(99.0, a_resets),
         now + 40_000,
+        |_| None,
     )
     .unwrap();
     assert!(tick.swap.is_none(), "{:?}", tick.swap);
@@ -1134,6 +1213,7 @@ fn an_idle_session_does_not_push_the_rotation_through_the_pool() {
         &env.paths,
         &five_hour_input(99.0, a_resets),
         now + 200_000,
+        |_| None,
     )
     .unwrap();
     assert!(tick.swap.is_none(), "{:?}", tick.swap);
@@ -1210,6 +1290,7 @@ fn a_session_idle_since_before_a_swap_is_ignored_however_long_it_idles() {
         &env.paths,
         &session_input("idle", 5000, 99.0, a_resets),
         now,
+        |_| None,
     )
     .unwrap();
     let swapped = swap::run(
@@ -1237,6 +1318,7 @@ fn a_session_idle_since_before_a_swap_is_ignored_however_long_it_idles() {
             &env.paths,
             &session_input("idle", 5000, 99.0, a_resets),
             now + later,
+            |_| None,
         )
         .unwrap();
         assert!(tick.swap.is_none(), "after {later} ms: {:?}", tick.swap);
@@ -1253,6 +1335,7 @@ fn a_session_idle_since_before_a_swap_is_ignored_however_long_it_idles() {
         &env.paths,
         &session_input("idle", 7000, 12.0, b_resets),
         now + 3_700_000,
+        |_| None,
     )
     .unwrap();
     assert_eq!(store.last_sample(b).unwrap().unwrap().windows[0].pct, 12.0);
@@ -1275,6 +1358,7 @@ fn a_changed_reading_counts_even_without_new_api_time() {
         &env.paths,
         &session_input("busy", 5000, 99.0, a_resets),
         now,
+        |_| None,
     )
     .unwrap();
     swap::run(
@@ -1293,6 +1377,7 @@ fn a_changed_reading_counts_even_without_new_api_time() {
         &env.paths,
         &session_input("busy", 5000, 100.0, time::now_s() + 7200),
         now + 31_000,
+        |_| None,
     )
     .unwrap()
     .swap
@@ -1325,6 +1410,7 @@ fn a_request_that_finishes_after_a_swap_still_counts_for_the_old_account() {
         &env.paths,
         &session_input("agent", 5000, 98.5, a_resets),
         now,
+        |_| None,
     )
     .unwrap();
     swap::run(
@@ -1352,6 +1438,7 @@ fn a_request_that_finishes_after_a_swap_still_counts_for_the_old_account() {
             &env.paths,
             &session_input(session, api, pct, a_resets),
             now + later,
+            |_| None,
         )
         .unwrap();
         assert!(
@@ -1382,6 +1469,7 @@ fn a_reading_sharing_the_new_accounts_own_reset_time_counts() {
         &env.paths,
         &session_input("s", 5000, 99.0, shared),
         now,
+        |_| None,
     )
     .unwrap();
     swap::run(
@@ -1400,6 +1488,7 @@ fn a_reading_sharing_the_new_accounts_own_reset_time_counts() {
         &env.paths,
         &session_input("s", 6000, 100.0, shared),
         now + 130_000,
+        |_| None,
     )
     .unwrap();
     assert_eq!(store.last_sample(b).unwrap().unwrap().windows[0].pct, 100.0);
@@ -1442,6 +1531,7 @@ fn with_nothing_known_of_the_new_account_an_ambiguous_reading_counts() {
         &env.paths,
         &session_input("s", 6000, 100.0, shared),
         now + 130_000,
+        |_| None,
     )
     .unwrap();
     assert_eq!(store.last_sample(b).unwrap().unwrap().windows[0].pct, 100.0);
@@ -1473,6 +1563,7 @@ fn with_aligned_reset_times_a_copy_of_the_old_accounts_reading_is_not_counted() 
         &env.paths,
         &session_input("idle", 5000, 99.0, shared),
         now,
+        |_| None,
     )
     .unwrap();
     swap::run(
@@ -1491,6 +1582,7 @@ fn with_aligned_reset_times_a_copy_of_the_old_accounts_reading_is_not_counted() 
         &env.paths,
         &session_input("idle", 5000, 99.0, shared),
         now + 150_000,
+        |_| None,
     )
     .unwrap();
     assert!(tick.swap.is_none(), "{:?}", tick.swap);
@@ -1501,6 +1593,7 @@ fn with_aligned_reset_times_a_copy_of_the_old_accounts_reading_is_not_counted() 
         &env.paths,
         &session_input("busy", 9000, 41.0, shared),
         now + 160_000,
+        |_| None,
     )
     .unwrap();
     assert_eq!(store.last_sample(b).unwrap().unwrap().windows[0].pct, 41.0);
@@ -1554,6 +1647,7 @@ fn mark_pending(store: &Store, fp: &str, from: Option<i64>, to: i64) {
         from,
         to,
         at: time::now_ms(),
+        relay: None,
     };
     store
         .set_meta(
@@ -1610,6 +1704,7 @@ fn an_unidentified_login_after_a_dead_swap_stops_everything_until_settled() {
             &env.paths,
             &five_hour_input(10.0, time::now_s() + 3600),
             at,
+            |_| None,
         )
         .unwrap()
     };
@@ -1708,6 +1803,7 @@ fn a_dropped_reading_at_a_limit_asks_for_a_confirmation_once_per_account_in_use(
             &env.paths,
             &session_input("s", 9000, 100.0, shared),
             at,
+            |_| None,
         )
         .unwrap()
     };
@@ -1951,6 +2047,65 @@ fn a_weekly_budget_that_would_reset_unused_moves_its_account_ahead() {
     assert!((marked - week_reset).abs() <= 5, "{marked} vs {week_reset}");
 }
 
+/// The models sessions sent requests for decide which model-scoped limits count, not only the
+/// model the status line saw last: desktop sessions run no status line, so while one uses Fable
+/// through the proxy, an account at its Fable limit is not picked.
+#[test]
+fn an_account_at_its_fable_limit_is_skipped_while_a_session_uses_fable() {
+    let env = Env::new();
+    let (store, a, b, c) = pool(&env);
+    store.set_setting("strict_order", Some("true")).unwrap();
+    store.set_order(&[a, b, c]).unwrap();
+    // A terminal session's status line last saw Opus.
+    store
+        .set_meta(swap::META_PROFILE_MODEL, "claude-opus-5-5")
+        .unwrap();
+    let with_fable = |account, fable| Sample {
+        windows: vec![
+            window("five_hour", 10.0, time::now_s() + 3600),
+            window("seven_day", 40.0, time::now_s() + 86_400 * 3),
+            window("seven_day_fable", fable, time::now_s() + 86_400 * 3),
+        ],
+        ..sample(account, 10.0, 40.0)
+    };
+    store.record_sample(&sample(a, 10.0, 40.0)).unwrap();
+    store.record_sample(&with_fable(b, 100.0)).unwrap();
+    store.record_sample(&with_fable(c, 20.0)).unwrap();
+    assert_eq!(
+        swap::next_target(&store, Some(a)).unwrap().unwrap().id,
+        b,
+        "on Opus alone, b's Fable limit does not count"
+    );
+
+    // A desktop session sends a Fable request through the proxy.
+    let relayed = |pct, ts, model: &str| Sample {
+        ts,
+        profile: "relay".into(),
+        session_id: Some("desktop-1".into()),
+        model: Some(model.into()),
+        ..sample(a, pct, 40.0)
+    };
+    let now = time::now_ms();
+    store
+        .record_sample(&relayed(12.0, now, "claude-fable-5-2"))
+        .unwrap();
+    assert_eq!(
+        swap::next_target(&store, Some(a)).unwrap().unwrap().id,
+        c,
+        "b is at its Fable limit"
+    );
+    // Its next request goes out on Opus a minute later: Fable is still in use.
+    store
+        .record_sample(&relayed(13.0, now + 60_000, "claude-opus-5-5"))
+        .unwrap();
+    assert_eq!(swap::next_target(&store, Some(a)).unwrap().unwrap().id, c);
+    // Nothing sent Fable in the hour before the latest request: b is back.
+    store
+        .record_sample(&relayed(14.0, now + 3_600_000 + 1, "claude-opus-5-5"))
+        .unwrap();
+    assert_eq!(swap::next_target(&store, Some(a)).unwrap().unwrap().id, b);
+}
+
 /// A ready account's weekly budget must not expire while a later-resetting account keeps
 /// running below its limits.
 #[test]
@@ -2188,6 +2343,7 @@ fn an_account_left_at_a_stop_is_not_switched_back_to_on_old_readings() {
         &env.paths,
         &StatusInput::parse(&input),
         time::now_ms(),
+        |_| None,
     )
     .unwrap();
     assert!(tick.swap.is_none(), "{:?}", tick.swap);
@@ -2251,7 +2407,14 @@ fn a_ready_seat_takes_over_from_a_budget_that_would_reset_unused() {
         now_s + 86_400 * 3
     );
     let later = time::now_ms() + 121_000;
-    let tick = statusline::tick(&store, &env.paths, &StatusInput::parse(&input), later).unwrap();
+    let tick = statusline::tick(
+        &store,
+        &env.paths,
+        &StatusInput::parse(&input),
+        later,
+        |_| None,
+    )
+    .unwrap();
     let req = tick.swap.expect("a seat is ready");
     assert_eq!(
         (req.from, req.reason),

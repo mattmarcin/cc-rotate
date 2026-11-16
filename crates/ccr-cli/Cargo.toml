@@ -15,9 +15,14 @@ path = "src/main.rs"
 name = "cc-rotate"
 path = "src/launcher.rs"
 
+[features]
+# `relay run` reads CC_ROTATE_RELAY_TEST_UPSTREAM to send requests to a local server. For tests only.
+relay-test-upstream = ["ccr-relay/test-upstream"]
+
 [dependencies]
 anyhow = "1.0.104"
 ccr-core = { version = "0.1.0", path = "../ccr-core" }
+ccr-relay = { version = "0.1.0", path = "../ccr-relay" }
 clap = { version = "4.6.7", features = ["derive"] }
 crossterm = { version = "0.29.0", default-features = false, features = ["events", "windows"] }
 dunce = "1.0.5"

@@ -15,7 +15,7 @@ use crate::paths::Paths;
 use crate::process;
 use crate::scheduler::{self, Thresholds};
 use crate::store::{Account, Sample, Store, WaitingSession, WaitingState, kind};
-use crate::swap::{self, META_PROFILE_MODEL};
+use crate::swap;
 
 /// A swap that landed this soon before a turn stopped may not have reached that turn's request:
 /// the stop may be the previous account's.
@@ -36,6 +36,34 @@ pub const READING_WAIT_MS: u64 = 5_000;
 /// `asyncRewake` hook at its timeout, so the hook gives up a minute before (`MAX_WAIT_MS`).
 pub const HOOK_TIMEOUT_S: u64 = 24 * 3600;
 pub const MAX_WAIT_MS: i64 = (HOOK_TIMEOUT_S as i64 - 60) * 1000;
+
+/// Claude Code reads a login kept in the macOS Keychain at most every 30 s (spec section 18.1).
+/// A session woken sooner after the swap would send its turn with the login it stopped on, so
+/// the wake waits this long after the swap.
+pub const KEYCHAIN_CACHE_MS: i64 = 31_000;
+
+/// Whether a wake at `now_ms` must wait for Claude Code to read the login a swap at
+/// `active_since_ms` put in the Keychain item.
+pub fn keychain_wait(now_ms: i64, active_since_ms: i64, keychain: bool) -> bool {
+    keychain && now_ms - active_since_ms < KEYCHAIN_CACHE_MS
+}
+
+/// Whether a wake now waits for Claude Code's Keychain cache to pass the login the last swap
+/// wrote (spec 24.3). `keychain` says whether the profile's login is a Keychain item; it is only
+/// asked in the 31 s after a swap wrote the login.
+/// Never in relay mode: a swap writes no login there, so there is nothing to wait for (relay
+/// spec, section 8).
+pub fn waits_for_keychain(
+    store: &Store,
+    now_ms: i64,
+    keychain: impl FnOnce() -> bool,
+) -> Result<bool> {
+    if crate::relay::home(store)?.is_some() {
+        return Ok(false);
+    }
+    let written_at = swap::login_written_at(store)?;
+    Ok(now_ms - written_at < KEYCHAIN_CACHE_MS && keychain_wait(now_ms, written_at, keychain()))
+}
 
 /// What the hook does next.
 #[derive(Debug, Clone)]
@@ -73,7 +101,11 @@ pub fn decide(store: &Store, paths: &Paths, ws: &WaitingSession, now_ms: i64) ->
     }
     // Moved on: another account is in the profile, or a swap since the stop put this one back,
     // which it only does while the account has room.
-    if ws.account_id != Some(active.id) || swap::active_since(store)? > ws.since_ms {
+    let active_since = swap::active_since(store)?;
+    if ws.account_id != Some(active.id) || active_since > ws.since_ms {
+        if waits_for_keychain(store, now_ms, || login_in_keychain(paths))? {
+            return Ok(Decision::Wait);
+        }
         let (pool, _) = swap::load_pool(store, now_ms / 1000)?;
         let has_room = pool
             .iter()
@@ -155,24 +187,24 @@ fn limit_reset(store: &Store, ws: &WaitingSession, account: &Account, now_ms: i6
     Ok(!Limit::of(store, account)?.blocking(&sample, now_ms / 1000))
 }
 
-/// What counts as at a limit for an account: its thresholds, for the model in use.
+/// What counts as at a limit for an account: its thresholds, for the models in use.
 struct Limit {
     thresholds: Thresholds,
-    model: Option<String>,
+    models: Vec<String>,
 }
 
 impl Limit {
     fn of(store: &Store, account: &Account) -> Result<Limit> {
         Ok(Limit {
             thresholds: Thresholds::from(&store.settings()?).for_account(account),
-            model: store.meta(META_PROFILE_MODEL)?,
+            models: swap::models_in_use(store)?,
         })
     }
 
     /// Whether `sample` has a window at its threshold at `at_s` (a window counts as 0 once its
     /// reset time has passed).
     fn blocking(&self, sample: &Sample, at_s: i64) -> bool {
-        scheduler::window_usage(Some(sample), at_s, self.thresholds, self.model.as_deref())
+        scheduler::window_usage(Some(sample), at_s, self.thresholds, &self.models)
             .iter()
             .any(scheduler::WindowUsage::blocking)
     }
@@ -299,6 +331,63 @@ pub fn note_reading(
             )?;
         }
         Ok(())
+    })
+}
+
+/// Whether the profile's login is the Keychain item, which Claude Code caches (macOS only).
+fn login_in_keychain(paths: &Paths) -> bool {
+    cfg!(target_os = "macos")
+        && matches!(
+            paths.credentials().location(),
+            Ok(Some(crate::credstore::Location::Keychain))
+        )
+}
+
+/// The `Stop` hook (spec section 24.3): a turn of `session_id` ended normally at `now_ms`. A
+/// session stopped at a limit is working again when that is after its stop, or after its wake
+/// when it was woken: Claude Code does not run `Stop` for a turn refused at a limit. This is
+/// how a desktop session, which runs no status line, is seen working again. Returns whether it
+/// was marked resumed.
+pub fn note_turn_ended(store: &Store, session_id: &str, now_ms: i64) -> Result<bool> {
+    let Some(ws) = store.waiting_session(session_id)? else {
+        return Ok(false);
+    };
+    let after = match ws.state {
+        WaitingState::Waiting => ws.since_ms,
+        WaitingState::Woken | WaitingState::Stuck => match ws.woken_at {
+            Some(t) => t,
+            None => return Ok(false),
+        },
+        WaitingState::Resumed | WaitingState::Ended => return Ok(false),
+    };
+    if now_ms <= after {
+        return Ok(false);
+    }
+    let active = store.active_account()?;
+    store.immediate(|s| {
+        if !s.set_waiting_state(
+            &ws.session_id,
+            ws.since_ms,
+            &[ws.state],
+            WaitingState::Resumed,
+            None,
+            now_ms,
+        )? {
+            return Ok(false);
+        }
+        s.log_event(
+            kind::SESSION,
+            None,
+            active.as_ref().map(|a| a.id),
+            Some("resumed"),
+            Some(json!({
+                "session": ws.session_id,
+                "label": active.as_ref().map(|a| a.label.clone()),
+                "woken": ws.state != WaitingState::Waiting,
+                "via": "stop_hook",
+            })),
+        )?;
+        Ok(true)
     })
 }
 

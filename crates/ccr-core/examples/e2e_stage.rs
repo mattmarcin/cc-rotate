@@ -9,6 +9,10 @@
 //!
 //! `<map file>` gets `{sha256(access token) hex: label}`, so a fake API can tell the accounts
 //! apart without holding a token. The scratch store has usage checks off.
+//!
+//! With `--made-up` first, the accounts are made up instead (random tokens that no server
+//! accepts), and the real store is not read: for tests whose every request goes to the fake API
+//! (`tests/e2e/desktop-wait-at-limit.py`).
 
 use anyhow::{Context, Result, bail};
 use ccr_core::store::{AccountIdentity, AccountState, Store};
@@ -16,12 +20,19 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let made_up = args.first().is_some_and(|a| a == "--made-up");
+    if made_up {
+        args.remove(0);
+    }
     let [data_dir, profile, map_file, labels @ ..] = args.as_slice() else {
         bail!("usage: e2e_stage <scratch data dir> <scratch profile> <map file> <label>...");
     };
     if labels.is_empty() {
         bail!("name at least one account");
+    }
+    if made_up {
+        return stage_made_up(std::path::Path::new(data_dir), profile, map_file, labels);
     }
     if std::env::var_os("CC_ROTATE_DATA_DIR").is_some() {
         bail!("unset CC_ROTATE_DATA_DIR: the accounts come from the real store");
@@ -83,6 +94,55 @@ fn stage(
         )?;
         scratch.save_credential(id, &oauth, "login")?;
         println!("staged {label} ({minutes} minutes left on its access token)");
+    }
+    std::fs::write(map_file, Value::Object(map).to_string())?;
+    Ok(())
+}
+
+/// Accounts that exist only in the scratch store, with made-up logins.
+fn stage_made_up(
+    data_dir: &std::path::Path,
+    profile: &str,
+    map_file: &str,
+    labels: &[String],
+) -> Result<()> {
+    std::fs::create_dir_all(data_dir)?;
+    let scratch = Store::open(&data_dir.join("store.db"))?;
+    scratch.set_setting("usage_checks", Some("false"))?;
+    scratch.set_setting("profile_dir", Some(profile))?;
+    std::fs::create_dir_all(profile)?;
+    let mut map = Map::new();
+    for label in labels {
+        let mut random = [0u8; 32];
+        getrandom::fill(&mut random).map_err(|e| anyhow::anyhow!("random bytes: {e}"))?;
+        let hex: String = random.iter().map(|b| format!("{b:02x}")).collect();
+        let token = format!("sk-ant-oat01-e2e-made-up-{hex}");
+        let digest: String = Sha256::digest(token.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        map.insert(digest, json!(label));
+        let id = scratch.insert_account(
+            label,
+            &AccountIdentity {
+                email: Some(format!("{label}@e2e.invalid")),
+                account_uuid: Some(format!("00000000-0000-4000-8000-{:012}", map.len())),
+                subscription_type: Some("max".into()),
+                rate_limit_tier: Some("default_claude_max_5x".into()),
+                ..Default::default()
+            },
+            AccountState::Parked,
+        )?;
+        let oauth = json!({
+            "accessToken": token,
+            "refreshToken": format!("cc-rotate-e2e-no-refresh-{label}"),
+            "expiresAt": ccr_core::time::now_ms() + 8 * 3_600_000,
+            "scopes": ["user:inference", "user:profile"],
+            "subscriptionType": "max",
+            "rateLimitTier": "default_claude_max_5x",
+        });
+        scratch.save_credential(id, &oauth, "login")?;
+        println!("staged made-up account {label}");
     }
     std::fs::write(map_file, Value::Object(map).to_string())?;
     Ok(())

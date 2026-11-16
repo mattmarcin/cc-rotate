@@ -2,7 +2,7 @@
 
 Run one Claude Code profile on a pool of your own Claude accounts.
 When the account in use gets close to one of its usage limits, cc-rotate swaps the profile to another account in place.
-Running sessions keep going on their next request, with no restart and no proxy.
+Running sessions keep going on their next request, with no restart and, unless you turn on the app account, no proxy.
 
 Because every session lives in one profile, sessions can see and message each other, and their history lives in one place.
 
@@ -32,9 +32,12 @@ Because every session lives in one profile, sessions can see and message each ot
 - Accounts that are not in use get a usage check from time to time: cc-rotate runs Claude Code's own `/usage` with that account's login in a scratch folder, which shows how much of each limit is used without sending a prompt or using any of the account's limits.
   A swap also checks the account it is about to use first when its usage data is more than 15 minutes old.
 - For accounts you choose, cc-rotate can also keep a 5-hour window running: as soon as one ends while the account isn't in use, Claude Code sends one short Haiku request with its login (see **Keeping 5-hour windows running**).
+- The Claude desktop app's Code sessions can run on the pool too, once an administrator has the app start them through cc-rotate (see **Desktop app sessions**).
+- Optionally, the **app account** keeps every session signed in to one account, the one the desktop app uses, so artifacts and connectors stay with it, while a local proxy sends model requests on the pool account in use (see **App account**).
 
 cc-rotate never sends a request to Anthropic itself.
 All traffic is the unmodified Claude Code talking to Anthropic: your sessions, the sign-ins, the usage checks and, if you turn it on, the short requests that keep 5-hour windows running.
+The one exception is the app account, which is off unless you turn it on: its local proxy forwards your sessions' model requests to Anthropic with the login of the pool account in use, and changes nothing else in them.
 
 The design, with the Claude Code behavior it relies on, is in [docs/specs/2026-10-24-cc-rotate.md](docs/specs/2026-10-24-cc-rotate.md).
 
@@ -44,6 +47,8 @@ The design, with the Claude Code behavior it relies on, is in [docs/specs/2026-1
 |---|---|---|---|
 | Rotation | Supported, verified with real accounts | Supported, verified with real accounts (in WSL); Claude Code keeps its login in the same file as on Windows | Supported, verified with real accounts, with the login in the Keychain and in the file |
 | Desktop app | Supported | Builds; needs a desktop with a system tray | Builds; runs as a plain executable, not an app bundle |
+| Claude desktop app sessions | Supported, tried in the Claude app | Not covered | Supported, verified with real accounts in the Claude app |
+| App account | Supported, tried in the Claude app | Builds; not tried yet | Supported, verified with real accounts |
 | Data folder | `%LOCALAPPDATA%\cc-rotate` | `~/.local/share/cc-rotate` | `~/Library/Application Support/cc-rotate` |
 
 `~` is your home folder (`%USERPROFILE%` on Windows).
@@ -349,6 +354,9 @@ When its input or output isn't a terminal, it prints the status once and exits.
 | `cc-rotate-ctl warm-up <label>` | Start an account's 5-hour window now with one short Haiku request, then read its usage. |
 | `cc-rotate-ctl events` | Recent swaps, logins and problems. |
 | `cc-rotate-ctl doctor` | Check the profile, the store and Claude Code. |
+| `cc-rotate-ctl desktop` | Show whether the Claude desktop app's Code sessions run on the pool, and print the commands that turn that on or off (see **Desktop app sessions**). It also says whether the app account is on, and which account it is. |
+| `cc-rotate-ctl app-account` | Show the app account (or that it is off), the local proxy's address and whether it answers (see **App account**). |
+| `cc-rotate-ctl app-account <account>` / `app-account off` | Make the account the desktop app is signed in to the app account, or turn the app account off (`off` always means off). |
 | `cc-rotate-ctl backup <file>` | Print a daily backup of the profile's login file, decrypted. It contains tokens, so keep the output private. |
 | `cc-rotate-ctl config [key] [value]` | Show or change settings. `--unset` restores a default. |
 | `cc-rotate-ctl setup` | Create the cc-rotate profile. `--from <dir>` picks the template, `--force` rebuilds it. `--remove-alias` removes the `cc-rotate` PowerShell function older versions added; with an existing profile, that is all it does. `--keep-existing` keeps an existing profile instead of failing, only updating cc-rotate's hooks in it. |
@@ -374,6 +382,7 @@ When its input or output isn't a terminal, it prints the status once and exits.
 | `usage_check_max_age_s` | 900 | A swap checks the account it picked first when its usage data is older than this. 0 always checks first. |
 | `login_warning_days` | 5 | Warn this many days before an account's sign-in ends. 0 turns the warning off. |
 | `avoid_extra_usage` | false | When every account is at a limit and the one in use has extra usage on, move to one without, so sessions wait for a reset instead of paying. |
+| `app_account_renew_margin_s` | 900 | With the app account on, how many seconds before the login of the account in use expires the local proxy has Claude Code renew it (60 to 3600). |
 
 ### Tracking your other profiles too
 
@@ -445,9 +454,78 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.herdr-server.plist
 
 To undo it: `launchctl bootout gui/$(id -u)/local.herdr-server`, then delete the file.
 
+## Desktop app sessions
+
+The Claude desktop app's Code tab normally passes its own login to Claude Code, so its sessions use the account the app is signed in to and don't rotate.
+On macOS and Windows you can have the app start them through cc-rotate instead, and they then run on the pool like `cc-rotate` sessions: the preview, file and terminal panes work as before.
+This uses Claude Code's corporate launcher, which only an administrator can turn on, so it is off until you set it up.
+
+1. Run `cc-rotate-ctl desktop`. It shows what is set now and prints the commands to run, in Terminal on macOS or in PowerShell run as administrator on Windows.
+   - On macOS, the app's policy comes as a configuration profile: open it, then install **cc-rotate: desktop sessions on the pool** in System Settings > General > Device Management.
+   - A `sudo` (macOS) or administrator (Windows) command writes Claude Code's managed settings, naming `cc-rotate-ctl` as the launcher.
+2. Quit and reopen the Claude app. New Code sessions run on the pool.
+   A session started before, or one the app forks from another, moves to the pool when you continue it. On Windows it stays in its old profile instead and runs on the login Claude Code has stored there (from `claude /login` in a terminal), which may be another account than the app's, or none: then it says it is not logged in. Start a new session to run on the pool.
+3. `cc-rotate-ctl doctor` shows the result on its **Desktop app** line.
+
+To turn it off, run the commands `cc-rotate-ctl desktop` prints then, and quit and reopen the app.
+`cc-rotate-ctl uninstall` refuses while the app still starts sessions through `cc-rotate-ctl`, since the app could then start none.
+
+What to know:
+
+- **Artifacts.** An artifact belongs to the account that published it, and the app's artifact pane opens it with the app's own sign-in, so one published while another account was in use shows "This artifact has been deleted or is no longer available" there. Your claude.ai connectors in a session also follow the account in use. The app account fixes both (see **App account**).
+- **Swaps happen at a limit.** Desktop sessions don't run a status line, so cc-rotate gets no usage readings from them: a desktop session swaps when it stops at a limit, and is woken on the next account. Sessions in a terminal still swap before a limit. With the app account on, desktop sessions swap before a limit too.
+- **History after the app restarts.** The app looks for a session's history only in its own profile, so cc-rotate links each desktop session's transcript there, and the app still shows the session after it restarts (after an update, say). This is macOS only for now: on Windows the app may not find the history of a session that ran on the pool once it restarts.
+- **Windows** works the same way, and was tried in the Windows app: sessions run on the pool, follow swaps, and are woken on the next account at a limit.
+- **WSL sessions** the app runs inside WSL don't go through a launcher, so they stay on the app's account.
+- **Organization-managed computers.** When device management sets the app's policies or Claude Code's managed settings, `cc-rotate-ctl desktop` prints nothing that would replace them and says what to ask your administrator for.
+
+## App account
+
+Artifacts and claude.ai connectors belong to the account whose login a session holds.
+Normally that login changes with every swap, so an artifact published while another account is in use doesn't open in the desktop app's artifact pane, which opens it with the app's own sign-in.
+The **app account** keeps one account's login in the cc-rotate profile for good: sessions act as that account (the desktop app's account), while a small local proxy on your computer sends each session's model requests to Anthropic on the pool account in use, so usage still rotates across the pool.
+A swap then only changes which account the local proxy uses.
+It is off until you turn it on, and covers every session in the cc-rotate profile, in a terminal or in the app.
+
+1. Run `cc-rotate-ctl app-account <account>`, naming the account the Claude desktop app is signed in to (its label, email or id).
+   That account must be in the pool and signed in.
+   cc-rotate picks a port on 127.0.0.1, installs the local proxy as a service that starts at login and restarts when it ends (a LaunchAgent on macOS, a systemd user unit on Linux), and starts it.
+   The account in use stays in use, now through the local proxy.
+2. Start sessions with `cc-rotate`, or from the app with **Desktop app sessions** set up.
+   Both give new sessions the local proxy's address.
+   Sessions that were already running keep the address they started with until you restart them.
+   Those started before the app account was on read the profile's login, now the app account's, so they run as the app account directly, off the pool.
+3. `cc-rotate-ctl app-account` shows the app account (or that it is off), the local proxy's address and whether it answers, and how many sessions ran without the local proxy lately.
+   `cc-rotate-ctl doctor` checks it on its **App account** line.
+
+`cc-rotate-ctl app-account off` turns it off: the login of the account in use goes back into the profile, and new sessions start without the local proxy.
+`off` always means off, whatever your accounts are called: to name an account labelled "off", use its email or id.
+The local proxy keeps serving the sessions started while the app account was on until it has had no request for an hour, then removes its service and itself.
+Restart those sessions within that hour: once the local proxy is gone they get connection errors.
+`cc-rotate-ctl doctor` warns while any of them still runs.
+`cc-rotate-ctl uninstall` turns the app account off and removes the local proxy.
+
+What to know:
+
+- **The app account owns everything that is not a model request.** Artifacts, claude.ai connectors, cloud work (cloud agents, `/ultrareview`, routines) and Remote Control run on the app account, whichever account is in use. They no longer break at a swap, and cloud work uses the app account's limits.
+- **Keep the app account signed in.** Every session uses its login. If it is signed out, every session fails until you sign it in again (`cc-rotate-ctl login --relogin <label>`), and `doctor` says so. The warning before a sign-in ends matters most for it.
+- **Swaps before a limit everywhere.** The local proxy reads the usage of the account in use from every response, desktop sessions included. A request refused at a limit is sent again on the next account, so the turn doesn't stop.
+- **The local proxy has to run.** When it is down, sessions report connection errors ("Unable to connect to API") instead of falling back to another account. Its service restarts it within seconds, and the launchers start it when nothing answers.
+- **Logins of accounts not in use.** No session holds them, so the local proxy has Claude Code renew the login of the account in use before it expires, as a usage check does (`app_account_renew_margin_s` sets how long before).
+- **Security.** The local proxy listens on 127.0.0.1 only, and every request has to carry a random secret in its address, which is in `relay.json` in the data folder (readable only by you) and in your sessions' environment. It never logs a login, a request or a response body. Its log is `logs/relay.log` in the data folder.
+  One risk remains on a computer shared with other people: while nothing listens on its port (for a moment while the local proxy restarts, or after it has removed itself while sessions still point at it), another user of the computer can take the port and would receive your sessions' requests, including the secret and the app account's access token. A local proxy that finds its port taken says so in its log, and `doctor` shows that line.
+
+The app account does not cover:
+
+- Sessions started without a launcher (plain `claude` with `CLAUDE_CONFIG_DIR` set): they run as the app account directly, off the pool.
+- A network that needs an HTTP proxy or its own certificate authority to reach Anthropic: the local proxy connects directly.
+- Models or features the app account's plan offers but the plan of the account in use doesn't: Claude Code offers what the app account has, and such a request fails with Anthropic's error.
+- Artifacts published before the app account was on: they stay with the account that published them.
+- Future Claude Code versions: the local proxy relies on an internal Claude Code setting to be treated as Anthropic's own address. If a version stops honoring it, sessions keep working but offer fewer models; `doctor` warns when your Claude Code version has not been tested.
+
 ## What it does not cover
 
-- **The Claude desktop app.** Its Code tab passes its own login to Claude Code directly, so swapping the profile's login cannot reach it.
+- **The Claude desktop app, unless you set it up.** Its Code tab passes its own login to Claude Code, so swapping the profile's login cannot reach its sessions until they start through cc-rotate (see **Desktop app sessions**).
 - **Claude Code's Windows Credential Manager storage.** Claude Code can be switched to keep its login in the Windows Credential Manager; swaps would then stop reaching running sessions. `cc-rotate-ctl doctor` fails loudly if that is on.
 - **Cloud sessions.** Cloud agents (`isolation: "remote"`), `/ultrareview`, routines and Claude Code on the web run on Anthropic's servers under the account that started them, and use that account's limits.
   A swap cannot move them to another account.
@@ -456,8 +534,10 @@ To undo it: `launchctl bootout gui/$(id -u)/local.herdr-server`, then delete the
   Resuming a session while another account is in use can make Claude Code forget a cloud agent it was waiting for.
   Starting a cloud agent after a swap may fail, because Claude Code can still name the organization of the account it signed in with earlier.
   Prefer local background agents in the pool: they move with every swap.
+  With the app account on, the profile's login never changes, so cloud work stays on the app account across swaps, using its limits.
 - **Remote Control.** Claude Code ends a Remote Control session and archives it as soon as the profile's login belongs to another account, so the next swap ends it.
   Run `/remote-control` again to start one for the account now in use.
+  With the app account on, it stays on the app account and swaps don't end it.
 - **Claude Code updates.** cc-rotate relies on how Claude Code reloads its login and locks login renewal, which is not a documented interface.
   `cc-rotate-ctl doctor` and the app warn when your Claude Code version has not been tested.
 

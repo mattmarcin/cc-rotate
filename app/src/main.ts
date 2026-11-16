@@ -99,6 +99,27 @@ let colorOf = (_id: number) => "";
 const fiveOf = (a: AccountView) => a.windows.find((w) => w.kind === "session" && w.model === null);
 const weekOf = (a: AccountView) => a.windows.find((w) => w.kind === "weekly" && w.model === null);
 /** Windows limited to one model, or of a kind cc-rotate does not know. */
+/**
+ * The weekly window on Fable. Until each account's next Fable request, the proxy's last Fable
+ * reading may still carry its old name (`7d_oi`, which only ever came back on Fable requests).
+ */
+const fableOf = (a: AccountView) =>
+  a.windows.find((w) => w.kind === "weekly" && w.model === "fable") ?? a.windows.find((w) => w.name === "seven_day_overage_included");
+/** "Fable weekly limit: 38% used, resets Thu 9:00 AM", for a tooltip. */
+const limitTitle = (name: string, w: WindowUsage) =>
+  `${name}: ${pct(w.pct)} used${w.resets_at && w.resets_at * 1000 > Date.now() ? `, resets ${clock(w.resets_at * 1000)}` : ""}`;
+const fableTitle = (w: WindowUsage) => limitTitle("Fable weekly limit", w);
+/** The 5-hour, weekly and Fable limits, one line each, for an account's tooltip. */
+function limitsTitle(a: AccountView): string[] {
+  const five = fiveOf(a);
+  const week = weekOf(a);
+  const fable = fableOf(a);
+  return [
+    five ? limitTitle("5-hour limit", five) : "5-hour limit: not read yet",
+    week ? limitTitle("Weekly limit", week) : noWeekly(a) ? "No weekly limit" : "Weekly limit: not read yet",
+    fable ? fableTitle(fable) : "Fable weekly limit: not read yet",
+  ];
+}
 const otherWindows = (a: AccountView) => a.windows.filter((w) => w.model !== null || w.kind === "other");
 /** No weekly limit: the 5-hour window is what runs out. */
 const noWeekly = (a: AccountView) => a.weekly.effective === "none";
@@ -326,7 +347,8 @@ function stateText(a: AccountView): string {
 function activeSince(): number | null {
   const id = state.snap?.active_id;
   if (id === null || id === undefined) return null;
-  return state.events.find((e) => (e.kind === "swap" || e.kind === "adopted_login") && e.account_to === id)?.ts ?? null;
+  // A /login with the app account on (relay mode) makes an account the app account, not the one in use.
+  return state.events.find((e) => (e.kind === "swap" || (e.kind === "adopted_login" && !e.detail?.home)) && e.account_to === id)?.ts ?? null;
 }
 
 const swapNow = () =>
@@ -548,7 +570,7 @@ function renderNav() {
                   class: "side-link",
                   "data-focus": `acct-${a.id}`,
                   "aria-current": isAccount(a.id) ? "page" : null,
-                  title: a.email ?? a.label,
+                  title: [a.email ?? a.label, ...limitsTitle(a)].join("\n"),
                   onclick: () => go({ page: "account", id: a.id }),
                 },
                 h("span", { class: "swatch", style: { background: colorOf(a.id) } }),
@@ -735,6 +757,7 @@ function planSection(snap: Snapshot): Child {
             ? h("button", { class: "row-action quiet", "data-focus": `row-${a.id}`, onclick: () => useNow(a), title: `Swap to ${a.label} now` }, "Use now")
             : null;
     const st = stateLine(a, next === a.id);
+    const fable = fableOf(a);
     return h(
       "li",
       { class: `plan-row${a.id === snap.active_id ? " is-active" : ""}`, "data-id": a.id, style: { "--c": colorOf(a.id) } },
@@ -745,7 +768,10 @@ function planSection(snap: Snapshot): Child {
         h(
           "button",
           { class: "plan-who", "data-focus": `plan-${a.id}`, title: a.reason ? `${a.rank ? `${ordinal(a.rank)} pick: ` : ""}${a.reason}` : null, onclick: () => go({ page: "account", id: a.id }) },
-          h("span", { class: "plan-name" }, h("span", { class: "swatch" }), a.label, a.plan && h("span", { class: "plan-tag" }, a.plan)),
+          h("span", { class: "plan-name" }, h("span", { class: "swatch" }), h("span", { class: "plan-label" }, a.label),
+            a.plan && h("span", { class: "plan-tag" }, a.plan),
+            fable && h("span", { class: `plan-fable${fable.pct >= fable.threshold ? " over" : ""}`, title: fableTitle(fable) }, `Fable ${pct(fable.pct)}`),
+          ),
           h("span", { class: `plan-state ${a.state === "needs_login" ? "danger" : ""}`.trim() }, st),
         ),
         action,
@@ -1100,7 +1126,7 @@ function loadCostTable() {
               ),
               h("tfoot", null, h("tr", null, h("td", null, "Total"), spans.map(([, since]) => h("td", { class: "num" }, usd(rows.reduce((s, a) => s + sum(a.id, since), 0)))))),
             ),
-        h("p", { class: "muted cost-note" }, "Counted from the status line of sessions in the cc-rotate profile and other profiles cc-rotate tracks. An hour that started before a span counts in full."),
+        h("p", { class: "muted cost-note" }, "Counted from the status line of terminal sessions in the cc-rotate profile and other profiles cc-rotate tracks, and by the app account's proxy for desktop app sessions. An hour that started before a span counts in full."),
       );
     })
     .catch((e) => read === costReads && replace(costTable, h("h2", null, "By account"), h("p", { class: "muted" }, `Couldn't read API cost: ${e}`)));
@@ -1151,7 +1177,7 @@ function renderProjectTable() {
     projectTable,
     h("h2", null, "By folder"),
     noneYet
-      ? h("p", { class: "muted" }, "No project usage yet. cc-rotate starts counting a folder when a session's status line runs after this update. Earlier use stays on API cost, by account.")
+      ? h("p", { class: "muted" }, "No project usage yet. cc-rotate starts counting a folder when a session's status line runs, or when the app account's proxy serves a desktop app session. Earlier use stays on API cost, by account.")
       : rows.length === 0
         ? h("p", { class: "muted" }, "No project usage in this span.")
         : h(

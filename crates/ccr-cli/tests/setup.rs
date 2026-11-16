@@ -1,10 +1,12 @@
 //! `cc-rotate-ctl setup` as the installer runs it, on a fresh install and on an upgrade.
 
+mod common;
+
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 
 fn setup(root: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_cc-rotate-ctl"))
+    common::program(env!("CARGO_BIN_EXE_cc-rotate-ctl"))
         .arg("setup")
         .args(args)
         .arg("--from")

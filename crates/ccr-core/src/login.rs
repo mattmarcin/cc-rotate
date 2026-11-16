@@ -281,18 +281,21 @@ pub fn import(
     drop(account_lock);
     let mut activated = false;
     let current = store.account(id)?.expect("account just written");
-    if current.state == AccountState::Active {
-        if swap::install_active_login(store, paths, id, &oauth)? == swap::ActiveLogin::Unidentified
-        {
-            store.log_event(
-                kind::ERROR,
-                None,
-                Some(id),
-                Some("login"),
-                Some(json!({ "message": format!("Saved {}'s new login but didn't put it in the profile: an interrupted swap left it unclear which account the profile is signed in to.", current.label) })),
-            )?;
-        }
-    } else if !has_active && current.state == AccountState::Parked {
+    // The account whose login the profile has: the active one, or in relay mode the home
+    // account, whether or not it is active. Any other account's fresh login is only stored.
+    let in_profile = crate::relay::profile_account(store)?.is_some_and(|a| a.id == id);
+    if in_profile
+        && swap::install_active_login(store, paths, id, &oauth)? == swap::ActiveLogin::Unidentified
+    {
+        store.log_event(
+            kind::ERROR,
+            None,
+            Some(id),
+            Some("login"),
+            Some(json!({ "message": format!("Saved {}'s new login but didn't put it in the profile: an interrupted swap left it unclear which account the profile is signed in to.", current.label) })),
+        )?;
+    }
+    if !has_active && current.state == AccountState::Parked {
         let outcome = swap::run(
             store,
             paths,
@@ -400,6 +403,50 @@ fn check_same_account(target: &Account, ident: &AccountIdentity) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a finished `claude auth login` of account `uuid` (from `swap::tests::Env`) leaves.
+    fn staging(env: &crate::swap::tests::Env, name: &str, tag: &str, uuid: &str) -> PathBuf {
+        let dir = env.paths.data_dir.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(".credentials.json"),
+            json!({ "claudeAiOauth": crate::swap::tests::oauth(tag) }).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(".claude.json"),
+            json!({"oauthAccount": {"accountUuid": uuid, "emailAddress": format!("{uuid}@x.test"), "organizationUuid": "org-x"}}).to_string(),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn relay_relogin_writes_only_home() {
+        let env = crate::swap::tests::Env::new();
+        crate::relay::set_mode(&env.store, Some(env.a)).unwrap();
+        env.activate(env.b);
+        let relogin = |id: i64| LoginRequest {
+            relogin: Some(id),
+            ..Default::default()
+        };
+
+        // The home account, not active: its fresh login goes into the profile.
+        let st = staging(&env, "st-a", "a-new", "ua");
+        let out = import(&env.store, &env.paths, &st, &relogin(env.a)).unwrap();
+        assert!(!out.created && !out.activated);
+        assert_eq!(env.profile_refresh(), "refresh-a-new");
+        assert_eq!(env.stored_refresh(env.a), "refresh-a-new");
+        assert_eq!(env.state(env.b), AccountState::Active);
+
+        // The active account, not home: stored only.
+        let before = env.profile_bytes();
+        let st = staging(&env, "st-b", "b-new", "ub");
+        import(&env.store, &env.paths, &st, &relogin(env.b)).unwrap();
+        assert_eq!(env.profile_bytes(), before);
+        assert_eq!(env.stored_refresh(env.b), "refresh-b-new");
+        assert_eq!(env.state(env.b), AccountState::Active);
+    }
 
     const STATE: &str = "pM6CW2Gc-F0Ej7_TeazM";
     const URL: &str = "https://claude.com/cai/oauth/authorize?code=true&client_id=x&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&code_challenge=c&code_challenge_method=S256&state=pM6CW2Gc-F0Ej7_TeazM";

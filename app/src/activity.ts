@@ -2,8 +2,8 @@
 import type { EventRow } from "./api";
 import { h, type Child } from "./dom";
 
-/** Events left out unless "Show all" is on: renewals, skipped swaps, version notes, warm-ups, reorders. */
-const ROUTINE = new Set(["sync", "swap_skipped", "claude_version", "warm_up"]);
+/** Events left out unless "Show all" is on: renewals, skipped swaps, version notes, warm-ups, resends, reorders. */
+const ROUTINE = new Set(["sync", "swap_skipped", "claude_version", "warm_up", "relay_resend"]);
 export const routine = (e: EventRow) => ROUTINE.has(e.kind) || (e.kind === "state" && e.reason === "order");
 
 export const REASONS: Record<string, string> = {
@@ -14,7 +14,9 @@ export const REASONS: Record<string, string> = {
   weekly_expiring: "to use its weekly budget before it resets",
   stop_failure: "after Claude Code hit a limit",
   avoid_extra_usage: "so sessions wait instead of paying for extra usage",
+  rate_limit: "after Anthropic refused a request at a usage limit",
   dead_login: "because the login stopped working",
+  unauthorized: "because its login was refused and couldn't be renewed",
   manual: "by hand",
   login: "after its first sign-in",
   completed: "after an interrupted swap",
@@ -89,7 +91,21 @@ export function describe(e: EventRow, labelOf: (id: number | null) => string): {
     case "pool_exhausted":
       return { parts: ["No other account was ready to take over"], tone: "warn" };
     case "adopted_login":
-      return { parts: ["Now using ", to, " after a /login in the profile"] };
+      // With the app account on (relay mode), a /login changes the app account, not the account in use.
+      return e.detail?.home
+        ? { parts: ["Made ", to, " the app account after a /login in the profile"] }
+        : { parts: ["Now using ", to, " after a /login in the profile"] };
+    // The app account's events keep their stored kinds (relay_mode, relay_resend, relay_error).
+    case "relay_mode": {
+      const home = e.detail?.home as number | null | undefined;
+      return e.reason === "on"
+        ? { parts: ["App account turned on (", nb(labelOf(home ?? null)), ")"] }
+        : { parts: ["App account turned off"] };
+    }
+    case "relay_resend":
+      return { parts: ["Resent on ", to, " after ", from, " was refused at a limit"] };
+    case "relay_error":
+      return { parts: ["The local proxy couldn't reach Anthropic"], tone: "warn" };
     case "foreign_login":
       return { parts: ["The cc-rotate profile was signed in to an account that isn't in cc-rotate"], tone: "warn" };
     case "state":

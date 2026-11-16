@@ -123,6 +123,7 @@ fn numbers_unchanged_while_parked_are_the_accounts_own_after_a_swap_back() {
         &e.paths,
         &input("s", 1.0, t0 - start, 40.0, resets),
         t0,
+        |_| None,
     )
     .unwrap();
     swap::run(&e.store, &e.paths, &manual(e.b)).unwrap();
@@ -136,6 +137,7 @@ fn numbers_unchanged_while_parked_are_the_accounts_own_after_a_swap_back() {
         &e.paths,
         &input("s", 1.5, t1 - start, 40.0, resets),
         t1,
+        |_| None,
     )
     .unwrap();
     assert_eq!(e.store.last_sample(e.a).unwrap().unwrap().ts, t1);
@@ -160,6 +162,7 @@ fn an_idle_sessions_older_numbers_never_lower_the_accounts_usage() {
             &e.paths,
             &input(session, 1.0, at - start, pct, resets),
             at,
+            |_| None,
         )
         .unwrap()
     };
@@ -199,6 +202,7 @@ fn a_slow_status_line_start_keeps_the_process() {
             &e.paths,
             &input("s", total, at - start - late, 10.0, resets),
             at,
+            |_| None,
         )
         .unwrap();
         total += 0.1;
@@ -223,6 +227,7 @@ fn a_slow_first_status_line_keeps_the_process() {
             &e.paths,
             &input("s", total, at - start - late, 10.0, resets),
             at,
+            |_| None,
         )
         .unwrap();
         total += 0.1;
@@ -241,7 +246,14 @@ fn the_time_an_account_became_active_never_moves_back() {
         json!({"oauthAccount": {"accountUuid": "ub"}}).to_string(),
     )
     .unwrap();
-    statusline::tick(&e.store, &e.paths, &StatusInput::default(), time::now_ms()).unwrap();
+    statusline::tick(
+        &e.store,
+        &e.paths,
+        &StatusInput::default(),
+        time::now_ms(),
+        |_| None,
+    )
+    .unwrap();
     swap::run(&e.store, &e.paths, &manual(e.b)).unwrap();
     let swapped = swap::active_since(&e.store).unwrap();
     // Then `.claude.json` names a (a `/login`), its time an hour ago.
@@ -257,7 +269,14 @@ fn the_time_an_account_became_active_never_moves_back() {
         .unwrap()
         .set_modified(an_hour_ago)
         .unwrap();
-    statusline::tick(&e.store, &e.paths, &StatusInput::default(), time::now_ms()).unwrap();
+    statusline::tick(
+        &e.store,
+        &e.paths,
+        &StatusInput::default(),
+        time::now_ms(),
+        |_| None,
+    )
+    .unwrap();
     assert_eq!(e.store.active_account().unwrap().unwrap().id, e.a);
     assert!(swap::active_since(&e.store).unwrap() >= swapped);
 }
@@ -281,6 +300,7 @@ fn a_login_adopted_in_the_tick_that_first_shows_it_keeps_its_readings() {
         &e.paths,
         &input("s", 1.0, now - start, 40.0, resets),
         now,
+        |_| None,
     )
     .unwrap();
     std::thread::sleep(Duration::from_millis(20));
@@ -298,6 +318,7 @@ fn a_login_adopted_in_the_tick_that_first_shows_it_keeps_its_readings() {
         &e.paths,
         &input("s", 1.2, t - start, 3.0, b_resets),
         t,
+        |_| None,
     )
     .unwrap();
     assert_eq!(e.store.active_account().unwrap().unwrap().id, e.b);
@@ -309,6 +330,7 @@ fn a_login_adopted_in_the_tick_that_first_shows_it_keeps_its_readings() {
         &e.paths,
         &input("s", 1.3, later - start, 3.0, b_resets),
         later,
+        |_| None,
     )
     .unwrap();
     assert_eq!(e.store.last_sample(e.b).unwrap().unwrap().ts, later);
@@ -327,6 +349,7 @@ fn a_swap_settled_later_counts_from_when_it_wrote_the_login() {
         &e.paths,
         &input("s", 1.0, now - start, 40.0, resets),
         now,
+        |_| None,
     )
     .unwrap();
     // A swap that wrote b's login and died, its lock still held for a moment.
@@ -350,6 +373,7 @@ fn a_swap_settled_later_counts_from_when_it_wrote_the_login() {
         &e.paths,
         &input("s", 1.2, t - start, 3.0, b_resets),
         t,
+        |_| None,
     )
     .unwrap();
     drop(lock);
@@ -361,6 +385,7 @@ fn a_swap_settled_later_counts_from_when_it_wrote_the_login() {
         &e.paths,
         &input("other", 0.0, 1000, 3.0, b_resets),
         t2,
+        |_| None,
     )
     .unwrap();
     assert_eq!(e.store.active_account().unwrap().unwrap().id, e.b);
@@ -371,6 +396,7 @@ fn a_swap_settled_later_counts_from_when_it_wrote_the_login() {
         &e.paths,
         &input("s", 1.4, t3 - start, 3.0, b_resets),
         t3,
+        |_| None,
     )
     .unwrap();
     let last = e.store.last_sample(e.b).unwrap().unwrap();

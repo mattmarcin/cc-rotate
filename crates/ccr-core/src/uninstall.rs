@@ -1,21 +1,23 @@
-//! Removing cc-rotate (spec section 4.5): first what its install and its use leave outside its own
-//! folders (the app starting at login, the macOS Keychain items of the rotation profile and of
-//! leftover scratch profiles, observe mode in the user's other profiles, the PowerShell function
-//! older versions added, the app's webview data), then the programs, the rotation profile and the
-//! data folder.
+//! Removing cc-rotate (spec section 4.5): first relay mode, turned off, and the relay's service
+//! (relay spec 10), then what its install and its use leave outside its own folders (the app
+//! starting at login, the macOS Keychain items of the rotation profile and of leftover scratch
+//! profiles, observe mode in the user's other profiles, the PowerShell function older versions
+//! added, the app's webview data), then the programs, the rotation profile and the data folder.
 //!
 //! `plan` only reads; `run` carries a plan out. Whatever reaches beyond the user's files (the
-//! running app, start at login, the Keychain, the PowerShell profiles, the app's webview data)
-//! goes through `System`, so tests can never touch the real install.
+//! running app, start at login, the Keychain, the PowerShell profiles, the app's webview data,
+//! the relay's service, turning relay mode off) goes through `System`, so tests can never touch
+//! the real install.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Map, Value};
 
 use crate::credstore::Credentials;
 use crate::paths::{Paths, in_build_folder, legacy_lock_for};
+use crate::relay_service::{Service, ServiceState};
 use crate::store::Store;
 use crate::{credfile, profiles, secret, setup, statusline, time};
 
@@ -66,6 +68,17 @@ pub struct Plan {
     /// Why the programs are left alone, when they are.
     pub programs_kept: Option<String>,
     pub sessions: Sessions,
+    /// The data folder, whether it is there or not.
+    pub data: PathBuf,
+    /// Relay mode is on with this home account: `run` turns it off first (relay spec 10).
+    pub relay_home: Option<String>,
+    /// Relay mode is on and a swap is pending, so turning it off would be refused: uninstall
+    /// waits until the swap is settled.
+    pub relay_swap_pending: bool,
+    /// The relay's service, described, when it is installed.
+    pub relay_service: Option<String>,
+    /// `relay.json`, when it is there.
+    pub relay_config: Option<PathBuf>,
 }
 
 impl Plan {
@@ -172,6 +185,12 @@ pub trait System {
     fn remove_legacy_alias(&self) -> Result<()>;
     /// The folders the app's webview keeps its data in, those that are there.
     fn app_data(&self) -> Vec<PathBuf>;
+    /// The relay's service (relay spec 10), described, when it is installed.
+    fn relay_service(&self) -> Option<String>;
+    /// Stop the relay and remove its service.
+    fn remove_relay_service(&self) -> Result<()>;
+    /// Turn relay mode off (relay spec 4) with the store in `data_dir` and the profile `profile`.
+    fn turn_relay_off(&self, data_dir: &Path, profile: &Path) -> Result<()>;
 }
 
 /// The real system, for the names and places an install uses. Tests point it at names and places
@@ -190,6 +209,8 @@ pub struct RealSystem {
     pub xdg_autostart: PathBuf,
     /// Where the app's webview may keep data.
     pub app_data: Vec<PathBuf>,
+    /// The relay's service; `None` leaves it alone.
+    pub relay: Option<Service>,
 }
 
 impl RealSystem {
@@ -221,6 +242,7 @@ impl RealSystem {
             launchctl: true,
             xdg_autostart: home.join(".config").join("autostart"),
             app_data,
+            relay: Service::real().ok(),
         }
     }
 
@@ -394,6 +416,23 @@ impl System for RealSystem {
             .cloned()
             .collect()
     }
+
+    fn relay_service(&self) -> Option<String> {
+        let service = self.relay.as_ref()?;
+        (service.status() == ServiceState::Installed).then(|| service.describe())
+    }
+
+    fn remove_relay_service(&self) -> Result<()> {
+        match &self.relay {
+            Some(service) => service.remove(),
+            None => Ok(()),
+        }
+    }
+
+    fn turn_relay_off(&self, data_dir: &Path, profile: &Path) -> Result<()> {
+        let store = Store::open(&data_dir.join("store.db"))?;
+        crate::relay::turn_off(&store, &Paths::new(data_dir, profile))
+    }
 }
 
 #[cfg(unix)]
@@ -419,8 +458,24 @@ pub fn plan(
 ) -> Result<Plan> {
     let mut plan = Plan {
         profile: paths.profile_dir.clone(),
+        data: paths.data_dir.clone(),
         ..Default::default()
     };
+    if let Some(store) = store
+        && let Some(home) = crate::relay::home(store)?
+    {
+        plan.relay_home = Some(
+            store
+                .account(home)?
+                .map_or_else(|| format!("account {home}"), |a| a.label),
+        );
+        plan.relay_swap_pending = crate::swap::pending_swap(store)?.is_some();
+    }
+    plan.relay_service = system.relay_service();
+    let relay_config = paths.relay_config();
+    plan.relay_config = std::fs::symlink_metadata(&relay_config)
+        .is_ok()
+        .then_some(relay_config);
     match system.autostart()? {
         Some((entry, true)) => plan.autostart = Some(entry),
         Some((entry, false)) => plan.autostart_foreign = Some(entry),
@@ -572,16 +627,18 @@ fn data_removal(paths: &Paths) -> Result<DataRemoval> {
 }
 
 /// cc-rotate's own entries in a data folder, by the names it gives them: the store and its
-/// journal files, the key, the swap lock, and inside its lock, scratch, backup and log folders
-/// the entries it makes there (those folders go once empty).
+/// journal files, the key, the swap lock, the relay's config and lock, and inside its lock,
+/// scratch, backup and log folders the entries it makes there (those folders go once empty).
 fn data_entries(dir: &Path) -> Result<Vec<PathBuf>> {
-    const TOP: [&str; 6] = [
+    const TOP: [&str; 8] = [
         "store.db",
         "store.db-wal",
         "store.db-shm",
         "store.db-journal",
         secret::KEY_FILE,
         "swap.lock",
+        "relay.json",
+        "relay.lock",
     ];
     let mut found: Vec<PathBuf> = TOP
         .iter()
@@ -594,6 +651,7 @@ fn data_entries(dir: &Path) -> Result<Vec<PathBuf>> {
         let temp = name.starts_with('.')
             && name.ends_with(".tmp")
             && (name.starts_with(&format!(".{}.", secret::KEY_FILE))
+                || name.starts_with(".relay.json.")
                 || name.contains(".cc-rotate-"));
         if temp {
             found.push(entry.path());
@@ -616,7 +674,15 @@ fn data_entries(dir: &Path) -> Result<Vec<PathBuf>> {
         ("backups", |n| {
             n.starts_with("credentials-") && (n.ends_with(".ccr") || n.ends_with(".dpapi"))
         }),
-        ("logs", |n| n == "cc-rotate.log" || n == "cc-rotate.log.1"),
+        ("logs", |n| {
+            [
+                "cc-rotate.log",
+                "cc-rotate.log.1",
+                "relay.log",
+                "relay.log.1",
+            ]
+            .contains(&n)
+        }),
     ];
     for (folder, ours) in inside {
         let Ok(entries) = std::fs::read_dir(dir.join(folder)) else {
@@ -818,6 +884,41 @@ pub fn run(system: &dyn System, plan: &Plan, this_exe: &Path) -> Outcome {
         Ok(()) => out.done.push(done),
         Err(e) => out.failed.push(format!("{failing}: {e:#}")),
     };
+    // Relay mode off first, as `relay off` does, so a profile that stays has the login of the
+    // account in use (relay spec 10).
+    if let Some(home) = &plan.relay_home {
+        let result = system.turn_relay_off(&plan.data, &plan.profile);
+        let failed = result.is_err();
+        step(
+            format!("Turned the app account off (it was {home})"),
+            "Turning the app account off".into(),
+            result,
+        );
+        // The plan said the profile gets the login of the account in use again: not so.
+        if failed && let Removal::Keep(dir, _) = &plan.profile_dir {
+            step(
+                String::new(),
+                dir.display().to_string(),
+                Err(anyhow!(
+                    "it stays with the app account's login ({home}), not the login of the account in use"
+                )),
+            );
+        }
+    }
+    if let Some(service) = &plan.relay_service {
+        step(
+            format!("Stopped the local proxy and removed {service}"),
+            format!("Removing {service}"),
+            system.remove_relay_service(),
+        );
+    }
+    if let Some(config) = &plan.relay_config {
+        step(
+            format!("Deleted {}", config.display()),
+            format!("Deleting {}", config.display()),
+            remove_any(config),
+        );
+    }
     step(
         "Quit the cc-rotate app".into(),
         "Quitting the cc-rotate app".into(),
@@ -1257,6 +1358,9 @@ mod tests {
         /// Keychain items of other profiles (scratch ones) that are there.
         items: Vec<PathBuf>,
         fail_alias: bool,
+        fail_relay_off: bool,
+        /// The relay's service, when it is installed.
+        relay_service: Option<String>,
         calls: std::cell::RefCell<Vec<String>>,
     }
 
@@ -1300,6 +1404,25 @@ mod tests {
         }
         fn app_data(&self) -> Vec<PathBuf> {
             Vec::new()
+        }
+        fn relay_service(&self) -> Option<String> {
+            self.relay_service.clone()
+        }
+        fn remove_relay_service(&self) -> Result<()> {
+            self.calls.borrow_mut().push("remove_relay_service".into());
+            Ok(())
+        }
+        fn turn_relay_off(&self, data_dir: &Path, profile: &Path) -> Result<()> {
+            if self.fail_relay_off {
+                bail!("a swap is pending");
+            }
+            let store = Store::open(&data_dir.join("store.db"))?;
+            crate::relay::set_mode(&store, None)?;
+            let name = profile.file_name().unwrap_or_default().to_string_lossy();
+            self.calls
+                .borrow_mut()
+                .push(format!("turn_relay_off {name}"));
+            Ok(())
         }
     }
 
@@ -1431,6 +1554,203 @@ mod tests {
         assert_eq!(again.profile_dir, Removal::Absent);
         assert_eq!(again.data_dir, DataRemoval::Absent);
         assert!(run(&fake, &again, &i.ctl).failed.is_empty());
+    }
+
+    #[test]
+    fn uninstall_plan_lists_relay() {
+        let i = install();
+        {
+            let store = Store::open(&i.paths.store_db()).unwrap();
+            let home = store
+                .insert_account(
+                    "work",
+                    &crate::store::AccountIdentity::default(),
+                    crate::store::AccountState::Active,
+                )
+                .unwrap();
+            crate::relay::set_mode(&store, Some(home)).unwrap();
+        }
+        crate::relay::RelayConfig::create(&i.paths.relay_config()).unwrap();
+        std::fs::write(i.paths.relay_lock(), "").unwrap();
+        std::fs::create_dir_all(i.paths.logs_dir()).unwrap();
+        std::fs::write(i.paths.relay_log(), "").unwrap();
+        let fake = Fake {
+            relay_service: Some("the local proxy's LaunchAgent".into()),
+            ..Default::default()
+        };
+        let store = Store::open_read_only(&i.paths.store_db()).unwrap();
+        let p = plan(&fake, &i.paths, Some(&store), &i.ctl, time::now_ms()).unwrap();
+        drop(store);
+        assert_eq!(p.relay_home.as_deref(), Some("work"));
+        assert!(!p.relay_swap_pending);
+        assert_eq!(
+            p.relay_service.as_deref(),
+            Some("the local proxy's LaunchAgent")
+        );
+        assert_eq!(p.relay_config, Some(i.paths.relay_config()));
+        assert_eq!(p.data, i.paths.data_dir);
+        let DataRemoval::Entries(_, entries) = &p.data_dir else {
+            panic!("{:?}", p.data_dir)
+        };
+        for file in [
+            i.paths.relay_config(),
+            i.paths.relay_lock(),
+            i.paths.relay_log(),
+        ] {
+            assert!(entries.contains(&file), "{file:?} in {entries:?}");
+        }
+
+        let out = run(&fake, &p, &i.ctl);
+        assert!(out.failed.is_empty(), "{:?}", out.failed);
+        // Relay mode off first, as `relay off` does; then the service and relay.json.
+        assert_eq!(
+            fake.calls.borrow()[..3],
+            [
+                "turn_relay_off .claude-rotate",
+                "remove_relay_service",
+                "stop_app"
+            ]
+        );
+        assert!(
+            out.done[0].contains("Turned the app account off"),
+            "{:?}",
+            out.done
+        );
+        assert!(
+            out.done[1].contains("the local proxy's LaunchAgent"),
+            "{:?}",
+            out.done
+        );
+        assert!(out.done[2].contains("relay.json"), "{:?}", out.done);
+        assert!(!i.paths.relay_config().exists());
+
+        // Nothing of the relay: no relay steps.
+        let quiet = Fake::default();
+        let again = plan(&quiet, &i.paths, None, &i.ctl, time::now_ms()).unwrap();
+        assert_eq!(again.relay_home, None);
+        assert_eq!(again.relay_service, None);
+        assert_eq!(again.relay_config, None);
+        run(&quiet, &again, &i.ctl);
+        assert!(!quiet.calls.borrow().iter().any(|c| c.contains("relay")));
+    }
+
+    /// Relay mode that could not be turned off leaves the home account's login in a profile that
+    /// stays: the outcome says so, rather than the plan's "the login of the account in use".
+    #[test]
+    fn a_kept_profile_after_a_failed_relay_off_is_named() {
+        let i = install();
+        {
+            let store = Store::open(&i.paths.store_db()).unwrap();
+            let home = store
+                .insert_account(
+                    "work",
+                    &crate::store::AccountIdentity::default(),
+                    crate::store::AccountState::Active,
+                )
+                .unwrap();
+            crate::relay::set_mode(&store, Some(home)).unwrap();
+        }
+        let fake = Fake {
+            fail_relay_off: true,
+            ..Default::default()
+        };
+        let store = Store::open_read_only(&i.paths.store_db()).unwrap();
+        let mut p = plan(&fake, &i.paths, Some(&store), &i.ctl, time::now_ms()).unwrap();
+        drop(store);
+        p.profile_dir = Removal::Keep(i.paths.profile_dir.clone(), "a test".into());
+        let out = run(&fake, &p, &i.ctl);
+        assert!(
+            out.failed
+                .iter()
+                .any(|l| l.starts_with("Turning the app account off")),
+            "{:?}",
+            out.failed
+        );
+        let kept = format!(
+            "{}: it stays with the app account's login (work), not the login of the account in use",
+            i.paths.profile_dir.display()
+        );
+        assert!(out.failed.iter().any(|l| l == &kept), "{:?}", out.failed);
+
+        // A profile that goes needs no such line.
+        let i = install();
+        {
+            let store = Store::open(&i.paths.store_db()).unwrap();
+            let home = store
+                .insert_account(
+                    "work",
+                    &crate::store::AccountIdentity::default(),
+                    crate::store::AccountState::Active,
+                )
+                .unwrap();
+            crate::relay::set_mode(&store, Some(home)).unwrap();
+        }
+        let store = Store::open_read_only(&i.paths.store_db()).unwrap();
+        let p = plan(&fake, &i.paths, Some(&store), &i.ctl, time::now_ms()).unwrap();
+        drop(store);
+        assert!(
+            matches!(p.profile_dir, Removal::Delete(..)),
+            "{:?}",
+            p.profile_dir
+        );
+        let out = run(&fake, &p, &i.ctl);
+        assert!(
+            !out.failed.iter().any(|l| l.contains("stays with")),
+            "{:?}",
+            out.failed
+        );
+    }
+
+    #[test]
+    fn a_pending_swap_in_relay_mode_is_noted() {
+        let i = install();
+        {
+            let store = Store::open(&i.paths.store_db()).unwrap();
+            let home = store
+                .insert_account(
+                    "work",
+                    &crate::store::AccountIdentity::default(),
+                    crate::store::AccountState::Active,
+                )
+                .unwrap();
+            let pending = crate::swap::PendingSwap {
+                fp: "x".into(),
+                from: Some(home),
+                to: home,
+                at: time::now_ms(),
+                relay: None,
+            };
+            store
+                .set_meta(
+                    crate::swap::META_SWAP_PENDING,
+                    serde_json::to_string(&pending).unwrap(),
+                )
+                .unwrap();
+            let store_ro = Store::open_read_only(&i.paths.store_db()).unwrap();
+            let p = plan(
+                &Fake::default(),
+                &i.paths,
+                Some(&store_ro),
+                &i.ctl,
+                time::now_ms(),
+            )
+            .unwrap();
+            assert!(
+                !p.relay_swap_pending,
+                "relay mode is off: nothing to turn off"
+            );
+            crate::relay::set_mode(&store, Some(home)).unwrap();
+        }
+        let store = Store::open_read_only(&i.paths.store_db()).unwrap();
+        let p = plan(
+            &Fake::default(),
+            &i.paths,
+            Some(&store),
+            &i.ctl,
+            time::now_ms(),
+        )
+        .unwrap();
+        assert!(p.relay_swap_pending);
     }
 
     /// A profile deleted by hand leaves its Keychain item, which still goes; a profile kept keeps
@@ -1777,6 +2097,7 @@ mod tests {
             launchctl: false,
             xdg_autostart: home.path().join("autostart"),
             app_data: Vec::new(),
+            relay: None,
         };
         assert_eq!(system.autostart().unwrap(), None);
         #[cfg(windows)]

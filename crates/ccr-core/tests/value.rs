@@ -181,6 +181,7 @@ fn the_status_line_counts_cost_for_the_account_that_served_it() {
             &e.paths,
             &tick_input("s1", cost, at - start, pct, resets),
             at,
+            |_| None,
         )
         .unwrap();
     };
@@ -234,6 +235,7 @@ fn the_status_line_tells_a_sessions_processes_by_when_they_started() {
             &e.paths,
             &tick_input("s1", cost, ran_ms, 20.0, resets),
             at,
+            |_| None,
         )
         .unwrap();
     };
@@ -466,7 +468,7 @@ fn a_process_running_for_days_counts_its_cost_once() {
             );
             input.claude_pid = pid;
             input.version = Some("2.1.318".into());
-            statusline::tick(&e.store, &e.paths, &input, at).unwrap();
+            statusline::tick(&e.store, &e.paths, &input, at, |_| None).unwrap();
         }
         let counted = e
             .store
@@ -710,10 +712,10 @@ fn a_reading_of_paid_usage_takes_the_place_of_a_swap_with_nowhere_to_go() {
     five_hour(&e.store, e.c, 100.0, 900);
     let resets = now / 1000 + 3_600;
     let input = tick_input("s1", 3.0, 600_000, 100.0, resets);
-    let result = statusline::tick(&e.store, &e.paths, &input, now).unwrap();
+    let result = statusline::tick(&e.store, &e.paths, &input, now, |_| None).unwrap();
     assert!(result.confirm, "{result:?}");
     assert!(result.swap.is_none(), "{result:?}");
     // Read once; the next ticks go back to asking for swaps.
-    let result = statusline::tick(&e.store, &e.paths, &input, now + 40_000).unwrap();
+    let result = statusline::tick(&e.store, &e.paths, &input, now + 40_000, |_| None).unwrap();
     assert!(!result.confirm);
 }

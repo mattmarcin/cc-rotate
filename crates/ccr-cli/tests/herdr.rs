@@ -4,6 +4,8 @@
 //! Every command clears the real `HERDR_*` variables, so running the tests inside a herdr pane
 //! never reports anything to the herdr server that pane belongs to.
 
+mod common;
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -89,7 +91,7 @@ exit 0
 impl Fixture {
     /// `cc-rotate-ctl` with the herdr environment cleared and cc-rotate's data in the fixture.
     fn ctl(&self) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_cc-rotate-ctl"));
+        let mut cmd = common::program(env!("CARGO_BIN_EXE_cc-rotate-ctl"));
         for (name, _) in std::env::vars_os() {
             if name.to_string_lossy().starts_with("HERDR_") {
                 cmd.env_remove(&name);

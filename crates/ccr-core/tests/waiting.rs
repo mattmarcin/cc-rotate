@@ -483,6 +483,7 @@ fn a_woken_session_reporting_usage_is_resumed_and_a_silent_one_is_stuck() {
         &e.paths,
         &input("busy", 12.0, b_resets),
         time::now_ms(),
+        |_| None,
     )
     .unwrap();
     let busy = e.store.waiting_session("busy").unwrap().unwrap();
@@ -581,4 +582,120 @@ fn a_waiting_session_whose_hook_is_gone_is_over() {
         e.store.waiting_session("here").unwrap().unwrap().state,
         WaitingState::Waiting
     );
+}
+
+/// Desktop sessions run no status line; their `Stop` hook tells cc-rotate a stopped session is
+/// working again (spec section 24.3): a turn that ends normally after the stop or the wake.
+#[test]
+fn a_turn_ending_after_the_stop_or_wake_resumes_the_session() {
+    let e = env();
+    let b = e.store.account(e.b).unwrap().unwrap();
+    let t = time::now_ms() - 600_000;
+
+    // Woken at t: a turn ending later resumes it; one ending at the wake does not.
+    let ws = e
+        .store
+        .start_waiting("woken", t - 10_000, Some(e.a), None)
+        .unwrap();
+    assert!(waiting::note_woken(&e.store, &ws, &b, t).unwrap());
+    assert!(!waiting::note_turn_ended(&e.store, "woken", t).unwrap());
+    assert_eq!(
+        e.store.waiting_session("woken").unwrap().unwrap().state,
+        WaitingState::Woken
+    );
+    assert!(waiting::note_turn_ended(&e.store, "woken", t + 1_000).unwrap());
+    assert_eq!(
+        e.store.waiting_session("woken").unwrap().unwrap().state,
+        WaitingState::Resumed
+    );
+    // Once resumed, nothing more to do.
+    assert!(!waiting::note_turn_ended(&e.store, "woken", t + 2_000).unwrap());
+
+    // Marked stuck by a scan, then a turn ends: resumed after all.
+    let ws = e
+        .store
+        .start_waiting("stuck", t - 10_000, Some(e.a), None)
+        .unwrap();
+    assert!(waiting::note_woken(&e.store, &ws, &b, t).unwrap());
+    waiting::scan(&e.store, t + waiting::STUCK_AFTER_MS + 1).unwrap();
+    assert_eq!(
+        e.store.waiting_session("stuck").unwrap().unwrap().state,
+        WaitingState::Stuck
+    );
+    assert!(waiting::note_turn_ended(&e.store, "stuck", t + waiting::STUCK_AFTER_MS + 2).unwrap());
+    assert_eq!(
+        e.store.waiting_session("stuck").unwrap().unwrap().state,
+        WaitingState::Resumed
+    );
+
+    // Still waiting, and the user's next turn went through (the limit had reset).
+    e.store
+        .start_waiting("waiting", t, Some(e.a), None)
+        .unwrap();
+    assert!(waiting::note_turn_ended(&e.store, "waiting", t + 1).unwrap());
+    assert_eq!(
+        e.store.waiting_session("waiting").unwrap().unwrap().state,
+        WaitingState::Resumed
+    );
+
+    // A session cc-rotate never saw stop.
+    assert!(!waiting::note_turn_ended(&e.store, "unknown", t).unwrap());
+
+    let resumed = e
+        .store
+        .events(100)
+        .unwrap()
+        .into_iter()
+        .filter(|ev| ev.kind == kind::SESSION && ev.reason.as_deref() == Some("resumed"))
+        .count();
+    assert_eq!(resumed, 3);
+}
+
+/// Claude Code reads a Keychain login at most every 30 s (spec section 18.1): a session woken
+/// sooner after a swap would send its turn with the login it stopped on.
+#[test]
+fn the_wake_waits_for_claude_codes_keychain_cache() {
+    let active = 1_000_000;
+    assert!(waiting::keychain_wait(active + 30_999, active, true));
+    assert!(!waiting::keychain_wait(
+        active + waiting::KEYCHAIN_CACHE_MS,
+        active,
+        true
+    ));
+    assert!(!waiting::keychain_wait(active + 1, active, false));
+}
+
+/// In relay mode a swap writes no login (relay spec, section 8), so a wake never waits for the
+/// Keychain cache; with relay mode off it does after a swap.
+#[test]
+fn a_relay_swap_is_no_reason_to_wait_for_the_keychain() {
+    let e = env();
+    let now = time::now_ms();
+    reading(&e.store, e.a, 100.0, now - 1_000);
+    reading(&e.store, e.b, 10.0, now - 60_000);
+    ccr_core::relay::set_mode(&e.store, Some(e.a)).unwrap();
+    let ws = stop(&e, "s1", now);
+    swap_to_b(&e);
+    let now = time::now_ms();
+    assert!(!waiting::waits_for_keychain(&e.store, now, || true).unwrap());
+    let (account, _) = woken(waiting::decide(&e.store, &e.paths, &ws, now).unwrap());
+    assert_eq!(account, e.b);
+
+    let off = env();
+    swap_to_b(&off);
+    let now = time::now_ms();
+    assert!(waiting::waits_for_keychain(&off.store, now, || true).unwrap());
+    assert!(!waiting::waits_for_keychain(&off.store, now, || false).unwrap());
+}
+
+/// The Keychain wait counts from when the swap's write of the login returned, not from the swap's
+/// start, which can be up to three lock waits earlier.
+#[test]
+fn a_swap_records_when_the_login_was_written() {
+    let e = env();
+    let before = time::now_ms();
+    swap_to_b(&e);
+    let written = swap::login_written_at(&e.store).unwrap();
+    assert!(written >= swap::active_since(&e.store).unwrap());
+    assert!(written >= before && written <= time::now_ms());
 }

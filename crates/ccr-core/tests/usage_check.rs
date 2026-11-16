@@ -448,6 +448,7 @@ fn a_dead_swap_is_settled_by_asking_claude_code_whose_login_it_is() {
                     from: Some(a),
                     to: b,
                     at: time::now_ms(),
+                    relay: None,
                 })
                 .unwrap(),
             )
@@ -514,6 +515,7 @@ fn no_check_runs_while_a_swap_is_pending() {
                 from: Some(a),
                 to: b,
                 at: time::now_ms(),
+                relay: None,
             })
             .unwrap(),
         )
@@ -583,6 +585,7 @@ fn a_second_login_of_the_account_the_config_names_is_not_stored_as_the_active_ac
         &e.paths,
         &statusline::StatusInput::default(),
         time::now_ms(),
+        |_| None,
     )
     .unwrap();
     assert!(
@@ -651,6 +654,29 @@ fn a_login_of_another_pool_account_makes_it_active() {
     assert_eq!(stored_refresh(&store, b), "refresh-b2");
     assert_eq!(stored_refresh(&store, a), "refresh-a1");
     assert!(store.last_event_of(kind::ADOPTED_LOGIN).unwrap().is_some());
+}
+
+/// Relay mode, home a signed out after its login died in the profile, b active: a fresh login
+/// of a in the profile, once Claude Code says it is a's, is stored as a's and puts a back in the
+/// pool, parked, with b still active.
+#[test]
+fn relay_relogin_of_home_identified_clears_needs_login() {
+    let e = env();
+    let (store, a, b) = identified_pool(&e, "ua");
+    ccr_core::relay::set_mode(&store, Some(a)).unwrap();
+    store.set_state(a, AccountState::NeedsLogin).unwrap();
+    store.set_state(b, AccountState::Active).unwrap();
+
+    profile_login(&e, "a2");
+    statusline::sync(&store, &e.paths).unwrap();
+    e.answer("ua", 10.0);
+    assert_eq!(settle(&store, &e), swap::Settle::Settled);
+    assert_eq!(stored_refresh(&store, a), "refresh-a2");
+    assert_eq!(
+        store.account(a).unwrap().unwrap().state,
+        AccountState::Parked
+    );
+    assert_eq!(store.active_account().unwrap().unwrap().id, b);
 }
 
 /// A swap identifies a changed login before it stores the profile's login as the outgoing

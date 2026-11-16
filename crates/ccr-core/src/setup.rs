@@ -287,6 +287,19 @@ fn set_ctl_hooks(settings: &mut Map<String, Value>, ctl: &str) -> Result<()> {
             }]
         }),
     )?;
+    // Marks a session stopped at a limit as working again when one of its turns ends normally:
+    // desktop sessions run no status line to show it (spec section 24.3).
+    set_ctl_hook(
+        hooks,
+        "Stop",
+        json!({
+            "hooks": [{
+                "type": "command",
+                "command": format!("{ctl} hook stop"),
+                "timeout": 10
+            }]
+        }),
+    )?;
     // Reports `cc-rotate --resume <id>` to herdr when the session runs in a herdr pane (spec
     // section 19); outside herdr it exits at once.
     set_ctl_hook(
@@ -344,6 +357,26 @@ pub fn stop_failure_hook_current(settings: &Value) -> bool {
                             h.get("command").and_then(Value::as_str).is_some_and(|c| {
                                 c.contains("cc-rotate-ctl") && c.contains("stop-failure")
                             }) && h.get("asyncRewake").and_then(Value::as_bool) == Some(true)
+                        })
+                    })
+            })
+        })
+}
+
+/// Whether the profile's settings run `cc-rotate-ctl hook stop` (spec section 24.3).
+pub fn stop_hook_present(settings: &Value) -> bool {
+    settings
+        .pointer("/hooks/Stop")
+        .and_then(Value::as_array)
+        .is_some_and(|groups| {
+            groups.iter().any(|g| {
+                g.get("hooks")
+                    .and_then(Value::as_array)
+                    .is_some_and(|hooks| {
+                        hooks.iter().any(|h| {
+                            h.get("command").and_then(Value::as_str).is_some_and(|c| {
+                                c.contains("cc-rotate-ctl") && c.ends_with("hook stop")
+                            })
                         })
                     })
             })
@@ -903,5 +936,32 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// The `Stop` hook marks woken desktop sessions resumed (spec section 24.3): added once,
+    /// beside the user's own Stop hooks.
+    #[test]
+    fn setup_adds_the_stop_hook_once() {
+        let root = tempfile::tempdir().unwrap();
+        let user_stop = json!({"hooks": [{"type": "command", "command": "say done"}]});
+        std::fs::write(
+            root.path().join("settings.json"),
+            json!({"hooks": {"Stop": [user_stop.clone()]}}).to_string(),
+        )
+        .unwrap();
+        let ctl = root.path().join("cc-rotate-ctl");
+        assert!(update_hooks(root.path(), &ctl).unwrap());
+        assert!(!update_hooks(root.path(), &ctl).unwrap());
+        let settings: Value = serde_json::from_str(
+            &std::fs::read_to_string(root.path().join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        let stop = settings["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 2, "{stop:#?}");
+        assert_eq!(stop[0], user_stop);
+        let command = stop[1]["hooks"][0]["command"].as_str().unwrap();
+        assert!(command.ends_with("cc-rotate-ctl hook stop"), "{command}");
+        assert!(stop_hook_present(&settings));
+        assert!(!stop_hook_present(&json!({"hooks": {"Stop": [user_stop]}})));
     }
 }

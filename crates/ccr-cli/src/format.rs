@@ -331,6 +331,50 @@ fn pick_order(prefer_no_weekly_limit: bool, use_expiring_weekly: bool, strict: b
     }
 }
 
+/// How an event kind is shown: the app account's kinds keep their stored names (`relay_mode`,
+/// `relay_resend`, `relay_error`) in the store and in `events --json`, but are shown by what they
+/// mean.
+fn event_kind(kind: &str) -> &str {
+    match kind {
+        ccr_core::store::kind::RELAY_MODE => "app_account",
+        ccr_core::store::kind::RELAY_RESEND => "resend",
+        ccr_core::store::kind::RELAY_ERROR => "proxy_error",
+        other => other,
+    }
+}
+
+/// The sentence an app account event is shown with, `None` for other kinds.
+fn app_account_event(e: &Event, label: &dyn Fn(Option<i64>) -> String) -> Option<String> {
+    use ccr_core::store::kind;
+    let detail = |key: &str| e.detail.as_ref().and_then(|d| d.get(key));
+    let text = match e.kind.as_str() {
+        kind::RELAY_MODE => {
+            let mut text = match detail("home").and_then(|v| v.as_i64()) {
+                Some(home) if e.reason.as_deref() == Some("on") => {
+                    format!("App account turned on ({})", label(Some(home)))
+                }
+                _ if e.reason.as_deref() == Some("on") => "App account turned on".to_string(),
+                _ => "App account turned off".to_string(),
+            };
+            if let Some(why) = detail("why").and_then(|v| v.as_str()) {
+                text = format!("{text}: {why}");
+            }
+            text
+        }
+        kind::RELAY_RESEND => format!(
+            "Resent on {} after {} was refused at a limit",
+            label(e.account_to),
+            label(e.account_from)
+        ),
+        kind::RELAY_ERROR => match detail("kind").and_then(|v| v.as_str()) {
+            Some(why) => format!("The local proxy could not reach Anthropic ({why})"),
+            None => "The local proxy could not reach Anthropic".to_string(),
+        },
+        _ => return None,
+    };
+    Some(text)
+}
+
 pub fn events(store: &Store, events: &[Event]) -> String {
     let label = |id: Option<i64>| {
         id.and_then(|i| store.account(i).ok().flatten())
@@ -339,24 +383,24 @@ pub fn events(store: &Store, events: &[Event]) -> String {
     };
     let mut out = String::new();
     for e in events.iter().rev() {
-        let detail = e
-            .detail
-            .as_ref()
-            .and_then(|d| {
-                d.get("why")
-                    .or_else(|| d.get("message"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string)
-                    .or_else(|| {
-                        d.get("session")
-                            .and_then(|v| v.as_str())
-                            .map(|s| format!("session {}", s.chars().take(8).collect::<String>()))
-                    })
-                    .or_else(|| {
-                        d.get("version")
-                            .and_then(|v| v.as_str())
-                            .map(|v| format!("Claude Code {v}"))
-                    })
+        let detail = app_account_event(e, &label)
+            .or_else(|| {
+                e.detail.as_ref().and_then(|d| {
+                    d.get("why")
+                        .or_else(|| d.get("message"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                        .or_else(|| {
+                            d.get("session").and_then(|v| v.as_str()).map(|s| {
+                                format!("session {}", s.chars().take(8).collect::<String>())
+                            })
+                        })
+                        .or_else(|| {
+                            d.get("version")
+                                .and_then(|v| v.as_str())
+                                .map(|v| format!("Claude Code {v}"))
+                        })
+                })
             })
             .map(|s| format!("  {DIM}{s}{RESET}"))
             .unwrap_or_default();
@@ -364,7 +408,7 @@ pub fn events(store: &Store, events: &[Event]) -> String {
             out,
             "{:>8}  {:<14} {:<19} {} -> {}{}",
             ago(e.ts),
-            e.kind,
+            event_kind(&e.kind),
             e.reason.as_deref().unwrap_or(""),
             label(e.account_from),
             label(e.account_to),
@@ -594,6 +638,190 @@ pub fn doctor(checks: &[Check]) -> String {
     out
 }
 
+/// What `cc-rotate-ctl app-account` shows (relay spec 4).
+#[derive(Debug, Clone)]
+pub struct RelayView {
+    /// The app account's label while it is on.
+    pub home: Option<String>,
+    /// The relay's port, from `relay.json`, when it is there.
+    pub port: Option<u16>,
+    pub answers: bool,
+    pub service: ccr_core::relay_service::ServiceState,
+    /// Sessions whose status line ran without the relay's address in the last 10 minutes.
+    pub bypassing: usize,
+}
+
+/// `cc-rotate-ctl app-account`: the local proxy's address, never its secret.
+pub fn relay(v: &RelayView) -> String {
+    use ccr_core::relay_service::ServiceState;
+    let mut out = String::new();
+    match &v.home {
+        Some(home) => {
+            let _ = writeln!(out, "App account: {home}");
+            let _ = writeln!(
+                out,
+                "Sessions act as {home} (the desktop app's account); usage still rotates across the pool."
+            );
+        }
+        None => {
+            let _ = writeln!(out, "App account: off");
+        }
+    }
+    match v.port {
+        Some(port) => {
+            let _ = writeln!(out, "Local proxy: 127.0.0.1:{port}");
+            let answers = if v.answers { "yes" } else { "no" };
+            let _ = writeln!(out, "Answering: {answers}");
+        }
+        None => {
+            let _ = writeln!(out, "Local proxy: none (relay.json is not there)");
+        }
+    }
+    let service = match v.service {
+        ServiceState::Installed => "installed",
+        ServiceState::Missing => "not installed",
+    };
+    let _ = writeln!(out, "Service: {service}");
+    let _ = writeln!(
+        out,
+        "Sessions not going through the local proxy (last 10 minutes): {}",
+        v.bypassing
+    );
+    if let Some(home) = &v.home
+        && v.bypassing > 0
+    {
+        let _ = writeln!(
+            out,
+            "Those run as {home} directly, off the pool: restart them to move them onto the local proxy."
+        );
+    }
+    out
+}
+
+/// `cc-rotate-ctl desktop` (spec section 24.2). `relay_home` is the app account's label while it
+/// is on (relay spec, section 1).
+pub fn desktop(
+    setup: &ccr_core::desktop::Setup,
+    ctl: &std::path::Path,
+    relay_home: Option<&str>,
+) -> String {
+    use ccr_core::desktop::{self, Launcher, Platform, Policy};
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    if setup.platform == Platform::Unsupported {
+        out.push_str(
+            "The Claude desktop app's Code sessions can run on the pool on macOS and Windows only.\n",
+        );
+        return out;
+    }
+    let managed = |foreign: bool| {
+        if foreign {
+            ", set by device management"
+        } else {
+            ""
+        }
+    };
+    let policy = match &setup.policy {
+        Policy::On => "on".to_string(),
+        Policy::Off => "not set".to_string(),
+        Policy::Disabled => "off".to_string(),
+        Policy::Unknown(why) => format!("unknown ({why})"),
+    };
+    let _ = writeln!(
+        out,
+        "The app's policy {} ({}): {policy}{}",
+        desktop::POLICY_KEY,
+        desktop::policy_location(setup.platform),
+        managed(setup.policy_foreign)
+    );
+    let launcher = match &setup.launcher {
+        Launcher::Ours => "cc-rotate's (this cc-rotate-ctl)".to_string(),
+        Launcher::None => "none".to_string(),
+        Launcher::Other(v) => format!("another program: {v}"),
+        Launcher::Unreadable(why) => format!("unreadable ({why})"),
+    };
+    let file = desktop::settings_file(setup.platform).unwrap_or_default();
+    let _ = writeln!(
+        out,
+        "Claude Code's launcher (processWrapper in {}): {launcher}{}\n",
+        file.display(),
+        managed(setup.launcher_foreign)
+    );
+    let shell = match setup.platform {
+        Platform::Windows => "in PowerShell run as administrator",
+        _ => "in Terminal",
+    };
+    let list = |out: &mut String, commands: &[String]| {
+        for c in commands {
+            let _ = writeln!(out, "  {c}");
+        }
+    };
+    if setup.on() {
+        out.push_str("Desktop sessions run on the pool.\n");
+        let off = desktop::off_commands(setup);
+        if off.is_empty() {
+            out.push_str(
+                "Device management set this up, so turning it off is for its administrator.\n",
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "To turn this off, run these {shell}, then quit and reopen the Claude app:"
+            );
+            list(&mut out, &off);
+            if setup.platform == Platform::MacOs {
+                let _ = writeln!(
+                    out,
+                    "(Or remove \"{}\" in System Settings > General > Device Management.)",
+                    desktop::PROFILE_NAME
+                );
+            }
+        }
+    } else {
+        out.push_str("Desktop sessions run on the account the Claude app is signed in to.\n");
+        let on = desktop::on_commands(setup, ctl);
+        if !on.is_empty() {
+            if matches!(setup.launcher, Launcher::Other(_)) && !setup.launcher_foreign {
+                out.push_str("Turning this on replaces that launcher.\n");
+            }
+            let _ = writeln!(
+                out,
+                "To run them on the pool, run these {shell}, then quit and reopen the Claude app:"
+            );
+            list(&mut out, &on);
+            if setup.platform == Platform::MacOs
+                && setup.policy != Policy::On
+                && !setup.policy_foreign
+            {
+                let _ = writeln!(
+                    out,
+                    "In System Settings, open General > Device Management, double-click \"{}\" and install it (it needs your password).",
+                    desktop::PROFILE_NAME
+                );
+            }
+        }
+        for note in desktop::admin_notes(setup, ctl) {
+            let _ = writeln!(out, "{note}");
+        }
+    }
+    match relay_home {
+        Some(home) => {
+            let _ = writeln!(
+                out,
+                "\nThe app account is {home}: sessions act as {home} (the desktop app's account), so artifacts open in the app's artifact pane when the app is signed in to {home}; usage still rotates across the pool."
+            );
+        }
+        None => out.push_str(
+            "\nThe app account is off: artifacts published while another account is in use don't open in the app's artifact pane.\n\
+             To have every session act as the app's account, run `cc-rotate-ctl app-account <the account the app is signed in to>`.\n",
+        ),
+    }
+    if setup.platform == Platform::Windows {
+        out.push_str("This has not been tried in the Windows app yet.\n");
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -785,5 +1013,125 @@ mod tests {
             report(&[], 4),
             "No accounts yet. Add one with `cc-rotate-ctl login`.\n"
         );
+    }
+
+    #[test]
+    fn app_account_on_names_it_and_sessions_off_the_local_proxy() {
+        let text = relay(&RelayView {
+            home: Some("work".into()),
+            port: Some(50123),
+            answers: true,
+            service: ccr_core::relay_service::ServiceState::Installed,
+            bypassing: 2,
+        });
+        assert_eq!(
+            text,
+            "App account: work\n\
+             Sessions act as work (the desktop app's account); usage still rotates across the pool.\n\
+             Local proxy: 127.0.0.1:50123\nAnswering: yes\n\
+             Service: installed\nSessions not going through the local proxy (last 10 minutes): 2\n\
+             Those run as work directly, off the pool: restart them to move them onto the local proxy.\n"
+        );
+        assert!(!text.contains('\u{2014}'), "no em dashes");
+        assert!(!text.to_lowercase().contains("relay mode"), "{text}");
+    }
+
+    #[test]
+    fn app_account_events_are_shown_by_what_they_mean() {
+        use ccr_core::store::{AccountIdentity, kind};
+        use serde_json::json;
+        let store = Store::open_in_memory().unwrap();
+        let a = store
+            .insert_account("a", &AccountIdentity::default(), AccountState::Active)
+            .unwrap();
+        let b = store
+            .insert_account("b", &AccountIdentity::default(), AccountState::Parked)
+            .unwrap();
+        let on = Some(json!({ "home": a }));
+        let off = Some(json!({ "home": null }));
+        let failure = Some(json!({ "kind": "connect" }));
+        store
+            .log_event(kind::RELAY_MODE, Some(a), Some(a), Some("on"), on)
+            .unwrap();
+        store
+            .log_event(kind::RELAY_RESEND, Some(a), Some(b), None, None)
+            .unwrap();
+        store
+            .log_event(kind::RELAY_ERROR, None, None, None, failure)
+            .unwrap();
+        store
+            .log_event(kind::RELAY_MODE, Some(a), Some(a), Some("off"), off)
+            .unwrap();
+        let out = events(&store, &store.events(10).unwrap());
+        assert!(out.contains("app_account"), "{out}");
+        assert!(out.contains("App account turned on (a)"), "{out}");
+        assert!(out.contains("resend"), "{out}");
+        assert!(
+            out.contains("Resent on b after a was refused at a limit"),
+            "{out}"
+        );
+        assert!(out.contains("proxy_error"), "{out}");
+        assert!(
+            out.contains("The local proxy could not reach Anthropic (connect)"),
+            "{out}"
+        );
+        assert!(out.contains("App account turned off"), "{out}");
+        assert!(!out.contains("relay"), "{out}");
+    }
+
+    #[test]
+    fn app_account_off_says_off() {
+        let text = relay(&RelayView {
+            home: None,
+            port: None,
+            answers: false,
+            service: ccr_core::relay_service::ServiceState::Missing,
+            bypassing: 0,
+        });
+        assert_eq!(
+            text,
+            "App account: off\nLocal proxy: none (relay.json is not there)\nService: not installed\n\
+             Sessions not going through the local proxy (last 10 minutes): 0\n"
+        );
+    }
+
+    #[test]
+    fn desktop_names_the_app_account() {
+        use ccr_core::desktop::{Launcher, Platform, Policy, Setup};
+        let setup = Setup {
+            platform: Platform::MacOs,
+            policy: Policy::On,
+            policy_foreign: false,
+            launcher: Launcher::Ours,
+            launcher_foreign: false,
+        };
+        let ctl = std::path::Path::new("/usr/local/bin/cc-rotate-ctl");
+        let on = desktop(&setup, ctl, Some("work"));
+        assert!(
+            on.contains(
+                "The app account is work: sessions act as work (the desktop app's account)"
+            ),
+            "{on}"
+        );
+        assert!(
+            on.contains("open in the app's artifact pane when the app is signed in to work"),
+            "{on}"
+        );
+        assert!(!on.contains("don't open"), "{on}");
+
+        let off = desktop(&setup, ctl, None);
+        assert!(off.contains("The app account is off"), "{off}");
+        assert!(
+            off.contains("don't open in the app's artifact pane"),
+            "{off}"
+        );
+        assert!(
+            off.contains("cc-rotate-ctl app-account <the account the app is signed in to>"),
+            "{off}"
+        );
+        for text in [&on, &off] {
+            assert!(!text.contains('\u{2014}'), "no em dashes");
+            assert!(!text.to_lowercase().contains("relay"), "{text}");
+        }
     }
 }

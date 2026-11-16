@@ -1,9 +1,11 @@
 //! `cc-rotate-ctl statusline` as Claude Code runs it: the process it runs for comes from the
 //! `CLAUDE_PID` Claude Code puts in its environment (spec F25).
 
+mod common;
+
 use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use ccr_core::store::{AccountIdentity, AccountState, Store};
 use ccr_core::time;
@@ -48,7 +50,7 @@ fn fixture(root: &Path) -> (Store, i64) {
 }
 
 fn tick(root: &Path, claude_pid: Option<&str>, total: f64, ran_ms: i64) {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_cc-rotate-ctl"));
+    let mut command = common::program(env!("CARGO_BIN_EXE_cc-rotate-ctl"));
     command
         .arg("statusline")
         .env("CC_ROTATE_DATA_DIR", root.join("data"))

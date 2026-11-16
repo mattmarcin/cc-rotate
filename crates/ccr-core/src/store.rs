@@ -799,6 +799,14 @@ pub mod kind {
     /// A warm-up started an account's 5-hour window (`usage_check::warm_up`);
     /// `detail.cost_usd` is what Claude Code reported it cost at API prices.
     pub const WARM_UP: &str = "warm_up";
+    /// Relay mode was turned on (`on`, `detail.home` names the home account) or off (`off`);
+    /// `account_from` and `account_to` are the accounts whose login the profile had and has.
+    pub const RELAY_MODE: &str = "relay_mode";
+    /// The relay sent a request again on another account after Anthropic refused it at a usage
+    /// limit; `account_from` is the refused account, `account_to` the one it went to.
+    pub const RELAY_RESEND: &str = "relay_resend";
+    /// The relay could not reach Anthropic; `detail.kind` says what failed. At most one a minute.
+    pub const RELAY_ERROR: &str = "relay_error";
 }
 
 /// Typed view of the `settings` table with defaults applied.
@@ -832,6 +840,10 @@ pub struct Settings {
     /// When every account is at a limit and the one in use has extra usage on, move to one
     /// without, so sessions wait for a reset instead of paying (`extra_usage`).
     pub avoid_extra_usage: bool,
+    /// Relay mode renews the access token of the account in use, when it is not the home account,
+    /// when it ends within this many seconds. Set as `app_account_renew_margin_s` (relay mode's
+    /// user-facing name is "app account").
+    pub relay_renew_margin_s: i64,
 }
 
 pub const SETTING_KEYS: &[&str] = &[
@@ -851,6 +863,7 @@ pub const SETTING_KEYS: &[&str] = &[
     "login_warning_days",
     "strict_order",
     "avoid_extra_usage",
+    "app_account_renew_margin_s",
 ];
 
 pub struct Store {
@@ -915,6 +928,23 @@ impl Store {
             key_path: Some(secret::key_path(dir)),
             key: OnceCell::new(),
         })
+    }
+
+    /// One setting of the store at `path`, whatever its schema, without changing anything. For
+    /// the desktop launcher, which must find the profile even before an upgraded cc-rotate has
+    /// migrated the store (spec section 24.1).
+    pub fn read_setting_any_schema(path: &Path, key: &str) -> Result<Option<String>> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("opening store {} read-only", path.display()))?;
+        conn.busy_timeout(Duration::from_millis(5000))?;
+        Ok(conn
+            .query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| {
+                r.get(0)
+            })
+            .optional()?)
     }
 
     /// A copy of the store at `source`, made at `copy` (a consistent snapshot read through a
@@ -1282,7 +1312,22 @@ impl Store {
             avoid_extra_usage: get("avoid_extra_usage")?
                 .and_then(|v| parse_bool(&v))
                 .unwrap_or(false),
+            relay_renew_margin_s: int("app_account_renew_margin_s", 900)?.clamp(60, 3600),
         })
+    }
+
+    /// The models named by the samples taken in the `span_ms` up to the latest sample that names
+    /// one, the most recently seen first. Empty when no sample names a model.
+    pub fn recent_models(&self, span_ms: i64) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT model FROM samples
+             WHERE model IS NOT NULL
+               AND ts >= (SELECT ts FROM samples WHERE model IS NOT NULL
+                          ORDER BY ts DESC LIMIT 1) - ?1
+             GROUP BY model ORDER BY MAX(ts) DESC",
+        )?;
+        let rows = stmt.query_map([span_ms], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn meta(&self, key: &str) -> Result<Option<String>> {
@@ -2081,6 +2126,7 @@ impl Store {
                  AND key NOT IN (SELECT project_key FROM project_sessions)",
             [],
         )?;
+        crate::relay::prune_bypass(self, now_ms)?;
         self.set_meta("last_prune_at", now_ms)
     }
 
@@ -2209,6 +2255,7 @@ impl Store {
     ///
     /// `note_session_cost_for_project` files that same increase under `project`, the folder
     /// Claude Code was launched in. A tick that adds nothing still records the session there.
+    #[allow(clippy::too_many_arguments)]
     pub fn note_session_cost_for_project(
         &self,
         session_id: &str,
@@ -2267,6 +2314,7 @@ impl Store {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record_session_cost(
         &self,
         session_id: &str,
@@ -2346,6 +2394,34 @@ impl Store {
                 write_project(&s.conn, session_id, path, account_id, added, now_ms)?;
             }
             Ok(added)
+        })
+    }
+
+    /// What one model response would have cost at API prices, priced by the relay for a session
+    /// whose status line does not count it (`relay_proto::status_line_counts_cost`): it counts
+    /// whole for `account_id`, in the hour of `now_ms`, and, with the session and the folder it
+    /// was launched in, for that folder too.
+    pub fn note_response_cost(
+        &self,
+        session_id: Option<&str>,
+        project: Option<&str>,
+        usd: f64,
+        account_id: i64,
+        now_ms: i64,
+    ) -> Result<()> {
+        if !usd.is_finite() || usd <= 0.0 {
+            return Ok(());
+        }
+        self.immediate(|s| {
+            s.conn.execute(
+                "INSERT INTO account_costs (account_id, hour, usd) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (account_id, hour) DO UPDATE SET usd = usd + excluded.usd",
+                params![account_id, now_ms.div_euclid(3_600_000), usd],
+            )?;
+            if let (Some(session), Some(path)) = (session_id.filter(|s| !s.is_empty()), project) {
+                write_project(&s.conn, session, path, account_id, usd, now_ms)?;
+            }
+            Ok(())
         })
     }
 
@@ -2721,6 +2797,7 @@ fn validate_setting(key: &str, value: &str) -> Result<Option<String>> {
             whole_in(value, MIN_CHECK_INTERVAL_S, 7 * DAY_S)?;
         }
         "usage_check_max_age_s" => whole_in(value, 0, 7 * DAY_S)?,
+        "app_account_renew_margin_s" => whole_in(value, 60, 3600)?,
         // A relative path would be looked up from wherever cc-rotate runs, such as a project.
         "claude_path" | "profile_dir" => {
             if !std::path::Path::new(value).is_absolute() {
@@ -2799,6 +2876,28 @@ pub fn sanitize_label(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relay_settings() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(store.settings().unwrap().relay_renew_margin_s, 900);
+        assert!(
+            store
+                .set_setting("app_account_renew_margin_s", Some("10"))
+                .is_err()
+        );
+        store
+            .set_setting("app_account_renew_margin_s", Some("600"))
+            .unwrap();
+        assert_eq!(store.settings().unwrap().relay_renew_margin_s, 600);
+        assert!(store.set_setting("relay_mode", Some("on")).is_err());
+        // The old name is gone (nothing with it was released).
+        assert!(
+            store
+                .set_setting("relay_renew_margin_s", Some("600"))
+                .is_err()
+        );
+    }
 
     #[test]
     fn settings_are_bounded_and_paths_are_full() {
@@ -3048,6 +3147,39 @@ mod tests {
             .note_session_cost("s1", "pid:7", 3.75, Some(930_000), a, 3_000)
             .unwrap();
         assert!((added - 0.25).abs() < 1e-9, "{added}");
+    }
+
+    /// The desktop launcher reads where the profile is from a store of any schema: after an
+    /// upgrade, nothing may have migrated it yet (spec section 24.1).
+    #[test]
+    fn a_setting_is_read_from_a_store_of_another_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        let store = Store::open(&path).unwrap();
+        store
+            .set_setting("profile_dir", Some("/somewhere/profile"))
+            .unwrap();
+        drop(store);
+        for version in [SCHEMA_VERSION - 1, SCHEMA_VERSION + 1] {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            drop(conn);
+            assert_eq!(
+                Store::read_setting_any_schema(&path, "profile_dir")
+                    .unwrap()
+                    .as_deref(),
+                Some("/somewhere/profile")
+            );
+            assert_eq!(
+                Store::read_setting_any_schema(&path, "claude_path").unwrap(),
+                None
+            );
+        }
+        let conn = Connection::open(&path).unwrap();
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION + 1, "never migrated");
     }
 
     #[test]
@@ -3840,6 +3972,48 @@ mod tests {
         assert_eq!(s.find_account("u1@example.com").unwrap().id, a);
         assert_eq!(s.find_account(&a.to_string()).unwrap().id, a);
         assert!(s.find_account("missing").is_err());
+    }
+
+    #[test]
+    fn response_costs_add_up_per_account_hour_and_folder() {
+        let s = Store::open_in_memory().unwrap();
+        let a = s
+            .insert_account("a", &ident("u1"), AccountState::Active)
+            .unwrap();
+        let hour = 3_600_000;
+        let h0 = 490_000 * hour;
+        s.note_response_cost(Some("s1"), Some("/work/app"), 0.25, a, h0 + 1)
+            .unwrap();
+        s.note_response_cost(Some("s1"), Some("/work/app/"), 0.5, a, h0 + 2)
+            .unwrap();
+        // No folder: the account's hour only. Nothing, or nonsense, counts nothing.
+        s.note_response_cost(Some("s2"), None, 1.0, a, h0 + 3)
+            .unwrap();
+        s.note_response_cost(None, Some("/work/other"), 2.0, a, h0 + 4)
+            .unwrap();
+        s.note_response_cost(Some("s3"), Some("/work/zero"), 0.0, a, h0 + 5)
+            .unwrap();
+        s.note_response_cost(Some("s3"), Some("/work/nan"), f64::NAN, a, h0 + 5)
+            .unwrap();
+        assert_eq!(
+            s.hourly_costs_since(h0).unwrap(),
+            vec![HourlyCost {
+                account_id: a,
+                ts: h0,
+                usd: 3.75
+            }]
+        );
+        let spend = s.project_spend_since(h0).unwrap();
+        assert_eq!(spend.len(), 1);
+        assert_eq!(spend[0].path, "/work/app");
+        assert!((spend[0].usd - 0.75).abs() < 1e-9);
+        let touched: Vec<_> = s
+            .project_touches_since(h0)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.path)
+            .collect();
+        assert_eq!(touched, vec!["/work/app"]);
     }
 
     #[test]

@@ -3,8 +3,8 @@
 //! Limits are modelled generically. A sample holds every usage window the data source reported
 //! (Claude Code's status line input: `five_hour`, `seven_day`, and any window it adds later),
 //! and `classify` says what each one limits: a 5-hour session window or a weekly window, on all
-//! models or on one model family. An account is ineligible while any window that applies to the
-//! model in use is at or above its threshold.
+//! models or on one model family. An account is ineligible while any window that applies to a
+//! model in use (`swap::models_in_use`) is at or above its threshold.
 //!
 //! Ranking, best first (`Policy::tier`):
 //! 1. With `prefer_no_weekly_limit` on: accounts without a weekly limit.
@@ -89,6 +89,15 @@ impl WindowSpec {
         match (&self.model, model) {
             (None, _) | (Some(_), None) => true,
             (Some(family), Some(m)) => m.to_ascii_lowercase().contains(family.as_str()),
+        }
+    }
+
+    /// Whether this window limits any of `models`, the models in use. With none known, it
+    /// applies as for an unknown model.
+    pub fn applies_to_any(&self, models: &[String]) -> bool {
+        match models {
+            [] => self.applies_to(None),
+            _ => models.iter().any(|m| self.applies_to(Some(m))),
         }
     }
 
@@ -202,7 +211,7 @@ pub struct WindowUsage {
     /// Epoch seconds; in the past once the window has reset.
     pub resets_at: Option<i64>,
     pub threshold: f64,
-    /// Whether the window limits the model the rotation profile is using.
+    /// Whether the window limits a model in use.
     pub applies: bool,
 }
 
@@ -220,13 +229,14 @@ impl WindowUsage {
     }
 }
 
-/// The windows of an account's usage (`Store::current_usage`). A window it does not have is not
-/// reported by the data source any more, so it does not count.
+/// The windows of an account's usage (`Store::current_usage`), for the models in use
+/// (`WindowSpec::applies_to_any`). A window it does not have is not reported by the data source
+/// any more, so it does not count.
 pub fn window_usage(
     sample: Option<&Sample>,
     now_s: i64,
     t: Thresholds,
-    model: Option<&str>,
+    models: &[String],
 ) -> Vec<WindowUsage> {
     let Some(sample) = sample else {
         return Vec::new();
@@ -241,7 +251,7 @@ pub fn window_usage(
                 pct: effective(Some(w.pct), w.resets_at, now_s),
                 resets_at: w.resets_at,
                 threshold: t.for_kind(spec.kind),
-                applies: spec.applies_to(model),
+                applies: spec.applies_to_any(models),
                 kind: spec.kind,
                 model: spec.model,
                 name: w.name.clone(),
@@ -330,7 +340,13 @@ pub enum Reason {
     /// Spend an at-risk weekly budget before its earlier reset, without waiting for a limit.
     WeeklyExpiring,
     StopFailure,
+    /// The relay saw Anthropic refuse a request because the login is at a limit.
+    LimitRefused,
     DeadLogin,
+    /// The relay saw Anthropic keep refusing the active account's stored login as not signed in,
+    /// and no renewed login came (relay spec 9). The account is held back for a check to settle;
+    /// unlike `DeadLogin`, the swap does not mark it as needing a new sign-in.
+    Unauthorized,
     Manual,
     Login,
     /// Every account is at a limit and the one in use runs on paid extra usage: move to one
@@ -347,7 +363,9 @@ impl Reason {
             Self::PreferredAvailable => "preferred_available",
             Self::WeeklyExpiring => "weekly_expiring",
             Self::StopFailure => "stop_failure",
+            Self::LimitRefused => "rate_limit",
             Self::DeadLogin => "dead_login",
+            Self::Unauthorized => "unauthorized",
             Self::Manual => "manual",
             Self::Login => "login",
             Self::AvoidExtraUsage => "avoid_extra_usage",
@@ -362,7 +380,9 @@ impl Reason {
             "preferred_available" => Self::PreferredAvailable,
             "weekly_expiring" => Self::WeeklyExpiring,
             "stop_failure" => Self::StopFailure,
+            "rate_limit" => Self::LimitRefused,
             "dead_login" => Self::DeadLogin,
+            "unauthorized" => Self::Unauthorized,
             "manual" => Self::Manual,
             "login" => Self::Login,
             "avoid_extra_usage" => Self::AvoidExtraUsage,
@@ -968,7 +988,7 @@ mod tests {
     fn cand(account: Account, weekly: WeeklyLimit, windows: &[(&str, f64, i64)]) -> Candidate {
         Candidate {
             order: account.position as usize,
-            windows: window_usage(Some(&sample(windows)), NOW, T, Some("claude-opus-4-1")),
+            windows: window_usage(Some(&sample(windows)), NOW, T, &["claude-opus-4-1".into()]),
             weekly_detected: weekly,
             weekly_limit: weekly,
             held_back: false,
@@ -1044,10 +1064,26 @@ mod tests {
             ("five_hour", 10.0, NOW + 3600),
             ("seven_day_opus", 99.0, NOW + 86_400),
         ]);
-        let on_sonnet = window_usage(Some(&s), NOW, T, Some("claude-sonnet-4-5"));
-        let on_opus = window_usage(Some(&s), NOW, T, Some("claude-opus-4-1"));
+        let on_sonnet = window_usage(Some(&s), NOW, T, &["claude-sonnet-4-5".into()]);
+        let on_opus = window_usage(Some(&s), NOW, T, &["claude-opus-4-1".into()]);
         assert!(!on_sonnet.iter().any(WindowUsage::blocking));
         assert!(on_opus.iter().any(WindowUsage::blocking));
+        // Sessions on Sonnet and on Opus at once: the Opus limit counts.
+        let both = [
+            "claude-sonnet-4-5".to_string(),
+            "claude-opus-4-1".to_string(),
+        ];
+        assert!(
+            window_usage(Some(&s), NOW, T, &both)
+                .iter()
+                .any(WindowUsage::blocking)
+        );
+        // Nothing known: as for an unknown model.
+        assert!(
+            window_usage(Some(&s), NOW, T, &[])
+                .iter()
+                .any(WindowUsage::blocking)
+        );
     }
 
     #[test]
@@ -1292,6 +1328,30 @@ mod tests {
             threshold_trigger(&pool[0]).map(|(r, _)| r),
             Some(Reason::FiveHour)
         );
+    }
+
+    #[test]
+    fn reason_strings_round_trip() {
+        for r in [
+            Reason::FiveHour,
+            Reason::Weekly,
+            Reason::OtherLimit,
+            Reason::PreferredAvailable,
+            Reason::WeeklyExpiring,
+            Reason::StopFailure,
+            Reason::LimitRefused,
+            Reason::DeadLogin,
+            Reason::Unauthorized,
+            Reason::Manual,
+            Reason::Login,
+            Reason::AvoidExtraUsage,
+        ] {
+            assert_eq!(Reason::parse(r.as_str()), Some(r), "{r:?}");
+        }
+        assert_eq!(Reason::Unauthorized.as_str(), "unauthorized");
+        // Urgent, like a dead login: no cooldown.
+        assert!(!Reason::Unauthorized.respects_cooldown());
+        assert!(!Reason::Unauthorized.is_threshold());
     }
 
     #[test]
@@ -1655,7 +1715,7 @@ mod tests {
                 Some(&sample(windows)),
                 NOW,
                 T.for_account(&c.account),
-                Some("claude-opus-4-1"),
+                &["claude-opus-4-1".into()],
             );
             c
         };
@@ -1689,7 +1749,7 @@ mod tests {
             }),
             NOW,
             T,
-            None,
+            &[],
         );
         let known = cand(
             acct(4, "k", AccountState::Parked, 1),
@@ -1868,7 +1928,7 @@ mod tests {
                         },
                         &windows,
                     );
-                    c.windows = window_usage(Some(&sample(&windows)), now, T, None);
+                    c.windows = window_usage(Some(&sample(&windows)), now, T, &[]);
                     c
                 })
                 .collect();

@@ -227,7 +227,7 @@ export class ChartPanel {
       replace(this.summary, h("p", { class: "chart-caption" }, caption));
       this.message(
         `No API cost counted ${IN_RANGE[this.rangeDays]}.`,
-        "It's counted from the status line of sessions in the cc-rotate profile, and of other profiles cc-rotate tracks.",
+        "It's counted from the status line of terminal sessions in the cc-rotate profile and other profiles cc-rotate tracks, and by the app account's proxy for desktop app sessions.",
       );
       return;
     }
