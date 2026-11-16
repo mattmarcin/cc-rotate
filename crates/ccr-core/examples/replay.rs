@@ -287,7 +287,7 @@ fn play(
     end_s: i64,
 ) -> Result<Outcome> {
     let accounts = store.accounts()?;
-    let model = store.meta(swap::META_PROFILE_MODEL)?;
+    let models = swap::models_in_use(store)?;
     let mut positions: Vec<i64> = accounts.iter().map(|a| a.position).collect();
     positions.dedup();
     let mut weekly = HashMap::new();
@@ -340,14 +340,7 @@ fn play(
         }
 
         let pool = candidates(
-            &accounts,
-            &sims,
-            &positions,
-            &weekly,
-            active,
-            policy,
-            model.as_deref(),
-            t,
+            &accounts, &sims, &positions, &weekly, active, policy, &models, t,
         );
         let pool = with_expiring(pool, policy, rates, &mut promoted, active, t);
 
@@ -374,14 +367,7 @@ fn play(
         if d > 0.0 {
             let current = pool.iter().find(|c| c.account.id == active).unwrap();
             let pool_now = candidates(
-                &accounts,
-                &sims,
-                &positions,
-                &weekly,
-                active,
-                policy,
-                model.as_deref(),
-                t,
+                &accounts, &sims, &positions, &weekly, active, policy, &models, t,
             );
             let blocked = pool_now
                 .iter()
@@ -434,7 +420,7 @@ fn candidates(
     weekly: &HashMap<i64, (scheduler::WeeklyLimit, scheduler::WeeklyLimit)>,
     active: i64,
     policy: Policy,
-    model: Option<&str>,
+    models: &[String],
     now_s: i64,
 ) -> Vec<Candidate> {
     accounts
@@ -461,7 +447,7 @@ fn candidates(
                     Some(&sample),
                     now_s,
                     policy.thresholds.for_account(&account),
-                    model,
+                    models,
                 ),
                 weekly_detected: detected,
                 weekly_limit: limit,

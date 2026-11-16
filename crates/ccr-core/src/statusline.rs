@@ -403,16 +403,15 @@ fn confirm_due(store: &Store, sample: &Sample, active_id: i64, now_ms: i64) -> R
     if !settings.usage_checks {
         return Ok(false);
     }
-    let model = store.meta(META_PROFILE_MODEL)?;
+    let models = swap::models_in_use(store)?;
     let thresholds = scheduler::Thresholds::from(&settings);
     let thresholds = match store.account(active_id)? {
         Some(account) => thresholds.for_account(&account),
         None => thresholds,
     };
-    let blocking =
-        scheduler::window_usage(Some(sample), now_ms / 1000, thresholds, model.as_deref())
-            .iter()
-            .any(scheduler::WindowUsage::blocking);
+    let blocking = scheduler::window_usage(Some(sample), now_ms / 1000, thresholds, &models)
+        .iter()
+        .any(scheduler::WindowUsage::blocking);
     if !blocking {
         return Ok(false);
     }

@@ -1285,6 +1285,20 @@ impl Store {
         })
     }
 
+    /// The models named by the samples taken in the `span_ms` up to the latest sample that names
+    /// one, the most recently seen first. Empty when no sample names a model.
+    pub fn recent_models(&self, span_ms: i64) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT model FROM samples
+             WHERE model IS NOT NULL
+               AND ts >= (SELECT ts FROM samples WHERE model IS NOT NULL
+                          ORDER BY ts DESC LIMIT 1) - ?1
+             GROUP BY model ORDER BY MAX(ts) DESC",
+        )?;
+        let rows = stmt.query_map([span_ms], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     pub fn meta(&self, key: &str) -> Result<Option<String>> {
         Ok(self
             .conn
