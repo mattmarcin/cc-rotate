@@ -27,8 +27,10 @@
 //!   be read), the account is held back from swaps until a check settles it, and that check
 //!   makes Claude Code renew: the login either works (and is stored) or is rejected.
 //!
-//! The account in use is only read to confirm a threshold swap (`confirm_active`), with a copy
-//! of the profile's login whose refresh token is removed, so Claude Code cannot renew it.
+//! The account in use is only read by `confirm_active`: to confirm a threshold swap, and now and
+//! then when the status line asks (spec section 20.4: readings it could not attribute, paid extra
+//! usage, a window limited to one model family). It uses a copy of the profile's login whose
+//! refresh token is removed, so Claude Code cannot renew it.
 //!
 //! The usage endpoint limits how often each login may ask: it answers 429 with a `retry-after` of
 //! up to an hour. Claude Code logs that wait in its debug log, and automatic checks of the
@@ -1311,14 +1313,19 @@ fn confirm_with(
         return Ok(CheckOutcome::Failed { why });
     }
     let Some(report) = report else {
-        return Ok(match rate_limited(&debug_log) {
-            Some(wait) => CheckOutcome::RateLimited {
-                until: time::now_ms() + wait,
-            },
-            None => CheckOutcome::Failed {
+        let Some(wait) = rate_limited(&debug_log) else {
+            return Ok(CheckOutcome::Failed {
                 why: failure(&ran, &debug_log),
-            },
-        });
+            });
+        };
+        // The usage endpoint's wait holds for the account's next checks too (R17).
+        let until = time::now_ms() + wait;
+        store.immediate(|s| {
+            let mut st = state(s, active.id)?;
+            st.not_before = st.not_before.max(Some(until));
+            save_state(s, active.id, &st)
+        })?;
+        return Ok(CheckOutcome::RateLimited { until });
     };
     if active.account_uuid.is_none() || report.account_uuid != active.account_uuid {
         return Ok(CheckOutcome::Failed {
@@ -1326,6 +1333,15 @@ fn confirm_with(
         });
     }
     let now = time::now_ms();
+    // The endpoint answered, so a wait it asked for is over. The back-off after a failed check
+    // of the stored login (it has a `problem`) stays.
+    store.immediate(|s| {
+        let mut st = state(s, active.id)?;
+        if st.problem.is_none() && st.not_before.take().is_some() {
+            save_state(s, active.id, &st)?;
+        }
+        Ok(())
+    })?;
     if let Some(extra) = &report.extra_usage {
         store.set_extra_usage(active.id, extra, report.fetched_at_ms)?;
     }
@@ -2082,6 +2098,36 @@ mod tests {
         // Turning checks on again lifts it.
         e.store.set_setting("usage_checks", Some("true")).unwrap();
         assert!(blocked(&e.store).unwrap().is_none());
+    }
+
+    /// A refusal while reading the account in use is remembered like any other, so the status
+    /// line does not ask again before the wait ends.
+    #[test]
+    fn a_refusal_of_the_account_in_use_is_remembered() {
+        let e = env();
+        let a = account(&e, "a", "ua", AccountState::Active);
+        credfile::write_oauth(&e.paths.credentials_file(), &oauth("a-live")).unwrap();
+        let run = fake(Fake {
+            debug_log: "[DEBUG] fetchUtilization: 429 remembered for this bearer; not asking again for 1454s\n[ERROR] Failed to load usage data: Request failed with status code 429\n".into(),
+            ..Default::default()
+        });
+        let before = time::now_ms();
+        let out = confirm_with(&e.store, &e.paths, &run).unwrap();
+        let CheckOutcome::RateLimited { until } = out else {
+            panic!("{out:?}")
+        };
+        assert!((until - before - 1_454_000).abs() < 5_000);
+        assert_eq!(state(&e.store, a).unwrap().not_before, Some(until));
+
+        // A reading that goes through ends the wait.
+        let run = fake(Fake {
+            stamp: Some("ua".into()),
+            pct: 40.0,
+            ..Default::default()
+        });
+        let out = confirm_with(&e.store, &e.paths, &run).unwrap();
+        assert!(matches!(out, CheckOutcome::Read { .. }), "{out:?}");
+        assert_eq!(state(&e.store, a).unwrap().not_before, None);
     }
 
     #[test]

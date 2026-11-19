@@ -33,7 +33,7 @@ use crate::{credfile, time};
 /// 11: how long each session's process had run at its last total (`session_costs.ran_ms`).
 /// 12: the same API-price cost filed under the folder Claude Code was launched in
 /// (`projects`, `project_costs`, `project_sessions`).
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE accounts (
@@ -600,6 +600,34 @@ pub struct WindowPeak {
 
 const SAMPLE_COLS: &str = "id, ts, account_id, profile, session_id, model";
 
+/// Schema 13. An index of the readings of an account itself (`Sample::reads_account`, the
+/// condition `OWN_READING`): `Store::current_usage` finds an account's latest one on every
+/// status line run, which would otherwise walk back over every status line reading since.
+const SCHEMA_V13: &str = r#"
+CREATE INDEX IF NOT EXISTS samples_own ON samples (account_id, ts, id)
+    WHERE session_id IS NULL AND profile <> 'rotate';
+"#;
+
+/// A reading of an account itself (`Sample::reads_account`), in SQL. Written as in the
+/// `samples_own` index (`SCHEMA_V13`), `ROTATION_PROFILE` included, so that a query with it
+/// can use the index.
+const OWN_READING: &str = "session_id IS NULL AND profile <> 'rotate'";
+
+/// The query for an account's (`?1`) latest sample taken at or before `?2`; with `own`, the
+/// latest that is a reading of the account itself. That one names its index: without
+/// statistics SQLite takes `samples_account_ts` and walks back over the status line readings.
+fn latest_sample_sql(own: bool) -> String {
+    let (index, own) = if own {
+        ("INDEXED BY samples_own", format!("AND {OWN_READING}"))
+    } else {
+        ("", String::new())
+    };
+    format!(
+        "SELECT {SAMPLE_COLS} FROM samples {index} WHERE account_id = ?1 AND ts <= ?2 {own}
+         ORDER BY ts DESC, id DESC LIMIT 1"
+    )
+}
+
 /// The `profile` of readings from the rotation profile's status line.
 pub const ROTATION_PROFILE: &str = "rotate";
 
@@ -1078,6 +1106,10 @@ impl Store {
             if version < 12 {
                 s.conn.execute_batch(SCHEMA_V12)?;
                 s.conn.pragma_update(None, "user_version", 12)?;
+            }
+            if version < 13 {
+                s.conn.execute_batch(SCHEMA_V13)?;
+                s.conn.pragma_update(None, "user_version", 13)?;
             }
             Ok(())
         })
@@ -1767,22 +1799,29 @@ impl Store {
 
     /// The account's latest sample taken at or before `until_ms`.
     pub fn last_sample_until(&self, account_id: i64, until_ms: i64) -> Result<Option<Sample>> {
-        self.sample_until(account_id, until_ms, false)
+        self.sample_until(account_id, until_ms, false, false)
+    }
+
+    /// The latest reading of the account itself (`Sample::reads_account`): a usage check, or
+    /// another profile's `/usage`. Each window at its usage as of that reading.
+    pub fn own_reading(&self, account_id: i64) -> Result<Option<Sample>> {
+        self.sample_until(account_id, i64::MAX, true, true)
     }
 
     /// The account's latest sample taken at or before `until_ms`, with each window's `high` for
-    /// its percentage when `usage`.
-    fn sample_until(&self, account_id: i64, until_ms: i64, usage: bool) -> Result<Option<Sample>> {
+    /// its percentage when `usage`. With `own`, the latest that is a reading of the account
+    /// itself (`Sample::reads_account`).
+    fn sample_until(
+        &self,
+        account_id: i64,
+        until_ms: i64,
+        usage: bool,
+        own: bool,
+    ) -> Result<Option<Sample>> {
         let row = self
             .conn
-            .query_row(
-                &format!(
-                    "SELECT {SAMPLE_COLS} FROM samples WHERE account_id = ?1 AND ts <= ?2
-                     ORDER BY ts DESC, id DESC LIMIT 1"
-                ),
-                [account_id, until_ms],
-                sample_from_row,
-            )
+            .prepare_cached(&latest_sample_sql(own))?
+            .query_row([account_id, until_ms], sample_from_row)
             .optional()?;
         let Some((id, mut sample)) = row else {
             return Ok(None);
@@ -1809,13 +1848,18 @@ impl Store {
     /// it, and not before the latest reading of the account itself, has one whose reset is still
     /// ahead: a session idle since before a window reset shows none of the window that started
     /// since.
+    ///
+    /// A window limited to one model family (the Fable week) that the latest reading lacks is
+    /// added from the latest reading of the account itself, however old: the status line reports
+    /// the limits on all models only (F13), so those stand as that reading left them, a reset
+    /// time that has passed too, until the account's next own reading says which it has.
     pub fn current_usage(&self, account_id: i64) -> Result<Option<Sample>> {
         self.current_usage_until(account_id, i64::MAX)
     }
 
     /// The account's usage as of `until_ms` (`current_usage`), from readings taken at or before it.
     pub fn current_usage_until(&self, account_id: i64, until_ms: i64) -> Result<Option<Sample>> {
-        let Some(mut sample) = self.sample_until(account_id, until_ms, true)? else {
+        let Some(mut sample) = self.sample_until(account_id, until_ms, true, false)? else {
             return Ok(None);
         };
         // Not from before a reading of the account itself, which says which windows it has
@@ -1849,6 +1893,18 @@ impl Store {
         for w in recent {
             if sample.window(&w.name).is_none() {
                 sample.windows.push(w);
+            }
+        }
+        // The windows on one model family, which only a reading of the account itself has.
+        if !sample.reads_account()
+            && let Some(own) = self.sample_until(account_id, sample.ts, true, true)?
+        {
+            for w in own.windows {
+                if crate::scheduler::classify(&w.name).model.is_some()
+                    && sample.window(&w.name).is_none()
+                {
+                    sample.windows.push(w);
+                }
             }
         }
         sample.windows.sort_by(|a, b| a.name.cmp(&b.name));
@@ -3067,6 +3123,56 @@ mod tests {
     }
 
     #[test]
+    fn upgrading_adds_the_index_of_own_readings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        let store = Store::open(&path).unwrap();
+        let a = store
+            .insert_account("a", &AccountIdentity::default(), AccountState::Active)
+            .unwrap();
+        let window = |name: &str| SampleWindow {
+            name: name.into(),
+            pct: 70.0,
+            resets_at: Some(1_000_000),
+        };
+        let reading = |ts, profile: &str, session: Option<&str>, windows| Sample {
+            ts,
+            account_id: a,
+            profile: profile.into(),
+            session_id: session.map(str::to_string),
+            model: None,
+            windows,
+        };
+        store
+            .record_sample(&reading(
+                1_000,
+                "check",
+                None,
+                vec![window("seven_day"), window("seven_day_fable")],
+            ))
+            .unwrap();
+        store
+            .record_sample(&reading(
+                900_000,
+                "rotate",
+                Some("s"),
+                vec![window("seven_day")],
+            ))
+            .unwrap();
+        drop(store);
+        // As the store schema 12 left.
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("DROP INDEX samples_own;").unwrap();
+        conn.pragma_update(None, "user_version", 12).unwrap();
+        drop(conn);
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.own_reading(a).unwrap().unwrap().ts, 1_000);
+        let usage = store.current_usage(a).unwrap().unwrap();
+        assert!(usage.window("seven_day_fable").is_some(), "{usage:?}");
+    }
+
+    #[test]
     fn a_read_only_open_never_changes_the_store() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("store.db");
@@ -3316,6 +3422,120 @@ mod tests {
         assert!(
             s.save_credential(a, &json!({"refreshToken": ""}), "login")
                 .is_err()
+        );
+    }
+
+    /// A window on one model family comes from readings of the account itself only, so it stands
+    /// as the latest of those left it, however many status line readings follow, and goes when
+    /// one of those has none.
+    #[test]
+    fn a_window_on_one_model_family_stands_until_the_next_own_reading() {
+        let s = Store::open_in_memory().unwrap();
+        let a = s
+            .insert_account("a", &ident("ua"), AccountState::Active)
+            .unwrap();
+        let w = |name: &str, pct: f64, resets_at: i64| SampleWindow {
+            name: name.into(),
+            pct,
+            resets_at: Some(resets_at),
+        };
+        let day = 86_400_000;
+        let week = 5 * 86_400;
+        let reading = |ts, profile: &str, session: Option<&str>, windows| Sample {
+            ts,
+            account_id: a,
+            profile: profile.into(),
+            session_id: session.map(str::to_string),
+            model: None,
+            windows,
+        };
+        let names = |until: i64| -> Vec<(String, f64)> {
+            s.current_usage_until(a, until)
+                .unwrap()
+                .unwrap()
+                .windows
+                .into_iter()
+                .map(|w| (w.name, w.pct))
+                .collect()
+        };
+        let all = |week_pct: f64, fable: f64| {
+            vec![
+                ("seven_day".to_string(), week_pct),
+                ("seven_day_fable".to_string(), fable),
+            ]
+        };
+        s.record_sample(&reading(
+            1_000,
+            "rotate",
+            Some("s"),
+            vec![w("seven_day", 10.0, week)],
+        ))
+        .unwrap();
+        s.record_sample(&reading(
+            2_000,
+            "check",
+            None,
+            vec![w("seven_day", 11.0, week), w("seven_day_fable", 70.0, week)],
+        ))
+        .unwrap();
+        // Days of status line readings later, past the window's reset too.
+        for (i, ts) in [3_000, day, 6 * day].into_iter().enumerate() {
+            let pct = 12.0 + i as f64;
+            s.record_sample(&reading(
+                ts,
+                "rotate",
+                Some("s"),
+                vec![w("seven_day", pct, week)],
+            ))
+            .unwrap();
+        }
+        assert_eq!(names(1_000), [("seven_day".to_string(), 10.0)]);
+        assert_eq!(names(2_000), all(11.0, 70.0));
+        assert_eq!(names(day), all(13.0, 70.0));
+        assert_eq!(names(6 * day), all(14.0, 70.0));
+        assert_eq!(s.last_sample(a).unwrap().unwrap().windows.len(), 1);
+        assert_eq!(s.own_reading(a).unwrap().unwrap().ts, 2_000);
+
+        // The next reading of the account itself has no such window.
+        s.record_sample(&reading(
+            7 * day,
+            "other-profile",
+            None,
+            vec![w("seven_day", 1.0, 2 * week)],
+        ))
+        .unwrap();
+        s.record_sample(&reading(
+            7 * day + 1,
+            "rotate",
+            Some("s"),
+            vec![w("seven_day", 2.0, 2 * week)],
+        ))
+        .unwrap();
+        assert_eq!(names(i64::MAX), [("seven_day".to_string(), 2.0)]);
+        assert_eq!(names(6 * day), all(14.0, 70.0), "as of before it");
+    }
+
+    /// The latest reading of an account itself is found through its index, not by walking back
+    /// over the status line readings since.
+    #[test]
+    fn the_latest_own_reading_is_found_by_index() {
+        let s = Store::open_in_memory().unwrap();
+        assert!(OWN_READING.contains(&format!("profile <> '{ROTATION_PROFILE}'")));
+        let plan: Vec<String> = s
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", latest_sample_sql(true)))
+            .unwrap()
+            .query_map([1, 2], |r| r.get(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|step| step.contains("samples_own")),
+            "{plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|step| step.contains("TEMP B-TREE")),
+            "{plan:?}"
         );
     }
 

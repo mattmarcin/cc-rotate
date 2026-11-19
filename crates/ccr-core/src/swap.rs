@@ -749,10 +749,12 @@ pub fn stop_hold_until(
     let news = match (latest, &at_stop) {
         (Some(l), _) if l.ts <= left => false,
         (Some(l), Some(s)) => {
-            let reset_since = s
-                .windows
-                .iter()
-                .any(|w| w.resets_at.is_some_and(|r| r * 1000 <= l.ts));
+            // Reset since the stop: not a window whose reset had passed by then, which the
+            // account's usage can still list (`Store::current_usage`).
+            let reset_since = s.windows.iter().any(|w| {
+                w.resets_at
+                    .is_some_and(|r| r * 1000 > s.ts && r * 1000 <= l.ts)
+            });
             reset_since || !same_numbers(l, s)
         }
         (Some(_), None) => true,
