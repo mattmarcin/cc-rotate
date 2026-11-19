@@ -48,6 +48,7 @@ There are no versioned releases yet, so only the latest `main` is supported.
   A private group is one named after you with no members listed; another account that has it as its own primary group isn't listed, so cc-rotate can't see it.
   macOS access control lists are not read.
   When a `claude` is found but refused, the error and `cc-rotate-ctl doctor` say which step, and setting `claude_path` uses it anyway.
+- When you set up desktop app sessions, the Claude desktop app runs `cc-rotate-ctl desktop-launch` before every Code session it starts. It only reads the store (opened read-only, for the profile's location), changes the session's environment as described in the design document (section 24.1) and starts Claude Code; it writes nothing but an error to the log. On macOS it also hard-links desktop session transcripts between the app's profile and the rotation profile, so the app finds a session's history and a resumed session runs on the pool; it never replaces or deletes a transcript, and starts `cc-rotate-ctl desktop-link-transcripts` in the background for that while the session runs. Claude Code's managed settings, which name it, can only be written by an administrator, and cc-rotate prints the commands instead of running them.
 - Your other Claude Code profiles are only read, to find out which account each belongs to; their logins are never imported or changed.
 
 ## Scope

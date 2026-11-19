@@ -6,6 +6,7 @@
 pub mod budget;
 pub mod credfile;
 pub mod credstore;
+pub mod desktop;
 pub mod doctor;
 pub mod extra_usage;
 pub mod forecast;
@@ -50,13 +51,7 @@ pub fn open(profile_override: Option<PathBuf>) -> Result<(Store, Paths)> {
         .map(PathBuf::from);
     let profile = match profile_override.or(from_env) {
         Some(p) => p,
-        None => match store.settings()?.profile_dir {
-            Some(p) if !std::path::Path::new(&p).is_absolute() => anyhow::bail!(
-                "profile_dir must be a full path. Set it with cc-rotate-ctl --profile <full path> config profile_dir <full path>."
-            ),
-            Some(p) => PathBuf::from(p),
-            None => Paths::default_profile_dir()?,
-        },
+        None => profile_from_setting(store.settings()?.profile_dir)?,
     };
     // Its login and settings (which can hold secrets in `env`) are the user's alone, even when
     // an older version made them with the default mode.
@@ -65,4 +60,35 @@ pub fn open(profile_override: Option<PathBuf>) -> Result<(Store, Paths)> {
         secret::restrict_to_owner(&profile.join(file), 0o600);
     }
     Ok((store, Paths::new(data_dir, profile)))
+}
+
+/// The `profile_dir` setting, or the default profile when it is unset.
+fn profile_from_setting(setting: Option<String>) -> Result<PathBuf> {
+    match setting {
+        Some(p) if !std::path::Path::new(&p).is_absolute() => anyhow::bail!(
+            "profile_dir must be a full path. Set it with cc-rotate-ctl --profile <full path> config profile_dir <full path>."
+        ),
+        Some(p) => Ok(PathBuf::from(p)),
+        None => Paths::default_profile_dir(),
+    }
+}
+
+/// The profile `open` would resolve, without changing anything: the store is opened read-only
+/// (and not at all when there is none yet), and no permissions are touched. For the desktop
+/// launcher, which runs for every Code session the app starts (spec section 24.1).
+pub fn resolve_profile_read_only(profile_override: Option<PathBuf>) -> Result<PathBuf> {
+    let from_env = std::env::var_os("CC_ROTATE_PROFILE")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    if let Some(p) = profile_override.or(from_env) {
+        return Ok(p);
+    }
+    let db = Paths::default_data_dir()?.join("store.db");
+    if !db.exists() {
+        return Paths::default_profile_dir();
+    }
+    // Any schema: after an upgrade the store may not be migrated yet.
+    profile_from_setting(
+        Store::read_setting_any_schema(&db, "profile_dir")?.filter(|v| !v.is_empty()),
+    )
 }

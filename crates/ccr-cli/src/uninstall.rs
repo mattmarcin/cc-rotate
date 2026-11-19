@@ -59,7 +59,11 @@ pub fn run(profile: Option<PathBuf>, dry_run: bool, yes: bool, force: bool) -> R
     drop(store);
 
     print_plan(&plan);
-    let blocked = blocked(&plan, force);
+    let blocked = blocked(&plan, force).or_else(|| {
+        (!force)
+            .then(|| ccr_core::desktop::uninstall_refusal(&ccr_core::desktop::read_setup()))
+            .flatten()
+    });
     if dry_run {
         if let Some(why) = blocked {
             println!();

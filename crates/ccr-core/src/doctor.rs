@@ -111,6 +111,13 @@ pub fn run(store: &Store, paths: &Paths) -> Vec<Check> {
     checks.push(profile_settings_check(paths));
     checks.push(environment_check(paths, |k| std::env::var(k).ok()));
     checks.push(herdr_check(paths, herdr::detect()));
+    checks.push(desktop_check(
+        &crate::desktop::read_setup(),
+        std::fs::read_to_string(paths.settings_file())
+            .ok()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+            .is_some_and(|s| crate::setup::stop_hook_present(&s)),
+    ));
 
     let legacy = crate::setup::legacy_alias_files();
     if !legacy.is_empty() {
@@ -621,6 +628,81 @@ fn encryption_check(store: &Store) -> Check {
     }
 }
 
+/// The desktop app's Code sessions (spec section 24.3).
+fn desktop_check(setup: &crate::desktop::Setup, stop_hook: bool) -> Check {
+    use crate::desktop::{Launcher, Platform, Policy, launcher_program};
+    let name = "Desktop app";
+    if setup.platform == Platform::Unsupported {
+        return check(
+            name,
+            Status::Ok,
+            "the desktop app's sessions can't use the pool on this platform",
+        );
+    }
+    let fix = "Run `cc-rotate-ctl desktop` for the commands that set it up.";
+    match (&setup.policy, &setup.launcher) {
+        (Policy::On, Launcher::Ours) if stop_hook => check(
+            name,
+            Status::Ok,
+            "the desktop app's Code sessions run on the pool (new sessions)",
+        ),
+        (Policy::On, Launcher::Ours) => check(
+            name,
+            Status::Warn,
+            "the desktop app's Code sessions run on the pool, but the profile has no `hook stop`, so a woken one is reported as stuck. Run `cc-rotate-ctl setup --keep-existing`.",
+        ),
+        (Policy::On, Launcher::Other(value)) => {
+            let missing = launcher_program(value).is_some_and(|p| p.is_absolute() && !p.exists());
+            if missing {
+                check(
+                    name,
+                    Status::Fail,
+                    format!(
+                        "Claude Code's managed settings name a launcher that is not there ({value}), so the desktop app can start no Code session. {fix}"
+                    ),
+                )
+            } else {
+                check(
+                    name,
+                    Status::Warn,
+                    format!(
+                        "the desktop app starts Code sessions through another launcher ({value}), so they don't run on the pool. {fix}"
+                    ),
+                )
+            }
+        }
+        (Policy::On, Launcher::None) => check(
+            name,
+            Status::Warn,
+            format!(
+                "the app's launcher policy is on, but Claude Code's managed settings name no launcher. {fix}"
+            ),
+        ),
+        (Policy::On, Launcher::Unreadable(why)) => check(
+            name,
+            Status::Warn,
+            format!("Claude Code's managed settings can't be read ({why})"),
+        ),
+        (Policy::Off | Policy::Disabled, Launcher::Ours) => check(
+            name,
+            Status::Warn,
+            format!(
+                "Claude Code's managed settings name cc-rotate's launcher, but the app's launcher policy is off, so desktop sessions run on the app's account. {fix}"
+            ),
+        ),
+        (Policy::Unknown(why), _) => check(
+            name,
+            Status::Warn,
+            format!("the app's launcher policy can't be read ({why})"),
+        ),
+        (Policy::Off | Policy::Disabled, _) => check(
+            name,
+            Status::Ok,
+            "the desktop app's Code sessions run on the app's account (`cc-rotate-ctl desktop` sets them up on the pool)",
+        ),
+    }
+}
+
 fn profile_settings_check(paths: &Paths) -> Check {
     let path = paths.settings_file();
     let Ok(text) = std::fs::read_to_string(&path) else {
@@ -823,6 +905,83 @@ fn herdr_check(paths: &Paths, detected: Result<herdr::Detected, crate::paths::No
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_desktop_app_line() {
+        use crate::desktop::{Launcher, Platform, Policy, Setup};
+        let setup = |policy: Policy, launcher: Launcher| Setup {
+            platform: Platform::MacOs,
+            policy,
+            policy_foreign: false,
+            launcher,
+            launcher_foreign: false,
+        };
+        let status = |s: &Setup, stop_hook: bool| desktop_check(s, stop_hook).status;
+
+        let off = desktop_check(&setup(Policy::Off, Launcher::None), false);
+        assert_eq!(off.name, "Desktop app");
+        assert_eq!(off.status, Status::Ok);
+        assert!(off.detail.contains("app's account"), "{}", off.detail);
+        assert_eq!(status(&setup(Policy::On, Launcher::Ours), true), Status::Ok);
+        let no_hook = desktop_check(&setup(Policy::On, Launcher::Ours), false);
+        assert_eq!(no_hook.status, Status::Warn);
+        assert!(
+            no_hook
+                .detail
+                .contains("cc-rotate-ctl setup --keep-existing")
+        );
+        // Half set up.
+        assert_eq!(
+            status(&setup(Policy::On, Launcher::None), true),
+            Status::Warn
+        );
+        assert_eq!(
+            status(&setup(Policy::Off, Launcher::Ours), true),
+            Status::Warn
+        );
+        assert_eq!(
+            status(&setup(Policy::Disabled, Launcher::Ours), true),
+            Status::Warn
+        );
+        // Another launcher that is there runs the sessions, just not on the pool; a missing one
+        // stops the app from starting any.
+        let dir = tempfile::tempdir().unwrap();
+        let present = dir.path().join("corp-launcher");
+        std::fs::write(&present, "").unwrap();
+        let other = |p: &std::path::Path| Launcher::Other(p.to_string_lossy().into_owned());
+        assert_eq!(
+            status(&setup(Policy::On, other(&present)), true),
+            Status::Warn
+        );
+        assert_eq!(
+            status(&setup(Policy::On, other(&dir.path().join("gone"))), true),
+            Status::Fail
+        );
+        assert_eq!(
+            status(
+                &setup(
+                    Policy::On,
+                    Launcher::Other(serde_json::json!([dir.path().join("gone"), "x"]).to_string())
+                ),
+                true
+            ),
+            Status::Fail
+        );
+        // Without the policy, another launcher is not the app's business.
+        assert_eq!(
+            status(&setup(Policy::Off, other(&dir.path().join("gone"))), true),
+            Status::Ok
+        );
+        assert_eq!(
+            status(&setup(Policy::On, Launcher::Unreadable("x".into())), true),
+            Status::Warn
+        );
+        let unsupported = Setup {
+            platform: Platform::Unsupported,
+            ..setup(Policy::Off, Launcher::None)
+        };
+        assert_eq!(status(&unsupported, false), Status::Ok);
+    }
 
     #[test]
     fn environment_check_finds_overrides_and_the_retry_watchdog() {

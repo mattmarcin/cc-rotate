@@ -594,6 +594,116 @@ pub fn doctor(checks: &[Check]) -> String {
     out
 }
 
+/// `cc-rotate-ctl desktop` (spec section 24.2).
+pub fn desktop(setup: &ccr_core::desktop::Setup, ctl: &std::path::Path) -> String {
+    use ccr_core::desktop::{self, Launcher, Platform, Policy};
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    if setup.platform == Platform::Unsupported {
+        out.push_str(
+            "The Claude desktop app's Code sessions can run on the pool on macOS and Windows only.\n",
+        );
+        return out;
+    }
+    let managed = |foreign: bool| {
+        if foreign {
+            ", set by device management"
+        } else {
+            ""
+        }
+    };
+    let policy = match &setup.policy {
+        Policy::On => "on".to_string(),
+        Policy::Off => "not set".to_string(),
+        Policy::Disabled => "off".to_string(),
+        Policy::Unknown(why) => format!("unknown ({why})"),
+    };
+    let _ = writeln!(
+        out,
+        "The app's policy {} ({}): {policy}{}",
+        desktop::POLICY_KEY,
+        desktop::policy_location(setup.platform),
+        managed(setup.policy_foreign)
+    );
+    let launcher = match &setup.launcher {
+        Launcher::Ours => "cc-rotate's (this cc-rotate-ctl)".to_string(),
+        Launcher::None => "none".to_string(),
+        Launcher::Other(v) => format!("another program: {v}"),
+        Launcher::Unreadable(why) => format!("unreadable ({why})"),
+    };
+    let file = desktop::settings_file(setup.platform).unwrap_or_default();
+    let _ = writeln!(
+        out,
+        "Claude Code's launcher (processWrapper in {}): {launcher}{}\n",
+        file.display(),
+        managed(setup.launcher_foreign)
+    );
+    let shell = match setup.platform {
+        Platform::Windows => "in PowerShell run as administrator",
+        _ => "in Terminal",
+    };
+    let list = |out: &mut String, commands: &[String]| {
+        for c in commands {
+            let _ = writeln!(out, "  {c}");
+        }
+    };
+    if setup.on() {
+        out.push_str("Desktop sessions run on the pool.\n");
+        let off = desktop::off_commands(setup);
+        if off.is_empty() {
+            out.push_str(
+                "Device management set this up, so turning it off is for its administrator.\n",
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "To turn this off, run these {shell}, then quit and reopen the Claude app:"
+            );
+            list(&mut out, &off);
+            if setup.platform == Platform::MacOs {
+                let _ = writeln!(
+                    out,
+                    "(Or remove \"{}\" in System Settings > General > Device Management.)",
+                    desktop::PROFILE_NAME
+                );
+            }
+        }
+    } else {
+        out.push_str("Desktop sessions run on the account the Claude app is signed in to.\n");
+        let on = desktop::on_commands(setup, ctl);
+        if !on.is_empty() {
+            if matches!(setup.launcher, Launcher::Other(_)) && !setup.launcher_foreign {
+                out.push_str("Turning this on replaces that launcher.\n");
+            }
+            let _ = writeln!(
+                out,
+                "To run them on the pool, run these {shell}, then quit and reopen the Claude app:"
+            );
+            list(&mut out, &on);
+            if setup.platform == Platform::MacOs
+                && setup.policy != Policy::On
+                && !setup.policy_foreign
+            {
+                let _ = writeln!(
+                    out,
+                    "In System Settings, open General > Device Management, double-click \"{}\" and install it (it needs your password).",
+                    desktop::PROFILE_NAME
+                );
+            }
+        }
+        for note in desktop::admin_notes(setup, ctl) {
+            let _ = writeln!(out, "{note}");
+        }
+    }
+    out.push_str(
+        "\nArtifacts published while another account is in use don't open in the app's artifact pane.\n",
+    );
+    if setup.platform == Platform::Windows {
+        out.push_str("This has not been tried in the Windows app yet.\n");
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
