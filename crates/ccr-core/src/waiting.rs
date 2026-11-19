@@ -15,7 +15,7 @@ use crate::paths::Paths;
 use crate::process;
 use crate::scheduler::{self, Thresholds};
 use crate::store::{Account, Sample, Store, WaitingSession, WaitingState, kind};
-use crate::swap::{self, META_PROFILE_MODEL};
+use crate::swap;
 
 /// A swap that landed this soon before a turn stopped may not have reached that turn's request:
 /// the stop may be the previous account's.
@@ -155,24 +155,24 @@ fn limit_reset(store: &Store, ws: &WaitingSession, account: &Account, now_ms: i6
     Ok(!Limit::of(store, account)?.blocking(&sample, now_ms / 1000))
 }
 
-/// What counts as at a limit for an account: its thresholds, for the model in use.
+/// What counts as at a limit for an account: its thresholds, for the models in use.
 struct Limit {
     thresholds: Thresholds,
-    model: Option<String>,
+    models: Vec<String>,
 }
 
 impl Limit {
     fn of(store: &Store, account: &Account) -> Result<Limit> {
         Ok(Limit {
             thresholds: Thresholds::from(&store.settings()?).for_account(account),
-            model: store.meta(META_PROFILE_MODEL)?,
+            models: swap::models_in_use(store)?,
         })
     }
 
     /// Whether `sample` has a window at its threshold at `at_s` (a window counts as 0 once its
     /// reset time has passed).
     fn blocking(&self, sample: &Sample, at_s: i64) -> bool {
-        scheduler::window_usage(Some(sample), at_s, self.thresholds, self.model.as_deref())
+        scheduler::window_usage(Some(sample), at_s, self.thresholds, &self.models)
             .iter()
             .any(scheduler::WindowUsage::blocking)
     }

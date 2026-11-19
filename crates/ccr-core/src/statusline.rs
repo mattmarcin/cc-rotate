@@ -25,6 +25,12 @@ pub const META_LAST_TICK_AT: &str = "statusline_last_tick_at";
 /// When a tick last asked for a usage check of the account in use (`confirm_due`).
 const META_CONFIRM_REQUESTED_AT: &str = "confirm_requested_at";
 const CONFIRM_QUIET_MS: i64 = 10 * 60_000;
+/// When a tick last asked for a reading of the account in use because one of its windows is
+/// limited to one model family (`model_windows_due`).
+const META_MODEL_WINDOWS_AT: &str = "model_windows_read_at";
+/// How often the account in use is read for such a window, and how long after its numbers last
+/// changed a session counts as working for it.
+const MODEL_WINDOWS_EVERY_MS: i64 = 10 * 60_000;
 pub const META_LAST_TICK_HAD_USAGE: &str = "statusline_last_tick_had_usage";
 const META_CONFIG_MTIME_SEEN: &str = "profile_config_mtime_seen";
 const META_PROFILE_UUID_SEEN: &str = "profile_account_uuid_seen";
@@ -240,8 +246,12 @@ pub fn tick(store: &Store, paths: &Paths, input: &StatusInput, now_ms: i64) -> R
     // use, unless its reading is another account's: then the request still carried that one's
     // login.
     let mut cost_account = active.id;
+    // Whether this session got a response on the account in use lately.
+    let mut working = false;
     if let Some(sample) = input.sample_for(active.id, crate::store::ROTATION_PROFILE, now_ms) {
-        if idle_since_swap(store, input, &process, &sample, now_ms)? {
+        let since = reading_since(store, input, &process, &sample, now_ms)?;
+        let fresh = since.is_some_and(|t| (0..MODEL_WINDOWS_EVERY_MS).contains(&(now_ms - t)));
+        if idle_since_swap(store, &sample, since)? {
             // The numbers of the account the session used before; it has not had a response
             // since.
             cost_account = reading_account(store, &sample, active.id)?.unwrap_or(active.id);
@@ -254,11 +264,13 @@ pub fn tick(store: &Store, paths: &Paths, input: &StatusInput, now_ms: i64) -> R
                     store.record_sample(&sample)?;
                     swap::note_known_resets(store, active.id, &sample.windows, now_ms / 1000)?;
                     note_session_working(store, input, active.id, &sample, now_ms)?;
+                    working = fresh;
                 }
                 // Recorded, but it does not vouch for the account's reset times.
                 swap::Attribution::Ambiguous => {
                     store.record_sample(&sample)?;
                     note_session_working(store, input, active.id, &sample, now_ms)?;
+                    working = fresh;
                 }
                 swap::Attribution::Elsewhere => {
                     result.confirm = confirm_due(store, &sample, active.id, now_ms)?;
@@ -317,6 +329,14 @@ pub fn tick(store: &Store, paths: &Paths, input: &StatusInput, now_ms: i64) -> R
         result.swap = None;
         result.confirm = true;
     }
+    if working
+        && !result.confirm
+        && !result.settle_login
+        && result.swap.is_none()
+        && model_windows_due(store, &pool, active.id, now_ms)?
+    {
+        result.confirm = true;
+    }
 
     store.prune(now_ms)?;
     crate::health::scan_from_tick(store, now_ms)?;
@@ -339,6 +359,48 @@ fn note_session_working(
         }
         _ => Ok(()),
     }
+}
+
+/// Whether to read the account in use's usage again (`usage_check::confirm_active`) for a window
+/// limited to one model family: its sessions spend that window, and the status line does not
+/// report it (F13), so its number stands still (`Store::current_usage`) until the account's next
+/// own reading. Asked by a session that is working, while such a window applies to a model in
+/// use, at most every `MODEL_WINDOWS_EVERY_MS`, and not sooner than that after the account
+/// became active or was last read. Not while the usage endpoint's wait runs (R17): a refusal
+/// sets `not_before` with no `problem`, unlike the back-off after a failed check of the stored
+/// login, which says nothing about the profile's. One of the sessions ticking at once asks.
+fn model_windows_due(
+    store: &Store,
+    pool: &[scheduler::Candidate],
+    active_id: i64,
+    now_ms: i64,
+) -> Result<bool> {
+    if !store.settings()?.usage_checks {
+        return Ok(false);
+    }
+    let limited = pool
+        .iter()
+        .find(|c| c.account.id == active_id)
+        .is_some_and(|c| c.windows.iter().any(|w| w.model.is_some() && w.applies));
+    if !limited {
+        return Ok(false);
+    }
+    let checks = crate::usage_check::state(store, active_id)?;
+    if checks.problem.is_none() && checks.not_before.is_some_and(|t| t > now_ms) {
+        return Ok(false);
+    }
+    let read = store.own_reading(active_id)?.map_or(0, |s| s.ts);
+    // Times ahead of the clock (it was set back) count as now, so the wait still ends.
+    let since = swap::active_since(store)?.max(read).min(now_ms);
+    store.immediate(|s| {
+        let last = s.meta_i64(META_MODEL_WINDOWS_AT)?.unwrap_or(0).max(since);
+        // Nor does a last request ahead of the clock keep it from ever asking again.
+        let due = (now_ms - last).abs() >= MODEL_WINDOWS_EVERY_MS;
+        if due {
+            s.set_meta(META_MODEL_WINDOWS_AT, now_ms)?;
+        }
+        Ok(due)
+    })
 }
 
 /// How often a swap away from paid extra usage is asked for while one is on its way.
@@ -403,16 +465,15 @@ fn confirm_due(store: &Store, sample: &Sample, active_id: i64, now_ms: i64) -> R
     if !settings.usage_checks {
         return Ok(false);
     }
-    let model = store.meta(META_PROFILE_MODEL)?;
+    let models = swap::models_in_use(store)?;
     let thresholds = scheduler::Thresholds::from(&settings);
     let thresholds = match store.account(active_id)? {
         Some(account) => thresholds.for_account(&account),
         None => thresholds,
     };
-    let blocking =
-        scheduler::window_usage(Some(sample), now_ms / 1000, thresholds, model.as_deref())
-            .iter()
-            .any(scheduler::WindowUsage::blocking);
+    let blocking = scheduler::window_usage(Some(sample), now_ms / 1000, thresholds, &models)
+        .iter()
+        .any(scheduler::WindowUsage::blocking);
     if !blocking {
         return Ok(false);
     }
@@ -551,21 +612,30 @@ fn claude_pid(value: Option<&str>) -> Option<u32> {
     value?.trim().parse().ok().filter(|pid| *pid > 0)
 }
 
-/// Whether the session has reported these numbers unchanged since before the account in use
-/// became active (`Store::note_session_reading`): it has had no response since, so they are the
-/// account it used before. A session only notices a new login when it next starts a request
-/// (F1), and repeats its last numbers until then, however long it idles (F24).
-fn idle_since_swap(
+/// Since when the session has reported these numbers unchanged (`Store::note_session_reading`),
+/// which is when it last got a response. `None` for a reading that names no session.
+fn reading_since(
     store: &Store,
     input: &StatusInput,
     process: &str,
     sample: &Sample,
     now_ms: i64,
-) -> Result<bool> {
+) -> Result<Option<i64>> {
     let Some(session) = input.session_id.as_deref().filter(|s| !s.is_empty()) else {
-        return Ok(false);
+        return Ok(None);
     };
     let since = store.note_session_reading(session, process, &sample.windows, now_ms)?;
+    Ok(Some(since))
+}
+
+/// Whether the session has reported these numbers unchanged since before the account in use
+/// became active (`reading_since`): it has had no response since, so they are the account it
+/// used before. A session only notices a new login when it next starts a request (F1), and
+/// repeats its last numbers until then, however long it idles (F24).
+fn idle_since_swap(store: &Store, sample: &Sample, since: Option<i64>) -> Result<bool> {
+    let Some(since) = since else {
+        return Ok(false);
+    };
     if since >= swap::active_since(store)? {
         return Ok(false);
     }

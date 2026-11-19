@@ -98,16 +98,20 @@ fn ps_lstart(pid: u32, fixed: bool) -> Option<String> {
 /// locale and time zone of the process that wrote it, matches too.
 pub fn started_at(pid: u32, recorded: &str) -> Option<bool> {
     let now = start_time(pid)?;
-    if now == recorded {
-        return Some(true);
-    }
-    #[cfg(unix)]
-    if !std::path::Path::new("/proc/self/stat").exists()
+    Some(now == recorded || older_record_matches(pid, recorded))
+}
+
+/// Whether `recorded` is the start time of `pid` as an older cc-rotate wrote it.
+#[cfg(unix)]
+fn older_record_matches(pid: u32, recorded: &str) -> bool {
+    !std::path::Path::new("/proc/self/stat").exists()
         && ps_lstart(pid, false).as_deref() == Some(recorded)
-    {
-        return Some(true);
-    }
-    Some(false)
+}
+
+/// Windows records never depended on the locale or time zone.
+#[cfg(not(unix))]
+fn older_record_matches(_pid: u32, _recorded: &str) -> bool {
+    false
 }
 
 /// The parent of the process `pid`, while both run.

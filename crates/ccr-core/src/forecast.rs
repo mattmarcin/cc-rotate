@@ -357,7 +357,7 @@ mod tests {
                 added_at: 0,
                 last_login_at: None,
             },
-            windows: window_usage(Some(&sample), NOW, T, None),
+            windows: window_usage(Some(&sample), NOW, T, &[]),
             weekly_detected: WeeklyLimit::None,
             weekly_limit: WeeklyLimit::None,
             order: id as usize,
@@ -446,7 +446,7 @@ mod tests {
                 }),
                 NOW,
                 T,
-                None,
+                &[],
             ));
         }
         let f = forecast(
@@ -501,7 +501,7 @@ mod tests {
                         }),
                         NOW,
                         T,
-                        None,
+                        &[],
                     ));
                     c
                 })
@@ -586,7 +586,7 @@ mod tests {
                 resets_at: Some(NOW + 3 * 86_400),
             }],
         };
-        s1.windows = window_usage(Some(&weekly), NOW, T, None);
+        s1.windows = window_usage(Some(&weekly), NOW, T, &[]);
         let pool = [s1, seat(2, AccountState::Parked, 0.0, None)];
         let f = play(&pool, 98.0 / 20.0);
         assert!(f.runs_out_at.is_some(), "{f:?}");
@@ -615,7 +615,7 @@ mod tests {
                 resets_at: Some(NOW + 3 * 86_400),
             }],
         };
-        s1.windows = window_usage(Some(&weekly), NOW, T, None);
+        s1.windows = window_usage(Some(&weekly), NOW, T, &[]);
         let pool = [s1, seat(2, AccountState::Parked, 99.0, Some(3600))];
         let f = play(&pool, 1.0);
         let plan = &f.plan;

@@ -254,7 +254,8 @@ fn scheduler_follows_the_order_and_skips_exhausted() {
         }
     );
 
-    store.record_sample(&sample(a, 10.0, 98.5)).unwrap();
+    // a is at its weekly limit (weekly limits swap at 100%), so every account is used up.
+    store.record_sample(&sample(a, 10.0, 100.0)).unwrap();
     let before = env.file_doc();
     assert_eq!(
         swap::run(&store, &env.paths, &manual(None)).unwrap(),
@@ -1951,6 +1952,64 @@ fn a_weekly_budget_that_would_reset_unused_moves_its_account_ahead() {
     assert!((marked - week_reset).abs() <= 5, "{marked} vs {week_reset}");
 }
 
+/// Every model the sessions' status lines reported in the last hour decides which model-scoped
+/// limits count, not only the one reported last: while one terminal session uses Fable and
+/// another Opus, an account at its Fable limit is not picked.
+#[test]
+fn an_account_at_its_fable_limit_is_skipped_while_a_session_uses_fable() {
+    let env = Env::new();
+    let (store, a, b, c) = pool(&env);
+    store.set_setting("strict_order", Some("true")).unwrap();
+    store.set_order(&[a, b, c]).unwrap();
+    // A terminal session's status line last saw Opus.
+    store
+        .set_meta(swap::META_PROFILE_MODEL, "claude-opus-5-5")
+        .unwrap();
+    let with_fable = |account, fable| Sample {
+        windows: vec![
+            window("five_hour", 10.0, time::now_s() + 3600),
+            window("seven_day", 40.0, time::now_s() + 86_400 * 3),
+            window("seven_day_fable", fable, time::now_s() + 86_400 * 3),
+        ],
+        ..sample(account, 10.0, 40.0)
+    };
+    store.record_sample(&sample(a, 10.0, 40.0)).unwrap();
+    store.record_sample(&with_fable(b, 100.0)).unwrap();
+    store.record_sample(&with_fable(c, 20.0)).unwrap();
+    assert_eq!(
+        swap::next_target(&store, Some(a)).unwrap().unwrap().id,
+        b,
+        "on Opus alone, b's Fable limit does not count"
+    );
+
+    // Another terminal session's status line reports Fable.
+    let reported = |pct, ts, model: &str| Sample {
+        ts,
+        session_id: Some("terminal-2".into()),
+        model: Some(model.into()),
+        ..sample(a, pct, 40.0)
+    };
+    let now = time::now_ms();
+    store
+        .record_sample(&reported(12.0, now, "claude-fable-5-2"))
+        .unwrap();
+    assert_eq!(
+        swap::next_target(&store, Some(a)).unwrap().unwrap().id,
+        c,
+        "b is at its Fable limit"
+    );
+    // A minute later it reports Opus: Fable is still in use.
+    store
+        .record_sample(&reported(13.0, now + 60_000, "claude-opus-5-5"))
+        .unwrap();
+    assert_eq!(swap::next_target(&store, Some(a)).unwrap().unwrap().id, c);
+    // No session reported Fable in the hour before the latest reading: b is back.
+    store
+        .record_sample(&reported(14.0, now + 3_600_000 + 1, "claude-opus-5-5"))
+        .unwrap();
+    assert_eq!(swap::next_target(&store, Some(a)).unwrap().unwrap().id, b);
+}
+
 /// A ready account's weekly budget must not expire while a later-resetting account keeps
 /// running below its limits.
 #[test]
@@ -2494,4 +2553,209 @@ fn keeping_a_window_running_is_opt_in() {
     assert!(store.account(a).unwrap().unwrap().keep_running);
     assert_eq!(usage_check::warm_ups_blocked(&store).unwrap(), None);
     assert!(store.set_keep_running(9_999, true).is_err());
+}
+
+/// A reading of the account itself (a usage check): the 5-hour and weekly windows on all models
+/// at `pcts`, and a weekly window limited to the Fable models at `fable`, when it has one.
+/// `resets` are the 5-hour and the weekly reset times.
+fn checked(
+    account: i64,
+    ts: i64,
+    pcts: (f64, f64),
+    fable: Option<f64>,
+    resets: (i64, i64),
+) -> Sample {
+    let mut windows = vec![
+        window("five_hour", pcts.0, resets.0),
+        window("seven_day", pcts.1, resets.1),
+    ];
+    windows.extend(fable.map(|pct| window("seven_day_fable", pct, resets.1)));
+    Sample {
+        ts,
+        account_id: account,
+        profile: usage_check::SOURCE.into(),
+        session_id: None,
+        model: None,
+        windows,
+    }
+}
+
+/// A status line reading as Claude Code sends it: the 5-hour and weekly windows on all models,
+/// and the session's model.
+fn model_input(model: &str, pcts: (f64, f64), resets: (i64, i64)) -> StatusInput {
+    let ((five, week), (five_resets, week_resets)) = (pcts, resets);
+    StatusInput::parse(&format!(
+        r#"{{"session_id":"s","model":{{"id":"{model}"}},"rate_limits":{{"five_hour":{{"used_percentage":{five},"resets_at":{five_resets}}},"seven_day":{{"used_percentage":{week},"resets_at":{week_resets}}}}}}}"#
+    ))
+}
+
+/// The status line reports no window limited to one model family, so the account in use would
+/// lose its Fable week ten minutes after its last usage check: nothing showed it and nothing
+/// swapped before it ran out. It stays, as the check read it, until the account's next own
+/// reading.
+#[test]
+fn the_account_in_use_keeps_its_windows_on_one_model_family() {
+    let env = Env::new();
+    let (store, a, _, _) = pool(&env);
+    let now = time::now_ms();
+    let start = now - 40 * 60_000;
+    let resets = (start / 1000 + 3 * 3600, now / 1000 + 3 * 86_400);
+    store
+        .record_sample(&checked(a, start, (10.0, 40.0), Some(78.0), resets))
+        .unwrap();
+    let fable = |store: &Store| {
+        let usage = store.current_usage(a).unwrap().unwrap();
+        usage.window("seven_day_fable").map(|w| w.pct)
+    };
+    let tick = |five: f64, week: f64, at: i64| {
+        let input = model_input("claude-fable-5-2", (five, week), resets);
+        statusline::tick(&store, &env.paths, &input, at).unwrap()
+    };
+
+    // Readings well over ten minutes after the check, and as far from one another.
+    tick(20.0, 41.0, start + 15 * 60_000);
+    tick(35.0, 43.0, start + 30 * 60_000);
+    assert_eq!(fable(&store), Some(78.0));
+    let usage = store.current_usage(a).unwrap().unwrap();
+    assert_eq!(usage.window("seven_day").unwrap().pct, 43.0);
+    // The reading itself is recorded as the status line gave it, so that a session repeating
+    // it is still told from one that is not (`store::same_windows`).
+    let recorded = store.last_sample(a).unwrap().unwrap();
+    let names: Vec<_> = recorded.windows.iter().map(|w| w.name.as_str()).collect();
+    assert_eq!(names, ["five_hour", "seven_day"]);
+    let (pool, _) = swap::load_pool(&store, now / 1000).unwrap();
+    let in_use = pool.iter().find(|c| c.account.id == a).unwrap();
+    assert!(
+        in_use
+            .windows
+            .iter()
+            .any(|w| w.name == "seven_day_fable" && w.applies),
+        "{:?}",
+        in_use.windows
+    );
+
+    // The account's next own reading settles it: a higher number, and then none at all.
+    store
+        .record_sample(&checked(
+            a,
+            start + 32 * 60_000,
+            (36.0, 43.0),
+            Some(91.0),
+            resets,
+        ))
+        .unwrap();
+    tick(38.0, 44.0, start + 33 * 60_000);
+    assert_eq!(fable(&store), Some(91.0));
+    store
+        .record_sample(&checked(a, start + 35 * 60_000, (38.0, 44.0), None, resets))
+        .unwrap();
+    tick(39.0, 44.0, start + 36 * 60_000);
+    assert_eq!(fable(&store), None, "the account's own reading has none");
+}
+
+/// A Fable week at its limit that only a usage check read still swaps the account in use away,
+/// like a limit the status line reports.
+#[test]
+fn a_limit_on_one_model_family_swaps_the_account_in_use_away() {
+    let env = Env::new();
+    let (store, a, _, _) = pool(&env);
+    let now = time::now_ms();
+    let start = now - 30 * 60_000;
+    let resets = (start / 1000 + 3 * 3600, now / 1000 + 3 * 86_400);
+    store
+        .record_sample(&checked(a, start, (10.0, 40.0), Some(100.0), resets))
+        .unwrap();
+    let input = |model: &str| model_input(model, (20.0, 41.0), resets);
+    // On another model family the limit does not apply.
+    let r = statusline::tick(&store, &env.paths, &input("claude-opus-5-5"), now - 60_000).unwrap();
+    assert!(r.swap.is_none(), "{r:?}");
+    let r = statusline::tick(&store, &env.paths, &input("claude-fable-5-2"), now).unwrap();
+    let req = r.swap.expect("a swap away from the used-up Fable week");
+    assert_eq!((req.from, req.reason), (Some(a), Reason::Weekly));
+}
+
+/// The account in use is read again now and then while one of its windows on one model family
+/// applies, since its sessions spend that window without the status line showing it.
+#[test]
+fn the_account_in_use_is_read_again_for_a_limit_the_status_line_does_not_report() {
+    let env = Env::new();
+    let (store, a, _, _) = pool(&env);
+    let now = time::now_ms();
+    let start = now - 90 * 60_000;
+    let resets = (start / 1000 + 3 * 3600, now / 1000 + 3 * 86_400);
+    let minute = 60_000;
+    // The swap that made the account active read it first.
+    store
+        .record_sample(&checked(a, start, (10.0, 40.0), Some(78.0), resets))
+        .unwrap();
+    store.set_meta(swap::META_ACTIVE_SINCE, start).unwrap();
+    let tick = |model: &str, five: f64, at: i64| {
+        let input = model_input(model, (five, 41.0), resets);
+        statusline::tick(&store, &env.paths, &input, at).unwrap()
+    };
+
+    // A limit on a model family no session uses needs no reading.
+    store.set_setting("usage_checks", Some("true")).unwrap();
+    assert!(!tick("claude-opus-5-5", 11.0, start + 11 * minute).confirm);
+    // The reading runs as a usage check, so not with those off.
+    store.set_setting("usage_checks", Some("false")).unwrap();
+    assert!(!tick("claude-fable-5-2", 12.0, start + 12 * minute).confirm);
+    store.set_setting("usage_checks", Some("true")).unwrap();
+    assert!(tick("claude-fable-5-2", 13.0, start + 13 * minute).confirm);
+    assert!(
+        !tick("claude-fable-5-2", 14.0, start + 14 * minute).confirm,
+        "asked once"
+    );
+    assert!(tick("claude-fable-5-2", 15.0, start + 24 * minute).confirm);
+    // A session that has had no response since repeats its numbers, and does not ask.
+    assert!(
+        !tick("claude-fable-5-2", 15.0, start + 36 * minute).confirm,
+        "idle"
+    );
+
+    // Not right after the account became active: the swap usually just read it.
+    store
+        .record_sample(&checked(
+            a,
+            start + 40 * minute,
+            (16.0, 41.0),
+            Some(80.0),
+            resets,
+        ))
+        .unwrap();
+    store
+        .set_meta(swap::META_ACTIVE_SINCE, start + 40 * minute)
+        .unwrap();
+    assert!(!tick("claude-fable-5-2", 17.0, start + 45 * minute).confirm);
+    assert!(tick("claude-fable-5-2", 18.0, start + 51 * minute).confirm);
+    // Nor within as long of a reading of the account that came another way.
+    store
+        .record_sample(&checked(
+            a,
+            start + 60 * minute,
+            (18.0, 41.0),
+            Some(81.0),
+            resets,
+        ))
+        .unwrap();
+    assert!(!tick("claude-fable-5-2", 19.0, start + 65 * minute).confirm);
+    // Nor while the usage endpoint asked to wait.
+    let refused = usage_check::CheckState {
+        not_before: Some(now + 3_600_000),
+        ..Default::default()
+    };
+    let key = format!("usage_check:{a}");
+    store
+        .set_meta(&key, serde_json::to_string(&refused).unwrap())
+        .unwrap();
+    assert_eq!(usage_check::state(&store, a).unwrap(), refused);
+    assert!(!tick("claude-fable-5-2", 20.0, start + 71 * minute).confirm);
+    usage_check::forget(&store, a).unwrap();
+    assert!(tick("claude-fable-5-2", 20.0, start + 71 * minute).confirm);
+
+    // An account without such a window is left to its status line.
+    store
+        .record_sample(&checked(a, start + 72 * minute, (20.0, 41.0), None, resets))
+        .unwrap();
+    assert!(!tick("claude-fable-5-2", 21.0, start + 85 * minute).confirm);
 }

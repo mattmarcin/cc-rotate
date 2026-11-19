@@ -490,7 +490,7 @@ mod tests {
         };
         Candidate {
             account: account(id, state),
-            windows: window_usage(Some(&sample), NOW, T, None),
+            windows: window_usage(Some(&sample), NOW, T, &[]),
             weekly_detected: WeeklyLimit::Has,
             weekly_limit: WeeklyLimit::Has,
             order: id as usize,
